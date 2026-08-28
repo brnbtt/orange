@@ -105,7 +105,7 @@ pub fn spawn(
     height: i32,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<VideoWindow> {
-    spawn_cascaded(title, width, height, 0, overlay)
+    spawn_window(title, width, height, 0, false, overlay)
 }
 
 pub fn spawn_cascaded(
@@ -115,11 +115,26 @@ pub fn spawn_cascaded(
     cascade: u32,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<VideoWindow> {
+    spawn_window(title, width, height, cascade, false, overlay)
+}
+
+pub fn spawn_monitor(title: &str, overlay: crate::overlay::SharedOverlay) -> Result<VideoWindow> {
+    spawn_window(title, 480, 270, 0, true, overlay)
+}
+
+fn spawn_window(
+    title: &str,
+    width: i32,
+    height: i32,
+    cascade: u32,
+    monitor: bool,
+    overlay: crate::overlay::SharedOverlay,
+) -> Result<VideoWindow> {
     let (tx, rx) = mpsc::channel::<Result<isize>>();
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
     std::thread::spawn(move || unsafe {
-        match create_window(&title, width, height, cascade, overlay) {
+        match create_window(&title, width, height, cascade, monitor, overlay) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
                     return;
@@ -318,6 +333,7 @@ unsafe fn create_window(
     width: i32,
     height: i32,
     cascade: u32,
+    monitor_mode: bool,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
@@ -344,15 +360,34 @@ unsafe fn create_window(
     let width = (width as f32 * scale).round() as i32;
     let height = (height as f32 * scale).round() as i32;
 
-    // Centre on the primary monitor.
-    let screen_w = GetSystemMetrics(SM_CXSCREEN);
-    let screen_h = GetSystemMetrics(SM_CYSCREEN);
-    let offset = (cascade.min(5) as f32 * 32.0 * scale).round() as i32;
-    let x = ((screen_w - width) / 2 + offset).min((screen_w - width).max(0));
-    let y = ((screen_h - height) / 2 + offset).min((screen_h - height).max(0));
+    let (x, y) = if monitor_mode {
+        let monitor = MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(monitor, &mut info).ok()?;
+        let margin = (24.0 * scale).round() as i32;
+        (
+            info.rcWork.right - width - margin,
+            info.rcWork.bottom - height - margin,
+        )
+    } else {
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let offset = (cascade.min(5) as f32 * 32.0 * scale).round() as i32;
+        (
+            ((screen_w - width) / 2 + offset).min((screen_w - width).max(0)),
+            ((screen_h - height) / 2 + offset).min((screen_h - height).max(0)),
+        )
+    };
 
     let hwnd = CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        if monitor_mode {
+            WS_EX_TOPMOST
+        } else {
+            WINDOW_EX_STYLE::default()
+        },
         class_name,
         PCWSTR(title.as_ptr()),
         // WS_POPUP: no title bar, no border. WS_THICKFRAME is kept so the

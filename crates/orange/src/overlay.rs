@@ -96,6 +96,8 @@ pub struct OverlayState {
     pub host: Option<String>,
     pub fps: Option<f64>,
     pub bitrate_kbps: Option<u32>,
+    /// Persistent compact status used by the bottom-right self-monitor.
+    pub monitor_mode: bool,
     shown_at: Instant,
     hot: Option<Control>,
     hits: Vec<Hit>,
@@ -123,6 +125,7 @@ impl Default for OverlayState {
             host: None,
             fps: None,
             bitrate_kbps: None,
+            monitor_mode: false,
             // Start hidden; the first mouse move reveals the controls.
             shown_at: Instant::now() - HIDE_AFTER * 2,
             hot: None,
@@ -341,6 +344,7 @@ impl OverlayState {
         self.muted.hash(&mut hasher);
         self.volume_dragging.hash(&mut hasher);
         self.fullscreen.hash(&mut hasher);
+        self.monitor_mode.hash(&mut hasher);
         self.hot.map(|c| c as u8).hash(&mut hasher);
         self.quality_label().hash(&mut hasher);
         self.detail_label().hash(&mut hasher);
@@ -584,7 +588,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // The element's `draw` signal requires a composition return value. `None`
     // aborts inside GLib once the controls time out, so hidden means one fully
     // transparent pixel rather than no object at all.
-    if !state.visible() {
+    if !state.visible() && !state.monitor_mode {
         state.hits.clear();
         let composition = transparent_composition()?;
         state.cache = Some((signature, composition.clone()));
@@ -592,6 +596,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     }
 
     let alpha = state.opacity();
+    let status_alpha = if state.monitor_mode { 1.0 } else { alpha };
     // Placement is in video coordinates; painting is at the output's physical
     // DPI. If both use video scale, tiny-skia's antialiasing is filtered again
     // when the sink fits the stream to the window, which softens every icon.
@@ -600,6 +605,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     let (fw, fh) = (vw as f32, vh as f32);
 
     let ink = rgba(CREAM, alpha);
+    let status_ink = rgba(CREAM, status_alpha);
     let mut hits: Vec<Hit> = Vec::new();
     let mut panels: Vec<Panel> = Vec::new();
 
@@ -615,8 +621,25 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // A broadcast mark at rest; hovering expands it to what is being received.
     {
         let expanded = state.hot == Some(Control::Stats);
-        let quality = state.quality_label();
-        let detail = if expanded { state.detail_label() } else { None };
+        let received = state.quality_label();
+        let quality = if state.monitor_mode {
+            String::from("STREAMING")
+        } else {
+            received.clone()
+        };
+        let detail = if expanded {
+            let detail = state.detail_label();
+            if state.monitor_mode {
+                Some(match detail {
+                    Some(detail) => format!("{received}  \u{00b7}  {detail}"),
+                    None => received,
+                })
+            } else {
+                detail
+            }
+        } else {
+            None
+        };
         let has_text = text::available();
         let label_size = LABEL * raster_scale;
         let mut text_w = text::width(&quality, label_size, Weight::Semibold) / raster_scale;
@@ -631,7 +654,8 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
         // Logical dimensions first; each is independently converted for the
         // destination rectangle and for the source pixmap.
         let h = CHIP;
-        let w = if expanded && has_text {
+        let show_label = (expanded || state.monitor_mode) && has_text;
+        let w = if show_label {
             CHIP + 8.0 + text_w + PAD
         } else {
             CHIP
@@ -652,15 +676,23 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
             |pixmap| {
                 let (w, h) = (w * raster_scale, h * raster_scale);
                 let icon = ICON * raster_scale;
-                panel(pixmap, 0.0, 0.0, w, h, CONTROL_RADIUS * raster_scale, alpha);
+                panel(
+                    pixmap,
+                    0.0,
+                    0.0,
+                    w,
+                    h,
+                    CONTROL_RADIUS * raster_scale,
+                    status_alpha,
+                );
                 live_mark(
                     pixmap,
                     (CHIP * raster_scale - icon) / 2.0,
                     (h - icon) / 2.0,
                     icon,
-                    rgba(ORANGE, alpha),
+                    rgba(ORANGE, status_alpha),
                 );
-                if !expanded || !has_text {
+                if !show_label {
                     return;
                 }
                 let baseline = h / 2.0 + text::cap_height(label_size) / 2.0;
@@ -672,7 +704,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                     &quality,
                     label_size,
                     Weight::Semibold,
-                    ink,
+                    status_ink,
                 );
                 if let Some(detail) = &detail {
                     caret += text::width(&quality, label_size, Weight::Semibold);
@@ -684,7 +716,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                         &joined,
                         label_size,
                         Weight::Regular,
-                        rgba(CREAM, 0.62 * alpha),
+                        rgba(CREAM, 0.62 * status_alpha),
                     );
                 }
             },
@@ -703,7 +735,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // --- close, top-right ---------------------------------------------------
     // Where a window's close button would be, since this frame has no title
     // bar of its own. Tinted red on hover: it ends the session.
-    {
+    if alpha > 0.0 {
         let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
         let (x, y) = (fw - MARGIN * render_scale - w, MARGIN * render_scale);
         let hovered = state.hot == Some(Control::Close);
@@ -750,7 +782,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // A speaker on its own until pointed at, then the slider grows out of it
     // to the right. The volume control is the one thing a viewer actually
     // reaches for, so it gets the largest target of the four.
-    {
+    if alpha > 0.0 {
         let open = state.audio_open();
         let gap = 12.0;
         let h = BUTTON;
@@ -870,7 +902,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
 
     // --- view, bottom-right -------------------------------------------------
     // Fullscreen, where every video player puts it.
-    {
+    if alpha > 0.0 {
         let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
         let x = fw - (MARGIN + BUTTON) * render_scale;
         let y = fh - (MARGIN + BUTTON) * render_scale;

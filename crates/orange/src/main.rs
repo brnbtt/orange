@@ -93,6 +93,9 @@ enum Command {
         /// Offset this viewer from earlier viewer windows.
         #[arg(long, default_value_t = 0)]
         cascade: u32,
+        /// Open as a compact always-on-top self-monitor.
+        #[arg(long)]
+        monitor: bool,
     },
     /// Open the viewer window with a synthetic stream. Design harness.
     ///
@@ -258,6 +261,7 @@ fn main() -> Result<()> {
             server,
             out,
             cascade,
+            monitor,
         } => {
             let output = match out {
                 Some(path) => webrtc::Output::File(path),
@@ -265,13 +269,23 @@ fn main() -> Result<()> {
                     let overlay = std::sync::Arc::new(std::sync::Mutex::new(
                         overlay::OverlayState::default(),
                     ));
-                    let win = window::spawn_cascaded(
-                        &format!("orange - {code}"),
-                        1280,
-                        720,
-                        cascade,
-                        overlay.clone(),
-                    )?;
+                    if monitor {
+                        overlay.lock().unwrap().monitor_mode = true;
+                    }
+                    let win = if monitor {
+                        window::spawn_monitor(
+                            &format!("orange - monitor - {code}"),
+                            overlay.clone(),
+                        )?
+                    } else {
+                        window::spawn_cascaded(
+                            &format!("orange - {code}"),
+                            1280,
+                            720,
+                            cascade,
+                            overlay.clone(),
+                        )?
+                    };
                     webrtc::Output::Window {
                         hwnd: win.hwnd,
                         overlay,

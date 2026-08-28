@@ -204,13 +204,16 @@ impl Supervisor {
     }
 
     /// Start `orange watch` for a code.
-    pub fn watch(code: &str, server: &str, cascade: usize) -> Result<Self> {
+    pub fn watch(code: &str, server: &str, cascade: usize, monitor: bool) -> Result<Self> {
         let mut command = orange_command()?;
         command
             .arg("watch")
             .args(["--code", code])
             .args(["--server", server])
             .args(["--cascade", &(cascade % 6).to_string()]);
+        if monitor {
+            command.arg("--monitor");
+        }
         Self::spawn(command)
     }
 

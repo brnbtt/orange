@@ -49,6 +49,7 @@ enum Screen {
 
 struct WatchSession {
     code: String,
+    monitor: bool,
     supervisor: Supervisor,
 }
 
@@ -77,6 +78,7 @@ struct Orange {
     sized_for: Option<Screen>,
     /// Drives the transient "Copied" confirmation on the share code.
     copied_at: Option<Instant>,
+    copied_code: Option<String>,
 }
 
 impl Orange {
@@ -117,6 +119,7 @@ impl Orange {
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
             sized_for: None,
             copied_at: None,
+            copied_code: None,
         }
     }
 
@@ -182,6 +185,15 @@ impl Orange {
         }
         if self.screen == Screen::Watching && self.watches.is_empty() {
             self.screen = Screen::Home;
+        }
+
+        // A newly-issued room code is immediately ready to paste into chat.
+        if let Some(code) = self.code() {
+            if self.copied_code.as_deref() != Some(&code) {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.clone()));
+                self.copied_code = Some(code);
+                self.copied_at = Some(Instant::now());
+            }
         }
         cx.notify();
     }
@@ -295,6 +307,8 @@ impl Orange {
                 self.active_target = Some(target);
                 self.active_preview = preview;
                 self.host = Some(stream);
+                self.copied_code = None;
+                self.copied_at = None;
                 self.screen = Screen::Streaming;
                 self.error = None;
             }
@@ -303,6 +317,14 @@ impl Orange {
     }
 
     fn join(&mut self, code: String) {
+        self.join_with_mode(code, false);
+    }
+
+    fn open_live_monitor(&mut self, code: String) {
+        self.join_with_mode(code, true);
+    }
+
+    fn join_with_mode(&mut self, code: String, monitor: bool) {
         let code = code.trim().to_ascii_uppercase();
         if code.is_empty() {
             self.error = Some("No code on the clipboard".into());
@@ -319,10 +341,11 @@ impl Orange {
             );
             return;
         }
-        match Supervisor::watch(&code, &self.server, self.watches.len()) {
+        match Supervisor::watch(&code, &self.server, self.watches.len(), monitor) {
             Ok(stream) => {
                 self.watches.push(WatchSession {
                     code,
+                    monitor,
                     supervisor: stream,
                 });
                 if self.host.is_none() {
@@ -340,6 +363,8 @@ impl Orange {
         }
         self.active_target = None;
         self.active_preview = None;
+        self.copied_code = None;
+        self.copied_at = None;
         self.screen = if self.watches.is_empty() {
             Screen::Home
         } else {
@@ -424,8 +449,26 @@ fn avatar(image: Option<std::sync::Arc<gpui::RenderImage>>, name: &str, size: f3
         .next()
         .map(|ch| ch.to_uppercase().collect::<String>())
         .unwrap_or_else(|| "?".into());
+    let content = match image {
+        Some(image) => gpui::img(image)
+            .w(px(size - 2.0))
+            .h(px(size - 2.0))
+            .rounded_full()
+            .overflow_hidden()
+            .object_fit(gpui::ObjectFit::Cover)
+            .with_animation(
+                SharedString::from("avatar-in"),
+                Animation::new(Duration::from_millis(180)),
+                |element, delta| element.opacity(delta),
+            )
+            .into_any_element(),
+        None => label(initial, TEXT)
+            .font_family("Bahnschrift")
+            .text_size(px(size * 0.42))
+            .font_weight(FontWeight::SEMIBOLD)
+            .into_any_element(),
+    };
     div()
-        .relative()
         .flex()
         .items_center()
         .justify_center()
@@ -437,33 +480,7 @@ fn avatar(image: Option<std::sync::Arc<gpui::RenderImage>>, name: &str, size: f3
         .bg(rgb(SURFACE_HOVER))
         .border_1()
         .border_color(rgb(BORDER))
-        .child(
-            label(initial, TEXT)
-                .font_family("Bahnschrift")
-                .text_size(px(size * 0.42))
-                .font_weight(FontWeight::SEMIBOLD),
-        )
-        .children(image.map(|image| {
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .w(px(size))
-                .h(px(size))
-                .p(px(1.0))
-                .child(
-                    gpui::img(image)
-                        .w_full()
-                        .h_full()
-                        .rounded_full()
-                        .overflow_hidden(),
-                )
-                .with_animation(
-                    SharedString::from("avatar-in"),
-                    Animation::new(Duration::from_millis(180)),
-                    |element, delta| element.opacity(delta),
-                )
-        }))
+        .child(content)
 }
 
 /// Technical microcopy from the identity board: compact, monospaced and used
@@ -596,11 +613,26 @@ fn logo(px_size: f32) -> impl IntoElement {
     static ANIMATED: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
         std::sync::OnceLock::new();
 
-    let animated = px_size >= 48.0;
+    let animated = px_size >= 80.0;
     let image = (if animated { &ANIMATED } else { &STATIC })
         .get_or_init(|| {
             let bytes = include_bytes!("../logo.png");
-            let base = image::load_from_memory(bytes).ok()?.into_rgba8().into_raw();
+            let decoded = image::load_from_memory(bytes).ok()?.into_rgba8();
+            let base = if animated {
+                // Reserve real canvas to the left of the mark. Extending rays
+                // inside the original tightly-cropped PNG only clipped them.
+                let scaled = image::imageops::resize(
+                    &decoded,
+                    96,
+                    96,
+                    image::imageops::FilterType::Triangle,
+                );
+                let mut canvas = image::RgbaImage::new(128, 128);
+                image::imageops::overlay(&mut canvas, &scaled, 28, 16);
+                canvas.into_raw()
+            } else {
+                decoded.into_raw()
+            };
             // A short transmit sweep followed by a hold. Constant motion made
             // the mark feel like a loading spinner; Routine's interfaces use
             // sparse, stateful motion that settles back into stillness.
@@ -618,7 +650,7 @@ fn logo(px_size: f32) -> impl IntoElement {
                         let first = (0..128usize).find(|x| base[(y * 128 + x) * 4 + 3] > 16);
                         let Some(first) = first else { continue };
                         let source = (y * 128 + first) * 4;
-                        let extension = (strength * 18.0).round() as usize;
+                        let extension = (strength * 32.0).round() as usize;
                         for distance in 1..=extension.min(first) {
                             let target = (y * 128 + first - distance) * 4;
                             let taper = 1.0 - distance as f32 / (extension + 1) as f32;
@@ -964,6 +996,7 @@ impl Orange {
     }
 
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hosting = self.host.is_some();
         let user_name = self
             .session
             .as_ref()
@@ -993,7 +1026,7 @@ impl Orange {
                     .items_center()
                     .justify_center()
                     .gap_3()
-                    .child(logo(88.0))
+                    .child(logo(112.0))
                     .child(wordmark(23.0))
                     .child(accent_rule(28.0))
                     .child(
@@ -1003,9 +1036,21 @@ impl Orange {
                     ),
             )
             .child(
-                primary("start", "Start streaming").on_click(cx.listener(|this, _, _, cx| {
-                    this.refresh_windows();
-                    this.screen = Screen::PickWindow;
+                primary(
+                    "start",
+                    if hosting {
+                        "View active stream"
+                    } else {
+                        "Start streaming"
+                    },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if hosting {
+                        this.screen = Screen::Streaming;
+                    } else {
+                        this.refresh_windows();
+                        this.screen = Screen::PickWindow;
+                    }
                     cx.notify();
                 })),
             )
@@ -1342,7 +1387,6 @@ impl Orange {
             .as_ref()
             .is_some_and(|code| self.watches.iter().any(|watch| &watch.code == code));
         let viewers = self.viewers();
-        let watch_count = self.watches.len();
         let quality = self.quality();
         let source_name = self
             .active_target
@@ -1407,6 +1451,7 @@ impl Orange {
                 div()
                     .flex()
                     .flex_col()
+                    .flex_shrink_0()
                     .rounded_md()
                     .overflow_hidden()
                     .bg(rgb(SURFACE))
@@ -1459,7 +1504,7 @@ impl Orange {
                                         } else {
                                             quiet("live-monitor", "Open live monitor")
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.join(code.clone());
+                                                    this.open_live_monitor(code.clone());
                                                     cx.notify();
                                                 }))
                                                 .into_any_element()
@@ -1472,6 +1517,7 @@ impl Orange {
                 Some(code) => card()
                     .id("code")
                     .flex_row()
+                    .flex_shrink_0()
                     .items_center()
                     .justify_between()
                     .py_3()
@@ -1488,7 +1534,7 @@ impl Orange {
                                     if just_copied {
                                         "Copied to clipboard"
                                     } else {
-                                        "Click to copy"
+                                        "Click to copy again"
                                     },
                                     if just_copied { GREEN } else { FAINT },
                                 )
@@ -1547,20 +1593,8 @@ impl Orange {
                     ),
             )
             .child(
-                secondary(
-                    "join-while-streaming",
-                    if watch_count == 0 {
-                        "Watch a friend's stream".to_string()
-                    } else {
-                        format!("Watch another stream · {watch_count} open")
-                    },
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let code = cx
-                        .read_from_clipboard()
-                        .and_then(|item| item.text())
-                        .unwrap_or_default();
-                    this.join(code);
+                secondary("back-streaming", "Back").on_click(cx.listener(|this, _, _, cx| {
+                    this.screen = Screen::Home;
                     cx.notify();
                 })),
             )
@@ -1592,7 +1626,17 @@ impl Orange {
                             .flex_col()
                             .gap_0p5()
                             .child(label(code, TEXT).font_weight(FontWeight::SEMIBOLD))
-                            .child(label("Open in its own viewer window", FAINT).text_xs()),
+                            .child(
+                                label(
+                                    if watch.monitor {
+                                        "Live monitor · bottom-right"
+                                    } else {
+                                        "Open in its own viewer window"
+                                    },
+                                    FAINT,
+                                )
+                                .text_xs(),
+                            ),
                     )
                     .child(
                         div()
