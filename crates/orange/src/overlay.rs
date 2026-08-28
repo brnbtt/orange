@@ -98,6 +98,8 @@ pub struct OverlayState {
     pub bitrate_kbps: Option<u32>,
     /// Persistent compact status used by the bottom-right self-monitor.
     pub monitor_mode: bool,
+    /// Native viewer HWND, populated by the window thread.
+    pub window: Option<isize>,
     shown_at: Instant,
     hot: Option<Control>,
     hits: Vec<Hit>,
@@ -126,6 +128,7 @@ impl Default for OverlayState {
             fps: None,
             bitrate_kbps: None,
             monitor_mode: false,
+            window: None,
             // Start hidden; the first mouse move reveals the controls.
             shown_at: Instant::now() - HIDE_AFTER * 2,
             hot: None,
@@ -623,23 +626,11 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
         let expanded = state.hot == Some(Control::Stats);
         let received = state.quality_label();
         let quality = if state.monitor_mode {
-            String::from("STREAMING")
+            format!("LIVE  \u{00b7}  {received}")
         } else {
             received.clone()
         };
-        let detail = if expanded {
-            let detail = state.detail_label();
-            if state.monitor_mode {
-                Some(match detail {
-                    Some(detail) => format!("{received}  \u{00b7}  {detail}"),
-                    None => received,
-                })
-            } else {
-                detail
-            }
-        } else {
-            None
-        };
+        let detail = if expanded { state.detail_label() } else { None };
         let has_text = text::available();
         let label_size = LABEL * raster_scale;
         let mut text_w = text::width(&quality, label_size, Weight::Semibold) / raster_scale;
@@ -685,6 +676,17 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                     CONTROL_RADIUS * raster_scale,
                     status_alpha,
                 );
+                if state.monitor_mode {
+                    if let Some(path) = rounded_rect(
+                        0.5 * raster_scale,
+                        0.5 * raster_scale,
+                        w - raster_scale,
+                        h - raster_scale,
+                        CONTROL_RADIUS * raster_scale,
+                    ) {
+                        stroke(pixmap, &path, rgba(ORANGE, 0.42), raster_scale);
+                    }
+                }
                 live_mark(
                     pixmap,
                     (CHIP * raster_scale - icon) / 2.0,
@@ -1042,6 +1044,7 @@ pub fn attach(composition: &gst::Element, overlay: &SharedOverlay) {
                     .ok()
                     .filter(|f| f.denom() != 0)
                     .map(|f| f.numer() as f64 / f.denom() as f64);
+                let mut resize = None;
                 if let Ok(mut state) = state.lock() {
                     let first = state.video == (0, 0);
                     state.video = (w.max(0) as u32, h.max(0) as u32);
@@ -1053,7 +1056,13 @@ pub fn attach(composition: &gst::Element, overlay: &SharedOverlay) {
                     // way to learn they exist.
                     if first && state.video != (0, 0) {
                         state.wake();
+                        resize = state
+                            .window
+                            .map(|hwnd| (hwnd, state.video.0, state.video.1));
                     }
+                }
+                if let Some((hwnd, width, height)) = resize {
+                    crate::window::set_video_aspect(hwnd, width, height);
                 }
             }
         }

@@ -309,13 +309,18 @@ pub fn build_audio_branch(
     pad: &gst::Pad,
     overlay: Option<crate::overlay::SharedOverlay>,
 ) -> Result<()> {
+    let initial_volume = overlay
+        .as_ref()
+        .and_then(|overlay| overlay.lock().ok())
+        .map(|state| if state.muted { 0.0 } else { state.volume })
+        .unwrap_or(0.3);
     let depay = gst::ElementFactory::make("rtpopusdepay").build()?;
     let dec = gst::ElementFactory::make("opusdec").build()?;
     let convert = gst::ElementFactory::make("audioconvert").build()?;
     let resample = gst::ElementFactory::make("audioresample").build()?;
     let volume = gst::ElementFactory::make("volume")
         .name("viewer-volume")
-        .property("volume", 0.3f64)
+        .property("volume", initial_volume)
         .build()?;
     let sink = gst::ElementFactory::make("wasapi2sink")
         .property("low-latency", true)
@@ -333,7 +338,7 @@ pub fn build_audio_branch(
 
     if let Some(overlay) = overlay {
         std::thread::spawn(move || {
-            let mut applied = f64::NAN;
+            let mut applied = initial_volume;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 let Ok(state) = overlay.lock() else { break };

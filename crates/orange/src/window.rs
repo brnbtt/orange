@@ -87,6 +87,7 @@ const BACKGROUND: COLORREF = COLORREF(0x000b0b0b); // BGR
 /// moves, and the point is to hide it when the mouse has stopped.
 const CURSOR_TIMER: usize = 1;
 const REVEAL_MESSAGE: u32 = WM_APP + 1;
+const ASPECT_MESSAGE: u32 = WM_APP + 2;
 const REVEAL_MS: u32 = 180;
 
 pub struct VideoWindow {
@@ -158,6 +159,7 @@ fn spawn_window(
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
     revealed: std::cell::Cell<bool>,
+    monitor_mode: bool,
     /// Style and bounds to put back when leaving fullscreen. `Some` means we
     /// are currently fullscreen.
     restore: std::cell::Cell<Option<(WINDOW_STYLE, RECT)>>,
@@ -173,6 +175,73 @@ pub fn reveal(hwnd: isize) {
             LPARAM(0),
         );
     }
+}
+
+pub fn set_video_aspect(hwnd: isize, width: u32, height: u32) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            ASPECT_MESSAGE,
+            WPARAM(width as usize),
+            LPARAM(height as isize),
+        );
+    }
+}
+
+unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let Some(ctx) = context(hwnd) else { return };
+    if ctx.restore.get().is_some() {
+        return;
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return;
+    }
+    let old_w = rect.right - rect.left;
+    let new_h = (old_w as f32 * height as f32 / width as f32).round() as i32;
+    let (x, y) = if ctx.monitor_mode {
+        (rect.left, rect.bottom - new_h)
+    } else {
+        (rect.left, rect.top + (rect.bottom - rect.top - new_h) / 2)
+    };
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        x,
+        y,
+        old_w,
+        new_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
+unsafe fn constrain_sizing(hwnd: HWND, edge: usize, rect: &mut RECT) -> bool {
+    let Some(ctx) = context(hwnd) else {
+        return false;
+    };
+    let video = ctx.overlay.lock().ok().map(|state| state.video);
+    let Some((width, height)) = video.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return false;
+    };
+    let ratio = width as f32 / height as f32;
+    let current_w = rect.right - rect.left;
+    let current_h = rect.bottom - rect.top;
+
+    match edge as u32 {
+        WMSZ_TOP => rect.right = rect.left + (current_h as f32 * ratio).round() as i32,
+        WMSZ_BOTTOM => rect.right = rect.left + (current_h as f32 * ratio).round() as i32,
+        WMSZ_TOPLEFT | WMSZ_TOPRIGHT => {
+            rect.top = rect.bottom - (current_w as f32 / ratio).round() as i32;
+        }
+        WMSZ_LEFT | WMSZ_RIGHT | WMSZ_BOTTOMLEFT | WMSZ_BOTTOMRIGHT => {
+            rect.bottom = rect.top + (current_w as f32 / ratio).round() as i32;
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Tell the overlay what display scaling it is being shown at.
@@ -420,9 +489,13 @@ unsafe fn create_window(
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
         revealed: std::cell::Cell::new(false),
+        monitor_mode,
         restore: std::cell::Cell::new(None),
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
+    if let Ok(mut overlay) = (*ctx).overlay.lock() {
+        overlay.window = Some(hwnd.0 as isize);
+    }
 
     sync_dpi(hwnd);
 
@@ -469,6 +542,10 @@ unsafe fn run_message_loop() {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            ASPECT_MESSAGE => {
+                resize_to_video_aspect(hwnd, wparam.0 as u32, lparam.0 as u32);
+                LRESULT(0)
+            }
             REVEAL_MESSAGE => {
                 if let Some(ctx) = context(hwnd) {
                     if !ctx.revealed.replace(true) {
@@ -482,6 +559,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // Let video occupy the complete window while retaining
             // `WS_THICKFRAME` for native resizing and snap layouts.
             WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
+            WM_SIZING => {
+                let rect = &mut *(lparam.0 as *mut RECT);
+                LRESULT(constrain_sizing(hwnd, wparam.0, rect) as isize)
+            }
             // Hit testing does double duty. It fires on every mouse move, so
             // it wakes the controls and updates hover; and it decides whether
             // this point should drag the window or receive a normal click.

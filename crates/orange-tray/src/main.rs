@@ -650,14 +650,14 @@ fn logo(px_size: f32) -> impl IntoElement {
                         let first = (0..128usize).find(|x| base[(y * 128 + x) * 4 + 3] > 16);
                         let Some(first) = first else { continue };
                         let source = (y * 128 + first) * 4;
-                        let extension = (strength * 32.0).round() as usize;
+                        let extension = (strength * 42.0).round() as usize;
                         for distance in 1..=extension.min(first) {
                             let target = (y * 128 + first - distance) * 4;
                             let taper = 1.0 - distance as f32 / (extension + 1) as f32;
                             raw[target] = base[source];
                             raw[target + 1] = base[source + 1];
                             raw[target + 2] = base[source + 2];
-                            let ray_alpha = strength.sqrt() * (0.55 + 0.45 * taper);
+                            let ray_alpha = strength.sqrt() * (0.78 + 0.22 * taper);
                             raw[target + 3] = (base[source + 3] as f32 * ray_alpha).round() as u8;
                         }
                     }
@@ -997,6 +997,13 @@ impl Orange {
 
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let hosting = self.host.is_some();
+        let defaults = format!(
+            "{} · {}",
+            self.quality().label.to_ascii_uppercase(),
+            self.fps
+                .map(|fps| format!("{fps} FPS"))
+                .unwrap_or_else(|| "AUTO FPS".into())
+        );
         let user_name = self
             .session
             .as_ref()
@@ -1014,9 +1021,9 @@ impl Orange {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(micro("READY", GREEN))
+                    .child(micro("READY TO STREAM", GREEN))
                     .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
-                    .child(micro("PEER-TO-PEER", MUTED)),
+                    .child(micro(defaults, MUTED)),
             )
             .child(
                 div()
@@ -1030,7 +1037,7 @@ impl Orange {
                     .child(wordmark(23.0))
                     .child(accent_rule(28.0))
                     .child(
-                        label("Share a game window directly with friends", MUTED)
+                        label("Pick a window, share the code, keep playing.", MUTED)
                             .font_family("Cascadia Mono")
                             .text_size(px(10.0)),
                     ),

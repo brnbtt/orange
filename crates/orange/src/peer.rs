@@ -60,7 +60,11 @@ fn watch_bus(pipeline: &gst::Pipeline, label: &'static str) {
                 );
             }
             gst::MessageView::Warning(w) => {
-                eprintln!("[{label}] warning: {} ({})", w.error(), w.debug().unwrap_or_default());
+                eprintln!(
+                    "[{label}] warning: {} ({})",
+                    w.error(),
+                    w.debug().unwrap_or_default()
+                );
             }
             gst::MessageView::Eos(_) => {
                 println!("[{label}] end of stream");
@@ -223,10 +227,20 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 println!("  Viewers run:  orange watch --code {code}\n");
             }
             Signal::ViewerJoined { peer, name } => {
-                match add_viewer(&pipeline, &tee, audio_tee.as_ref(), &peer, client.outgoing.clone()) {
+                match add_viewer(
+                    &pipeline,
+                    &tee,
+                    audio_tee.as_ref(),
+                    &peer,
+                    client.outgoing.clone(),
+                ) {
                     Ok(bin) => {
                         viewers.insert(peer.clone(), bin);
-                        println!("[host] {} joined ({} watching)", name.clone().unwrap_or_else(|| format!("viewer {peer}")), viewers.len());
+                        println!(
+                            "[host] {} joined ({} watching)",
+                            name.clone().unwrap_or_else(|| format!("viewer {peer}")),
+                            viewers.len()
+                        );
                     }
                     Err(err) => eprintln!("[host] could not add viewer {peer}: {err}"),
                 }
@@ -397,6 +411,10 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         Output::Window { overlay, .. } => Some(overlay.clone()),
         Output::File(_) => None,
     };
+    let viewer_hwnd = match &output {
+        Output::Window { hwnd, .. } => Some(*hwnd),
+        Output::File(_) => None,
+    };
     let overlay_for_audio = viewer_overlay.clone();
     let overlay_for_video = viewer_overlay.clone();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
@@ -428,14 +446,31 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
 
     pipeline.set_state(gst::State::Playing)?;
 
-    while let Some(signal) = client.incoming.recv().await {
+    loop {
+        let signal = if let Some(hwnd) = viewer_hwnd {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                client.incoming.recv(),
+            )
+            .await
+            {
+                Ok(signal) => signal,
+                Err(_) if !crate::window::is_alive(hwnd) => break,
+                Err(_) => continue,
+            }
+        } else {
+            client.incoming.recv().await
+        };
+        let Some(signal) = signal else { break };
         match signal {
             Signal::Sdp { kind, sdp, .. } if kind == "offer" => {
                 let desc = parse_sdp(&kind, &sdp)?;
                 bin.emit_by_name::<()>("set-remote-description", &[&desc, &None::<gst::Promise>]);
                 create_answer(&bin, client.outgoing.clone());
             }
-            Signal::Ice { mline, candidate, .. } => {
+            Signal::Ice {
+                mline, candidate, ..
+            } => {
                 bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
             }
             Signal::StreamInfo { host_name } => {

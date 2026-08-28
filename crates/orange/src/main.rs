@@ -270,7 +270,9 @@ fn main() -> Result<()> {
                         overlay::OverlayState::default(),
                     ));
                     if monitor {
-                        overlay.lock().unwrap().monitor_mode = true;
+                        let mut state = overlay.lock().unwrap();
+                        state.monitor_mode = true;
+                        state.muted = true;
                     }
                     let win = if monitor {
                         window::spawn_monitor(
