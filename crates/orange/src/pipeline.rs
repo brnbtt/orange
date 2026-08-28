@@ -82,13 +82,20 @@ impl Default for CaptureSettings {
 /// its children, so voice chat, music and notification sounds never reach the
 /// stream. Capturing the whole output device would pick all of that up.
 ///
+/// A pid of zero means whole-screen sharing, where capturing everything the
+/// machine plays is the expected behaviour.
+///
 /// Opus at 128 kbps stereo is transparent enough for games and is a rounding
 /// error next to the video bitrate.
 pub fn build_audio_chain(pid: u32) -> String {
+    let scope = if pid == 0 {
+        String::new()
+    } else {
+        format!("loopback-mode=include-process-tree loopback-target-pid={pid} ")
+    };
     format!(
-        "wasapi2src loopback=true loopback-mode=include-process-tree \
-         loopback-target-pid={pid} loopback-silence-on-device-mute=true \
-         low-latency=true \
+        "wasapi2src loopback=true {scope}\
+         loopback-silence-on-device-mute=true low-latency=true \
          ! queue max-size-buffers=10 leaky=downstream \
          ! audioconvert ! audioresample \
          ! opusenc bitrate=128000 frame-size=10 \
@@ -142,27 +149,37 @@ pub fn check_elements(codec: Codec) -> Result<()> {
 /// Build the GPU-resident half of the pipeline, up to and including the parser.
 /// The caller appends a sink: a muxer for recording, or WebRTC for streaming.
 ///
+/// A zero window handle means the whole screen. `d3d11screencapturesrc` takes
+/// either a `window-handle` or a `monitor-index`, so the two cases differ only
+/// in that property.
+///
 /// The framerate caps sit directly after the source so the capture element
 /// knows the rate to run at; `d3d11convert` does not do framerate conversion,
 /// so requesting it further downstream would fail to negotiate.
 pub fn build_capture_chain(settings: &CaptureSettings) -> String {
     let scale_caps = match settings.scale {
-        Some((w, h)) => format!(
-            "! video/x-raw(memory:D3D11Memory),width={w},height={h} "
-        ),
+        Some((w, h)) => format!("! video/x-raw(memory:D3D11Memory),width={w},height={h} "),
         None => String::new(),
     };
 
+    let source = if settings.hwnd == 0 {
+        "d3d11screencapturesrc capture-api=wgc monitor-index=0 show-cursor=true".to_string()
+    } else {
+        format!(
+            "d3d11screencapturesrc window-handle={} capture-api=wgc \
+             window-capture-mode=client show-cursor=false",
+            settings.hwnd
+        )
+    };
+
     format!(
-        "d3d11screencapturesrc window-handle={hwnd} capture-api=wgc \
-         window-capture-mode=client show-cursor=false \
+        "{source} \
          ! video/x-raw(memory:D3D11Memory),framerate={fps}/1 \
          ! queue max-size-buffers=3 leaky=downstream \
          ! d3d11convert \
          {scale_caps}\
          ! {encoder} bitrate={bitrate} \
          ! {parser}",
-        hwnd = settings.hwnd,
         fps = settings.fps,
         encoder = settings.codec.encoder(),
         bitrate = settings.bitrate,

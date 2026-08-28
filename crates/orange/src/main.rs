@@ -117,8 +117,15 @@ impl QualityArgs {
             fps: self.fps,
             scale: self.scale.as_deref().map(parse_scale).transpose()?,
             // Scope audio to the captured window's process, so voice chat and
-            // music stay out of the stream.
-            audio_pid: if self.no_audio { None } else { targets::pid_for_hwnd(hwnd) },
+            // music stay out of the stream. Whole-screen sharing captures
+            // everything, which is the expected behaviour there.
+            audio_pid: if self.no_audio {
+                None
+            } else if hwnd == 0 {
+                Some(0)
+            } else {
+                targets::pid_for_hwnd(hwnd)
+            },
         })
     }
 }

@@ -14,9 +14,24 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetAncestor, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GA_ROOTOWNER, GWL_EXSTYLE,
+    WS_EX_TOOLWINDOW,
 };
+
+/// Window classes that are part of the shell or overlays rather than
+/// applications. These are visible, titled and owned by nothing, so no
+/// generic rule excludes them - they have to be named.
+const EXCLUDED_CLASSES: &[&str] = &[
+    "Progman",              // the desktop itself, titled "Program Manager"
+    "WorkerW",              // desktop wallpaper host
+    "Shell_TrayWnd",        // taskbar
+    "Shell_SecondaryTrayWnd",
+    "Windows.UI.Core.CoreWindow", // system UI surfaces
+    "ApplicationFrameWindow_Hidden",
+    "CEF-OSC-WIDGET",       // NVIDIA GeForce overlay
+    "XamlExplorerHostIslandWindow",
+];
 
 #[derive(Debug, Clone)]
 pub struct CaptureTarget {
@@ -102,10 +117,37 @@ unsafe fn is_cloaked(hwnd: HWND) -> bool {
     res.is_ok() && cloaked != 0
 }
 
+unsafe fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let len = GetClassNameW(hwnd, &mut buf);
+    String::from_utf16_lossy(&buf[..len.max(0) as usize])
+}
+
+/// Roughly the set a user would see in Alt+Tab.
+///
+/// Three rules do most of the work: tool windows are palettes and overlays,
+/// not applications; a window that is not its own root owner is a dialog or
+/// popup belonging to something else; and cloaked windows are suspended UWP
+/// apps that render nothing.
+unsafe fn is_app_window(hwnd: HWND) -> bool {
+    if !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
+        return false;
+    }
+    if GetAncestor(hwnd, GA_ROOTOWNER) != hwnd {
+        return false;
+    }
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+        return false;
+    }
+    let class = class_name(hwnd);
+    !EXCLUDED_CLASSES.iter().any(|c| *c == class)
+}
+
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let out = &mut *(lparam.0 as *mut Vec<CaptureTarget>);
 
-    if !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
+    if !is_app_window(hwnd) {
         return BOOL(1);
     }
 

@@ -14,11 +14,13 @@ use image::{Frame, RgbaImage};
 use std::sync::Arc;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, GetWindowRect, SM_CXSCREEN, SM_CYSCREEN,
+};
 
 /// Render the full window including hardware-accelerated content.
 const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(0x0000_0002);
@@ -66,6 +68,69 @@ pub fn thumbnail(hwnd: isize, max_w: u32, max_h: u32) -> Option<Thumbnail> {
     let scaled = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
 
     Some((tw, th, scaled.into_raw()))
+}
+
+/// Capture the whole primary screen, for the "Entire screen" option.
+pub fn screen_thumbnail(max_w: u32, max_h: u32) -> Option<Thumbnail> {
+    unsafe {
+        let width = GetSystemMetrics(SM_CXSCREEN).max(0) as u32;
+        let height = GetSystemMetrics(SM_CYSCREEN).max(0) as u32;
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(Some(mem_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let previous = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+
+        // BitBlt from the screen rather than PrintWindow: there is no single
+        // window to ask, and this composites whatever is actually on display.
+        let ok = BitBlt(mem_dc, 0, 0, width as i32, height as i32, Some(screen_dc), 0, 0, SRCCOPY)
+            .is_ok();
+
+        let result = if ok && !bits.is_null() {
+            let len = (width * height * 4) as usize;
+            let mut buffer = vec![0u8; len];
+            std::ptr::copy_nonoverlapping(bits as *const u8, buffer.as_mut_ptr(), len);
+            for chunk in buffer.chunks_exact_mut(4) {
+                chunk[3] = 255;
+            }
+            Some(buffer)
+        } else {
+            None
+        };
+
+        SelectObject(mem_dc, previous);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(None, screen_dc);
+
+        let image = RgbaImage::from_raw(width, height, result?)?;
+        let scale = (max_w as f32 / width as f32)
+            .min(max_h as f32 / height as f32)
+            .min(1.0);
+        let (tw, th) = (
+            ((width as f32 * scale) as u32).max(1),
+            ((height as f32 * scale) as u32).max(1),
+        );
+        let scaled =
+            image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
+        Some((tw, th, scaled.into_raw()))
+    }
 }
 
 /// Turn captured pixels into something GPUI can draw. Must run on the UI thread.

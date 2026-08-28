@@ -60,6 +60,9 @@ struct Orange {
     logging_in: Option<LoginAttempt>,
     error: Option<String>,
     server: String,
+    /// Whether the window is currently sized for the picker, so the resize
+    /// happens once per transition rather than every frame.
+    sized_for: Option<bool>,
     /// Drives the transient "Copied" confirmation on the share code.
     copied_at: Option<Instant>,
 }
@@ -92,6 +95,7 @@ impl Orange {
             logging_in: None,
             error: None,
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
+            sized_for: None,
             copied_at: None,
         }
     }
@@ -136,6 +140,21 @@ impl Orange {
                 // Never offer our own windows as a capture target.
                 windows.retain(|w| !w.process.to_lowercase().starts_with("orange"));
 
+                // A zero handle is the sentinel for whole-screen capture, which
+                // the pipeline turns into a monitor source rather than a window
+                // one. It goes first because it is the common choice.
+                windows.insert(
+                    0,
+                    WindowTarget {
+                        hwnd: 0,
+                        pid: 0,
+                        title: "Entire screen".into(),
+                        process: "Desktop".into(),
+                        width: 0,
+                        height: 0,
+                    },
+                );
+
                 // Capture off the UI thread. PrintWindow is synchronous and
                 // costs tens of milliseconds per window, so doing this inline
                 // froze the app for as long as it took to walk the list.
@@ -143,7 +162,12 @@ impl Orange {
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     for hwnd in handles {
-                        if let Some(thumb) = capture::thumbnail(hwnd as isize, 320, 180) {
+                        let thumb = if hwnd == 0 {
+                            capture::screen_thumbnail(320, 180)
+                        } else {
+                            capture::thumbnail(hwnd as isize, 320, 180)
+                        };
+                        if let Some(thumb) = thumb {
                             // A closed picker drops the receiver; stop early.
                             if tx.send((hwnd, thumb)).is_err() {
                                 return;
@@ -372,7 +396,20 @@ fn dot(color: u32) -> gpui::Div {
 }
 
 impl Render for Orange {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The picker needs room for a two-column grid; every other screen is a
+        // narrow column. Resizing on transition keeps both comfortable rather
+        // than compromising on one size for all of them.
+        let wanted = if self.screen == Screen::PickWindow {
+            size(px(452.0), px(620.0))
+        } else {
+            size(px(400.0), px(540.0))
+        };
+        if self.sized_for != Some(self.screen == Screen::PickWindow) {
+            self.sized_for = Some(self.screen == Screen::PickWindow);
+            window.resize(wanted);
+        }
+
         let body = match self.screen {
             Screen::SignedOut => self.render_signed_out(cx).into_any_element(),
             Screen::Home => self.render_home(cx).into_any_element(),
@@ -701,14 +738,16 @@ impl Orange {
                 div()
                     .id("windows")
                     .flex()
-                    .flex_col()
-                    .gap_1p5()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
                     .when(count == 0, |d| {
                         d.child(
                             card()
+                                .w_full()
                                 .items_center()
                                 .child(label("No windows found", MUTED).text_xs()),
                         )
@@ -718,17 +757,22 @@ impl Orange {
                             .iter()
                             .cloned()
                             .map(|target| {
+                                let is_screen = target.hwnd == 0;
                                 let title = if target.title.is_empty() {
                                     target.app_name()
                                 } else {
                                     target.title.clone()
                                 };
-                                let meta = format!(
-                                    "{} · {}×{}",
-                                    target.app_name(),
-                                    target.width,
-                                    target.height
-                                );
+                                let meta = if is_screen {
+                                    "Everything you see".to_string()
+                                } else {
+                                    format!(
+                                        "{} · {}×{}",
+                                        target.app_name(),
+                                        target.width,
+                                        target.height
+                                    )
+                                };
                                 let thumb = self.thumbnails.get(&target.hwnd).cloned();
 
                                 div()
@@ -736,15 +780,17 @@ impl Orange {
                                     .flex()
                                     .flex_col()
                                     .flex_shrink_0()
+                                    // Two per row, minus the gap.
+                                    .w(px(196.0))
                                     .rounded_lg()
                                     .overflow_hidden()
                                     .bg(rgb(SURFACE))
                                     .border_1()
-                                    .border_color(rgb(BORDER))
+                                    .border_color(rgb(if is_screen { ORANGE_DIM } else { BORDER }))
                                     .cursor_pointer()
                                     .hover(|s| s.border_color(rgb(ORANGE)))
                                     .child(
-                                        // Fixed-height preview strip, so rows
+                                        // Fixed-height preview strip, so cards
                                         // stay uniform whatever the window shape.
                                         //
                                         // flex_shrink_0 is load-bearing: as a
@@ -783,6 +829,7 @@ impl Orange {
                                             .child(
                                                 div()
                                                     .overflow_hidden()
+                                                    .text_xs()
                                                     .text_color(rgb(TEXT))
                                                     .child(title),
                                             )
