@@ -156,6 +156,7 @@ impl Orange {
                 self.error = status.error.clone();
             }
             self.host = None;
+            self.watches.retain(|watch| !watch.monitor);
             self.active_target = None;
             self.active_preview = None;
             self.screen = if self.watches.is_empty() {
@@ -218,6 +219,7 @@ impl Orange {
                 // A zero handle is the sentinel for whole-screen capture, which
                 // the pipeline turns into a monitor source rather than a window
                 // one. It goes first because it is the common choice.
+                let (screen_width, screen_height) = capture::screen_size().unwrap_or((0, 0));
                 windows.insert(
                     0,
                     WindowTarget {
@@ -225,8 +227,8 @@ impl Orange {
                         pid: 0,
                         title: "Entire screen".into(),
                         process: "Desktop".into(),
-                        width: 0,
-                        height: 0,
+                        width: screen_width,
+                        height: screen_height,
                     },
                 );
 
@@ -301,6 +303,9 @@ impl Orange {
             );
             return;
         }
+        // A self-monitor belongs to exactly one host room. Never carry one
+        // into a replacement stream while its old room is winding down.
+        self.watches.retain(|watch| !watch.monitor);
         let preview = self.thumbnails.get(&target.hwnd).cloned();
         match Supervisor::host(&target, &self.quality(), self.fps, &self.server) {
             Ok(stream) => {
@@ -361,6 +366,7 @@ impl Orange {
         if let Some(mut host) = self.host.take() {
             host.stop();
         }
+        self.watches.retain(|watch| !watch.monitor);
         self.active_target = None;
         self.active_preview = None;
         self.copied_code = None;

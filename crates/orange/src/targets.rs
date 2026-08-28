@@ -10,26 +10,25 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, MAX_PATH, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GA_ROOTOWNER, GWL_EXSTYLE,
-    WS_EX_TOOLWINDOW,
+    EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GA_ROOTOWNER,
+    GWL_EXSTYLE, WS_EX_TOOLWINDOW,
 };
 
 /// Window classes that are part of the shell or overlays rather than
 /// applications. These are visible, titled and owned by nothing, so no
 /// generic rule excludes them - they have to be named.
 const EXCLUDED_CLASSES: &[&str] = &[
-    "Progman",              // the desktop itself, titled "Program Manager"
-    "WorkerW",              // desktop wallpaper host
-    "Shell_TrayWnd",        // taskbar
+    "Progman",       // the desktop itself, titled "Program Manager"
+    "WorkerW",       // desktop wallpaper host
+    "Shell_TrayWnd", // taskbar
     "Shell_SecondaryTrayWnd",
     "Windows.UI.Core.CoreWindow", // system UI surfaces
     "ApplicationFrameWindow_Hidden",
-    "CEF-OSC-WIDGET",       // NVIDIA GeForce overlay
+    "CEF-OSC-WIDGET", // NVIDIA GeForce overlay
     "XamlExplorerHostIslandWindow",
 ];
 
@@ -155,14 +154,23 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if GetWindowRect(hwnd, &mut rect).is_err() {
         return BOOL(1);
     }
+    let mut client = RECT::default();
+    let (width, height) = if GetClientRect(hwnd, &mut client).is_ok()
+        && client.right > client.left
+        && client.bottom > client.top
+    {
+        (client.right - client.left, client.bottom - client.top)
+    } else {
+        (rect.right - rect.left, rect.bottom - rect.top)
+    };
 
     let target = CaptureTarget {
         hwnd: hwnd.0 as isize,
         pid: pid_of(hwnd),
         title: window_title(hwnd),
         process: process_name(hwnd),
-        width: rect.right - rect.left,
-        height: rect.bottom - rect.top,
+        width,
+        height,
     };
 
     if target.is_interesting() {

@@ -32,6 +32,12 @@ const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(0x0000_0002)
 /// `Send`. The UI thread turns it into an image when it arrives.
 pub type Thumbnail = (u32, u32, Vec<u8>);
 
+pub fn screen_size() -> Option<(i32, i32)> {
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 /// Capture a window and scale it to fit within `max_w` x `max_h`.
 ///
 /// Returns `None` for windows that refuse to draw, which is common enough
@@ -94,13 +100,24 @@ pub fn screen_thumbnail(max_w: u32, max_h: u32) -> Option<Thumbnail> {
             ..Default::default()
         };
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let bitmap = CreateDIBSection(Some(mem_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let bitmap =
+            CreateDIBSection(Some(mem_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
         let previous = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
 
         // BitBlt from the screen rather than PrintWindow: there is no single
         // window to ask, and this composites whatever is actually on display.
-        let ok = BitBlt(mem_dc, 0, 0, width as i32, height as i32, Some(screen_dc), 0, 0, SRCCOPY)
-            .is_ok();
+        let ok = BitBlt(
+            mem_dc,
+            0,
+            0,
+            width as i32,
+            height as i32,
+            Some(screen_dc),
+            0,
+            0,
+            SRCCOPY,
+        )
+        .is_ok();
 
         let result = if ok && !bits.is_null() {
             let len = (width * height * 4) as usize;
@@ -127,8 +144,7 @@ pub fn screen_thumbnail(max_w: u32, max_h: u32) -> Option<Thumbnail> {
             ((width as f32 * scale) as u32).max(1),
             ((height as f32 * scale) as u32).max(1),
         );
-        let scaled =
-            image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
+        let scaled = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
         Some((tw, th, scaled.into_raw()))
     }
 }

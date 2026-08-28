@@ -189,6 +189,7 @@ impl Supervisor {
         fps: Option<u32>,
         server: &str,
     ) -> Result<Self> {
+        let scale = quality.scale_for(target);
         let mut command = orange_command()?;
         command
             .arg("host")
@@ -196,7 +197,7 @@ impl Supervisor {
             .args(["--server", server])
             .args(["--codec", quality.codec])
             .args(["--bitrate", &quality.bitrate.to_string()])
-            .args(["--scale", &quality.scale]);
+            .args(["--scale", &scale]);
         if let Some(fps) = fps {
             command.args(["--fps", &fps.to_string()]);
         }
@@ -299,33 +300,73 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quality {
     pub label: &'static str,
-    pub scale: &'static str,
+    pub max_width: u32,
+    pub max_height: u32,
     pub bitrate: u32,
     pub codec: &'static str,
     /// Rough upload cost per viewer, shown so the tradeoff is visible.
     pub mbps: u32,
 }
 
+impl Quality {
+    /// Fit the source inside this quality tier without changing its ratio.
+    fn scale_for(&self, target: &WindowTarget) -> String {
+        let source_w = target.width.max(2) as f32;
+        let source_h = target.height.max(2) as f32;
+        let factor = (self.max_width as f32 / source_w)
+            .min(self.max_height as f32 / source_h)
+            .min(1.0);
+        let even = |value: f32| ((value.round() as u32).max(2) / 2) * 2;
+        format!("{}x{}", even(source_w * factor), even(source_h * factor))
+    }
+}
+
 pub const QUALITIES: &[Quality] = &[
     Quality {
         label: "720p",
-        scale: "1280x720",
+        max_width: 1280,
+        max_height: 720,
         bitrate: 4_000,
         codec: "av1",
         mbps: 4,
     },
     Quality {
         label: "1080p",
-        scale: "1920x1080",
+        max_width: 1920,
+        max_height: 1080,
         bitrate: 8_000,
         codec: "av1",
         mbps: 8,
     },
     Quality {
         label: "1440p",
-        scale: "2560x1440",
+        max_width: 2560,
+        max_height: 1440,
         bitrate: 18_000,
         codec: "av1",
         mbps: 18,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(width: i32, height: i32) -> WindowTarget {
+        WindowTarget {
+            hwnd: 1,
+            pid: 1,
+            title: String::new(),
+            process: String::new(),
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn quality_bounds_preserve_source_shape() {
+        assert_eq!(QUALITIES[1].scale_for(&target(2002, 1804)), "1198x1080");
+        assert_eq!(QUALITIES[1].scale_for(&target(3440, 1440)), "1920x804");
+        assert_eq!(QUALITIES[1].scale_for(&target(1280, 720)), "1280x720");
+    }
+}
