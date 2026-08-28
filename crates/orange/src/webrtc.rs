@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_sdp as gst_sdp;
+use gstreamer_video::prelude::VideoOverlayExtManual;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::{Arc, Mutex};
 
@@ -123,9 +124,10 @@ fn connect_signalling(peers: Arc<Mutex<Peers>>) {
 
 /// Where the received video should end up.
 pub enum Output {
-    /// Render in a window. `d3d11videosink` creates its own for now; milestone
-    /// 3 replaces this with our borderless window.
-    Show,
+    /// Render into a window we own, by HWND. `d3d11videosink` implements
+    /// `GstVideoOverlay`, so it draws into our borderless frame instead of
+    /// creating a bare window of its own.
+    Window(isize),
     /// Write to a file, so the result can be verified without a display.
     File(String),
 }
@@ -210,10 +212,20 @@ pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Ou
         .context("d3d11av1dec missing - no hardware AV1 decode on this GPU?")?;
 
     let tail: Vec<gst::Element> = match output {
-        Output::Show => {
+        Output::Window(hwnd) => {
             let sink = gst::ElementFactory::make("d3d11videosink")
                 .property("sync", false)
+                .property("force-aspect-ratio", true)
                 .build()?;
+            // Must be set before the sink reaches PAUSED, otherwise it creates
+            // its own window and ours stays empty. `GstVideoOverlay` is an
+            // interface, so the element has to be cast to it.
+            let overlay = sink
+                .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
+                .context("d3d11videosink does not implement GstVideoOverlay")?;
+            // SAFETY: `hwnd` comes from our own window, created by
+            // `window::spawn`, and remains valid while the viewer runs.
+            unsafe { overlay.set_window_handle(hwnd as usize) };
             vec![sink]
         }
         Output::File(path) => {

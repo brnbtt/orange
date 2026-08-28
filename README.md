@@ -14,7 +14,7 @@ Milestone 1 of 6. Capture and encode work; there is no networking yet.
 | 3 | Signalling relay, host/watch as separate processes | **done** (one machine) |
 | 4 | Multiple simultaneous viewers, single encode | **done** |
 | 5 | Two machines across the internet | next |
-| 6 | Viewer window: borderless, rounded, overlay controls | |
+| 6 | Viewer window: borderless + rounded, video embedded | **in progress** |
 | 7 | Game audio (`wasapi2src` + `opusenc`) | |
 | 8 | Installer, tray, autostart | |
 
