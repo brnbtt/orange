@@ -358,31 +358,33 @@ impl Render for Orange {
 impl Orange {
     /// Custom titlebar. GPUI hides the system one via `appears_transparent`,
     /// which its source documents as supported on Windows.
+    ///
+    /// Dragging needs `window_control_area(Drag)` rather than a mouse handler:
+    /// a borderless window is moved by the OS through hit-testing, so the
+    /// draggable regions have to be declared. The buttons are deliberately
+    /// left out of those regions, or the hit test would swallow their clicks.
     fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_go_back = matches!(
-            self.screen,
-            Screen::PickWindow | Screen::Settings
-        );
+        let breadcrumb = match self.screen {
+            Screen::PickWindow => Some("· share"),
+            Screen::Settings => Some("· settings"),
+            _ => None,
+        };
 
         div()
-            .id("titlebar")
             .flex()
             .items_center()
-            .justify_between()
             .h(px(44.0))
             .pl_4()
             .pr_1()
             .border_b_1()
             .border_color(rgb(BORDER))
-            // Dragging the bar moves the window, since there is no system one.
-            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                window.start_window_move();
-            })
             .child(
                 div()
+                    .id("titlebar-brand")
                     .flex()
                     .items_center()
                     .gap_2p5()
+                    .window_control_area(gpui::WindowControlArea::Drag)
                     .child(logo(16.0))
                     .child(
                         div()
@@ -391,16 +393,18 @@ impl Orange {
                             .text_color(rgb(TEXT))
                             .child("ORANGE"),
                     )
-                    .children(can_go_back.then(|| {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(FAINT))
-                            .child(match self.screen {
-                                Screen::PickWindow => "· share",
-                                Screen::Settings => "· settings",
-                                _ => "",
-                            })
+                    .children(breadcrumb.map(|text| {
+                        div().text_xs().text_color(rgb(FAINT)).child(text)
                     })),
+            )
+            // The empty middle is draggable too, so the whole bar behaves as
+            // people expect - except where the controls are.
+            .child(
+                div()
+                    .id("titlebar-drag")
+                    .flex_1()
+                    .h_full()
+                    .window_control_area(gpui::WindowControlArea::Drag),
             )
             .child(
                 div()
