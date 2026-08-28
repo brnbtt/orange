@@ -1,5 +1,6 @@
 //! orange - low-overhead window streaming for friends.
 
+mod auth;
 mod overlay;
 mod peer;
 mod window;
@@ -62,16 +63,23 @@ enum Command {
     Host {
         #[arg(long)]
         hwnd: isize,
-        #[arg(long, default_value = "ws://127.0.0.1:9000")]
+        #[arg(long, default_value = "ws://127.0.0.1:9000/ws", env = "ORANGE_SERVER")]
         server: String,
         #[command(flatten)]
         quality: QualityArgs,
     },
+    /// Sign in with Discord, so viewers and hosts see names instead of ids.
+    Login {
+        #[arg(long, default_value = "ws://127.0.0.1:9000/ws", env = "ORANGE_SERVER")]
+        server: String,
+    },
+    /// Forget the stored Discord session.
+    Logout,
     /// Watch a shared window by code.
     Watch {
         #[arg(long)]
         code: String,
-        #[arg(long, default_value = "ws://127.0.0.1:9000")]
+        #[arg(long, default_value = "ws://127.0.0.1:9000/ws", env = "ORANGE_SERVER")]
         server: String,
         /// Write to a file instead of rendering. For headless verification.
         #[arg(long)]
@@ -166,6 +174,16 @@ fn main() -> Result<()> {
             }
         }
         Command::Serve { addr } => runtime()?.block_on(signal::serve(&addr)),
+        Command::Login { server } => runtime()?.block_on(async {
+            let session = auth::login(&server).await?;
+            println!("Signed in as {}", session.name);
+            Ok(())
+        }),
+        Command::Logout => {
+            auth::clear_session()?;
+            println!("Signed out.");
+            Ok(())
+        }
         Command::Host {
             hwnd,
             server,

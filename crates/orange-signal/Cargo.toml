@@ -3,11 +3,13 @@ name = "orange-signal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Signalling protocol and relay for orange. Deliberately free of any media dependency."
+description = "Signalling protocol, Discord identity, and relay for orange. Deliberately free of any media dependency."
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 futures-util.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

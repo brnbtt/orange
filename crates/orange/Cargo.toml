@@ -17,8 +17,11 @@ gstreamer-webrtc = "0.25"
 gstreamer-sdp = "0.25"
 anyhow.workspace = true
 tokio.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tiny-skia = "0.11"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dependencies.windows]
 version = "0.62"

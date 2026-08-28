@@ -1,22 +1,27 @@
 //! Signalling: how two peers find each other and exchange SDP.
 //!
-//! The server is deliberately dumb. It knows nothing about video, holds no
-//! media, and only relays JSON between the two members of a room. That is what
-//! keeps hosting costs near zero - the actual stream goes peer to peer, and
-//! this only carries a few kilobytes of handshake.
+//! The relay is deliberately dumb about media. It matches peers by room code
+//! and forwards a few kilobytes of handshake; video goes directly peer to
+//! peer. Identity is layered on top: peers may authenticate with a Discord
+//! session so that names appear instead of opaque ids.
 //!
-//! A room is identified by a short code that the host shares. Possession of
-//! the code is the only credential, which is the deliberate "no accounts"
-//! tradeoff: anyone you give it to can watch, and can pass it on.
+//! Note that identity is **not** an access control boundary here. Possession
+//! of the room code still grants access; logging in only attaches a name to
+//! whoever turns up.
 
-use anyhow::{bail, Context, Result};
+pub mod auth;
+mod server;
+
+pub use auth::Identity;
+pub use server::serve;
+
+use anyhow::{bail, Result};
+use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::tungstenite::Message;
 
 /// Messages exchanged between peers and the relay.
 ///
@@ -26,14 +31,27 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Signal {
+    /// Peer -> server, optional first message: prove who you are.
+    Authenticate { session: String },
+    /// Server -> peer: identity accepted.
+    Authenticated { name: String },
     /// Host -> server: open a room.
     Host,
     /// Server -> host: the room is open under this code.
     Hosting { code: String },
     /// Viewer -> server: join a room.
     Join { code: String },
+    /// Server -> viewer: whose stream this is.
+    StreamInfo {
+        #[serde(default)]
+        host_name: Option<String>,
+    },
     /// Server -> host: a viewer arrived, start negotiating with it.
-    ViewerJoined { peer: String },
+    ViewerJoined {
+        peer: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// Server -> host: a viewer disconnected, tear its branch down.
     ViewerLeft { peer: String },
     /// Either direction: session description.
@@ -55,12 +73,11 @@ pub enum Signal {
 }
 
 impl Signal {
-    pub fn to_text(&self) -> Result<Message> {
-        Ok(Message::Text(serde_json::to_string(self)?))
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
     }
 
-    /// Overwrite the routing id. Used by the relay so a viewer cannot claim to
-    /// be a different peer.
+    /// Overwrite the routing id, so a viewer cannot claim to be another peer.
     fn with_peer(self, id: &str) -> Self {
         match self {
             Signal::Sdp { kind, sdp, .. } => Signal::Sdp {
@@ -99,50 +116,32 @@ fn generate_code() -> String {
     format!("{a}-{b}")
 }
 
+fn generate_peer_id() -> String {
+    use rand::Rng;
+    format!("{:08x}", rand::thread_rng().gen::<u32>())
+}
+
 type Tx = mpsc::UnboundedSender<Message>;
 
 #[derive(Default)]
-struct Room {
+pub struct Room {
     host: Option<Tx>,
-    /// Several viewers can watch one host simultaneously, each with its own
-    /// peer connection.
+    host_name: Option<String>,
     viewers: HashMap<String, Tx>,
 }
 
-type Rooms = Arc<Mutex<HashMap<String, Room>>>;
+pub type Rooms = Arc<Mutex<HashMap<String, Room>>>;
 
-/// Identifier for one viewer's connection within a room.
-fn generate_peer_id() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    format!("{:08x}", rng.gen::<u32>())
+enum Role {
+    Host,
+    Viewer(String),
 }
 
-/// Run the relay. One process, no state beyond the live rooms.
-pub async fn serve(addr: &str) -> Result<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("could not bind {addr}"))?;
-    println!("orange signalling server listening on {addr}");
-
-    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
-
-    while let Ok((stream, peer)) = listener.accept().await {
-        let rooms = rooms.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, rooms).await {
-                eprintln!("[signal] {peer} disconnected: {err}");
-            }
-        });
-    }
-    Ok(())
-}
-
-async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
-    let (mut sink, mut source) = ws.split();
-
+/// Serve one connected peer for its lifetime.
+pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> Result<()> {
+    let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sink.send(msg).await.is_err() {
@@ -151,37 +150,60 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
         }
     });
 
-    // Which room this connection belongs to. Viewers also carry their peer id.
     let mut joined: Option<(String, Role)> = None;
+    let mut identity: Option<Identity> = None;
 
     while let Some(msg) = source.next().await {
-        let msg = msg?;
-        let Message::Text(text) = msg else { continue };
+        let Message::Text(text) = msg? else { continue };
         let signal: Signal = match serde_json::from_str(&text) {
             Ok(s) => s,
             Err(err) => {
-                let _ = tx.send(
+                let _ = tx.send(Message::Text(
                     Signal::Error {
                         message: format!("bad message: {err}"),
                     }
-                    .to_text()?,
-                );
+                    .to_json(),
+                ));
                 continue;
             }
         };
 
         match signal {
+            Signal::Authenticate { session } => {
+                match auth.identify(&session).await {
+                    Some(found) => {
+                        let _ = tx.send(Message::Text(
+                            Signal::Authenticated {
+                                name: found.name.clone(),
+                            }
+                            .to_json(),
+                        ));
+                        identity = Some(found);
+                    }
+                    None => {
+                        // Not fatal: anonymous peers are still allowed.
+                        let _ = tx.send(Message::Text(
+                            Signal::Error {
+                                message: "session expired, continuing anonymously".into(),
+                            }
+                            .to_json(),
+                        ));
+                    }
+                }
+            }
             Signal::Host => {
                 let code = generate_code();
+                let name = identity.as_ref().map(|i| i.name.clone());
                 rooms.lock().await.insert(
                     code.clone(),
                     Room {
                         host: Some(tx.clone()),
+                        host_name: name,
                         viewers: HashMap::new(),
                     },
                 );
                 joined = Some((code.clone(), Role::Host));
-                tx.send(Signal::Hosting { code }.to_text()?)?;
+                tx.send(Message::Text(Signal::Hosting { code }.to_json()))?;
             }
             Signal::Join { code } => {
                 let code = code.trim().to_ascii_uppercase();
@@ -190,23 +212,32 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
                 match rooms.get_mut(&code) {
                     Some(room) if room.host.is_some() => {
                         room.viewers.insert(peer.clone(), tx.clone());
+                        let host_name = room.host_name.clone();
                         joined = Some((code.clone(), Role::Viewer(peer.clone())));
-                        // Only the host offers, so it must be told to start.
+
+                        let _ = tx.send(Message::Text(
+                            Signal::StreamInfo { host_name }.to_json(),
+                        ));
                         if let Some(host) = &room.host {
-                            let _ = host.send(Signal::ViewerJoined { peer }.to_text()?);
+                            let _ = host.send(Message::Text(
+                                Signal::ViewerJoined {
+                                    peer,
+                                    name: identity.as_ref().map(|i| i.name.clone()),
+                                }
+                                .to_json(),
+                            ));
                         }
                     }
                     _ => {
-                        tx.send(
+                        tx.send(Message::Text(
                             Signal::Error {
                                 message: format!("no stream with code {code}"),
                             }
-                            .to_text()?,
-                        )?;
+                            .to_json(),
+                        ))?;
                     }
                 }
             }
-            // Everything else is relayed to the other party in the conversation.
             other => {
                 let Some((code, role)) = &joined else {
                     bail!("message before joining a room");
@@ -215,17 +246,14 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
                 let Some(room) = rooms.get(code) else { continue };
 
                 match role {
-                    // Host addresses a specific viewer.
                     Role::Host => {
                         if let Some(target) = other.peer_id().and_then(|id| room.viewers.get(id)) {
-                            let _ = target.send(other.to_text()?);
+                            let _ = target.send(Message::Text(other.to_json()));
                         }
                     }
-                    // Viewer always talks to the host, stamped with its own id
-                    // so it cannot impersonate another viewer.
                     Role::Viewer(peer) => {
                         if let Some(host) = &room.host {
-                            let _ = host.send(other.with_peer(peer).to_text()?);
+                            let _ = host.send(Message::Text(other.with_peer(peer).to_json()));
                         }
                     }
                 }
@@ -233,8 +261,6 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
         }
     }
 
-    // Clean up. A room without a host is useless, so it goes; a departing
-    // viewer just frees its branch on the host.
     match joined {
         Some((code, Role::Host)) => {
             rooms.lock().await.remove(&code);
@@ -245,7 +271,7 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
             if let Some(room) = rooms.get_mut(&code) {
                 room.viewers.remove(&peer);
                 if let Some(host) = &room.host {
-                    let _ = host.send(Signal::ViewerLeft { peer }.to_text()?);
+                    let _ = host.send(Message::Text(Signal::ViewerLeft { peer }.to_json()));
                 }
             }
         }
@@ -254,10 +280,7 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
     Ok(())
 }
 
-enum Role {
-    Host,
-    Viewer(String),
-}
+// --- client -----------------------------------------------------------------
 
 /// Client side of the relay, shared by host and viewer.
 pub struct SignalClient {
@@ -265,9 +288,8 @@ pub struct SignalClient {
     pub incoming: mpsc::UnboundedReceiver<Signal>,
 }
 
-/// rustls refuses to pick a crypto backend for you when more than one could
-/// apply, and panics at first use rather than failing gracefully. Install one
-/// explicitly, once, before any TLS happens.
+/// rustls refuses to pick a crypto backend when more than one could apply, and
+/// panics at first use rather than failing gracefully. Install one explicitly.
 fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -278,11 +300,9 @@ fn install_crypto_provider() {
 pub async fn connect(url: &str) -> Result<SignalClient> {
     install_crypto_provider();
 
-    // `connect_async` handles ws:// directly; wss:// needs the TLS connector,
-    // which is what Azure's ingress terminates on.
     let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(url, None, false, None)
         .await
-        .with_context(|| format!("could not reach signalling server at {url}"))?;
+        .map_err(|e| anyhow::anyhow!("could not reach signalling server at {url}: {e}"))?;
     let (mut sink, mut source) = ws.split();
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Signal>();
@@ -290,20 +310,16 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
 
     tokio::spawn(async move {
         while let Some(signal) = out_rx.recv().await {
-            match signal.to_text() {
-                Ok(msg) => {
-                    if sink.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-                Err(err) => eprintln!("[signal] encode failed: {err}"),
+            let text = tokio_tungstenite::tungstenite::Message::Text(signal.to_json());
+            if sink.send(text).await.is_err() {
+                break;
             }
         }
     });
 
     tokio::spawn(async move {
         while let Some(Ok(msg)) = source.next().await {
-            if let Message::Text(text) = msg {
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
                 match serde_json::from_str::<Signal>(&text) {
                     Ok(signal) => {
                         if in_tx.send(signal).is_err() {

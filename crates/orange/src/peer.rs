@@ -122,6 +122,13 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
 pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     check_elements(settings.codec)?;
     let mut client = connect(url).await?;
+
+    // Identity is optional: without it viewers show up as opaque ids.
+    if let Some(session) = crate::auth::load_session() {
+        client.outgoing.send(Signal::Authenticate {
+            session: session.token,
+        })?;
+    }
     client.outgoing.send(Signal::Host)?;
 
     // --- pipeline ---------------------------------------------------------
@@ -168,11 +175,11 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 println!("\n  Share this code:  {code}\n");
                 println!("  Viewers run:  orange watch --code {code}\n");
             }
-            Signal::ViewerJoined { peer } => {
+            Signal::ViewerJoined { peer, name } => {
                 match add_viewer(&pipeline, &tee, audio_tee.as_ref(), &peer, client.outgoing.clone()) {
                     Ok(bin) => {
                         viewers.insert(peer.clone(), bin);
-                        println!("[host] viewer {peer} joined ({} total)", viewers.len());
+                        println!("[host] {} joined ({} watching)", name.clone().unwrap_or_else(|| format!("viewer {peer}")), viewers.len());
                     }
                     Err(err) => eprintln!("[host] could not add viewer {peer}: {err}"),
                 }
@@ -202,6 +209,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                     bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
                 }
             }
+            Signal::Authenticated { name } => println!("[host] signed in as {name}"),
             Signal::Error { message } => eprintln!("[host] server: {message}"),
             _ => {}
         }
@@ -315,6 +323,11 @@ fn create_offer(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: St
 /// Viewer: join a stream by code.
 pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let mut client = connect(url).await?;
+    if let Some(session) = crate::auth::load_session() {
+        client.outgoing.send(Signal::Authenticate {
+            session: session.token,
+        })?;
+    }
     client.outgoing.send(Signal::Join {
         code: code.to_string(),
     })?;
@@ -371,6 +384,15 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
             Signal::Ice { mline, candidate, .. } => {
                 bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
             }
+            Signal::StreamInfo { host_name } => {
+                if let Some(name) = host_name {
+                    println!("[watch] {name}'s stream");
+                }
+
+            }
+
+            Signal::Authenticated { name } => println!("[watch] signed in as {name}"),
+
             Signal::Error { message } => {
                 anyhow::bail!("{message}");
             }
