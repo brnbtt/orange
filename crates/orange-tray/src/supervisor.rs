@@ -75,7 +75,9 @@ fn gstreamer_bin() -> Option<std::path::PathBuf> {
         std::env::var("LOCALAPPDATA")
             .ok()
             .map(|p| std::path::PathBuf::from(p).join(r"Programs\gstreamer\1.0\msvc_x86_64\bin")),
-        Some(std::path::PathBuf::from(r"C:\gstreamer\1.0\msvc_x86_64\bin")),
+        Some(std::path::PathBuf::from(
+            r"C:\gstreamer\1.0\msvc_x86_64\bin",
+        )),
         std::env::var("ProgramFiles")
             .ok()
             .map(|p| std::path::PathBuf::from(p).join(r"gstreamer\1.0\msvc_x86_64\bin")),
@@ -110,7 +112,10 @@ pub fn list_windows() -> Result<Vec<WindowTarget>> {
         .context("could not run `orange list`")?;
     let text = String::from_utf8_lossy(&output.stdout);
     // The binary prints nothing else on stdout in JSON mode, but be forgiving.
-    let json = text.lines().find(|l| l.trim_start().starts_with('[')).unwrap_or("[]");
+    let json = text
+        .lines()
+        .find(|l| l.trim_start().starts_with('['))
+        .unwrap_or("[]");
     Ok(serde_json::from_str(json)?)
 }
 
@@ -178,7 +183,12 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// Start `orange host` for a window and begin parsing its output.
-    pub fn host(target: &WindowTarget, quality: &Quality, server: &str) -> Result<Self> {
+    pub fn host(
+        target: &WindowTarget,
+        quality: &Quality,
+        fps: Option<u32>,
+        server: &str,
+    ) -> Result<Self> {
         let mut command = orange_command()?;
         command
             .arg("host")
@@ -187,6 +197,9 @@ impl Supervisor {
             .args(["--codec", quality.codec])
             .args(["--bitrate", &quality.bitrate.to_string()])
             .args(["--scale", &quality.scale]);
+        if let Some(fps) = fps {
+            command.args(["--fps", &fps.to_string()]);
+        }
         Self::spawn(command)
     }
 
@@ -251,7 +264,9 @@ impl Drop for Supervisor {
 
 /// Extract the few facts the UI cares about from the child's log lines.
 fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
-    let Ok(mut status) = status.lock() else { return };
+    let Ok(mut status) = status.lock() else {
+        return;
+    };
 
     if let Some(rest) = line.split("Share this code:").nth(1) {
         status.code = Some(rest.trim().to_string());

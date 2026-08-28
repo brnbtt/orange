@@ -59,13 +59,16 @@ struct Orange {
     avatar: Option<std::sync::Arc<gpui::RenderImage>>,
     avatar_rx: Option<std::sync::mpsc::Receiver<capture::Thumbnail>>,
     quality: usize,
+    fps: Option<u32>,
+    active_target: Option<WindowTarget>,
+    active_preview: Option<std::sync::Arc<gpui::RenderImage>>,
     stream: Option<Supervisor>,
     logging_in: Option<LoginAttempt>,
     error: Option<String>,
     server: String,
-    /// Whether the window is currently sized for the picker, so the resize
-    /// happens once per transition rather than every frame.
-    sized_for: Option<bool>,
+    /// Last screen the window was sized for, so resize happens once per
+    /// transition rather than every frame.
+    sized_for: Option<Screen>,
     /// Drives the transient "Copied" confirmation on the share code.
     copied_at: Option<Instant>,
 }
@@ -83,6 +86,7 @@ impl Orange {
         .detach();
 
         let session = session::load();
+        let preferences = session::load_preferences();
         let avatar_rx = request_avatar(session.as_ref().and_then(|s| s.avatar_url.clone()));
         Self {
             screen: if session.is_some() {
@@ -96,7 +100,10 @@ impl Orange {
             thumb_rx: None,
             avatar: None,
             avatar_rx,
-            quality: 1,
+            quality: preferences.quality.min(QUALITIES.len() - 1),
+            fps: preferences.fps,
+            active_target: None,
+            active_preview: None,
             stream: None,
             logging_in: None,
             error: None,
@@ -142,6 +149,8 @@ impl Orange {
                     self.error = status.error.clone();
                 }
                 self.stream = None;
+                self.active_target = None;
+                self.active_preview = None;
                 self.screen = Screen::Home;
             }
         }
@@ -150,6 +159,13 @@ impl Orange {
 
     fn quality(&self) -> Quality {
         QUALITIES[self.quality.min(QUALITIES.len() - 1)]
+    }
+
+    fn save_preferences(&self) {
+        session::save_preferences(session::Preferences {
+            quality: self.quality,
+            fps: self.fps,
+        });
     }
 
     fn refresh_windows(&mut self) {
@@ -244,8 +260,11 @@ impl Orange {
             );
             return;
         }
-        match Supervisor::host(&target, &self.quality(), &self.server) {
+        let preview = self.thumbnails.get(&target.hwnd).cloned();
+        match Supervisor::host(&target, &self.quality(), self.fps, &self.server) {
             Ok(stream) => {
+                self.active_target = Some(target);
+                self.active_preview = preview;
                 self.stream = Some(stream);
                 self.screen = Screen::Streaming;
                 self.error = None;
@@ -281,6 +300,8 @@ impl Orange {
         if let Some(mut stream) = self.stream.take() {
             stream.stop();
         }
+        self.active_target = None;
+        self.active_preview = None;
         self.screen = Screen::Home;
     }
 
@@ -365,12 +386,20 @@ fn avatar(image: Option<std::sync::Arc<gpui::RenderImage>>, name: &str, size: f3
                 .font_weight(FontWeight::SEMIBOLD),
         )
         .children(image.map(|image| {
-            gpui::img(image)
+            div()
                 .absolute()
                 .top_0()
                 .left_0()
                 .w(px(size))
                 .h(px(size))
+                .p(px(1.0))
+                .child(
+                    gpui::img(image)
+                        .w_full()
+                        .h_full()
+                        .rounded_full()
+                        .overflow_hidden(),
+                )
                 .with_animation(
                     SharedString::from("avatar-in"),
                     Animation::new(Duration::from_millis(180)),
@@ -468,12 +497,41 @@ fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui
         .child(text.into())
 }
 
+fn option_pill(
+    id: SharedString,
+    text: impl Into<SharedString>,
+    active: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .border_1()
+        .border_color(rgb(if active { ORANGE } else { BORDER }))
+        .bg(rgb(if active { ORANGE } else { SURFACE }))
+        .text_color(rgb(if active { INK } else { MUTED }))
+        .when(active, |element| element.font_weight(FontWeight::SEMIBOLD))
+        .when(!active, |element| {
+            element.hover(|style| {
+                style
+                    .bg(rgb(SURFACE_HOVER))
+                    .border_color(rgb(ORANGE_DIM))
+                    .text_color(rgb(TEXT))
+            })
+        })
+        .child(text.into())
+}
+
 /// The mark: a scanline eclipse crescent, from the logo exploration.
 ///
 /// Embedded as a PNG rather than drawn, because the scanline texture cannot be
 /// expressed with GPUI primitives without hundreds of elements. Hero-sized
-/// instances receive a subtle traveling light through the rays; titlebar-sized
-/// instances stay static because animation at 18px would only read as flicker.
+/// instances receive a periodic transmit sweep that pushes their scanlines
+/// outward as rays; titlebar-sized instances stay static because animation at
+/// 18px would only read as flicker.
 fn logo(px_size: f32) -> impl IntoElement {
     static STATIC: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
         std::sync::OnceLock::new();
@@ -485,21 +543,33 @@ fn logo(px_size: f32) -> impl IntoElement {
         .get_or_init(|| {
             let bytes = include_bytes!("../logo.png");
             let base = image::load_from_memory(bytes).ok()?.into_rgba8().into_raw();
-            let frame_count = if animated { 18 } else { 1 };
+            // A short transmit sweep followed by a hold. Constant motion made
+            // the mark feel like a loading spinner; Routine's interfaces use
+            // sparse, stateful motion that settles back into stillness.
+            let frame_count = if animated { 44 } else { 1 };
             let mut frames = Vec::with_capacity(frame_count);
             for frame_index in 0..frame_count {
                 let mut raw = base.clone();
-                if animated {
-                    let phase = frame_index as f32 / frame_count as f32 * std::f32::consts::TAU;
-                    for (index, pixel) in raw.chunks_exact_mut(4).enumerate() {
-                        if pixel[3] == 0 {
+                if animated && frame_index < 20 {
+                    let sweep_y = frame_index as f32 / 19.0 * 127.0;
+                    for y in 0..128usize {
+                        let strength = (1.0 - (y as f32 - sweep_y).abs() / 15.0).max(0.0);
+                        if strength <= 0.0 {
                             continue;
                         }
-                        let x = (index % 128) as f32;
-                        let y = (index / 128) as f32;
-                        let wave = ((x * 0.115 - y * 0.018 - phase).sin() + 1.0) * 0.5;
-                        let intensity = 0.58 + 0.42 * wave * wave;
-                        pixel[3] = (pixel[3] as f32 * intensity).round() as u8;
+                        let first = (0..128usize).find(|x| base[(y * 128 + x) * 4 + 3] > 16);
+                        let Some(first) = first else { continue };
+                        let source = (y * 128 + first) * 4;
+                        let extension = (strength * 18.0).round() as usize;
+                        for distance in 1..=extension.min(first) {
+                            let target = (y * 128 + first - distance) * 4;
+                            let taper = 1.0 - distance as f32 / (extension + 1) as f32;
+                            raw[target] = base[source];
+                            raw[target + 1] = base[source + 1];
+                            raw[target + 2] = base[source + 2];
+                            let ray_alpha = strength.sqrt() * (0.55 + 0.45 * taper);
+                            raw[target + 3] = (base[source + 3] as f32 * ray_alpha).round() as u8;
+                        }
                     }
                 }
                 // GPUI wants BGRA; the PNG decodes as RGBA.
@@ -508,7 +578,7 @@ fn logo(px_size: f32) -> impl IntoElement {
                 }
                 let buffer = image::RgbaImage::from_raw(128, 128, raw)?;
                 frames.push(if animated {
-                    image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(55, 1))
+                    image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(45, 1))
                 } else {
                     image::Frame::new(buffer)
                 });
@@ -581,13 +651,13 @@ impl Render for Orange {
         // The picker needs room for a two-column grid; every other screen is a
         // narrow column. Resizing on transition keeps both comfortable rather
         // than compromising on one size for all of them.
-        let wanted = if self.screen == Screen::PickWindow {
-            size(px(576.0), px(660.0))
-        } else {
-            size(px(400.0), px(540.0))
+        let wanted = match self.screen {
+            Screen::PickWindow => size(px(576.0), px(660.0)),
+            Screen::Streaming => size(px(480.0), px(640.0)),
+            _ => size(px(400.0), px(540.0)),
         };
-        if self.sized_for != Some(self.screen == Screen::PickWindow) {
-            self.sized_for = Some(self.screen == Screen::PickWindow);
+        if self.sized_for != Some(self.screen) {
+            self.sized_for = Some(self.screen);
             window.resize(wanted);
         }
 
@@ -955,11 +1025,15 @@ impl Orange {
                             .flex()
                             .flex_col()
                             .gap_0p5()
-                            .child(micro(format!("{} SHARE OPTIONS", count), ORANGE))
+                            .child(micro(format!("{} SOURCES AVAILABLE", count), ORANGE))
                             .child(
                                 label("Choose what to share", TEXT)
                                     .font_family("Bahnschrift")
                                     .font_weight(FontWeight::SEMIBOLD),
+                            )
+                            .child(
+                                label("Click a preview to start streaming immediately.", FAINT)
+                                    .text_xs(),
                             ),
                     )
                     .child(
@@ -999,7 +1073,7 @@ impl Orange {
                                     target.title.clone()
                                 };
                                 let meta = if is_screen {
-                                    "Everything you see".to_string()
+                                    "Full display · includes notifications".to_string()
                                 } else {
                                     format!(
                                         "{} · {}×{}",
@@ -1010,10 +1084,12 @@ impl Orange {
                                 };
                                 let thumb = self.thumbnails.get(&target.hwnd).cloned();
                                 let hwnd = target.hwnd;
+                                let group = SharedString::from(format!("card-{hwnd}"));
 
                                 div()
                                     .id(SharedString::from(format!("w{hwnd}")))
-                                    .group("card")
+                                    .group(group.clone())
+                                    .relative()
                                     .flex()
                                     .flex_col()
                                     .flex_shrink_0()
@@ -1022,9 +1098,21 @@ impl Orange {
                                     .overflow_hidden()
                                     .bg(rgb(SURFACE))
                                     .border_1()
-                                    .border_color(rgb(if is_screen { ORANGE_DIM } else { BORDER }))
+                                    .border_color(rgb(BORDER))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE)))
+                                    .active(|s| s.bg(rgb(BG)).border_color(rgb(ORANGE_DIM)))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .w_full()
+                                            .h(px(2.0))
+                                            .bg(rgb(ORANGE))
+                                            .opacity(0.0)
+                                            .group_hover(group.clone(), |s| s.opacity(1.0)),
+                                    )
                                     .child(
                                         // 16:9 preview. flex_shrink_0 is
                                         // load-bearing: as a flex item this
@@ -1069,13 +1157,33 @@ impl Orange {
                                             .px_3()
                                             .child(
                                                 div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
                                                     .w_full()
                                                     .overflow_hidden()
                                                     .whitespace_nowrap()
                                                     .text_ellipsis()
                                                     .text_xs()
                                                     .text_color(rgb(TEXT))
-                                                    .child(title),
+                                                    .group_hover(group.clone(), |s| {
+                                                        s.text_color(rgb(ORANGE))
+                                                    })
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .overflow_hidden()
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
+                                                            .child(title),
+                                                    )
+                                                    .child(
+                                                        micro("→", ORANGE)
+                                                            .opacity(0.0)
+                                                            .group_hover(group.clone(), |s| {
+                                                                s.opacity(1.0)
+                                                            }),
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -1148,6 +1256,7 @@ impl Orange {
                                                 .child(q.label)
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.quality = index;
+                                                    this.save_preferences();
                                                     cx.notify();
                                                 }))
                                         })
@@ -1171,6 +1280,26 @@ impl Orange {
     fn render_streaming(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let code = self.code();
         let viewers = self.viewers();
+        let quality = self.quality();
+        let source_name = self
+            .active_target
+            .as_ref()
+            .map(|target| {
+                if target.title.is_empty() {
+                    target.app_name()
+                } else {
+                    target.title.clone()
+                }
+            })
+            .unwrap_or_else(|| "Selected source".into());
+        let stream_details = format!(
+            "{} · {}",
+            quality.label,
+            self.fps
+                .map(|fps| format!("{fps} fps"))
+                .unwrap_or_else(|| "display refresh".into())
+        );
+        let preview = self.active_preview.clone();
         let just_copied = self
             .copied_at
             .map(|t| t.elapsed() < Duration::from_secs(2))
@@ -1182,54 +1311,115 @@ impl Orange {
             .gap_3()
             .flex_1()
             .min_h(px(0.0))
-            .child(micro("YOUR STREAM IS LIVE", GREEN))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_1p5()
-                    .child(if code.is_some() {
-                        live_dot().into_any_element()
-                    } else {
-                        dot(MUTED).into_any_element()
-                    })
+                    .justify_between()
                     .child(
-                        label(
-                            if code.is_some() {
-                                "Live"
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(if code.is_some() {
+                                live_dot().into_any_element()
                             } else {
-                                "Starting…"
-                            },
-                            TEXT,
-                        )
-                        .font_weight(FontWeight::SEMIBOLD),
+                                dot(MUTED).into_any_element()
+                            })
+                            .child(
+                                label(
+                                    if code.is_some() {
+                                        "Streaming"
+                                    } else {
+                                        "Starting stream…"
+                                    },
+                                    TEXT,
+                                )
+                                .font_weight(FontWeight::SEMIBOLD),
+                            ),
+                    )
+                    .child(micro(&stream_details, MUTED)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(SURFACE))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w_full()
+                            .h(px(220.0))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .bg(rgb(BG))
+                            .child(match preview {
+                                Some(image) => {
+                                    gpui::img(image).w_full().h(px(220.0)).into_any_element()
+                                }
+                                None => label("Source preview unavailable", FAINT)
+                                    .text_xs()
+                                    .into_any_element(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(label(source_name, TEXT).text_xs()),
+                            )
+                            .child(micro("SOURCE PREVIEW", ORANGE)),
                     ),
             )
             .child(match code.clone() {
                 Some(code) => card()
                     .id("code")
+                    .flex_row()
                     .items_center()
-                    .py_4()
-                    .gap_2()
+                    .justify_between()
+                    .py_3()
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE_DIM)))
                     .child(
                         div()
-                            .text_color(rgb(ORANGE))
-                            .text_size(px(30.0))
-                            .font_weight(FontWeight::BOLD)
-                            .child(code.clone()),
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(label("Share code", TEXT).text_xs())
+                            .child(
+                                label(
+                                    if just_copied {
+                                        "Copied to clipboard"
+                                    } else {
+                                        "Click to copy"
+                                    },
+                                    if just_copied { GREEN } else { FAINT },
+                                )
+                                .text_xs(),
+                            ),
                     )
                     .child(
-                        label(
-                            if just_copied {
-                                "Copied to clipboard"
-                            } else {
-                                "Click to copy"
-                            },
-                            if just_copied { GREEN } else { FAINT },
-                        )
-                        .text_xs(),
+                        div()
+                            .text_color(rgb(ORANGE))
+                            .text_size(px(24.0))
+                            .font_weight(FontWeight::BOLD)
+                            .child(code.clone()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.clone()));
@@ -1239,7 +1429,7 @@ impl Orange {
                     .into_any_element(),
                 None => card()
                     .items_center()
-                    .py_4()
+                    .py_3()
                     .child(label("Connecting…", MUTED).text_xs())
                     .into_any_element(),
             })
@@ -1320,6 +1510,8 @@ impl Orange {
 
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let signed_in = self.session.as_ref().map(|s| s.name.clone());
+        let selected_quality = self.quality;
+        let selected_fps = self.fps;
         let identity = match &signed_in {
             Some(name) => div()
                 .flex()
@@ -1375,17 +1567,69 @@ impl Orange {
                     }),
             )
             .child(
-                card().child(label("Relay", TEXT)).child(
-                    div()
-                        .w_full()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .font_family("Cascadia Mono")
-                        .text_size(px(10.0))
-                        .text_color(rgb(FAINT))
-                        .child(self.server.clone()),
-                ),
+                card()
+                    .gap_2()
+                    .child(label("Default quality", TEXT))
+                    .child(
+                        div().flex().gap_1p5().children(
+                            QUALITIES
+                                .iter()
+                                .enumerate()
+                                .map(|(index, quality)| {
+                                    option_pill(
+                                        SharedString::from(format!("settings-quality-{index}")),
+                                        quality.label,
+                                        index == selected_quality,
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.quality = index;
+                                        this.save_preferences();
+                                        cx.notify();
+                                    }))
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                    .child(
+                        label("Used when a new stream starts. You can still change it before sharing.", FAINT)
+                            .text_xs(),
+                    ),
+            )
+            .child(
+                card()
+                    .gap_2()
+                    .child(label("Frame rate", TEXT))
+                    .child(
+                        div().flex().gap_1p5().children(
+                            [
+                                (None, "Auto"),
+                                (Some(60), "60"),
+                                (Some(120), "120"),
+                                (Some(240), "240"),
+                            ]
+                            .into_iter()
+                            .map(|(fps, text)| {
+                                option_pill(
+                                    SharedString::from(format!(
+                                        "settings-fps-{}",
+                                        fps.unwrap_or(0)
+                                    )),
+                                    text,
+                                    fps == selected_fps,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.fps = fps;
+                                    this.save_preferences();
+                                    cx.notify();
+                                }))
+                            })
+                            .collect::<Vec<_>>(),
+                        ),
+                    )
+                    .child(
+                        label("Auto follows the refresh rate of the display being captured.", FAINT)
+                            .text_xs(),
+                    ),
             )
             .child(div().flex_1())
             .child(
