@@ -13,11 +13,18 @@ use gstreamer as gst;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::pipeline::{build_audio_chain, build_capture_chain, check_audio_elements, check_elements, CaptureSettings};
+use crate::pipeline::{
+    build_audio_chain, build_capture_chain, check_audio_elements, check_elements, CaptureSettings,
+};
+use crate::webrtc::{
+    audio_rtp_caps, build_audio_branch, build_receive_branch, encoding_name, rtp_caps, Output,
+};
 use orange_signal::{connect, Signal};
-use crate::webrtc::{audio_rtp_caps, build_audio_branch, build_receive_branch, encoding_name, rtp_caps, Output};
 
 /// Public STUN lets peers discover their external address. Without it, two
 /// machines behind different routers will never find each other.
@@ -86,6 +93,46 @@ fn watch_connection(bin: &gst::Element, label: String) {
     bin.connect_notify(Some("connection-state"), move |bin, _| {
         let state = bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
         println!("[{label}] peer connection: {state:?}");
+    });
+}
+
+/// Measure the encoded video arriving from WebRTC and expose it to the viewer.
+///
+/// The pad still carries RTP here, before depayloading and decoding, so this is
+/// the bitrate actually received rather than an estimate based on decoded
+/// frame sizes. The streaming callback only increments an atomic counter; a
+/// low-frequency worker does the division and touches UI state once a second.
+fn watch_incoming_bitrate(pad: &gst::Pad, overlay: crate::overlay::SharedOverlay) {
+    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes_for_probe = bytes.clone();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+            bytes_for_probe.fetch_add(buffer.size() as u64, Ordering::Relaxed);
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    let overlay = Arc::downgrade(&overlay);
+    std::thread::spawn(move || {
+        let mut sampled_at = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let elapsed = sampled_at.elapsed().as_secs_f64();
+            sampled_at = Instant::now();
+            let received = bytes.swap(0, Ordering::Relaxed);
+
+            let Some(overlay) = overlay.upgrade() else {
+                break;
+            };
+            if received == 0 || elapsed == 0.0 {
+                continue;
+            }
+
+            let kbps = ((received as f64 * 8.0) / elapsed / 1000.0).round() as u32;
+            if let Ok(mut state) = overlay.lock() {
+                state.bitrate_kbps = Some(kbps);
+            };
+        }
     });
 }
 
@@ -346,10 +393,12 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let pipeline_weak = pipeline.downgrade();
     // The audio branch needs the overlay to follow its volume control, so keep
     // a handle before the video branch consumes the output.
-    let overlay_for_audio = match &output {
+    let viewer_overlay = match &output {
         Output::Window { overlay, .. } => Some(overlay.clone()),
         Output::File(_) => None,
     };
+    let overlay_for_audio = viewer_overlay.clone();
+    let overlay_for_video = viewer_overlay.clone();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
     bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
@@ -359,7 +408,12 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         let result = match kind.as_str() {
             "OPUS" => build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
             "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
-                Some(output) => build_receive_branch(&pipeline, pad, output),
+                Some(output) => {
+                    if let Some(overlay) = overlay_for_video.clone() {
+                        watch_incoming_bitrate(pad, overlay);
+                    }
+                    build_receive_branch(&pipeline, pad, output)
+                }
                 None => Ok(()),
             },
             other => {
@@ -385,10 +439,14 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                 bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
             }
             Signal::StreamInfo { host_name } => {
+                if let Some(overlay) = &viewer_overlay {
+                    if let Ok(mut state) = overlay.lock() {
+                        state.host = host_name.clone();
+                    }
+                }
                 if let Some(name) = host_name {
                     println!("[watch] {name}'s stream");
                 }
-
             }
 
             Signal::Authenticated { name } => println!("[watch] signed in as {name}"),

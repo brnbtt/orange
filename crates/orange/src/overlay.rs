@@ -279,6 +279,7 @@ impl OverlayState {
         self.video.hash(&mut hasher);
         self.client.hash(&mut hasher);
         self.dpi.to_bits().hash(&mut hasher);
+        self.visible().hash(&mut hasher);
         ((self.opacity() * 24.0) as u32).hash(&mut hasher);
         ((self.volume * 100.0) as u32).hash(&mut hasher);
         self.muted.hash(&mut hasher);
@@ -468,13 +469,13 @@ fn cluster(x: f32, y: f32, w: f32, h: f32, paint: impl FnOnce(&mut Pixmap)) -> O
 
 /// Rasterise the controls and wrap them as an overlay composition.
 ///
-/// Returns `None` when they are hidden, which tells the sink there is nothing
-/// to composite and costs nothing.
+/// Hidden controls become one transparent pixel. The element's `draw` signal
+/// requires a composition object even when there is nothing visible.
 pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposition> {
     let (vw, vh) = state.video;
-    if vw == 0 || vh == 0 || !state.visible() {
+    if vw == 0 || vh == 0 {
         state.hits.clear();
-        return None;
+        return transparent_composition();
     }
 
     let signature = state.signature();
@@ -482,6 +483,16 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
         if *cached == signature {
             return Some(composition.clone());
         }
+    }
+
+    // The element's `draw` signal requires a composition return value. `None`
+    // aborts inside GLib once the controls time out, so hidden means one fully
+    // transparent pixel rather than no object at all.
+    if !state.visible() {
+        state.hits.clear();
+        let composition = transparent_composition()?;
+        state.cache = Some((signature, composition.clone()));
+        return Some(composition);
     }
 
     let alpha = state.opacity();
@@ -717,6 +728,11 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     let composition = to_composition(panels)?;
     state.cache = Some((signature, composition.clone()));
     Some(composition)
+}
+
+fn transparent_composition() -> Option<gst_video::VideoOverlayComposition> {
+    let pixmap = Pixmap::new(1, 1)?;
+    to_composition(vec![Panel { pixmap, x: 0.0, y: 0.0 }])
 }
 
 /// Wrap the rasterised clusters as something the sink can composite.
