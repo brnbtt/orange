@@ -4079,6 +4079,7 @@ dependencies = [
  "anyhow",
  "embed-resource",
  "gpui",
+ "image",
  "serde",
  "serde_json",
  "windows 0.62.2",

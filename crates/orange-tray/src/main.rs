@@ -8,6 +8,7 @@
 // cmd window behind the UI.
 #![windows_subsystem = "windows"]
 
+mod capture;
 mod session;
 mod supervisor;
 mod tray;
@@ -51,6 +52,8 @@ struct Orange {
     screen: Screen,
     session: Option<session::Session>,
     windows: Vec<WindowTarget>,
+    /// Thumbnails keyed by window handle, captured when the picker opens.
+    thumbnails: std::collections::HashMap<i64, std::sync::Arc<gpui::RenderImage>>,
     quality: usize,
     stream: Option<Supervisor>,
     logging_in: Option<LoginAttempt>,
@@ -81,6 +84,7 @@ impl Orange {
             },
             session,
             windows: Vec::new(),
+            thumbnails: std::collections::HashMap::new(),
             quality: 1,
             stream: None,
             logging_in: None,
@@ -127,6 +131,17 @@ impl Orange {
             Ok(mut windows) => {
                 // Never offer our own windows as a capture target.
                 windows.retain(|w| !w.process.to_lowercase().starts_with("orange"));
+
+                // Thumbnails are captured here rather than lazily during
+                // render: PrintWindow is synchronous and would stutter the UI
+                // if it ran inside a paint.
+                self.thumbnails.clear();
+                for target in &windows {
+                    if let Some(image) = capture::thumbnail(target.hwnd as isize, 320, 180) {
+                        self.thumbnails.insert(target.hwnd, image);
+                    }
+                }
+
                 self.windows = windows;
                 self.error = None;
             }
@@ -668,21 +683,58 @@ impl Orange {
                                     target.width,
                                     target.height
                                 );
-                                card()
+                                let thumb = self.thumbnails.get(&target.hwnd).cloned();
+
+                                div()
                                     .id(SharedString::from(format!("w{}", target.hwnd)))
-                                    .gap_0p5()
-                                    .py_2p5()
+                                    .flex()
+                                    .flex_col()
+                                    .rounded_lg()
+                                    .overflow_hidden()
+                                    .bg(rgb(SURFACE))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
                                     .cursor_pointer()
-                                    .hover(|s| {
-                                        s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE_DIM))
-                                    })
+                                    .hover(|s| s.border_color(rgb(ORANGE)))
+                                    .child(
+                                        // Fixed-height preview strip, so rows
+                                        // stay uniform whatever the window shape.
+                                        div()
+                                            .h(px(104.0))
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(rgb(0x0b0b0d))
+                                            .overflow_hidden()
+                                            .child(match thumb {
+                                                Some(image) => gpui::img(image)
+                                                    .h(px(104.0))
+                                                    .into_any_element(),
+                                                // Some windows refuse to draw:
+                                                // elevated processes, protected
+                                                // surfaces. Say so rather than
+                                                // showing an empty box.
+                                                None => label("no preview", FAINT)
+                                                    .text_xs()
+                                                    .into_any_element(),
+                                            }),
+                                    )
                                     .child(
                                         div()
-                                            .overflow_hidden()
-                                            .text_color(rgb(TEXT))
-                                            .child(title),
+                                            .flex()
+                                            .flex_col()
+                                            .gap_0p5()
+                                            .px_3()
+                                            .py_2p5()
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .text_color(rgb(TEXT))
+                                                    .child(title),
+                                            )
+                                            .child(label(meta, FAINT).text_xs()),
                                     )
-                                    .child(label(meta, FAINT).text_xs())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.start_stream(target.clone());
                                         cx.notify();
