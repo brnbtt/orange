@@ -55,10 +55,55 @@ fn orange_exe() -> Result<std::path::PathBuf> {
     Ok(dir.join("orange.exe"))
 }
 
+/// Locate GStreamer's `bin` directory.
+///
+/// `orange.exe` links GStreamer dynamically, so those DLLs must be on the
+/// PATH of the *child* process or it dies at load time with a
+/// "gstreamer-1.0-0.dll was not found" dialog before `main` ever runs. The
+/// tray itself has no GStreamer dependency, which is why it starts fine and
+/// only the child fails.
+fn gstreamer_bin() -> Option<std::path::PathBuf> {
+    // An explicit root wins, since that is what the dev shell sets.
+    if let Ok(root) = std::env::var("GSTREAMER_1_0_ROOT_MSVC_X86_64") {
+        let bin = std::path::PathBuf::from(root).join("bin");
+        if bin.is_dir() {
+            return Some(bin);
+        }
+    }
+
+    let candidates = [
+        std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|p| std::path::PathBuf::from(p).join(r"Programs\gstreamer\1.0\msvc_x86_64\bin")),
+        Some(std::path::PathBuf::from(r"C:\gstreamer\1.0\msvc_x86_64\bin")),
+        std::env::var("ProgramFiles")
+            .ok()
+            .map(|p| std::path::PathBuf::from(p).join(r"gstreamer\1.0\msvc_x86_64\bin")),
+    ];
+    candidates.into_iter().flatten().find(|p| p.is_dir())
+}
+
+/// Build a command for the `orange` binary with GStreamer reachable.
+fn orange_command() -> Result<Command> {
+    let mut command = Command::new(orange_exe()?);
+
+    if let Some(bin) = gstreamer_bin() {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{};{}", bin.display(), existing));
+    }
+    command.creation_flags(CREATE_NO_WINDOW);
+    Ok(command)
+}
+
+/// Whether the media stack is present, so the UI can say so plainly rather
+/// than letting Windows show a DLL error dialog.
+pub fn gstreamer_available() -> bool {
+    gstreamer_bin().is_some()
+}
+
 pub fn list_windows() -> Result<Vec<WindowTarget>> {
-    let output = Command::new(orange_exe()?)
+    let output = orange_command()?
         .args(["list", "--json"])
-        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -78,10 +123,9 @@ pub fn list_windows() -> Result<Vec<WindowTarget>> {
 /// The child is returned so the caller can tell "still waiting for the user"
 /// apart from "it died", which otherwise looks identical from the UI.
 pub fn start_login(server: &str) -> Result<LoginAttempt> {
-    let child = Command::new(orange_exe()?)
+    let child = orange_command()?
         .arg("login")
         .args(["--server", server])
-        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -135,7 +179,7 @@ pub struct Supervisor {
 impl Supervisor {
     /// Start `orange host` for a window and begin parsing its output.
     pub fn host(target: &WindowTarget, quality: &Quality, server: &str) -> Result<Self> {
-        let mut command = Command::new(orange_exe()?);
+        let mut command = orange_command()?;
         command
             .arg("host")
             .args(["--hwnd", &target.hwnd.to_string()])
@@ -148,7 +192,7 @@ impl Supervisor {
 
     /// Start `orange watch` for a code.
     pub fn watch(code: &str, server: &str) -> Result<Self> {
-        let mut command = Command::new(orange_exe()?);
+        let mut command = orange_command()?;
         command
             .arg("watch")
             .args(["--code", code])
@@ -158,7 +202,6 @@ impl Supervisor {
 
     fn spawn(mut command: Command) -> Result<Self> {
         let mut child = command
-            .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

@@ -142,6 +142,13 @@ impl Orange {
     }
 
     fn start_stream(&mut self, target: WindowTarget) {
+        if !supervisor::gstreamer_available() {
+            self.error = Some(
+                "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
+                    .into(),
+            );
+            return;
+        }
         match Supervisor::host(&target, &self.quality(), &self.server) {
             Ok(stream) => {
                 self.stream = Some(stream);
@@ -156,6 +163,13 @@ impl Orange {
         let code = code.trim().to_ascii_uppercase();
         if code.is_empty() {
             self.error = Some("No code on the clipboard".into());
+            return;
+        }
+        if !supervisor::gstreamer_available() {
+            self.error = Some(
+                "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
+                    .into(),
+            );
             return;
         }
         match Supervisor::watch(&code, &self.server) {
