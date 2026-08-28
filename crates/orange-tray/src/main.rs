@@ -316,7 +316,10 @@ fn primary(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gp
         .text_color(rgb(INK))
         .font_weight(FontWeight::SEMIBOLD)
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0xff8c1f)))
+        .hover(|s| s.bg(rgb(0xff6f38)))
+        // Press feedback: without it, a click feels like nothing happened
+        // until the screen changes.
+        .active(|s| s.bg(rgb(ORANGE_DIM)))
         .child(text.into())
 }
 
@@ -335,7 +338,8 @@ fn secondary(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<
         .border_color(rgb(BORDER))
         .text_color(rgb(TEXT))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+        .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(0x3a3a3a)))
+        .active(|s| s.bg(rgb(BG)))
         .child(text.into())
 }
 
@@ -395,6 +399,34 @@ fn dot(color: u32) -> gpui::Div {
     div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(color))
 }
 
+/// A dot that breathes, for "this is live right now".
+fn live_dot() -> impl IntoElement {
+    dot(GREEN).with_animation(
+        SharedString::from("live-pulse"),
+        Animation::new(Duration::from_millis(1600)).repeat(),
+        |el, delta| {
+            // Triangle wave, so it fades out and back rather than snapping at
+            // the loop point.
+            let t = if delta < 0.5 {
+                delta * 2.0
+            } else {
+                (1.0 - delta) * 2.0
+            };
+            el.opacity(0.35 + 0.65 * t)
+        },
+    )
+}
+
+/// Fade content in. Keyed per screen so navigation reads as a transition
+/// rather than an instant swap.
+fn fade_in(id: impl Into<SharedString>, element: gpui::AnyElement) -> impl IntoElement {
+    div().child(element).with_animation(
+        id.into(),
+        Animation::new(Duration::from_millis(200)),
+        |el, delta| el.opacity(delta),
+    )
+}
+
 impl Render for Orange {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The picker needs room for a two-column grid; every other screen is a
@@ -409,6 +441,15 @@ impl Render for Orange {
             self.sized_for = Some(self.screen == Screen::PickWindow);
             window.resize(wanted);
         }
+
+        let key = match self.screen {
+            Screen::SignedOut => "signedout",
+            Screen::Home => "home",
+            Screen::PickWindow => "pick",
+            Screen::Streaming => "streaming",
+            Screen::Watching => "watching",
+            Screen::Settings => "settings",
+        };
 
         let body = match self.screen {
             Screen::SignedOut => self.render_signed_out(cx).into_any_element(),
@@ -433,21 +474,36 @@ impl Render for Orange {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
+                    // 20px gutters, 16 top, 16 bottom.
                     .px_5()
                     .pt_4()
-                    .pb_5()
-                    .gap_3()
-                    .child(body)
-                    .children(self.error.clone().map(|err| {
+                    .pb_4()
+                    .gap_4()
+                    .child(
                         div()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(0x241514))
-                            .border_1()
-                            .border_color(rgb(0x3d211f))
-                            .text_xs()
-                            .text_color(rgb(DANGER))
-                            .child(err)
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .child(fade_in(key, body)),
+                    )
+                    .children(self.error.clone().map(|err| {
+                        fade_in(
+                            SharedString::from("error"),
+                            div()
+                                .flex()
+                                .gap_2()
+                                .items_start()
+                                .p_3()
+                                .rounded_lg()
+                                .bg(rgb(0x241514))
+                                .border_1()
+                                .border_color(rgb(0x3d211f))
+                                .text_xs()
+                                .text_color(rgb(DANGER))
+                                .child(err)
+                                .into_any_element(),
+                        )
                     })),
             )
     }
@@ -787,7 +843,7 @@ impl Orange {
                                             .justify_center()
                                             .gap_0p5()
                                             .flex_shrink_0()
-                                            .h(px(56.0))
+                                            .h(px(52.0))
                                             .px_3()
                                             .child(
                                                 div()
@@ -818,22 +874,24 @@ impl Orange {
                             .collect::<Vec<_>>(),
                     ),
             )
-            // Quality is a setting, not the main task, so it sits in a footer
-            // rather than competing with the grid for attention.
+            // Quality is a setting, not the task, so it sits in a footer rather
+            // than competing with the grid for attention. One row, vertically
+            // centred: the hint used to hang below and break the alignment.
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .justify_between()
-                    .gap_3()
+                    .gap_4()
                     .pt_3()
                     .border_t_1()
                     .border_color(rgb(BORDER))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap_1()
+                            .items_center()
+                            .gap_3()
                             .child(
                                 div().flex().gap_1p5().children(
                                     QUALITIES
@@ -849,10 +907,22 @@ impl Orange {
                                                 .text_xs()
                                                 .cursor_pointer()
                                                 .border_1()
-                                                .border_color(rgb(if active { ORANGE } else { BORDER }))
+                                                .border_color(rgb(if active {
+                                                    ORANGE
+                                                } else {
+                                                    BORDER
+                                                }))
                                                 .bg(rgb(if active { ORANGE } else { SURFACE }))
                                                 .text_color(rgb(if active { INK } else { MUTED }))
-                                                .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                                .when(active, |d| {
+                                                    d.font_weight(FontWeight::SEMIBOLD)
+                                                })
+                                                .when(!active, |d| {
+                                                    d.hover(|s| {
+                                                        s.bg(rgb(SURFACE_HOVER))
+                                                            .text_color(rgb(TEXT))
+                                                    })
+                                                })
                                                 .child(q.label)
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.quality = index;
@@ -895,7 +965,7 @@ impl Orange {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(dot(if code.is_some() { GREEN } else { MUTED }))
+                    .child(if code.is_some() { live_dot().into_any_element() } else { dot(MUTED).into_any_element() })
                     .child(
                         label(if code.is_some() { "Live" } else { "Starting…" }, TEXT)
                             .font_weight(FontWeight::SEMIBOLD),
@@ -989,7 +1059,7 @@ impl Orange {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(dot(GREEN))
+                    .child(live_dot())
                     .child(label("Watching", TEXT).font_weight(FontWeight::SEMIBOLD)),
             )
             .child(
