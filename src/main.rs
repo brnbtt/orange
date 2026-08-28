@@ -1,16 +1,13 @@
 //! orange - low-overhead window streaming for friends.
-//!
-//! Milestone 1: prove the Rust/GStreamer integration by listing capturable
-//! windows and recording one to a file, using the same GPU-resident pipeline
-//! that streaming will use.
 
 mod pipeline;
 mod targets;
+mod webrtc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use gstreamer as gst;
 use gst::prelude::*;
+use gstreamer as gst;
 use pipeline::{CaptureSettings, Codec};
 use std::time::{Duration, Instant};
 
@@ -27,24 +24,56 @@ enum Command {
     List,
     /// Record a window to a file. Diagnostic for the capture path.
     Record {
-        /// Window handle from `orange list`.
         #[arg(long)]
         hwnd: isize,
         #[arg(long, default_value = "orange-capture.mkv")]
         out: String,
-        #[arg(long, default_value = "av1")]
-        codec: String,
-        /// Kilobits per second.
-        #[arg(long, default_value_t = 30_000)]
-        bitrate: u32,
-        #[arg(long, default_value_t = 60)]
-        fps: u32,
+        #[command(flatten)]
+        quality: QualityArgs,
         #[arg(long, default_value_t = 10)]
         seconds: u64,
-        /// Downscale on the GPU, e.g. 1920x1080.
-        #[arg(long)]
-        scale: Option<String>,
     },
+    /// Send a window over WebRTC and receive it back in the same process.
+    /// Diagnostic for the transport path, with no signalling involved.
+    Loopback {
+        #[arg(long)]
+        hwnd: isize,
+        /// Render the received stream in a window instead of writing a file.
+        #[arg(long)]
+        show: bool,
+        #[arg(long, default_value = "orange-loopback.mkv")]
+        out: String,
+        #[command(flatten)]
+        quality: QualityArgs,
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+    },
+}
+
+#[derive(clap::Args)]
+struct QualityArgs {
+    #[arg(long, default_value = "av1")]
+    codec: String,
+    /// Kilobits per second.
+    #[arg(long, default_value_t = 25_000)]
+    bitrate: u32,
+    #[arg(long, default_value_t = 60)]
+    fps: u32,
+    /// Downscale on the GPU, e.g. 1920x1080.
+    #[arg(long)]
+    scale: Option<String>,
+}
+
+impl QualityArgs {
+    fn settings(&self, hwnd: isize) -> Result<CaptureSettings> {
+        Ok(CaptureSettings {
+            hwnd,
+            codec: Codec::parse(&self.codec)?,
+            bitrate: self.bitrate,
+            fps: self.fps,
+            scale: self.scale.as_deref().map(parse_scale).transpose()?,
+        })
+    }
 }
 
 fn parse_scale(s: &str) -> Result<(u32, u32)> {
@@ -63,20 +92,41 @@ fn main() -> Result<()> {
         Command::Record {
             hwnd,
             out,
-            codec,
-            bitrate,
-            fps,
+            quality,
             seconds,
-            scale,
         } => {
-            let settings = CaptureSettings {
-                hwnd,
-                codec: Codec::parse(&codec)?,
-                bitrate,
-                fps,
-                scale: scale.as_deref().map(parse_scale).transpose()?,
+            let settings = quality.settings(hwnd)?;
+            println!(
+                "Recording hwnd {hwnd} as {:?} at {} kbps -> {out}",
+                settings.codec, settings.bitrate
+            );
+            let pipeline = pipeline::build_record_pipeline(&settings, &out)?;
+            run_pipeline(&pipeline, seconds)?;
+            report_file(&out)
+        }
+        Command::Loopback {
+            hwnd,
+            show,
+            out,
+            quality,
+            seconds,
+        } => {
+            let settings = quality.settings(hwnd)?;
+            println!(
+                "Loopback hwnd {hwnd} as {:?} at {} kbps",
+                settings.codec, settings.bitrate
+            );
+            let output = if show {
+                webrtc::Output::Show
+            } else {
+                webrtc::Output::File(out.clone())
             };
-            cmd_record(settings, &out, seconds)
+            webrtc::run_loopback(&settings, output, seconds)?;
+            if show {
+                Ok(())
+            } else {
+                report_file(&out)
+            }
         }
     }
 }
@@ -96,13 +146,12 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-fn cmd_record(settings: CaptureSettings, out: &str, seconds: u64) -> Result<()> {
-    println!(
-        "Recording hwnd {} as {:?} at {} kbps -> {out}",
-        settings.hwnd, settings.codec, settings.bitrate
-    );
-
-    let pipeline = pipeline::build_record_pipeline(&settings, out)?;
+/// Run a pipeline for a fixed duration, then shut it down cleanly.
+///
+/// The bus is polled rather than waited on indefinitely: Windows Graphics
+/// Capture produces no frames for an idle window, so a blocking wait would
+/// hang with no explanation.
+pub fn run_pipeline(pipeline: &gst::Pipeline, seconds: u64) -> Result<()> {
     pipeline.set_state(gst::State::Playing)?;
 
     let bus = pipeline.bus().expect("pipeline without bus");
@@ -110,13 +159,8 @@ fn cmd_record(settings: CaptureSettings, out: &str, seconds: u64) -> Result<()> 
     let deadline = Duration::from_secs(seconds);
     let mut error = None;
 
-    // Poll the bus rather than blocking forever: a window that never redraws
-    // produces no frames, and we would otherwise hang with no explanation.
     while started.elapsed() < deadline {
-        let remaining = deadline.saturating_sub(started.elapsed());
-        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(
-            remaining.as_millis().min(200) as u64,
-        )) else {
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) else {
             continue;
         };
         match msg.view() {
@@ -133,8 +177,7 @@ fn cmd_record(settings: CaptureSettings, out: &str, seconds: u64) -> Result<()> 
         }
     }
 
-    // Clean EOS so the muxer writes its headers; without this the file is
-    // unplayable.
+    // Clean EOS so muxers write their headers; without it the file is unplayable.
     pipeline.send_event(gst::event::Eos::new());
     let _ = bus.timed_pop_filtered(
         gst::ClockTime::from_seconds(5),
@@ -142,21 +185,20 @@ fn cmd_record(settings: CaptureSettings, out: &str, seconds: u64) -> Result<()> 
     );
     pipeline.set_state(gst::State::Null)?;
 
-    if let Some(err) = error {
-        return Err(err);
+    match error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
+}
 
-    let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+fn report_file(path: &str) -> Result<()> {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if size == 0 {
         anyhow::bail!(
-            "captured nothing ({out} is empty or missing). Windows Graphics Capture \
+            "captured nothing ({path} is empty or missing). Windows Graphics Capture \
              only produces frames when the window redraws - is it minimised or idle?"
         );
     }
-    println!(
-        "Wrote {out} ({:.1} MB in {:.1}s)",
-        size as f64 / 1_048_576.0,
-        started.elapsed().as_secs_f64()
-    );
+    println!("Wrote {path} ({:.1} MB)", size as f64 / 1_048_576.0);
     Ok(())
 }

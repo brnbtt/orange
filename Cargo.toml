@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 gstreamer = "0.25"
 gstreamer-video = "0.25"
+gstreamer-webrtc = "0.25"
+gstreamer-sdp = "0.25"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 

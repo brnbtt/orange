@@ -10,10 +10,10 @@ Milestone 1 of 6. Capture and encode work; there is no networking yet.
 | # | Milestone | State |
 | --- | --- | --- |
 | 1 | Window enumeration, GPU capture, hardware encode | **done** |
-| 2 | WebRTC transport between two machines | next |
-| 3 | Viewer window: borderless, rounded, overlay controls | |
+| 2 | WebRTC transport, no transcode | **done** (loopback) |
+| 3 | Viewer window: borderless, rounded, overlay controls | next |
 | 4 | Game audio (`wasapi2src` + `opusenc`) | |
-| 5 | Share links + signalling | |
+| 5 | Share links + signalling between machines | |
 | 6 | Installer, tray, autostart | |
 
 ## Measured, not assumed
@@ -55,6 +55,26 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait
 cargo build
 ```
 
+## Transport: why `webrtcbin`, not `webrtcsink`
+
+`webrtcsink` is the friendlier element — it handles negotiation and codec
+selection for you — but **it owns the encoder and expects raw video**. Using it
+would re-encode frames we already encoded on the GPU, throwing away the reason
+this project is cheap.
+
+`webrtcbin` accepts RTP-payloaded, already-encoded media, so NVENC output goes
+straight onto the wire:
+
+```
+nvd3d11av1enc -> av1parse -> rtpav1pay -> webrtcbin
+                                             |
+webrtcbin -> rtpav1depay -> av1parse -> d3d11av1dec -> d3d11videosink
+```
+
+The price is writing signalling ourselves. `orange loopback` runs both peers in
+one process and passes SDP by direct function call, which exercises the whole
+media path with no network code in the way.
+
 ## Usage
 
 ```powershell
@@ -62,12 +82,16 @@ orange list
 # HWND                SIZE  PROCESS                          TITLE
 # 395876         2560x1440  MortalShell2-Win64-Shipping.exe  MortalShell2
 
+# capture + encode only
 orange record --hwnd 395876 --codec av1 --bitrate 25000 --scale 1920x1080 --seconds 8 --out test.mkv
+
+# capture -> encode -> WebRTC -> decode -> render
+orange loopback --hwnd 395876 --scale 1280x720 --bitrate 8000 --show
 ```
 
-`record` is a diagnostic. It exercises the exact capture and encode path that
-streaming will use, with no network in the way — so when a stream misbehaves,
-this tells you which half is at fault.
+Both subcommands are diagnostics: `record` isolates the capture half, `loopback`
+adds transport. When a real stream misbehaves, they tell you which half is at
+fault.
 
 ## Gotchas found the hard way
 

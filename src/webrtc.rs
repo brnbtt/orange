@@ -1,0 +1,248 @@
+//! WebRTC transport.
+//!
+//! The important architectural decision lives here: we use `webrtcbin` rather
+//! than `webrtcsink`.
+//!
+//! `webrtcsink` is friendlier - it handles negotiation and codec selection -
+//! but it owns the encoder and expects raw video. That would re-encode frames
+//! we have already encoded on the GPU, discarding the whole reason this
+//! project is cheap. `webrtcbin` accepts RTP-payloaded, already-encoded media,
+//! so our NVENC output goes straight onto the wire.
+//!
+//! The price is that we do signalling ourselves. This module proves the media
+//! path with both peers in one process, exchanging SDP by direct call.
+
+use anyhow::{Context, Result};
+use gst::prelude::*;
+use gstreamer as gst;
+use gstreamer_sdp as gst_sdp;
+use gstreamer_webrtc as gst_webrtc;
+use std::sync::{Arc, Mutex};
+
+use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
+
+/// RTP caps for our encoded stream. AV1 has no static payload type, so we pick
+/// one from the dynamic range and both ends agree on it.
+fn rtp_caps() -> gst::Caps {
+    gst::Caps::builder("application/x-rtp")
+        .field("media", "video")
+        .field("encoding-name", "AV1")
+        .field("payload", 96i32)
+        .field("clock-rate", 90_000i32)
+        .build()
+}
+
+struct Peers {
+    sender: gst::Element,
+    receiver: gst::Element,
+}
+
+/// Wire the two `webrtcbin` elements together: offer/answer plus ICE.
+///
+/// Normally these messages would cross a network via a signalling server. Here
+/// they are function calls, which isolates the media path from any networking
+/// concerns while we verify it.
+fn connect_signalling(peers: Arc<Mutex<Peers>>) {
+    let (sender, receiver) = {
+        let p = peers.lock().unwrap();
+        (p.sender.clone(), p.receiver.clone())
+    };
+
+    // Trickle ICE, in both directions.
+    let rx = receiver.clone();
+    sender.connect("on-ice-candidate", false, move |values| {
+        let mlineindex = values[1].get::<u32>().unwrap();
+        let candidate = values[2].get::<String>().unwrap();
+        rx.emit_by_name::<()>("add-ice-candidate", &[&mlineindex, &candidate]);
+        None
+    });
+
+    let tx = sender.clone();
+    receiver.connect("on-ice-candidate", false, move |values| {
+        let mlineindex = values[1].get::<u32>().unwrap();
+        let candidate = values[2].get::<String>().unwrap();
+        tx.emit_by_name::<()>("add-ice-candidate", &[&mlineindex, &candidate]);
+        None
+    });
+
+    // The sender drives negotiation as soon as its sink pad is linked.
+    let peers_for_neg = peers.clone();
+    sender.connect("on-negotiation-needed", false, move |_| {
+        let peers = peers_for_neg.clone();
+        let (sender, receiver) = {
+            let p = peers.lock().unwrap();
+            (p.sender.clone(), p.receiver.clone())
+        };
+        // The closure below takes ownership, so keep a handle for the emit.
+        let sender_for_offer = sender.clone();
+
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let Ok(Some(reply)) = reply else {
+                eprintln!("[webrtc] offer failed");
+                return;
+            };
+            let offer = reply
+                .value("offer")
+                .unwrap()
+                .get::<gst_webrtc::WebRTCSessionDescription>()
+                .unwrap();
+
+            sender.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
+            receiver.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
+
+            // Answer back the other way.
+            let sender2 = sender.clone();
+            let receiver2 = receiver.clone();
+            let answer_promise = gst::Promise::with_change_func(move |reply| {
+                let Ok(Some(reply)) = reply else {
+                    eprintln!("[webrtc] answer failed");
+                    return;
+                };
+                let answer = reply
+                    .value("answer")
+                    .unwrap()
+                    .get::<gst_webrtc::WebRTCSessionDescription>()
+                    .unwrap();
+                receiver2
+                    .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
+                sender2
+                    .emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
+                println!("[webrtc] negotiation complete");
+            });
+            receiver.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
+        });
+
+        sender_for_offer.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
+        None
+    });
+
+    // Silence the unused warning on the SDP import while keeping it available
+    // for the real signalling module that replaces this.
+    let _ = gst_sdp::SDPMessage::new();
+}
+
+/// Where the received video should end up.
+pub enum Output {
+    /// Render in a window. `d3d11videosink` creates its own for now; milestone
+    /// 3 replaces this with our borderless window.
+    Show,
+    /// Write to a file, so the result can be verified without a display.
+    File(String),
+}
+
+/// Capture a window, send it over WebRTC, receive it back, and output it.
+///
+/// Both peers live in this process. If this works, the encode -> payload ->
+/// transport -> depayload -> decode path is sound and only signalling stands
+/// between us and streaming to another machine.
+pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) -> Result<()> {
+    check_elements(settings.codec)?;
+
+    let pipeline = gst::Pipeline::new();
+
+    // --- sending half -------------------------------------------------------
+    let capture = gst::parse::bin_from_description(&build_capture_chain(settings), true)
+        .context("failed to build capture chain")?;
+    let pay = gst::ElementFactory::make("rtpav1pay")
+        .build()
+        .context("rtpav1pay missing")?;
+    let caps_filter = gst::ElementFactory::make("capsfilter")
+        .property("caps", rtp_caps())
+        .build()?;
+    let send_bin = gst::ElementFactory::make("webrtcbin")
+        .name("sender")
+        .property_from_str("bundle-policy", "max-bundle")
+        .build()
+        .context("webrtcbin missing")?;
+
+    // --- receiving half -----------------------------------------------------
+    let recv_bin = gst::ElementFactory::make("webrtcbin")
+        .name("receiver")
+        .property_from_str("bundle-policy", "max-bundle")
+        .build()?;
+
+    pipeline.add_many([
+        capture.upcast_ref(),
+        &pay,
+        &caps_filter,
+        &send_bin,
+        &recv_bin,
+    ])?;
+    gst::Element::link_many([capture.upcast_ref(), &pay, &caps_filter])?;
+
+    // webrtcbin takes media on request pads.
+    let src_pad = caps_filter.static_pad("src").unwrap();
+    let sink_pad = send_bin
+        .request_pad_simple("sink_%u")
+        .context("webrtcbin refused a sink pad")?;
+    src_pad.link(&sink_pad)?;
+
+    // The receiver's pad appears only once media starts flowing.
+    let pipeline_weak = pipeline.downgrade();
+    let output = Arc::new(Mutex::new(Some(output)));
+    recv_bin.connect_pad_added(move |_, pad| {
+        let Some(pipeline) = pipeline_weak.upgrade() else {
+            return;
+        };
+        let Some(output) = output.lock().unwrap().take() else {
+            return; // only handle the first stream
+        };
+
+        if let Err(err) = build_receive_branch(&pipeline, pad, output) {
+            eprintln!("[webrtc] could not build receive branch: {err}");
+        }
+    });
+
+    connect_signalling(Arc::new(Mutex::new(Peers {
+        sender: send_bin,
+        receiver: recv_bin,
+    })));
+
+    crate::run_pipeline(&pipeline, seconds)
+}
+
+/// Attach depayload -> parse -> hardware decode -> output to the receiver.
+fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Output) -> Result<()> {
+    let depay = gst::ElementFactory::make("rtpav1depay").build()?;
+    let parse = gst::ElementFactory::make("av1parse").build()?;
+    let dec = gst::ElementFactory::make("d3d11av1dec")
+        .build()
+        .context("d3d11av1dec missing - no hardware AV1 decode on this GPU?")?;
+
+    let tail: Vec<gst::Element> = match output {
+        Output::Show => {
+            let sink = gst::ElementFactory::make("d3d11videosink")
+                .property("sync", false)
+                .build()?;
+            vec![sink]
+        }
+        Output::File(path) => {
+            // Re-encode only because writing raw frames to disk is impractical.
+            // This branch exists for verification, not for the real product.
+            let enc = gst::ElementFactory::make("nvd3d11av1enc")
+                .property("bitrate", 25_000u32)
+                .build()?;
+            let parse2 = gst::ElementFactory::make("av1parse").build()?;
+            let mux = gst::ElementFactory::make("matroskamux").build()?;
+            let sink = gst::ElementFactory::make("filesink")
+                .property("location", path)
+                .build()?;
+            vec![enc, parse2, mux, sink]
+        }
+    };
+
+    let mut all: Vec<gst::Element> = vec![depay.clone(), parse.clone(), dec.clone()];
+    all.extend(tail);
+
+    for e in &all {
+        pipeline.add(e)?;
+    }
+    gst::Element::link_many(all.iter().collect::<Vec<_>>().as_slice())?;
+    for e in &all {
+        e.sync_state_with_parent()?;
+    }
+
+    pad.link(&depay.static_pad("sink").unwrap())?;
+    println!("[webrtc] receiving stream");
+    Ok(())
+}
