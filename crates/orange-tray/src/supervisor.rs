@@ -74,16 +74,48 @@ pub fn list_windows() -> Result<Vec<WindowTarget>> {
 ///
 /// The server must be passed explicitly: the binary's default points at
 /// localhost, which is not where the relay lives.
-pub fn start_login(server: &str) -> Result<()> {
-    Command::new(orange_exe()?)
+///
+/// The child is returned so the caller can tell "still waiting for the user"
+/// apart from "it died", which otherwise looks identical from the UI.
+pub fn start_login(server: &str) -> Result<LoginAttempt> {
+    let child = Command::new(orange_exe()?)
         .arg("login")
         .args(["--server", server])
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("could not start `orange login`")?;
-    Ok(())
+    Ok(LoginAttempt { child })
+}
+
+pub struct LoginAttempt {
+    child: Child,
+}
+
+impl LoginAttempt {
+    /// `None` while still running; `Some(reason)` once it has exited without
+    /// producing a session.
+    pub fn failure(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {
+                let mut reason = String::new();
+                if let Some(stderr) = self.child.stderr.take() {
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        if !line.trim().is_empty() {
+                            reason = line;
+                        }
+                    }
+                }
+                Some(if reason.is_empty() {
+                    "Login was cancelled or timed out".to_string()
+                } else {
+                    reason
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// What the UI has learned from a running child process.

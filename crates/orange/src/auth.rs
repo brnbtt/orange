@@ -148,11 +148,31 @@ pub async fn login(server: &str) -> Result<Session> {
     }
 }
 
+/// Open a URL in the default browser.
+///
+/// Deliberately not `cmd /C start`: OAuth URLs are full of `&`, which cmd
+/// treats as a command separator, so the URL gets chopped into fragments and
+/// the browser never opens. `ShellExecuteW` takes the string as-is.
 fn open_in_browser(url: &str) -> Result<()> {
-    // `start` is a shell builtin, hence cmd; the empty title argument is
-    // required or the first quoted argument is taken as the window title.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()?;
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let operation = HSTRING::from("open");
+    let target = HSTRING::from(url);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute returns a value <= 32 on failure.
+    if result.0 as isize <= 32 {
+        bail!("the shell refused to open a browser (code {})", result.0 as isize);
+    }
     Ok(())
 }

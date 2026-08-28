@@ -17,7 +17,7 @@ use gpui::{
     Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use std::time::{Duration, Instant};
-use supervisor::{Quality, Supervisor, WindowTarget, QUALITIES};
+use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
 // A deliberately small palette. Three surface levels give enough depth without
 // the UI turning into a gradient soup.
@@ -52,7 +52,7 @@ struct Orange {
     windows: Vec<WindowTarget>,
     quality: usize,
     stream: Option<Supervisor>,
-    logging_in: bool,
+    logging_in: Option<LoginAttempt>,
     error: Option<String>,
     server: String,
     /// Drives the transient "Copied" confirmation on the share code.
@@ -82,7 +82,7 @@ impl Orange {
             windows: Vec::new(),
             quality: 1,
             stream: None,
-            logging_in: false,
+            logging_in: None,
             error: None,
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
             copied_at: None,
@@ -90,12 +90,16 @@ impl Orange {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
-        // Login happens in a child process; notice when it lands.
-        if self.logging_in {
+        // Login happens in a child process; notice when it lands, and when it
+        // dies without producing a session.
+        if self.logging_in.is_some() {
             if let Some(session) = session::load() {
                 self.session = Some(session);
-                self.logging_in = false;
+                self.logging_in = None;
                 self.screen = Screen::Home;
+            } else if let Some(reason) = self.logging_in.as_mut().and_then(|a| a.failure()) {
+                self.error = Some(reason);
+                self.logging_in = None;
             }
         }
 
@@ -130,11 +134,10 @@ impl Orange {
     }
 
     fn start_login(&mut self) {
-        self.logging_in = true;
         self.error = None;
-        if let Err(err) = supervisor::start_login(&self.server) {
-            self.error = Some(err.to_string());
-            self.logging_in = false;
+        match supervisor::start_login(&self.server) {
+            Ok(attempt) => self.logging_in = Some(attempt),
+            Err(err) => self.error = Some(err.to_string()),
         }
     }
 
@@ -399,20 +402,20 @@ impl Orange {
                 div().w_full().max_w(px(260.0)).child(
                     primary(
                         "signin",
-                        if self.logging_in {
+                        if self.logging_in.is_some() {
                             "Waiting for Discord…"
                         } else {
                             "Sign in with Discord"
                         },
                     )
-                    .when(self.logging_in, |d| d.bg(rgb(ORANGE_DIM)))
+                    .when(self.logging_in.is_some(), |d| d.bg(rgb(ORANGE_DIM)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.start_login();
                         cx.notify();
                     })),
                 ),
             )
-            .children(self.logging_in.then(|| {
+            .children(self.logging_in.is_some().then(|| {
                 label("Finish in your browser, then come back here.", FAINT).text_xs()
             }))
             // Identity is optional in the protocol - it only attaches a name.
@@ -420,7 +423,7 @@ impl Orange {
             .child(
                 quiet("skip", "Continue without signing in").on_click(cx.listener(
                     |this, _, _, cx| {
-                        this.logging_in = false;
+                        this.logging_in = None;
                         this.screen = Screen::Home;
                         cx.notify();
                     },
