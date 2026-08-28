@@ -4,6 +4,10 @@
 //! The viewer window stays native because GPUI's `Surface` element has no
 //! Windows implementation - its only variant is macOS-gated.
 
+// Without this the binary is a console application and Windows opens a black
+// cmd window behind the UI.
+#![windows_subsystem = "windows"]
+
 mod session;
 mod supervisor;
 
@@ -116,7 +120,7 @@ impl Orange {
     fn start_login(&mut self) {
         self.logging_in = true;
         self.error = None;
-        if let Err(err) = supervisor::start_login() {
+        if let Err(err) = supervisor::start_login(&self.server) {
             self.error = Some(err.to_string());
             self.logging_in = false;
         }

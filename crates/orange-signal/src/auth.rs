@@ -54,9 +54,12 @@ impl DiscordConfig {
     }
 
     pub fn authorize_url(&self, state: &str) -> String {
+        // No `prompt` parameter: Discord's default shows the consent screen on
+        // first authorisation and skips it thereafter. `prompt=none` would
+        // fail outright for a user who has never authorised the app.
         format!(
             "https://discord.com/oauth2/authorize\
-             ?response_type=code&client_id={}&scope=identify&state={}&redirect_uri={}&prompt=none",
+             ?response_type=code&client_id={}&scope=identify&state={}&redirect_uri={}",
             urlencode(&self.client_id),
             urlencode(state),
             urlencode(&self.redirect_uri),

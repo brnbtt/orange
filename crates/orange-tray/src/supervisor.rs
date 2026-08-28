@@ -12,8 +12,13 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
+use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+/// Child processes are console applications; without this each one flashes a
+/// black window in front of the user.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WindowTarget {
@@ -53,6 +58,7 @@ fn orange_exe() -> Result<std::path::PathBuf> {
 pub fn list_windows() -> Result<Vec<WindowTarget>> {
     let output = Command::new(orange_exe()?)
         .args(["list", "--json"])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -65,9 +71,14 @@ pub fn list_windows() -> Result<Vec<WindowTarget>> {
 
 /// Kick off `orange login`, which opens the browser and writes the session
 /// file when it completes. The tray notices by watching for that file.
-pub fn start_login() -> Result<()> {
+///
+/// The server must be passed explicitly: the binary's default points at
+/// localhost, which is not where the relay lives.
+pub fn start_login(server: &str) -> Result<()> {
     Command::new(orange_exe()?)
         .arg("login")
+        .args(["--server", server])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -115,6 +126,7 @@ impl Supervisor {
 
     fn spawn(mut command: Command) -> Result<Self> {
         let mut child = command
+            .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
