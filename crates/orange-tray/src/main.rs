@@ -406,34 +406,43 @@ impl Orange {
                 div()
                     .flex()
                     .items_center()
-                    .child(titlebar_button("settings", "⚙").on_click(cx.listener(
-                        |this, _, _, cx| {
+                    .child(titlebar_button("settings", "⚙", SURFACE_HOVER).on_click(
+                        cx.listener(|this, _, _, cx| {
                             this.screen = if this.screen == Screen::Settings {
                                 Screen::Home
                             } else {
                                 Screen::Settings
                             };
                             cx.notify();
-                        },
-                    )))
-                    .child(titlebar_button("minimise", "—").on_click(|_, window, _| {
-                        window.minimize_window();
-                    }))
+                        }),
+                    ))
+                    .child(
+                        titlebar_button("minimise", "—", SURFACE_HOVER).on_click(
+                            |_, window, _| {
+                                window.minimize_window();
+                            },
+                        ),
+                    )
                     // Closing hides to tray rather than quitting, so an active
                     // stream survives dismissing the window.
                     .child(
-                        titlebar_button("close", "✕")
-                            .hover(|s| s.bg(rgb(0x8c2b28)).text_color(rgb(TEXT)))
-                            .on_click(|_, window, _| {
-                                window.minimize_window();
-                            }),
+                        titlebar_button("close", "✕", 0x8c2b28).on_click(|_, window, _| {
+                            window.minimize_window();
+                        }),
                     ),
             )
     }
 }
 
 /// Square, unobtrusive control in the titlebar.
-fn titlebar_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+///
+/// The hover colour is a parameter rather than something callers add
+/// afterwards: GPUI panics if `.hover()` is applied twice to one element.
+fn titlebar_button(
+    id: &'static str,
+    glyph: &'static str,
+    hover_bg: u32,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -445,7 +454,7 @@ fn titlebar_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui
         .text_xs()
         .text_color(rgb(MUTED))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
+        .hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(TEXT)))
         .child(glyph)
 }
 
