@@ -13,7 +13,7 @@ mod session;
 mod supervisor;
 mod tray;
 
-use gpui::{
+use gpui::{Animation, AnimationExt, 
     div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FontWeight, SharedString,
     Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
@@ -401,7 +401,7 @@ impl Render for Orange {
         // narrow column. Resizing on transition keeps both comfortable rather
         // than compromising on one size for all of them.
         let wanted = if self.screen == Screen::PickWindow {
-            size(px(452.0), px(620.0))
+            size(px(576.0), px(660.0))
         } else {
             size(px(400.0), px(540.0))
         };
@@ -669,6 +669,10 @@ impl Orange {
         let quality = self.quality();
         let selected = self.quality;
         let count = self.windows.len();
+        // Distinguishes "still capturing" from "this window refuses to draw",
+        // which previously both showed as "no preview" and made every card
+        // flash a failure message before its thumbnail arrived.
+        let capturing = self.thumb_rx.is_some();
 
         div()
             .flex()
@@ -679,54 +683,12 @@ impl Orange {
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(label("Quality", MUTED).text_xs())
-                    .child(
-                        div().flex().gap_1p5().children(
-                            QUALITIES
-                                .iter()
-                                .enumerate()
-                                .map(|(index, q)| {
-                                    let active = index == selected;
-                                    div()
-                                        .id(SharedString::from(format!("q{index}")))
-                                        .flex_1()
-                                        .flex()
-                                        .justify_center()
-                                        .px_3()
-                                        .py_1p5()
-                                        .rounded_lg()
-                                        .cursor_pointer()
-                                        .border_1()
-                                        .border_color(rgb(if active { ORANGE } else { BORDER }))
-                                        .bg(rgb(if active { ORANGE } else { SURFACE }))
-                                        .text_color(rgb(if active { INK } else { MUTED }))
-                                        .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
-                                        .hover(|s| s.border_color(rgb(ORANGE)))
-                                        .child(q.label)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.quality = index;
-                                            cx.notify();
-                                        }))
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                    )
-                    .child(
-                        label(
-                            format!("about {} Mbps upload for each viewer", quality.mbps),
-                            FAINT,
-                        )
-                        .text_xs(),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
+                    .items_baseline()
                     .justify_between()
-                    .items_center()
-                    .child(label("Window", MUTED).text_xs())
+                    .child(
+                        label("Choose what to share", TEXT)
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
                     .child(
                         quiet("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| {
                             this.refresh_windows();
@@ -740,7 +702,7 @@ impl Orange {
                     .flex()
                     .flex_row()
                     .flex_wrap()
-                    .gap_2()
+                    .gap_3()
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
@@ -766,74 +728,87 @@ impl Orange {
                                 let meta = if is_screen {
                                     "Everything you see".to_string()
                                 } else {
-                                    format!(
-                                        "{} · {}×{}",
-                                        target.app_name(),
-                                        target.width,
-                                        target.height
-                                    )
+                                    format!("{} · {}×{}", target.app_name(), target.width, target.height)
                                 };
                                 let thumb = self.thumbnails.get(&target.hwnd).cloned();
+                                let hwnd = target.hwnd;
 
                                 div()
-                                    .id(SharedString::from(format!("w{}", target.hwnd)))
+                                    .id(SharedString::from(format!("w{hwnd}")))
+                                    .group("card")
                                     .flex()
                                     .flex_col()
                                     .flex_shrink_0()
-                                    // Two per row, minus the gap.
-                                    .w(px(196.0))
+                                    .w(px(252.0))
                                     .rounded_lg()
                                     .overflow_hidden()
                                     .bg(rgb(SURFACE))
                                     .border_1()
                                     .border_color(rgb(if is_screen { ORANGE_DIM } else { BORDER }))
                                     .cursor_pointer()
-                                    .hover(|s| s.border_color(rgb(ORANGE)))
+                                    .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE)))
                                     .child(
-                                        // Fixed-height preview strip, so cards
-                                        // stay uniform whatever the window shape.
-                                        //
-                                        // flex_shrink_0 is load-bearing: as a
-                                        // flex item in a scrolling column this
+                                        // 16:9 preview. flex_shrink_0 is
+                                        // load-bearing: as a flex item this
                                         // would otherwise be compressed to
-                                        // nothing and the preview would vanish.
+                                        // nothing inside a scrolling parent.
                                         div()
                                             .flex_shrink_0()
-                                            .h(px(104.0))
+                                            .h(px(142.0))
                                             .w_full()
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .bg(rgb(0x0b0b0d))
+                                            .bg(rgb(0x08070a))
                                             .overflow_hidden()
-                                            .child(match thumb {
-                                                Some(image) => gpui::img(image)
-                                                    .h(px(104.0))
+                                            .child(match (thumb, capturing) {
+                                                (Some(image), _) => gpui::img(image)
+                                                    .h(px(142.0))
+                                                    .with_animation(
+                                                        SharedString::from(format!("fade{hwnd}")),
+                                                        Animation::new(Duration::from_millis(260)),
+                                                        |el, delta| el.opacity(delta),
+                                                    )
                                                     .into_any_element(),
-                                                // Some windows refuse to draw:
-                                                // elevated processes, protected
-                                                // surfaces. Say so rather than
-                                                // showing an empty box.
-                                                None => label("no preview", FAINT)
+                                                (None, true) => label("capturing…", FAINT)
+                                                    .text_xs()
+                                                    .into_any_element(),
+                                                (None, false) => label("no preview", FAINT)
                                                     .text_xs()
                                                     .into_any_element(),
                                             }),
                                     )
                                     .child(
+                                        // Fixed height keeps the grid even; a
+                                        // two-line title would make rows ragged.
                                         div()
                                             .flex()
                                             .flex_col()
+                                            .justify_center()
                                             .gap_0p5()
+                                            .flex_shrink_0()
+                                            .h(px(56.0))
                                             .px_3()
-                                            .py_2p5()
                                             .child(
                                                 div()
+                                                    .w_full()
                                                     .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
                                                     .text_xs()
                                                     .text_color(rgb(TEXT))
                                                     .child(title),
                                             )
-                                            .child(label(meta, FAINT).text_xs()),
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_xs()
+                                                    .text_color(rgb(FAINT))
+                                                    .child(meta),
+                                            ),
                                     )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.start_stream(target.clone());
@@ -843,11 +818,61 @@ impl Orange {
                             .collect::<Vec<_>>(),
                     ),
             )
+            // Quality is a setting, not the main task, so it sits in a footer
+            // rather than competing with the grid for attention.
             .child(
-                quiet("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
-                    this.screen = Screen::Home;
-                    cx.notify();
-                })),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div().flex().gap_1p5().children(
+                                    QUALITIES
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, q)| {
+                                            let active = index == selected;
+                                            div()
+                                                .id(SharedString::from(format!("q{index}")))
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_md()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .border_1()
+                                                .border_color(rgb(if active { ORANGE } else { BORDER }))
+                                                .bg(rgb(if active { ORANGE } else { SURFACE }))
+                                                .text_color(rgb(if active { INK } else { MUTED }))
+                                                .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                                .child(q.label)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.quality = index;
+                                                    cx.notify();
+                                                }))
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                            )
+                            .child(
+                                label(format!("~{} Mbps per viewer", quality.mbps), FAINT)
+                                    .text_xs(),
+                            ),
+                    )
+                    .child(
+                        quiet("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
+                            this.screen = Screen::Home;
+                            cx.notify();
+                        })),
+                    ),
             )
     }
 
