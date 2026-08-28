@@ -735,6 +735,7 @@ impl Orange {
                                     .id(SharedString::from(format!("w{}", target.hwnd)))
                                     .flex()
                                     .flex_col()
+                                    .flex_shrink_0()
                                     .rounded_lg()
                                     .overflow_hidden()
                                     .bg(rgb(SURFACE))
@@ -745,7 +746,13 @@ impl Orange {
                                     .child(
                                         // Fixed-height preview strip, so rows
                                         // stay uniform whatever the window shape.
+                                        //
+                                        // flex_shrink_0 is load-bearing: as a
+                                        // flex item in a scrolling column this
+                                        // would otherwise be compressed to
+                                        // nothing and the preview would vanish.
                                         div()
+                                            .flex_shrink_0()
                                             .h(px(104.0))
                                             .w_full()
                                             .flex()
@@ -990,6 +997,30 @@ impl Orange {
 }
 
 fn main() {
+    // Diagnostic: capture every window and report, since a windowsgui binary
+    // has no console to print to.
+    if std::env::args().any(|a| a == "--test-capture") {
+        let mut report = String::new();
+        match supervisor::list_windows() {
+            Ok(windows) => {
+                for w in windows {
+                    match capture::thumbnail(w.hwnd as isize, 320, 180) {
+                        Some((tw, th, bytes)) => report.push_str(&format!(
+                            "OK    {tw}x{th} {} bytes   {}\n",
+                            bytes.len(),
+                            w.title
+                        )),
+                        None => report.push_str(&format!("FAIL                      {}\n", w.title)),
+                    }
+                }
+            }
+            Err(err) => report.push_str(&format!("list failed: {err}\n")),
+        }
+        let path = std::env::temp_dir().join("orange-capture-test.txt");
+        let _ = std::fs::write(path, report);
+        return;
+    }
+
     // Installed before the UI so a failure here is visible as a missing icon
     // rather than a half-started app.
     let tray_events = tray::install().ok();
