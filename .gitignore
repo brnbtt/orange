@@ -1,4 +1,10 @@
 /target
+
+# Recordings and capture output land in the working directory.
 *.mkv
 *.mp4
 *.png
+
+# Source assets are checked in explicitly: the logo is compiled into the tray
+# binary with include_bytes!, so a clone without it does not build.
+!crates/orange-tray/logo.png
