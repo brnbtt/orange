@@ -135,10 +135,13 @@ fn connect_signalling(peers: Arc<Mutex<Peers>>) {
 
 /// Where the received video should end up.
 pub enum Output {
-    /// Render into a window we own, by HWND. `d3d11videosink` implements
-    /// `GstVideoOverlay`, so it draws into our borderless frame instead of
-    /// creating a bare window of its own.
-    Window(isize),
+    /// Render into a window we own, by HWND, with controls composited on top.
+    /// `d3d11videosink` implements `GstVideoOverlay`, so it draws into our
+    /// borderless frame instead of creating a bare window of its own.
+    Window {
+        hwnd: isize,
+        overlay: crate::overlay::SharedOverlay,
+    },
     /// Write to a file, so the result can be verified without a display.
     File(String),
 }
@@ -230,21 +233,47 @@ pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Ou
         .context("d3d11av1dec missing - no hardware AV1 decode on this GPU?")?;
 
     let tail: Vec<gst::Element> = match output {
-        Output::Window(hwnd) => {
+        Output::Window { hwnd, overlay } => {
+            // Controls are composited into the frame here, on the GPU, rather
+            // than drawn by a second window that would have to chase this one.
+            let composition = gst::ElementFactory::make("overlaycomposition")
+                .build()
+                .context("overlaycomposition missing")?;
+
+            // Learn the video size; it is the coordinate space the overlay and
+            // all hit testing work in.
+            let state = overlay.clone();
+            composition.connect("caps-changed", false, move |values| {
+                if let Ok(caps) = values[1].get::<gst::Caps>() {
+                    if let Some(s) = caps.structure(0) {
+                        let w = s.get::<i32>("width").unwrap_or(0);
+                        let h = s.get::<i32>("height").unwrap_or(0);
+                        if let Ok(mut state) = state.lock() {
+                            state.video = (w.max(0) as u32, h.max(0) as u32);
+                        }
+                    }
+                }
+                None
+            });
+
+            let state = overlay.clone();
+            composition.connect("draw", false, move |values| {
+                let mut state = state.lock().ok()?;
+                crate::overlay::render(&mut state).map(|c| c.to_value())
+            });
+
             let sink = gst::ElementFactory::make("d3d11videosink")
                 .property("sync", false)
                 .property("force-aspect-ratio", true)
                 .build()?;
-            // Must be set before the sink reaches PAUSED, otherwise it creates
-            // its own window and ours stays empty. `GstVideoOverlay` is an
-            // interface, so the element has to be cast to it.
-            let overlay = sink
+            let overlay_iface = sink
                 .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
                 .context("d3d11videosink does not implement GstVideoOverlay")?;
             // SAFETY: `hwnd` comes from our own window, created by
             // `window::spawn`, and remains valid while the viewer runs.
-            unsafe { overlay.set_window_handle(hwnd as usize) };
-            vec![sink]
+            unsafe { overlay_iface.set_window_handle(hwnd as usize) };
+
+            vec![composition, sink]
         }
         Output::File(path) => {
             // Re-encode only because writing raw frames to disk is impractical.
@@ -279,9 +308,14 @@ pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Ou
 
 /// Attach the audio branch: depayload -> decode -> volume -> speakers.
 ///
-/// The `volume` element is named so the viewer UI can find it later and drive
-/// it from an overlay control.
-pub fn build_audio_branch(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()> {
+/// The overlay's volume and mute state is applied here. A short poll is used
+/// rather than a callback because the state is owned by the window thread and
+/// changes only on user input; at 20 Hz the cost is unmeasurable.
+pub fn build_audio_branch(
+    pipeline: &gst::Pipeline,
+    pad: &gst::Pad,
+    overlay: Option<crate::overlay::SharedOverlay>,
+) -> Result<()> {
     let depay = gst::ElementFactory::make("rtpopusdepay").build()?;
     let dec = gst::ElementFactory::make("opusdec").build()?;
     let convert = gst::ElementFactory::make("audioconvert").build()?;
@@ -295,13 +329,29 @@ pub fn build_audio_branch(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()
         .build()
         .or_else(|_| gst::ElementFactory::make("autoaudiosink").build())?;
 
-    let all = [depay.clone(), dec, convert, resample, volume, sink];
+    let all = [depay.clone(), dec, convert, resample, volume.clone(), sink];
     for e in &all {
         pipeline.add(e)?;
     }
     gst::Element::link_many(all.iter().collect::<Vec<_>>().as_slice())?;
     for e in &all {
         e.sync_state_with_parent()?;
+    }
+
+    if let Some(overlay) = overlay {
+        std::thread::spawn(move || {
+            let mut applied = f64::NAN;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let Ok(state) = overlay.lock() else { break };
+                let wanted = if state.muted { 0.0 } else { state.volume };
+                drop(state);
+                if (wanted - applied).abs() > f64::EPSILON {
+                    volume.set_property("volume", wanted);
+                    applied = wanted;
+                }
+            }
+        });
     }
 
     pad.link(&depay.static_pad("sink").unwrap())?;

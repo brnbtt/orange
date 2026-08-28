@@ -19,7 +19,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
+use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH, ScreenToClient};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -38,12 +38,17 @@ pub struct VideoWindow {
 unsafe impl Send for VideoWindow {}
 
 /// Create the viewer window and run its message loop on a dedicated thread.
-pub fn spawn(title: &str, width: i32, height: i32) -> Result<VideoWindow> {
+pub fn spawn(
+    title: &str,
+    width: i32,
+    height: i32,
+    overlay: crate::overlay::SharedOverlay,
+) -> Result<VideoWindow> {
     let (tx, rx) = mpsc::channel::<Result<isize>>();
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
     std::thread::spawn(move || unsafe {
-        match create_window(&title, width, height) {
+        match create_window(&title, width, height, overlay) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
                     return;
@@ -63,7 +68,47 @@ pub fn spawn(title: &str, width: i32, height: i32) -> Result<VideoWindow> {
     }
 }
 
-unsafe fn create_window(title: &[u16], width: i32, height: i32) -> Result<HWND> {
+/// Per-window state reachable from the window procedure.
+struct WindowContext {
+    overlay: crate::overlay::SharedOverlay,
+}
+
+/// Map a point in client coordinates to the video's coordinate space.
+///
+/// The sink letterboxes to preserve aspect ratio, so the video does not fill
+/// the client area and a naive mapping would put the controls in the wrong
+/// place on any window that is not exactly the video's aspect.
+fn client_to_video(hwnd: HWND, cx: f32, cy: f32, video: (u32, u32)) -> Option<(f32, f32)> {
+    let (vw, vh) = video;
+    if vw == 0 || vh == 0 {
+        return None;
+    }
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut rect).ok()? };
+    let cw = (rect.right - rect.left) as f32;
+    let ch = (rect.bottom - rect.top) as f32;
+    if cw <= 0.0 || ch <= 0.0 {
+        return None;
+    }
+    let scale = (cw / vw as f32).min(ch / vh as f32);
+    let dw = vw as f32 * scale;
+    let dh = vh as f32 * scale;
+    let ox = (cw - dw) / 2.0;
+    let oy = (ch - dh) / 2.0;
+    Some(((cx - ox) / scale, (cy - oy) / scale))
+}
+
+unsafe fn context(hwnd: HWND) -> Option<&'static WindowContext> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowContext;
+    ptr.as_ref()
+}
+
+unsafe fn create_window(
+    title: &[u16],
+    width: i32,
+    height: i32,
+    overlay: crate::overlay::SharedOverlay,
+) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
     let class_name = w!("orange_viewer");
 
@@ -111,6 +156,10 @@ unsafe fn create_window(title: &[u16], width: i32, height: i32) -> Result<HWND> 
         std::mem::size_of_val(&pref) as u32,
     );
 
+    // Leaked deliberately and reclaimed in WM_DESTROY.
+    let ctx = Box::into_raw(Box::new(WindowContext { overlay }));
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
+
     let _ = ShowWindow(hwnd, SW_SHOW);
     Ok(hwnd)
 }
@@ -126,14 +175,63 @@ unsafe fn run_message_loop() {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            // With no title bar there is nothing to grab, so the whole surface
-            // acts as one, except a margin at the edges left for resizing.
+            // Hit testing does double duty. It fires on every mouse move, so
+            // it wakes the controls and updates hover; and it decides whether
+            // this point should drag the window or receive a normal click.
+            //
+            // Without the second part, HTCAPTION would swallow every click and
+            // the controls would be impossible to press.
             WM_NCHITTEST => {
                 let hit = DefWindowProcW(hwnd, msg, wparam, lparam);
-                if hit.0 == HTCLIENT as isize {
-                    return LRESULT(HTCAPTION as isize);
+                if hit.0 != HTCLIENT as isize {
+                    return hit; // resize borders keep their behaviour
                 }
-                hit
+
+                let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                let mut point = POINT {
+                    x: screen_x,
+                    y: screen_y,
+                };
+                let _ = ScreenToClient(hwnd, &mut point);
+
+                let over_control = context(hwnd)
+                    .and_then(|ctx| {
+                        let mut overlay = ctx.overlay.lock().ok()?;
+                        let video = overlay.video;
+                        let (vx, vy) =
+                            client_to_video(hwnd, point.x as f32, point.y as f32, video)?;
+                        Some(overlay.on_mouse_move(vx, vy))
+                    })
+                    .unwrap_or(false);
+
+                let hot = context(hwnd)
+                    .and_then(|ctx| ctx.overlay.lock().ok().map(|o| o.hovered()))
+                    .unwrap_or(false);
+
+                let _ = over_control;
+                if hot {
+                    LRESULT(HTCLIENT as isize)
+                } else {
+                    LRESULT(HTCAPTION as isize)
+                }
+            }
+            WM_LBUTTONDOWN => {
+                let x = (lparam.0 & 0xFFFF) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                if let Some(ctx) = context(hwnd) {
+                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                        let video = overlay.video;
+                        if let Some((vx, vy)) = client_to_video(hwnd, x, y, video) {
+                            overlay.on_click(vx, vy);
+                            if overlay.close_requested {
+                                let _ =
+                                    PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                            }
+                        }
+                    }
+                }
+                LRESULT(0)
             }
             WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
                 let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -156,6 +254,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+                if !ptr.is_null() {
+                    drop(Box::from_raw(ptr));
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                }
                 PostQuitMessage(0);
                 LRESULT(0)
             }

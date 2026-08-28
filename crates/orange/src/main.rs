@@ -1,5 +1,6 @@
 //! orange - low-overhead window streaming for friends.
 
+mod overlay;
 mod peer;
 mod window;
 mod pipeline;
@@ -151,8 +152,9 @@ fn main() -> Result<()> {
                 settings.codec, settings.bitrate
             );
             let output = if show {
-                let win = window::spawn("orange - loopback", 1280, 720)?;
-                webrtc::Output::Window(win.hwnd)
+                let overlay = std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
+                let win = window::spawn("orange - loopback", 1280, 720, overlay.clone())?;
+                webrtc::Output::Window { hwnd: win.hwnd, overlay }
             } else {
                 webrtc::Output::File(out.clone())
             };
@@ -180,8 +182,9 @@ fn main() -> Result<()> {
             let output = match out {
                 Some(path) => webrtc::Output::File(path),
                 None => {
-                    let win = window::spawn(&format!("orange - {code}"), 1280, 720)?;
-                    webrtc::Output::Window(win.hwnd)
+                    let overlay = std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
+                    let win = window::spawn(&format!("orange - {code}"), 1280, 720, overlay.clone())?;
+                    webrtc::Output::Window { hwnd: win.hwnd, overlay }
                 }
             };
             runtime()?.block_on(peer::run_watch(&code, &server, output))

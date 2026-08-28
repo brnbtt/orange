@@ -331,6 +331,12 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     // Media arrives as separate pads: one for video, one for audio. Only the
     // video pad consumes the output target.
     let pipeline_weak = pipeline.downgrade();
+    // The audio branch needs the overlay to follow its volume control, so keep
+    // a handle before the video branch consumes the output.
+    let overlay_for_audio = match &output {
+        Output::Window { overlay, .. } => Some(overlay.clone()),
+        Output::File(_) => None,
+    };
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
     bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
@@ -338,7 +344,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         };
         let kind = encoding_name(pad).unwrap_or_default();
         let result = match kind.as_str() {
-            "OPUS" => build_audio_branch(&pipeline, pad),
+            "OPUS" => build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
             "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
                 Some(output) => build_receive_branch(&pipeline, pad, output),
                 None => Ok(()),
