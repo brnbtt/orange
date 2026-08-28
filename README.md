@@ -11,10 +11,11 @@ Milestone 1 of 6. Capture and encode work; there is no networking yet.
 | --- | --- | --- |
 | 1 | Window enumeration, GPU capture, hardware encode | **done** |
 | 2 | WebRTC transport, no transcode | **done** (loopback) |
-| 3 | Viewer window: borderless, rounded, overlay controls | next |
-| 4 | Game audio (`wasapi2src` + `opusenc`) | |
-| 5 | Share links + signalling between machines | |
-| 6 | Installer, tray, autostart | |
+| 3 | Signalling relay, host/watch as separate processes | **done** (one machine) |
+| 4 | Two machines across the internet | next |
+| 5 | Viewer window: borderless, rounded, overlay controls | |
+| 6 | Game audio (`wasapi2src` + `opusenc`) | |
+| 7 | Installer, tray, autostart | |
 
 ## Measured, not assumed
 
@@ -92,6 +93,31 @@ orange loopback --hwnd 395876 --scale 1280x720 --bitrate 8000 --show
 Both subcommands are diagnostics: `record` isolates the capture half, `loopback`
 adds transport. When a real stream misbehaves, they tell you which half is at
 fault.
+
+## Streaming between machines
+
+```powershell
+orange serve                              # the relay (one instance, anywhere reachable)
+orange host --hwnd 395876 --scale 1920x1080 --bitrate 25000
+#   Share this code:  BC2-VH3
+orange watch --code BC2-VH3               # on a friend's machine
+```
+
+Point both ends at the same relay with `--server ws://host:9000`.
+
+### The relay carries no video
+
+It knows nothing about media. It matches two peers by room code and forwards a
+few kilobytes of SDP and ICE, then gets out of the way — video goes directly
+peer to peer. That is what keeps hosting costs near zero, and why a tiny VM is
+enough regardless of how many people are watching.
+
+**The room code is the only credential.** Anyone you give it to can watch, and
+can pass it on. That is the deliberate cost of "no accounts, no logins".
+
+Public STUN (`stun.l.google.com:19302`) is used for address discovery. Peers
+that cannot hole-punch will need a TURN server, which *does* relay video and
+therefore costs real bandwidth.
 
 ## Gotchas found the hard way
 

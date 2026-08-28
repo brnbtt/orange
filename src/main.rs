@@ -1,6 +1,8 @@
 //! orange - low-overhead window streaming for friends.
 
+mod peer;
 mod pipeline;
+mod signal;
 mod targets;
 mod webrtc;
 
@@ -47,6 +49,30 @@ enum Command {
         quality: QualityArgs,
         #[arg(long, default_value_t = 10)]
         seconds: u64,
+    },
+    /// Run the signalling relay. Carries handshakes only, never video.
+    Serve {
+        #[arg(long, default_value = "0.0.0.0:9000")]
+        addr: String,
+    },
+    /// Share a window. Prints a code for viewers to join with.
+    Host {
+        #[arg(long)]
+        hwnd: isize,
+        #[arg(long, default_value = "ws://127.0.0.1:9000")]
+        server: String,
+        #[command(flatten)]
+        quality: QualityArgs,
+    },
+    /// Watch a shared window by code.
+    Watch {
+        #[arg(long)]
+        code: String,
+        #[arg(long, default_value = "ws://127.0.0.1:9000")]
+        server: String,
+        /// Write to a file instead of rendering. For headless verification.
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -128,7 +154,36 @@ fn main() -> Result<()> {
                 report_file(&out)
             }
         }
+        Command::Serve { addr } => runtime()?.block_on(signal::serve(&addr)),
+        Command::Host {
+            hwnd,
+            server,
+            quality,
+        } => {
+            let settings = quality.settings(hwnd)?;
+            println!(
+                "Hosting hwnd {hwnd} as {:?} at {} kbps",
+                settings.codec, settings.bitrate
+            );
+            runtime()?.block_on(peer::run_host(&settings, &server))
+        }
+        Command::Watch { code, server, out } => {
+            let output = match out {
+                Some(path) => webrtc::Output::File(path),
+                None => webrtc::Output::Show,
+            };
+            runtime()?.block_on(peer::run_watch(&code, &server, output))
+        }
     }
+}
+
+/// Signalling is async; GStreamer is not. One runtime, created only when a
+/// networked subcommand needs it.
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start async runtime")
 }
 
 fn cmd_list() -> Result<()> {

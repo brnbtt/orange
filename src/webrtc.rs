@@ -23,7 +23,7 @@ use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
 
 /// RTP caps for our encoded stream. AV1 has no static payload type, so we pick
 /// one from the dynamic range and both ends agree on it.
-fn rtp_caps() -> gst::Caps {
+pub fn rtp_caps() -> gst::Caps {
     gst::Caps::builder("application/x-rtp")
         .field("media", "video")
         .field("encoding-name", "AV1")
@@ -202,7 +202,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
 }
 
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
-fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Output) -> Result<()> {
+pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Output) -> Result<()> {
     let depay = gst::ElementFactory::make("rtpav1depay").build()?;
     let parse = gst::ElementFactory::make("av1parse").build()?;
     let dec = gst::ElementFactory::make("d3d11av1dec")
