@@ -44,6 +44,7 @@ enum Screen {
     PickWindow,
     Streaming,
     Watching,
+    Settings,
 }
 
 struct Orange {
@@ -317,54 +318,7 @@ impl Render for Orange {
             Screen::PickWindow => self.render_pick(cx).into_any_element(),
             Screen::Streaming => self.render_streaming(cx).into_any_element(),
             Screen::Watching => self.render_watching(cx).into_any_element(),
-        };
-
-        // The header is deliberately quiet on the signed-out screen, where the
-        // centred mark carries the branding instead.
-        let header = if self.screen == Screen::SignedOut {
-            div().into_any_element()
-        } else {
-            div()
-                .flex()
-                .justify_between()
-                .items_center()
-                .pb_3()
-                .border_b_1()
-                .border_color(rgb(BORDER))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(logo(20.0))
-                        .child(
-                            label("orange", TEXT)
-                                .font_weight(FontWeight::SEMIBOLD),
-                        ),
-                )
-                .child(match &self.session {
-                    Some(s) => div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(dot(GREEN))
-                        .child(label(s.name.clone(), MUTED).text_xs())
-                        .into_any_element(),
-                    None => div()
-                        .id("header-signin")
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .cursor_pointer()
-                        .child(dot(FAINT))
-                        .child(label("Not signed in", FAINT).text_xs())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.screen = Screen::SignedOut;
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                })
-                .into_any_element()
+            Screen::Settings => self.render_settings(cx).into_any_element(),
         };
 
         div()
@@ -372,26 +326,127 @@ impl Render for Orange {
             .flex_col()
             .size_full()
             .bg(rgb(BG))
-            .p_4()
-            .gap_3()
             .text_sm()
-            .child(header)
-            .child(body)
-            .children(self.error.clone().map(|err| {
+            .font_family("Segoe UI")
+            .child(self.render_titlebar(cx))
+            .child(
                 div()
                     .flex()
-                    .gap_2()
-                    .items_start()
-                    .p_2p5()
-                    .rounded_lg()
-                    .bg(rgb(0x241514))
-                    .border_1()
-                    .border_color(rgb(0x3d211f))
-                    .text_xs()
-                    .text_color(rgb(DANGER))
-                    .child(err)
-            }))
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .px_5()
+                    .pt_4()
+                    .pb_5()
+                    .gap_3()
+                    .child(body)
+                    .children(self.error.clone().map(|err| {
+                        div()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(0x241514))
+                            .border_1()
+                            .border_color(rgb(0x3d211f))
+                            .text_xs()
+                            .text_color(rgb(DANGER))
+                            .child(err)
+                    })),
+            )
     }
+}
+
+impl Orange {
+    /// Custom titlebar. GPUI hides the system one via `appears_transparent`,
+    /// which its source documents as supported on Windows.
+    fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_go_back = matches!(
+            self.screen,
+            Screen::PickWindow | Screen::Settings
+        );
+
+        div()
+            .id("titlebar")
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(44.0))
+            .pl_4()
+            .pr_1()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            // Dragging the bar moves the window, since there is no system one.
+            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.start_window_move();
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(logo(16.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(TEXT))
+                            .child("ORANGE"),
+                    )
+                    .children(can_go_back.then(|| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(FAINT))
+                            .child(match self.screen {
+                                Screen::PickWindow => "· share",
+                                Screen::Settings => "· settings",
+                                _ => "",
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(titlebar_button("settings", "⚙").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.screen = if this.screen == Screen::Settings {
+                                Screen::Home
+                            } else {
+                                Screen::Settings
+                            };
+                            cx.notify();
+                        },
+                    )))
+                    .child(titlebar_button("minimise", "—").on_click(|_, window, _| {
+                        window.minimize_window();
+                    }))
+                    // Closing hides to tray rather than quitting, so an active
+                    // stream survives dismissing the window.
+                    .child(
+                        titlebar_button("close", "✕")
+                            .hover(|s| s.bg(rgb(0x8c2b28)).text_color(rgb(TEXT)))
+                            .on_click(|_, window, _| {
+                                window.minimize_window();
+                            }),
+                    ),
+            )
+    }
+}
+
+/// Square, unobtrusive control in the titlebar.
+fn titlebar_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(38.0))
+        .h(px(36.0))
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
+        .child(glyph)
 }
 
 impl Orange {
@@ -763,6 +818,63 @@ impl Orange {
                     })),
             )
     }
+
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let signed_in = self.session.as_ref().map(|s| s.name.clone());
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .flex_1()
+            .child(
+                card()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(label("Discord", TEXT))
+                            .child(
+                                label(
+                                    signed_in.clone().unwrap_or_else(|| "Not signed in".into()),
+                                    FAINT,
+                                )
+                                .text_xs(),
+                            ),
+                    )
+                    .child(match signed_in {
+                        Some(_) => quiet("so", "Sign out")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                session::clear();
+                                this.session = None;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                        None => quiet("si", "Sign in")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.screen = Screen::SignedOut;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    }),
+            )
+            .child(
+                card()
+                    .child(label("Relay", TEXT))
+                    .child(label(self.server.clone(), FAINT).text_xs()),
+            )
+            .child(div().flex_1())
+            .child(
+                secondary("back-settings", "Done").on_click(cx.listener(|this, _, _, cx| {
+                    this.screen = Screen::Home;
+                    cx.notify();
+                })),
+            )
+    }
 }
 
 fn main() {
@@ -778,8 +890,12 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
                         title: Some("orange".into()),
-                        ..Default::default()
+                        // Hide the system titlebar so we can draw our own.
+                        // GPUI documents this as supported on Windows.
+                        appears_transparent: true,
+                        traffic_light_position: None,
                     }),
+                    window_min_size: Some(size(px(360.0), px(480.0))),
                     ..Default::default()
                 },
                 |_, cx| cx.new(Orange::new),
