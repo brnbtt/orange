@@ -141,10 +141,7 @@ pub enum Output {
     /// Render into a window we own, by HWND, with controls composited on top.
     /// `d3d11videosink` implements `GstVideoOverlay`, so it draws into our
     /// borderless frame instead of creating a bare window of its own.
-    Window {
-        hwnd: isize,
-        overlay: crate::overlay::SharedOverlay,
-    },
+    Window(crate::window::PlaybackWindow),
     /// Write to a file, so the result can be verified without a display.
     File(String),
 }
@@ -227,14 +224,52 @@ pub fn encoding_name(pad: &gst::Pad) -> Option<String> {
     structure.get::<String>("encoding-name").ok()
 }
 
+/// Add and link a dynamic receive branch as one transaction. GStreamer does
+/// not roll back partially added elements or pad links when a later operation
+/// fails, so the caller must do it explicitly before keeping the session alive.
+fn attach_receive_elements(
+    pipeline: &gst::Pipeline,
+    pad: &gst::Pad,
+    elements: &[gst::Element],
+) -> Result<()> {
+    let mut added = 0;
+    let result = (|| -> Result<()> {
+        for element in elements {
+            pipeline.add(element)?;
+            added += 1;
+        }
+        gst::Element::link_many(elements)?;
+        for element in elements {
+            element.sync_state_with_parent()?;
+        }
+        pad.link(&elements[0].static_pad("sink").unwrap())?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        if let Some(sink_pad) = elements
+            .first()
+            .and_then(|element| element.static_pad("sink"))
+        {
+            let _ = pad.unlink(&sink_pad);
+        }
+        for element in elements.iter().take(added).rev() {
+            let _ = element.set_state(gst::State::Null);
+            let _ = pipeline.remove(element);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
     output: Output,
 ) -> Result<()> {
-    let reveal_hwnd = match &output {
-        Output::Window { hwnd, .. } => Some(*hwnd),
+    let reveal_playback = match &output {
+        Output::Window(playback) => Some(playback.clone()),
         Output::File(_) => None,
     };
     let depay = gst::ElementFactory::make("rtpav1depay").build()?;
@@ -244,13 +279,13 @@ pub fn build_receive_branch(
         .context("d3d11av1dec missing - no hardware AV1 decode on this GPU?")?;
 
     let tail: Vec<gst::Element> = match output {
-        Output::Window { hwnd, overlay } => {
+        Output::Window(playback) => {
             // Controls are composited into the frame here, on the GPU, rather
             // than drawn by a second window that would have to chase this one.
             let composition = gst::ElementFactory::make("overlaycomposition")
                 .build()
                 .context("overlaycomposition missing")?;
-            crate::overlay::attach(&composition, &overlay, hwnd);
+            crate::overlay::attach(&composition, &playback);
 
             let sink = gst::ElementFactory::make("d3d11videosink")
                 .property("sync", false)
@@ -259,9 +294,9 @@ pub fn build_receive_branch(
             let overlay_iface = sink
                 .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
                 .context("d3d11videosink does not implement GstVideoOverlay")?;
-            // SAFETY: `hwnd` comes from our own window, created by
-            // `window::spawn`, and remains valid while the viewer runs.
-            unsafe { overlay_iface.set_window_handle(hwnd as usize) };
+            // SAFETY: the handle belongs to this playback component and
+            // remains valid while the receiver session is running.
+            unsafe { overlay_iface.set_window_handle(playback.hwnd() as usize) };
 
             vec![composition, sink]
         }
@@ -283,17 +318,9 @@ pub fn build_receive_branch(
     let mut all: Vec<gst::Element> = vec![depay.clone(), parse.clone(), dec.clone()];
     all.extend(tail);
 
-    for e in &all {
-        pipeline.add(e)?;
-    }
-    gst::Element::link_many(all.iter().collect::<Vec<_>>().as_slice())?;
-    for e in &all {
-        e.sync_state_with_parent()?;
-    }
-
-    pad.link(&depay.static_pad("sink").unwrap())?;
-    if let Some(hwnd) = reveal_hwnd {
-        crate::window::reveal(hwnd);
+    attach_receive_elements(pipeline, pad, &all)?;
+    if let Some(playback) = reveal_playback {
+        playback.reveal();
     }
     println!("[webrtc] receiving video");
     Ok(())
@@ -327,20 +354,18 @@ pub fn build_audio_branch(
         .build()
         .or_else(|_| gst::ElementFactory::make("autoaudiosink").build())?;
 
-    let all = [depay.clone(), dec, convert, resample, volume.clone(), sink];
-    for e in &all {
-        pipeline.add(e)?;
-    }
-    gst::Element::link_many(all.iter().collect::<Vec<_>>().as_slice())?;
-    for e in &all {
-        e.sync_state_with_parent()?;
-    }
+    let all = [depay, dec, convert, resample, volume.clone(), sink];
+    attach_receive_elements(pipeline, pad, &all)?;
 
     if let Some(overlay) = overlay {
+        let overlay = Arc::downgrade(&overlay);
         std::thread::spawn(move || {
             let mut applied = initial_volume;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                let Some(overlay) = overlay.upgrade() else {
+                    break;
+                };
                 let Ok(state) = overlay.lock() else { break };
                 let wanted = if state.muted { 0.0 } else { state.volume };
                 drop(state);
@@ -351,8 +376,6 @@ pub fn build_audio_branch(
             }
         });
     }
-
-    pad.link(&depay.static_pad("sink").unwrap())?;
     println!("[webrtc] receiving audio");
     Ok(())
 }

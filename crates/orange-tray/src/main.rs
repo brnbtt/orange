@@ -205,7 +205,15 @@ impl Orange {
             .as_mut()
             .is_some_and(|monitor| !monitor.supervisor.running())
         {
+            let monitor_error = self
+                .monitor
+                .as_ref()
+                .and_then(|monitor| monitor.supervisor.status.lock().ok())
+                .and_then(|status| status.error.clone());
             self.monitor = None;
+            if let Some(error) = monitor_error {
+                self.show_error(error);
+            }
         }
 
         // A newly-issued room code is immediately ready to paste into chat.
@@ -214,9 +222,6 @@ impl Orange {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.clone()));
                 if !self.own_codes.contains(&code) {
                     self.own_codes.push(code.clone());
-                    if self.own_codes.len() > 16 {
-                        self.own_codes.remove(0);
-                    }
                     self.save_preferences();
                 }
                 self.copied_code = Some(code);
@@ -388,7 +393,7 @@ impl Orange {
             );
             return;
         }
-        match Supervisor::watch(&code, &self.server, self.watches.len(), false) {
+        match Supervisor::watch(&code, &self.server, self.watches.len()) {
             Ok(stream) => {
                 self.watches.push(WatchSession {
                     code,
@@ -407,7 +412,7 @@ impl Orange {
         if self.monitor.is_some() {
             return;
         }
-        match Supervisor::watch(&code, &self.server, 0, true) {
+        match Supervisor::live_monitor(&code, &self.server) {
             Ok(supervisor) => {
                 self.monitor = Some(WatchSession { code, supervisor });
                 self.clear_error();

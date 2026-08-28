@@ -96,8 +96,7 @@ pub struct OverlayState {
     pub host: Option<String>,
     pub fps: Option<f64>,
     pub bitrate_kbps: Option<u32>,
-    /// Persistent compact status used by the bottom-right self-monitor.
-    pub monitor_mode: bool,
+    profile: crate::window::PlaybackProfile,
     shown_at: Instant,
     hot: Option<Control>,
     hits: Vec<Hit>,
@@ -111,21 +110,21 @@ pub struct OverlayState {
     pub pinned: bool,
 }
 
-impl Default for OverlayState {
-    fn default() -> Self {
+impl OverlayState {
+    pub fn new(profile: crate::window::PlaybackProfile) -> Self {
         Self {
             video: (0, 0),
             client: (0, 0),
             dpi: 1.0,
-            volume: 0.3,
-            muted: false,
+            volume: profile.initial_volume(),
+            muted: profile.starts_muted(),
             volume_dragging: false,
             fullscreen: false,
             viewers: None,
             host: None,
             fps: None,
             bitrate_kbps: None,
-            monitor_mode: false,
+            profile,
             // Start hidden; the first mouse move reveals the controls.
             shown_at: Instant::now() - HIDE_AFTER * 2,
             hot: None,
@@ -136,11 +135,7 @@ impl Default for OverlayState {
             pinned: false,
         }
     }
-}
 
-pub type SharedOverlay = Arc<Mutex<OverlayState>>;
-
-impl OverlayState {
     pub fn visible(&self) -> bool {
         self.pinned || self.volume_dragging || self.shown_at.elapsed() < HIDE_AFTER
     }
@@ -344,13 +339,15 @@ impl OverlayState {
         self.muted.hash(&mut hasher);
         self.volume_dragging.hash(&mut hasher);
         self.fullscreen.hash(&mut hasher);
-        self.monitor_mode.hash(&mut hasher);
+        self.profile.hash(&mut hasher);
         self.hot.map(|c| c as u8).hash(&mut hasher);
         self.quality_label().hash(&mut hasher);
         self.detail_label().hash(&mut hasher);
         hasher.finish()
     }
 }
+
+pub type SharedOverlay = Arc<Mutex<OverlayState>>;
 
 // --- painting ---------------------------------------------------------------
 
@@ -588,7 +585,8 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // The element's `draw` signal requires a composition return value. `None`
     // aborts inside GLib once the controls time out, so hidden means one fully
     // transparent pixel rather than no object at all.
-    if !state.visible() && !state.monitor_mode {
+    let persistent_live = state.profile.persistent_live_status();
+    if !state.visible() && !persistent_live {
         state.hits.clear();
         let composition = transparent_composition()?;
         state.cache = Some((signature, composition.clone()));
@@ -596,7 +594,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     }
 
     let alpha = state.opacity();
-    let status_alpha = if state.monitor_mode { 1.0 } else { alpha };
+    let status_alpha = if persistent_live { 1.0 } else { alpha };
     // Placement is in video coordinates; painting is at the output's physical
     // DPI. If both use video scale, tiny-skia's antialiasing is filtered again
     // when the sink fits the stream to the window, which softens every icon.
@@ -622,14 +620,14 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     {
         let expanded = state.hot == Some(Control::Stats);
         let received = state.quality_label();
-        let quality = if state.monitor_mode {
+        let quality = if persistent_live {
             String::from("LIVE")
         } else {
             received.clone()
         };
         let detail = if expanded {
             let detail = state.detail_label();
-            if state.monitor_mode {
+            if persistent_live {
                 Some(match detail {
                     Some(detail) => format!("{received}  \u{00b7}  {detail}"),
                     None => received,
@@ -653,12 +651,14 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
 
         // Logical dimensions first; each is independently converted for the
         // destination rectangle and for the source pixmap.
-        let h = CHIP;
-        let show_label = (expanded || state.monitor_mode) && has_text;
+        let h = if persistent_live { 30.0 } else { CHIP };
+        let show_label = (expanded || persistent_live) && has_text;
+        let label_gap = if persistent_live { 4.0 } else { 8.0 };
+        let end_pad = if persistent_live { 8.0 } else { PAD };
         let w = if show_label {
-            CHIP + 8.0 + text_w + PAD
+            h + label_gap + text_w + end_pad
         } else {
-            CHIP
+            h
         };
         // Centred on the close button's axis rather than sharing its top
         // edge: the chip is shorter, and aligning tops leaves it looking
@@ -685,7 +685,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                     CONTROL_RADIUS * raster_scale,
                     status_alpha,
                 );
-                if state.monitor_mode {
+                if persistent_live {
                     if let Some(path) = rounded_rect(
                         0.5 * raster_scale,
                         0.5 * raster_scale,
@@ -698,7 +698,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                 }
                 live_mark(
                     pixmap,
-                    (CHIP * raster_scale - icon) / 2.0,
+                    (h - icon) / 2.0,
                     (h - icon) / 2.0,
                     icon,
                     rgba(ORANGE, status_alpha),
@@ -707,7 +707,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                     return;
                 }
                 let baseline = h / 2.0 + text::cap_height(label_size) / 2.0;
-                let mut caret = (CHIP + 8.0) * raster_scale;
+                let mut caret = (h + label_gap) * raster_scale;
                 text::draw(
                     pixmap,
                     caret,
@@ -793,7 +793,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // A speaker on its own until pointed at, then the slider grows out of it
     // to the right. The volume control is the one thing a viewer actually
     // reaches for, so it gets the largest target of the four.
-    if alpha > 0.0 && !state.monitor_mode {
+    if alpha > 0.0 {
         let open = state.audio_open();
         let gap = 12.0;
         let h = BUTTON;
@@ -913,7 +913,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
 
     // --- view, bottom-right -------------------------------------------------
     // Fullscreen, where every video player puts it.
-    if alpha > 0.0 && !state.monitor_mode {
+    if alpha > 0.0 {
         let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
         let x = fw - (MARGIN + BUTTON) * render_scale;
         let y = fh - (MARGIN + BUTTON) * render_scale;
@@ -1038,11 +1038,12 @@ fn to_composition(panels: Vec<Panel>) -> Option<gst_video::VideoOverlayCompositi
 ///
 /// Both the real viewer and the design harness call this, so what you see
 /// while iterating on the layout is what a viewer actually gets.
-pub fn attach(composition: &gst::Element, overlay: &SharedOverlay, hwnd: isize) {
+pub fn attach(composition: &gst::Element, playback: &crate::window::PlaybackWindow) {
     // Learn the video size and frame rate; the former is the coordinate space
     // the overlay and all hit testing work in, and both are shown to the
     // viewer.
-    let state = overlay.clone();
+    let state = playback.overlay().clone();
+    let playback_for_caps = playback.clone();
     composition.connect("caps-changed", false, move |values| {
         if let Ok(caps) = values[1].get::<gst::Caps>() {
             if let Some(s) = caps.structure(0) {
@@ -1053,7 +1054,7 @@ pub fn attach(composition: &gst::Element, overlay: &SharedOverlay, hwnd: isize) 
                     .ok()
                     .filter(|f| f.denom() != 0)
                     .map(|f| f.numer() as f64 / f.denom() as f64);
-                let mut resize = None;
+                let mut source_changed = None;
                 if let Ok(mut state) = state.lock() {
                     let previous = state.video;
                     state.video = (w.max(0) as u32, h.max(0) as u32);
@@ -1067,18 +1068,18 @@ pub fn attach(composition: &gst::Element, overlay: &SharedOverlay, hwnd: isize) 
                         if previous == (0, 0) {
                             state.wake();
                         }
-                        resize = Some((hwnd, state.video.0, state.video.1));
+                        source_changed = Some(state.video);
                     }
                 }
-                if let Some((hwnd, width, height)) = resize {
-                    crate::window::set_video_aspect(hwnd, width, height);
+                if let Some((width, height)) = source_changed {
+                    playback_for_caps.set_source_size(width, height);
                 }
             }
         }
         None
     });
 
-    let state = overlay.clone();
+    let state = playback.overlay().clone();
     composition.connect("draw", false, move |_values| {
         let mut state = state.lock().ok()?;
         render(&mut state).map(|c| c.to_value())

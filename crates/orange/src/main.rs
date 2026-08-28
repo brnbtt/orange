@@ -93,9 +93,9 @@ enum Command {
         /// Offset this viewer from earlier viewer windows.
         #[arg(long, default_value_t = 0)]
         cascade: u32,
-        /// Open as a compact always-on-top self-monitor.
-        #[arg(long)]
-        monitor: bool,
+        /// Playback behavior for an ordinary viewer or the local live monitor.
+        #[arg(long, value_enum, default_value_t = PlaybackKind::Friend)]
+        profile: PlaybackKind,
     },
     /// Open the viewer window with a synthetic stream. Design harness.
     ///
@@ -124,6 +124,12 @@ enum Command {
         #[arg(long)]
         pin: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PlaybackKind {
+    Friend,
+    Monitor,
 }
 
 #[derive(clap::Args)]
@@ -216,13 +222,11 @@ fn main() -> Result<()> {
                 settings.codec, settings.bitrate, settings.fps
             );
             let output = if show {
-                let overlay =
-                    std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
-                let win = window::spawn("orange - loopback", 1280, 720, overlay.clone())?;
-                webrtc::Output::Window {
-                    hwnd: win.hwnd,
-                    overlay,
-                }
+                let playback = window::PlaybackWindow::spawn(
+                    "orange - loopback",
+                    window::PlaybackProfile::FriendViewer { cascade: 0 },
+                )?;
+                webrtc::Output::Window(playback)
             } else {
                 webrtc::Output::File(out.clone())
             };
@@ -261,37 +265,20 @@ fn main() -> Result<()> {
             server,
             out,
             cascade,
-            monitor,
+            profile,
         } => {
             let output = match out {
                 Some(path) => webrtc::Output::File(path),
                 None => {
-                    let overlay = std::sync::Arc::new(std::sync::Mutex::new(
-                        overlay::OverlayState::default(),
-                    ));
-                    if monitor {
-                        let mut state = overlay.lock().unwrap();
-                        state.monitor_mode = true;
-                        state.muted = true;
-                    }
-                    let win = if monitor {
-                        window::spawn_monitor(
-                            &format!("orange - monitor - {code}"),
-                            overlay.clone(),
-                        )?
-                    } else {
-                        window::spawn_cascaded(
-                            &format!("orange - {code}"),
-                            1280,
-                            720,
-                            cascade,
-                            overlay.clone(),
-                        )?
+                    let playback_profile = match profile {
+                        PlaybackKind::Friend => window::PlaybackProfile::FriendViewer { cascade },
+                        PlaybackKind::Monitor => window::PlaybackProfile::LiveMonitor,
                     };
-                    webrtc::Output::Window {
-                        hwnd: win.hwnd,
-                        overlay,
-                    }
+                    let playback = window::PlaybackWindow::spawn(
+                        &format!("orange - {code}"),
+                        playback_profile,
+                    )?;
+                    webrtc::Output::Window(playback)
                 }
             };
             runtime()?.block_on(peer::run_watch(&code, &server, output))
@@ -310,10 +297,10 @@ fn main() -> Result<()> {
                 anyhow::bail!("fps must be greater than zero");
             }
 
-            let overlay =
-                std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
+            let playback =
+                window::PlaybackWindow::spawn_preview("orange - preview", ww as i32, wh as i32)?;
             {
-                let mut state = overlay.lock().unwrap();
+                let mut state = playback.overlay().lock().unwrap();
                 state.pinned = pin;
                 // Stand-in values so the status cluster has something to lay
                 // out. The real viewer fills these from the stream.
@@ -322,22 +309,15 @@ fn main() -> Result<()> {
                 state.viewers = Some(3);
             }
 
-            let win = window::spawn("orange - preview", ww as i32, wh as i32, overlay.clone())?;
             println!("Preview: {vw}x{vh} at {fps} fps in a {ww}x{wh} window.");
             println!(
                 "Move the mouse to wake the controls{}. Esc or the X closes.",
                 if pin { " (pinned open)" } else { "" }
             );
 
-            let pipeline = build_preview_pipeline(
-                (vw, vh),
-                fps,
-                &pattern,
-                image.as_deref(),
-                win.hwnd,
-                &overlay,
-            )?;
-            run_until_closed(&pipeline, win.hwnd)
+            let pipeline =
+                build_preview_pipeline((vw, vh), fps, &pattern, image.as_deref(), &playback)?;
+            run_until_closed(&pipeline, playback.hwnd())
         }
     }
 }
@@ -352,8 +332,7 @@ fn build_preview_pipeline(
     fps: u32,
     pattern: &str,
     image: Option<&str>,
-    hwnd: isize,
-    overlay: &overlay::SharedOverlay,
+    playback: &window::PlaybackWindow,
 ) -> Result<gst::Pipeline> {
     let (w, h) = size;
 
@@ -379,7 +358,7 @@ fn build_preview_pipeline(
     let composition = gst::ElementFactory::make("overlaycomposition")
         .build()
         .context("overlaycomposition missing")?;
-    overlay::attach(&composition, overlay, hwnd);
+    overlay::attach(&composition, playback);
 
     let sink = gst::ElementFactory::make("d3d11videosink")
         // Unlike the real viewer, sync to the clock: there is no live source
@@ -391,7 +370,7 @@ fn build_preview_pipeline(
         .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
         .context("d3d11videosink does not implement GstVideoOverlay")?;
     // SAFETY: `hwnd` is our own window, alive for as long as this runs.
-    unsafe { overlay_iface.set_window_handle(hwnd as usize) };
+    unsafe { overlay_iface.set_window_handle(playback.hwnd() as usize) };
 
     pipeline.add_many([source.upcast_ref(), &composition, &sink])?;
     gst::Element::link_many([source.upcast_ref(), &composition, &sink])?;

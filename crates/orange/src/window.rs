@@ -90,75 +90,110 @@ const REVEAL_MESSAGE: u32 = WM_APP + 1;
 const ASPECT_MESSAGE: u32 = WM_APP + 2;
 const REVEAL_MS: u32 = 180;
 
-pub struct VideoWindow {
-    pub hwnd: isize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlaybackProfile {
+    FriendViewer { cascade: u32 },
+    LiveMonitor,
 }
 
-#[derive(Clone, Copy)]
-enum WindowRole {
-    Viewer { cascade: u32 },
-    Monitor,
-}
+impl PlaybackProfile {
+    fn envelope(self) -> (i32, i32) {
+        match self {
+            Self::FriendViewer { .. } => (1280, 720),
+            Self::LiveMonitor => (480, 270),
+        }
+    }
 
-impl WindowRole {
-    fn is_monitor(self) -> bool {
-        matches!(self, Self::Monitor)
+    pub(crate) fn initial_volume(self) -> f64 {
+        0.3
+    }
+
+    pub(crate) fn starts_muted(self) -> bool {
+        matches!(self, Self::LiveMonitor)
+    }
+
+    pub(crate) fn persistent_live_status(self) -> bool {
+        matches!(self, Self::LiveMonitor)
+    }
+
+    fn always_on_top(self) -> bool {
+        matches!(self, Self::LiveMonitor)
+    }
+
+    fn activates_on_reveal(self) -> bool {
+        matches!(self, Self::FriendViewer { .. })
     }
 }
 
-// The HWND is used from the GStreamer thread to hand to the sink. Win32 window
-// handles are process-wide, so this is sound; only message-loop calls are
-// thread-affine.
-unsafe impl Send for VideoWindow {}
-
-/// Create the viewer window and run its message loop on a dedicated thread.
-pub fn spawn(
-    title: &str,
-    width: i32,
-    height: i32,
+/// One native playback component used for both friend streams and the local
+/// live monitor. The profile changes policy, never the media or interaction
+/// implementation.
+#[derive(Clone)]
+pub struct PlaybackWindow {
+    hwnd: isize,
     overlay: crate::overlay::SharedOverlay,
-) -> Result<VideoWindow> {
-    spawn_window(
-        title,
-        width,
-        height,
-        WindowRole::Viewer { cascade: 0 },
-        overlay,
-    )
 }
 
-pub fn spawn_cascaded(
-    title: &str,
-    width: i32,
-    height: i32,
-    cascade: u32,
-    overlay: crate::overlay::SharedOverlay,
-) -> Result<VideoWindow> {
-    spawn_window(
-        title,
-        width,
-        height,
-        WindowRole::Viewer { cascade },
-        overlay,
-    )
-}
+impl PlaybackWindow {
+    /// Create a playback window and run its message loop on a dedicated thread.
+    pub fn spawn(title: &str, profile: PlaybackProfile) -> Result<Self> {
+        Self::spawn_with_envelope(title, profile, profile.envelope())
+    }
 
-pub fn spawn_monitor(title: &str, overlay: crate::overlay::SharedOverlay) -> Result<VideoWindow> {
-    spawn_window(title, 480, 270, WindowRole::Monitor, overlay)
+    /// The design harness can request a particular shell size while retaining
+    /// the friend-viewer presentation and interaction behavior.
+    pub fn spawn_preview(title: &str, width: i32, height: i32) -> Result<Self> {
+        Self::spawn_with_envelope(
+            title,
+            PlaybackProfile::FriendViewer { cascade: 0 },
+            (width, height),
+        )
+    }
+
+    fn spawn_with_envelope(
+        title: &str,
+        profile: PlaybackProfile,
+        envelope: (i32, i32),
+    ) -> Result<Self> {
+        let overlay = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::overlay::OverlayState::new(profile),
+        ));
+        let hwnd = spawn_window(title, envelope, profile, overlay.clone())?;
+        Ok(Self { hwnd, overlay })
+    }
+
+    pub fn hwnd(&self) -> isize {
+        self.hwnd
+    }
+
+    pub fn overlay(&self) -> &crate::overlay::SharedOverlay {
+        &self.overlay
+    }
+
+    pub fn is_alive(&self) -> bool {
+        is_alive(self.hwnd)
+    }
+
+    pub fn reveal(&self) {
+        reveal(self.hwnd);
+    }
+
+    pub fn set_source_size(&self, width: u32, height: u32) {
+        set_video_aspect(self.hwnd, width, height);
+    }
 }
 
 fn spawn_window(
     title: &str,
-    width: i32,
-    height: i32,
-    role: WindowRole,
+    envelope: (i32, i32),
+    profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
-) -> Result<VideoWindow> {
+) -> Result<isize> {
     let (tx, rx) = mpsc::channel::<Result<isize>>();
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
     std::thread::spawn(move || unsafe {
-        match create_window(&title, width, height, role, overlay) {
+        match create_window(&title, envelope, profile, overlay) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
                     return;
@@ -172,7 +207,7 @@ fn spawn_window(
     });
 
     match rx.recv() {
-        Ok(Ok(hwnd)) => Ok(VideoWindow { hwnd }),
+        Ok(Ok(hwnd)) => Ok(hwnd),
         Ok(Err(err)) => Err(err),
         Err(_) => bail!("window thread died before it was ready"),
     }
@@ -182,7 +217,10 @@ fn spawn_window(
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
     revealed: std::cell::Cell<bool>,
-    role: WindowRole,
+    profile: PlaybackProfile,
+    envelope: std::cell::Cell<(i32, i32)>,
+    source: std::cell::Cell<(u32, u32)>,
+    size_move_start: std::cell::Cell<(i32, i32)>,
     /// Style and bounds to put back when leaving fullscreen. `Some` means we
     /// are currently fullscreen.
     restore: std::cell::Cell<Option<(WINDOW_STYLE, RECT)>>,
@@ -217,11 +255,46 @@ fn fit_aspect(
     source_width: u32,
     source_height: u32,
 ) -> (i32, i32) {
-    let ratio = source_width as f32 / source_height as f32;
-    if max_width as f32 / max_height as f32 > ratio {
-        ((max_height as f32 * ratio).round() as i32, max_height)
+    if max_width <= 0 || max_height <= 0 || source_width == 0 || source_height == 0 {
+        return (0, 0);
+    }
+
+    let max_width = i64::from(max_width);
+    let max_height = i64::from(max_height);
+    let source_width = i64::from(source_width);
+    let source_height = i64::from(source_height);
+    if max_width * source_height > max_height * source_width {
+        (
+            ((max_height * source_width + source_height / 2) / source_height) as i32,
+            max_height as i32,
+        )
     } else {
-        (max_width, (max_width as f32 / ratio).round() as i32)
+        (
+            max_width as i32,
+            ((max_width * source_height + source_width / 2) / source_width) as i32,
+        )
+    }
+}
+
+fn aspect_locked_size(
+    edge: u32,
+    current_width: i32,
+    current_height: i32,
+    source: (u32, u32),
+) -> Option<(i32, i32)> {
+    let (source_width, source_height) = source;
+    if current_width <= 0 || current_height <= 0 || source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let ratio = source_width as f32 / source_height as f32;
+    match edge {
+        WMSZ_TOP | WMSZ_BOTTOM => Some((
+            (current_height as f32 * ratio).round() as i32,
+            current_height,
+        )),
+        WMSZ_TOPLEFT | WMSZ_TOPRIGHT | WMSZ_LEFT | WMSZ_RIGHT | WMSZ_BOTTOMLEFT
+        | WMSZ_BOTTOMRIGHT => Some((current_width, (current_width as f32 / ratio).round() as i32)),
+        _ => None,
     }
 }
 
@@ -230,6 +303,7 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
         return;
     }
     let Some(ctx) = context(hwnd) else { return };
+    let previous = ctx.source.replace((width, height));
     if ctx.restore.get().is_some() {
         return;
     }
@@ -237,14 +311,21 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
     if GetWindowRect(hwnd, &mut rect).is_err() {
         return;
     }
-    if ctx.role.is_monitor() {
-        return; // fixed PiP shell; the sink letterboxes source content inside it
-    }
     let old_w = rect.right - rect.left;
     let old_h = rect.bottom - rect.top;
-    let (new_w, new_h) = fit_aspect(old_w, old_h, width, height);
-    let x = rect.left + (old_w - new_w) / 2;
-    let y = rect.top + (old_h - new_h) / 2;
+    let first_size = previous == (0, 0);
+    let bounds = ctx.envelope.get();
+    let (new_w, new_h) = fit_aspect(bounds.0, bounds.1, width, height);
+    let (x, y) = if first_size {
+        playback_position(ctx.profile, new_w, new_h)
+    } else if ctx.profile == PlaybackProfile::LiveMonitor {
+        (rect.right - new_w, rect.bottom - new_h)
+    } else {
+        (
+            rect.left + (old_w - new_w) / 2,
+            rect.top + (old_h - new_h) / 2,
+        )
+    };
     let _ = SetWindowPos(
         hwnd,
         None,
@@ -258,14 +339,68 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_aspect;
+    use super::{aspect_locked_size, fit_aspect};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP,
+        WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
+    };
 
     #[test]
-    fn source_aspects_fit_inside_a_bounded_viewer_envelope() {
-        assert_eq!(fit_aspect(720, 405, 1920, 1080), (720, 405));
-        assert_eq!(fit_aspect(720, 405, 1980, 1793), (447, 405));
-        assert_eq!(fit_aspect(720, 405, 1080, 1920), (228, 405));
-        assert_eq!(fit_aspect(720, 405, 2560, 1080), (720, 304));
+    fn source_aspects_fit_inside_profile_envelopes() {
+        assert_eq!(fit_aspect(1280, 720, 1920, 1080), (1280, 720));
+        assert_eq!(fit_aspect(1280, 720, 2560, 1080), (1280, 540));
+        assert_eq!(fit_aspect(1280, 720, 1080, 1080), (720, 720));
+        assert_eq!(fit_aspect(1280, 720, 1980, 1793), (795, 720));
+        assert_eq!(fit_aspect(1280, 720, 1080, 1920), (405, 720));
+
+        assert_eq!(fit_aspect(480, 270, 1920, 1080), (480, 270));
+        assert_eq!(fit_aspect(480, 270, 2560, 1080), (480, 203));
+        assert_eq!(fit_aspect(480, 270, 1080, 1080), (270, 270));
+        assert_eq!(fit_aspect(480, 270, 1980, 1793), (298, 270));
+        assert_eq!(fit_aspect(480, 270, 1080, 1920), (152, 270));
+    }
+
+    #[test]
+    fn fitted_sizes_preserve_source_ratio_with_rounding() {
+        for source in [
+            (1920, 1080),
+            (2560, 1080),
+            (1080, 1080),
+            (1980, 1793),
+            (1080, 1920),
+        ] {
+            let (width, height) = fit_aspect(937, 611, source.0, source.1);
+            let actual = width as f64 / height as f64;
+            let expected = source.0 as f64 / source.1 as f64;
+            assert!((actual - expected).abs() <= 1.0 / height as f64);
+        }
+    }
+
+    #[test]
+    fn edge_resizing_preserves_every_source_ratio() {
+        for source in [
+            (1920, 1080),
+            (2560, 1080),
+            (1080, 1080),
+            (1980, 1793),
+            (1080, 1920),
+        ] {
+            for edge in [
+                WMSZ_LEFT,
+                WMSZ_RIGHT,
+                WMSZ_TOP,
+                WMSZ_BOTTOM,
+                WMSZ_TOPLEFT,
+                WMSZ_TOPRIGHT,
+                WMSZ_BOTTOMLEFT,
+                WMSZ_BOTTOMRIGHT,
+            ] {
+                let (width, height) = aspect_locked_size(edge, 937, 611, source).unwrap();
+                let actual = width as f64 / height as f64;
+                let expected = source.0 as f64 / source.1 as f64;
+                assert!((actual - expected).abs() <= 1.0 / height as f64);
+            }
+        }
     }
 }
 
@@ -273,25 +408,24 @@ unsafe fn constrain_sizing(hwnd: HWND, edge: usize, rect: &mut RECT) -> bool {
     let Some(ctx) = context(hwnd) else {
         return false;
     };
-    if ctx.role.is_monitor() {
-        return false;
-    }
-    let video = ctx.overlay.lock().ok().map(|state| state.video);
-    let Some((width, height)) = video.filter(|(w, h)| *w > 0 && *h > 0) else {
+    let Some((width, height)) = Some(ctx.source.get()).filter(|(w, h)| *w > 0 && *h > 0) else {
         return false;
     };
-    let ratio = width as f32 / height as f32;
     let current_w = rect.right - rect.left;
     let current_h = rect.bottom - rect.top;
+    let Some((locked_w, locked_h)) =
+        aspect_locked_size(edge as u32, current_w, current_h, (width, height))
+    else {
+        return false;
+    };
 
     match edge as u32 {
-        WMSZ_TOP => rect.right = rect.left + (current_h as f32 * ratio).round() as i32,
-        WMSZ_BOTTOM => rect.right = rect.left + (current_h as f32 * ratio).round() as i32,
+        WMSZ_TOP | WMSZ_BOTTOM => rect.right = rect.left + locked_w,
         WMSZ_TOPLEFT | WMSZ_TOPRIGHT => {
-            rect.top = rect.bottom - (current_w as f32 / ratio).round() as i32;
+            rect.top = rect.bottom - locked_h;
         }
         WMSZ_LEFT | WMSZ_RIGHT | WMSZ_BOTTOMLEFT | WMSZ_BOTTOMRIGHT => {
-            rect.bottom = rect.top + (current_w as f32 / ratio).round() as i32;
+            rect.bottom = rect.top + locked_h;
         }
         _ => return false,
     }
@@ -307,6 +441,21 @@ unsafe fn sync_dpi(hwnd: HWND) {
     if let Some(ctx) = context(hwnd) {
         if let Ok(mut overlay) = ctx.overlay.lock() {
             overlay.dpi = dpi as f32 / 96.0;
+        }
+    }
+}
+
+unsafe fn sync_client_size(hwnd: HWND) {
+    let mut rect = RECT::default();
+    if GetClientRect(hwnd, &mut rect).is_err() {
+        return;
+    }
+    if let Some(ctx) = context(hwnd) {
+        if let Ok(mut overlay) = ctx.overlay.lock() {
+            overlay.client = (
+                (rect.right - rect.left).max(0) as u32,
+                (rect.bottom - rect.top).max(0) as u32,
+            );
         }
     }
 }
@@ -332,9 +481,7 @@ unsafe fn set_corner_style(hwnd: HWND, fullscreen: bool) {
 /// rather than the primary one, which is the part people notice.
 unsafe fn toggle_fullscreen(hwnd: HWND) {
     let Some(ctx) = context(hwnd) else { return };
-    if ctx.role.is_monitor() {
-        return;
-    }
+    let was_fullscreen = ctx.restore.get().is_some();
 
     if let Some((style, bounds)) = ctx.restore.take() {
         SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
@@ -380,6 +527,10 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         overlay.wake();
     }
     set_corner_style(hwnd, ctx.restore.get().is_some());
+    if was_fullscreen {
+        let (width, height) = ctx.source.get();
+        resize_to_video_aspect(hwnd, width, height);
+    }
 }
 
 /// Map a point in client coordinates to the video's coordinate space.
@@ -416,7 +567,7 @@ unsafe fn resize_hit_test(hwnd: HWND, x: i32, y: i32) -> Option<LRESULT> {
     let Some(ctx) = context(hwnd) else {
         return None;
     };
-    if ctx.role.is_monitor() || ctx.restore.get().is_some() {
+    if ctx.restore.get().is_some() {
         return None; // no resize edges in fullscreen
     }
 
@@ -454,11 +605,45 @@ unsafe fn context(hwnd: HWND) -> Option<&'static WindowContext> {
     ptr.as_ref()
 }
 
+unsafe fn primary_work_area() -> Result<RECT> {
+    let monitor = MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    GetMonitorInfoW(monitor, &mut info).ok()?;
+    Ok(info.rcWork)
+}
+
+unsafe fn playback_position(profile: PlaybackProfile, width: i32, height: i32) -> (i32, i32) {
+    let work = primary_work_area().unwrap_or(RECT {
+        left: 0,
+        top: 0,
+        right: GetSystemMetrics(SM_CXSCREEN),
+        bottom: GetSystemMetrics(SM_CYSCREEN),
+    });
+    let scale = GetDpiForSystem() as f32 / 96.0;
+    match profile {
+        PlaybackProfile::LiveMonitor => {
+            let margin = (24.0 * scale).round() as i32;
+            (work.right - width - margin, work.bottom - height - margin)
+        }
+        PlaybackProfile::FriendViewer { cascade } => {
+            let offset = (cascade.min(5) as f32 * 32.0 * scale).round() as i32;
+            let max_x = (work.right - width).max(work.left);
+            let max_y = (work.bottom - height).max(work.top);
+            (
+                ((work.left + work.right - width) / 2 + offset).clamp(work.left, max_x),
+                ((work.top + work.bottom - height) / 2 + offset).clamp(work.top, max_y),
+            )
+        }
+    }
+}
+
 unsafe fn create_window(
     title: &[u16],
-    width: i32,
-    height: i32,
-    role: WindowRole,
+    envelope: (i32, i32),
+    profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
@@ -482,36 +667,18 @@ unsafe fn create_window(
     // difference being that it is now backed by real pixels rather than an
     // upscale of two thirds as many.
     let scale = GetDpiForSystem() as f32 / 96.0;
-    let width = (width as f32 * scale).round() as i32;
-    let height = (height as f32 * scale).round() as i32;
-
-    let (x, y) = if role.is_monitor() {
-        let monitor = MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY);
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        GetMonitorInfoW(monitor, &mut info).ok()?;
-        let margin = (24.0 * scale).round() as i32;
-        (
-            info.rcWork.right - width - margin,
-            info.rcWork.bottom - height - margin,
-        )
-    } else {
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let WindowRole::Viewer { cascade } = role else {
-            unreachable!()
-        };
-        let offset = (cascade.min(5) as f32 * 32.0 * scale).round() as i32;
-        (
-            ((screen_w - width) / 2 + offset).min((screen_w - width).max(0)),
-            ((screen_h - height) / 2 + offset).min((screen_h - height).max(0)),
-        )
-    };
+    let work = primary_work_area()?;
+    let width = (envelope.0 as f32 * scale)
+        .round()
+        .min((work.right - work.left) as f32) as i32;
+    let height = (envelope.1 as f32 * scale)
+        .round()
+        .min((work.bottom - work.top) as f32) as i32;
+    let envelope = (width, height);
+    let (x, y) = playback_position(profile, width, height);
 
     let hwnd = CreateWindowExW(
-        if role.is_monitor() {
+        if profile.always_on_top() {
             WS_EX_TOPMOST
         } else {
             WINDOW_EX_STYLE::default()
@@ -520,11 +687,7 @@ unsafe fn create_window(
         PCWSTR(title.as_ptr()),
         // WS_POPUP: no title bar, no border. WS_THICKFRAME is kept so the
         // window can still be resized from its edges.
-        if role.is_monitor() {
-            WS_POPUP | WS_MINIMIZEBOX
-        } else {
-            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX
-        },
+        WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX,
         x,
         y,
         width,
@@ -552,12 +715,16 @@ unsafe fn create_window(
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
         revealed: std::cell::Cell::new(false),
-        role,
+        profile,
+        envelope: std::cell::Cell::new(envelope),
+        source: std::cell::Cell::new((0, 0)),
+        size_move_start: std::cell::Cell::new((0, 0)),
         restore: std::cell::Cell::new(None),
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
 
     sync_dpi(hwnd);
+    sync_client_size(hwnd);
 
     SetTimer(Some(hwnd), CURSOR_TIMER, 250, None);
     Ok(hwnd)
@@ -609,8 +776,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             REVEAL_MESSAGE => {
                 if let Some(ctx) = context(hwnd) {
                     if !ctx.revealed.replace(true) {
-                        if AnimateWindow(hwnd, REVEAL_MS, AW_BLEND | AW_ACTIVATE).is_err() {
-                            let _ = ShowWindow(hwnd, SW_SHOW);
+                        let activate = ctx.profile.activates_on_reveal();
+                        let flags = if activate {
+                            AW_BLEND | AW_ACTIVATE
+                        } else {
+                            AW_BLEND
+                        };
+                        if AnimateWindow(hwnd, REVEAL_MS, flags).is_err() {
+                            let _ = ShowWindow(
+                                hwnd,
+                                if activate { SW_SHOW } else { SW_SHOWNOACTIVATE },
+                            );
                         }
                     }
                 }
@@ -622,6 +798,28 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_SIZING => {
                 let rect = &mut *(lparam.0 as *mut RECT);
                 LRESULT(constrain_sizing(hwnd, wparam.0, rect) as isize)
+            }
+            WM_ENTERSIZEMOVE => {
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    if let Some(ctx) = context(hwnd) {
+                        ctx.size_move_start
+                            .set((rect.right - rect.left, rect.bottom - rect.top));
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_EXITSIZEMOVE => {
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    if let Some(ctx) = context(hwnd) {
+                        let size = (rect.right - rect.left, rect.bottom - rect.top);
+                        if size != ctx.size_move_start.get() {
+                            ctx.envelope.set(size);
+                        }
+                    }
+                }
+                LRESULT(0)
             }
             // Hit testing does double duty. It fires on every mouse move, so
             // it wakes the controls and updates hover; and it decides whether
@@ -770,6 +968,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // it keeps the video at native resolution on both displays.
             WM_DPICHANGED => {
                 let suggested = &*(lparam.0 as *const RECT);
+                if let Some(ctx) = context(hwnd) {
+                    if ctx.restore.get().is_none() {
+                        ctx.envelope.set((
+                            suggested.right - suggested.left,
+                            suggested.bottom - suggested.top,
+                        ));
+                    }
+                }
                 let _ = SetWindowPos(
                     hwnd,
                     None,

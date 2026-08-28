@@ -174,11 +174,13 @@ pub struct StreamStatus {
     pub viewers: Vec<String>,
     pub error: Option<String>,
     pub signed_in_as: Option<String>,
+    viewer_labels: Vec<(String, String)>,
 }
 
 pub struct Supervisor {
     child: Child,
     pub status: Arc<Mutex<StreamStatus>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Supervisor {
@@ -204,17 +206,24 @@ impl Supervisor {
         Self::spawn(command)
     }
 
-    /// Start `orange watch` for a code.
-    pub fn watch(code: &str, server: &str, cascade: usize, monitor: bool) -> Result<Self> {
+    /// Start an ordinary friend-viewer playback session.
+    pub fn watch(code: &str, server: &str, cascade: usize) -> Result<Self> {
+        Self::playback(code, server, cascade, "friend")
+    }
+
+    /// Start the host-owned live-monitor playback session.
+    pub fn live_monitor(code: &str, server: &str) -> Result<Self> {
+        Self::playback(code, server, 0, "monitor")
+    }
+
+    fn playback(code: &str, server: &str, cascade: usize, profile: &str) -> Result<Self> {
         let mut command = orange_command()?;
         command
             .arg("watch")
             .args(["--code", code])
             .args(["--server", server])
-            .args(["--cascade", &(cascade % 6).to_string()]);
-        if monitor {
-            command.arg("--monitor");
-        }
+            .args(["--cascade", &(cascade % 6).to_string()])
+            .args(["--profile", profile]);
         Self::spawn(command)
     }
 
@@ -226,18 +235,19 @@ impl Supervisor {
             .context("could not start the orange binary")?;
 
         let status = Arc::new(Mutex::new(StreamStatus::default()));
+        let mut readers = Vec::with_capacity(2);
 
         if let Some(stdout) = child.stdout.take() {
             let status = status.clone();
-            std::thread::spawn(move || {
+            readers.push(std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     parse_line(&line, &status);
                 }
-            });
+            }));
         }
         if let Some(stderr) = child.stderr.take() {
             let status = status.clone();
-            std::thread::spawn(move || {
+            readers.push(std::thread::spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     if line.contains("Error") || line.contains("error") {
                         if let Ok(mut status) = status.lock() {
@@ -245,19 +255,34 @@ impl Supervisor {
                         }
                     }
                 }
-            });
+            }));
         }
 
-        Ok(Self { child, status })
+        Ok(Self {
+            child,
+            status,
+            readers,
+        })
     }
 
     pub fn running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        if matches!(self.child.try_wait(), Ok(None)) {
+            return true;
+        }
+        self.finish_readers();
+        false
     }
 
     pub fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.finish_readers();
+    }
+
+    fn finish_readers(&mut self) {
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -277,23 +302,35 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
         status.code = Some(rest.trim().to_string());
     } else if let Some(rest) = line.strip_prefix("[host] signed in as ") {
         status.signed_in_as = Some(rest.trim().to_string());
-    } else if line.starts_with("[host] ") && line.contains(" joined (") {
-        if let Some(name) = line
-            .strip_prefix("[host] ")
-            .and_then(|r| r.split(" joined (").next())
-        {
-            let name = name.trim().to_string();
-            if !status.viewers.contains(&name) {
-                status.viewers.push(name);
+    } else if let Some(record) = line.strip_prefix("[host-status] ") {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
+            return;
+        };
+        let Some(event) = record.get("event").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some(peer) = record.get("peer").and_then(|value| value.as_str()) else {
+            return;
+        };
+        match event {
+            "joined" => {
+                let Some(label) = record.get("label").and_then(|value| value.as_str()) else {
+                    return;
+                };
+                if !status.viewer_labels.iter().any(|(id, _)| id == peer) {
+                    status
+                        .viewer_labels
+                        .push((peer.to_string(), label.to_string()));
+                }
             }
+            "left" => status.viewer_labels.retain(|(id, _)| id != peer),
+            _ => return,
         }
-    } else if line.starts_with("[host] ") && line.contains(" left (") {
-        if let Some(name) = line
-            .strip_prefix("[host] ")
-            .and_then(|r| r.split(" left (").next())
-        {
-            status.viewers.retain(|v| v != name.trim());
-        }
+        status.viewers = status
+            .viewer_labels
+            .iter()
+            .map(|(_, label)| label.clone())
+            .collect();
     }
 }
 
@@ -368,5 +405,39 @@ mod tests {
         assert_eq!(QUALITIES[1].scale_for(&target(2002, 1804)), "1198x1080");
         assert_eq!(QUALITIES[1].scale_for(&target(3440, 1440)), "1920x804");
         assert_eq!(QUALITIES[1].scale_for(&target(1280, 720)), "1280x720");
+    }
+
+    #[test]
+    fn host_status_removes_the_joined_display_name() {
+        let status = Arc::new(Mutex::new(StreamStatus::default()));
+        parse_line(
+            r#"[host-status] {"event":"joined","peer":"a","label":"orange"}"#,
+            &status,
+        );
+        parse_line(
+            r#"[host-status] {"event":"left","peer":"a","label":"orange"}"#,
+            &status,
+        );
+
+        assert!(status.lock().unwrap().viewers.is_empty());
+    }
+
+    #[test]
+    fn host_status_keeps_duplicate_display_names_separate() {
+        let status = Arc::new(Mutex::new(StreamStatus::default()));
+        parse_line(
+            r#"[host-status] {"event":"joined","peer":"a","label":"orange"}"#,
+            &status,
+        );
+        parse_line(
+            r#"[host-status] {"event":"joined","peer":"b","label":"orange"}"#,
+            &status,
+        );
+        parse_line(
+            r#"[host-status] {"event":"left","peer":"a","label":"orange"}"#,
+            &status,
+        );
+
+        assert_eq!(status.lock().unwrap().viewers, ["orange"]);
     }
 }

@@ -31,6 +31,11 @@ use orange_signal::{connect, Signal};
 /// machines behind different routers will never find each other.
 const STUN: &str = "stun://stun.l.google.com:19302";
 
+struct PipelineError {
+    source: String,
+    message: String,
+}
+
 fn make_webrtcbin(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make("webrtcbin")
         .name(name)
@@ -45,20 +50,33 @@ fn make_webrtcbin(name: &str) -> Result<gst::Element> {
 /// Without this, a failure inside the receive branch (a decoder refusing caps,
 /// an element failing to start) is completely silent: the peer connection
 /// reports Connected and nothing ever explains why no frames appear.
-fn watch_bus(pipeline: &gst::Pipeline, label: &'static str) {
-    let Some(bus) = pipeline.bus() else { return };
-    std::thread::spawn(move || loop {
-        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(500)) else {
-            continue;
-        };
+fn watch_bus(
+    pipeline: &gst::Pipeline,
+    label: &'static str,
+) -> Result<(
+    mpsc::UnboundedSender<PipelineError>,
+    mpsc::UnboundedReceiver<PipelineError>,
+)> {
+    let bus = pipeline.bus().context("pipeline has no bus")?;
+    let (errors, receiver) = mpsc::unbounded_channel();
+    let bus_errors = errors.clone();
+    bus.set_sync_handler(move |_, msg| {
         match msg.view() {
             gst::MessageView::Error(err) => {
-                eprintln!(
-                    "[{label}] ERROR from {}: {} ({})",
-                    msg.src().map(|s| s.path_string()).unwrap_or_default(),
+                if err.error().to_string().contains("Output window was closed") {
+                    return gst::BusSyncReply::Drop;
+                }
+                let source = msg.src().map(|s| s.path_string()).unwrap_or_default();
+                let error = format!(
+                    "GStreamer error from {source}: {} ({})",
                     err.error(),
                     err.debug().unwrap_or_default()
                 );
+                eprintln!("[{label}] ERROR: {error}");
+                let _ = bus_errors.send(PipelineError {
+                    source: source.to_string(),
+                    message: error,
+                });
             }
             gst::MessageView::Warning(w) => {
                 eprintln!(
@@ -69,11 +87,12 @@ fn watch_bus(pipeline: &gst::Pipeline, label: &'static str) {
             }
             gst::MessageView::Eos(_) => {
                 println!("[{label}] end of stream");
-                break;
             }
             _ => {}
         }
+        gst::BusSyncReply::Drop
     });
+    Ok((errors, receiver))
 }
 
 /// Log ICE and DTLS state transitions.
@@ -99,6 +118,19 @@ fn watch_connection(bin: &gst::Element, label: String) {
         let state = bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
         println!("[{label}] peer connection: {state:?}");
     });
+}
+
+fn check_promise_reply<'a>(
+    reply: std::result::Result<Option<&'a gst::StructureRef>, gst::PromiseError>,
+    operation: &str,
+) -> Result<Option<&'a gst::StructureRef>> {
+    let reply = reply.map_err(|err| anyhow::anyhow!("{operation} promise failed: {err:?}"))?;
+    if let Some(reply) = reply {
+        if let Ok(error) = reply.get::<gst::glib::Error>("error") {
+            anyhow::bail!("{operation} failed: {error}");
+        }
+    }
+    Ok(reply)
 }
 
 /// Measure the encoded video arriving from WebRTC and expose it to the viewer.
@@ -144,8 +176,10 @@ fn watch_incoming_bitrate(pad: &gst::Pad, overlay: crate::overlay::SharedOverlay
 /// Forward locally-gathered ICE candidates to the other peer.
 fn forward_ice(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
     bin.connect("on-ice-candidate", false, move |values| {
-        let mline = values[1].get::<u32>().unwrap();
-        let candidate = values[2].get::<String>().unwrap();
+        let (Ok(mline), Ok(candidate)) = (values[1].get::<u32>(), values[2].get::<String>()) else {
+            eprintln!("[webrtc] malformed ICE candidate callback");
+            return None;
+        };
         let _ = out.send(Signal::Ice {
             peer: peer.clone(),
             mline,
@@ -210,86 +244,161 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
         None => None,
     };
 
-    watch_bus(&pipeline, "host");
+    let (_session_errors, mut bus_errors) = watch_bus(&pipeline, "host")?;
+    let (viewer_failures, mut failed_viewers) = mpsc::unbounded_channel();
     // Do not let WGC emit its one guaranteed initial frame before a viewer
     // branch exists. READY keeps the graph prepared without starting capture.
-    pipeline.set_state(gst::State::Ready)?;
+    if let Err(error) = pipeline.set_state(gst::State::Ready) {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(error.into());
+    }
     let mut pipeline_started = false;
 
     // One peer connection per viewer, keyed by the relay's peer id.
     let mut viewers: HashMap<String, ViewerBranch> = HashMap::new();
 
     // --- signalling loop --------------------------------------------------
-    while let Some(signal) = client.incoming.recv().await {
-        match signal {
-            Signal::Hosting { code } => {
-                println!("\n  Share this code:  {code}\n");
-                println!("  Viewers run:  orange watch --code {code}\n");
-            }
-            Signal::ViewerJoined { peer, name } => {
-                match add_viewer(
-                    &pipeline,
-                    &tee,
-                    audio_tee.as_ref(),
-                    &peer,
-                    client.outgoing.clone(),
-                ) {
-                    Ok(branch) => {
-                        viewers.insert(peer.clone(), branch);
-                        if !pipeline_started {
-                            pipeline.set_state(gst::State::Playing)?;
-                            pipeline_started = true;
+    let session_result: Result<()> =
+        async {
+            loop {
+                let signal = tokio::select! {
+                    Some(error) = bus_errors.recv() => {
+                        if let Some(peer) = viewers
+                            .keys()
+                            .find(|peer| error.source.contains(&format!("viewer-{peer}")))
+                            .cloned()
+                        {
+                            let _ = viewer_failures.send((peer, error.message));
+                            continue;
                         }
-                        crate::targets::request_redraw(settings.hwnd);
-                        println!(
-                            "[host] {} joined ({} watching)",
-                            name.clone().unwrap_or_else(|| format!("viewer {peer}")),
-                            viewers.len()
-                        );
+                        anyhow::bail!(error.message)
+                    },
+                    Some((peer, error)) = failed_viewers.recv() => {
+                        if let Some(branch) = viewers.remove(&peer) {
+                            let label = branch.label.clone();
+                            remove_viewer(&pipeline, branch);
+                            if viewers.is_empty() {
+                                pipeline.set_state(gst::State::Ready)?;
+                                pipeline_started = false;
+                            }
+                            print_viewer_status("left", &peer, &label);
+                            println!(
+                                "[host] {label} left ({} remaining)",
+                                viewers.len()
+                            );
+                        }
+                        eprintln!("[host] viewer {peer} negotiation failed: {error}");
+                        continue;
                     }
-                    Err(err) => eprintln!("[host] could not add viewer {peer}: {err}"),
-                }
-            }
-            Signal::ViewerLeft { peer } => {
-                if let Some(branch) = viewers.remove(&peer) {
-                    remove_viewer(&pipeline, branch);
-                    if viewers.is_empty() {
-                        pipeline.set_state(gst::State::Ready)?;
-                        pipeline_started = false;
+                    signal = client.incoming.recv() => signal,
+                };
+                let Some(signal) = signal else { break };
+                match signal {
+                    Signal::Hosting { code } => {
+                        println!("\n  Share this code:  {code}\n");
+                        println!("  Viewers run:  orange watch --code {code}\n");
                     }
-                    println!("[host] viewer {peer} left ({} remaining)", viewers.len());
+                    Signal::ViewerJoined { peer, name } => {
+                        if viewers.contains_key(&peer) {
+                            eprintln!("[host] ignoring duplicate join from viewer {peer}");
+                            continue;
+                        }
+                        let label = name.unwrap_or_else(|| format!("viewer {peer}"));
+                        match add_viewer(
+                            &pipeline,
+                            &tee,
+                            audio_tee.as_ref(),
+                            &peer,
+                            label.clone(),
+                            client.outgoing.clone(),
+                            viewer_failures.clone(),
+                        ) {
+                            Ok(branch) => {
+                                viewers.insert(peer.clone(), branch);
+                                if !pipeline_started {
+                                    pipeline.set_state(gst::State::Playing)?;
+                                    pipeline_started = true;
+                                }
+                                crate::targets::request_redraw(settings.hwnd);
+                                println!("[host] {label} joined ({} watching)", viewers.len());
+                                print_viewer_status("joined", &peer, &label);
+                            }
+                            Err(err) => eprintln!("[host] could not add viewer {peer}: {err}"),
+                        }
+                    }
+                    Signal::ViewerLeft { peer } => {
+                        if let Some(branch) = viewers.remove(&peer) {
+                            let label = branch.label.clone();
+                            remove_viewer(&pipeline, branch);
+                            if viewers.is_empty() {
+                                pipeline.set_state(gst::State::Ready)?;
+                                pipeline_started = false;
+                            }
+                            println!("[host] {label} left ({} remaining)", viewers.len());
+                            print_viewer_status("left", &peer, &label);
+                        }
+                    }
+                    Signal::Sdp { peer, kind, sdp } if kind == "answer" => {
+                        if let Some(branch) = viewers.get(&peer) {
+                            let desc = match parse_sdp(&kind, &sdp) {
+                                Ok(desc) => desc,
+                                Err(error) => {
+                                    let _ = viewer_failures
+                                        .send((peer.clone(), format!("malformed answer: {error}")));
+                                    continue;
+                                }
+                            };
+                            let tee = tee.clone();
+                            let viewer_failures = viewer_failures.clone();
+                            let hwnd = settings.hwnd;
+                            let peer = peer.clone();
+                            let installed = gst::Promise::with_change_func(move |reply| {
+                                match check_promise_reply(reply, "installing remote answer") {
+                                    Ok(_) => {
+                                        crate::targets::request_redraw(hwnd);
+                                        force_key_unit(&tee);
+                                        println!("[host] streaming to {peer}");
+                                    }
+                                    Err(error) => {
+                                        let _ = viewer_failures.send((
+                                            peer.clone(),
+                                            format!("could not install answer: {error}"),
+                                        ));
+                                    }
+                                }
+                            });
+                            branch
+                                .bin
+                                .emit_by_name::<()>("set-remote-description", &[&desc, &installed]);
+                        }
+                    }
+                    Signal::Ice {
+                        peer,
+                        mline,
+                        candidate,
+                    } => {
+                        if let Some(branch) = viewers.get(&peer) {
+                            branch
+                                .bin
+                                .emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
+                        }
+                    }
+                    Signal::Authenticated { name } => println!("[host] signed in as {name}"),
+                    Signal::Error { message } => eprintln!("[host] server: {message}"),
+                    _ => {}
                 }
             }
-            Signal::Sdp { peer, kind, sdp } if kind == "answer" => {
-                if let Some(branch) = viewers.get(&peer) {
-                    let desc = parse_sdp(&kind, &sdp)?;
-                    branch.bin.emit_by_name::<()>(
-                        "set-remote-description",
-                        &[&desc, &None::<gst::Promise>],
-                    );
-                    crate::targets::request_redraw(settings.hwnd);
-                    force_key_unit(&tee);
-                    println!("[host] streaming to {peer}");
-                }
-            }
-            Signal::Ice {
-                peer,
-                mline,
-                candidate,
-            } => {
-                if let Some(branch) = viewers.get(&peer) {
-                    branch
-                        .bin
-                        .emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
-                }
-            }
-            Signal::Authenticated { name } => println!("[host] signed in as {name}"),
-            Signal::Error { message } => eprintln!("[host] server: {message}"),
-            _ => {}
+            Ok(())
         }
-    }
+        .await;
 
-    pipeline.set_state(gst::State::Null)?;
+    for (_, branch) in viewers.drain() {
+        remove_viewer(&pipeline, branch);
+    }
+    let stop_result = pipeline.set_state(gst::State::Null);
+    client.close().await;
+    session_result?;
+    stop_result?;
     Ok(())
 }
 
@@ -308,8 +417,23 @@ fn build_audio_tee(pipeline: &gst::Pipeline, pid: u32) -> Result<gst::Element> {
         .property("allow-not-linked", true)
         .build()?;
 
-    pipeline.add_many([chain.upcast_ref(), &caps_filter, &tee])?;
-    gst::Element::link_many([chain.upcast_ref(), &caps_filter, &tee])?;
+    let elements = [chain.upcast_ref(), &caps_filter, &tee];
+    let mut added = 0;
+    let result = (|| -> Result<()> {
+        for element in elements {
+            pipeline.add(element)?;
+            added += 1;
+        }
+        gst::Element::link_many(elements)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for element in elements.into_iter().take(added).rev() {
+            let _ = element.set_state(gst::State::Null);
+            let _ = pipeline.remove(element);
+        }
+        return Err(error);
+    }
     Ok(tee)
 }
 
@@ -327,6 +451,7 @@ struct TeeBranch {
 struct ViewerBranch {
     bin: gst::Element,
     links: Vec<TeeBranch>,
+    label: String,
 }
 
 fn link_tee_branch(
@@ -342,35 +467,44 @@ fn link_tee_branch(
         .build()?;
     let mut elements = vec![queue];
     elements.append(&mut payload);
-    for element in &elements {
-        pipeline.add(element)?;
-    }
-    gst::Element::link_many(elements.iter().collect::<Vec<_>>().as_slice())?;
 
     let sink_pad = bin
         .request_pad_simple("sink_%u")
         .context("webrtcbin refused a sink pad")?;
-    elements
-        .last()
-        .unwrap()
-        .static_pad("src")
-        .unwrap()
-        .link(&sink_pad)?;
-
-    let tee_pad = tee
-        .request_pad_simple("src_%u")
-        .context("tee refused a source pad")?;
-    tee_pad.link(&elements[0].static_pad("sink").unwrap())?;
-
-    for element in &elements {
-        element.sync_state_with_parent()?;
-    }
-    Ok(TeeBranch {
+    let Some(tee_pad) = tee.request_pad_simple("src_%u") else {
+        bin.release_request_pad(&sink_pad);
+        anyhow::bail!("tee refused a source pad");
+    };
+    let branch = TeeBranch {
         tee: tee.clone(),
         tee_pad,
         elements,
         bin_pad: sink_pad,
-    })
+    };
+
+    let result = (|| -> Result<()> {
+        for element in &branch.elements {
+            pipeline.add(element)?;
+        }
+        gst::Element::link_many(branch.elements.iter().collect::<Vec<_>>().as_slice())?;
+        branch
+            .elements
+            .last()
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .link(&branch.bin_pad)?;
+        branch
+            .tee_pad
+            .link(&branch.elements[0].static_pad("sink").unwrap())?;
+
+        Ok(())
+    })();
+    if let Err(error) = result {
+        remove_tee_branch(pipeline, bin, branch);
+        return Err(error);
+    }
+    Ok(branch)
 }
 
 fn add_viewer(
@@ -378,52 +512,82 @@ fn add_viewer(
     tee: &gst::Element,
     audio_tee: Option<&gst::Element>,
     peer: &str,
+    label: String,
     out: mpsc::UnboundedSender<Signal>,
+    failures: mpsc::UnboundedSender<(String, String)>,
 ) -> Result<ViewerBranch> {
     let bin = make_webrtcbin(&format!("viewer-{peer}"))?;
     pipeline.add(&bin)?;
+    let mut branch = ViewerBranch {
+        bin,
+        links: Vec::new(),
+        label,
+    };
 
-    let pay = gst::ElementFactory::make("rtpav1pay").build()?;
-    let caps = gst::ElementFactory::make("capsfilter")
-        .property("caps", rtp_caps())
-        .build()?;
-    let mut links = vec![link_tee_branch(pipeline, tee, &bin, 200, vec![pay, caps])?];
-    if let Some(audio_tee) = audio_tee {
-        links.push(link_tee_branch(pipeline, audio_tee, &bin, 50, Vec::new())?);
+    let result = (|| -> Result<()> {
+        let pay = gst::ElementFactory::make("rtpav1pay").build()?;
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property("caps", rtp_caps())
+            .build()?;
+        branch.links.push(link_tee_branch(
+            pipeline,
+            tee,
+            &branch.bin,
+            200,
+            vec![pay, caps],
+        )?);
+        if let Some(audio_tee) = audio_tee {
+            branch.links.push(link_tee_branch(
+                pipeline,
+                audio_tee,
+                &branch.bin,
+                50,
+                Vec::new(),
+            )?);
+        }
+        branch.bin.sync_state_with_parent()?;
+        for link in &branch.links {
+            for element in &link.elements {
+                element.sync_state_with_parent()?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        remove_viewer(pipeline, branch);
+        return Err(error);
     }
 
-    watch_connection(&bin, format!("host->{peer}"));
-    forward_ice(&bin, out.clone(), peer.to_string());
+    watch_connection(&branch.bin, format!("host->{peer}"));
+    forward_ice(&branch.bin, out.clone(), peer.to_string());
 
-    bin.sync_state_with_parent()?;
-
-    create_offer(&bin, out, peer.to_string());
-    Ok(ViewerBranch { bin, links })
+    create_offer(&branch.bin, out, failures, peer.to_string());
+    Ok(branch)
 }
 
 fn remove_viewer(pipeline: &gst::Pipeline, branch: ViewerBranch) {
     let _ = branch.bin.set_state(gst::State::Null);
     for link in branch.links {
-        for element in &link.elements {
-            let _ = element.set_state(gst::State::Null);
-        }
-        let _ = link
-            .tee_pad
-            .unlink(&link.elements[0].static_pad("sink").unwrap());
-        let _ = link
-            .elements
-            .last()
-            .unwrap()
-            .static_pad("src")
-            .unwrap()
-            .unlink(&link.bin_pad);
-        link.tee.release_request_pad(&link.tee_pad);
-        branch.bin.release_request_pad(&link.bin_pad);
-        for element in link.elements {
-            let _ = pipeline.remove(&element);
-        }
+        remove_tee_branch(pipeline, &branch.bin, link);
     }
     let _ = pipeline.remove(&branch.bin);
+}
+
+fn remove_tee_branch(pipeline: &gst::Pipeline, bin: &gst::Element, branch: TeeBranch) {
+    for element in &branch.elements {
+        let _ = element.set_state(gst::State::Null);
+    }
+    if let Some(sink_pad) = branch.elements[0].static_pad("sink") {
+        let _ = branch.tee_pad.unlink(&sink_pad);
+    }
+    if let Some(src_pad) = branch.elements.last().unwrap().static_pad("src") {
+        let _ = src_pad.unlink(&branch.bin_pad);
+    }
+    branch.tee.release_request_pad(&branch.tee_pad);
+    bin.release_request_pad(&branch.bin_pad);
+    for element in branch.elements {
+        let _ = pipeline.remove(&element);
+    }
 }
 
 fn force_key_unit(tee: &gst::Element) {
@@ -433,24 +597,65 @@ fn force_key_unit(tee: &gst::Element) {
     let _ = tee.send_event(event);
 }
 
-fn create_offer(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
+fn print_viewer_status(event: &str, peer: &str, label: &str) {
+    println!(
+        "[host-status] {}",
+        serde_json::json!({ "event": event, "peer": peer, "label": label })
+    );
+}
+
+fn create_offer(
+    bin: &gst::Element,
+    out: mpsc::UnboundedSender<Signal>,
+    failures: mpsc::UnboundedSender<(String, String)>,
+    peer: String,
+) {
     let bin_clone = bin.clone();
     let promise = gst::Promise::with_change_func(move |reply| {
-        let Ok(Some(reply)) = reply else {
-            eprintln!("[host] create-offer failed");
+        let reply = match check_promise_reply(reply, "creating offer") {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                let _ = failures.send((
+                    peer.clone(),
+                    "creating offer returned no description".into(),
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = failures.send((peer.clone(), error.to_string()));
+                return;
+            }
+        };
+        let Ok(offer_value) = reply.value("offer") else {
+            let _ = failures.send((
+                peer.clone(),
+                "creating offer returned no description".into(),
+            ));
             return;
         };
-        let offer = reply
-            .value("offer")
-            .unwrap()
-            .get::<gst_webrtc::WebRTCSessionDescription>()
-            .unwrap();
-        bin_clone.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
-        let _ = out.send(Signal::Sdp {
-            peer,
-            kind: "offer".into(),
-            sdp: offer.sdp().as_text().unwrap_or_default(),
+        let Ok(offer) = offer_value.get::<gst_webrtc::WebRTCSessionDescription>() else {
+            let _ = failures.send((
+                peer.clone(),
+                "creating offer returned an invalid description".into(),
+            ));
+            return;
+        };
+        let sdp = offer.sdp().as_text().unwrap_or_default();
+        let installed = gst::Promise::with_change_func(move |reply| {
+            match check_promise_reply(reply, "installing local offer") {
+                Ok(_) => {
+                    let _ = out.send(Signal::Sdp {
+                        peer,
+                        kind: "offer".into(),
+                        sdp,
+                    });
+                }
+                Err(error) => {
+                    let _ = failures.send((peer, error.to_string()));
+                }
+            }
         });
+        bin_clone.emit_by_name::<()>("set-local-description", &[&offer, &installed]);
     });
     bin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
 }
@@ -471,7 +676,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let pipeline = gst::Pipeline::new();
     let bin = make_webrtcbin("viewer")?;
     pipeline.add(&bin)?;
-    watch_bus(&pipeline, "watch");
+    let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch")?;
 
     watch_connection(&bin, "watch".to_string());
     forward_ice(&bin, client.outgoing.clone(), String::new());
@@ -481,32 +686,24 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let pipeline_weak = pipeline.downgrade();
     // The audio branch needs the overlay to follow its volume control, so keep
     // a handle before the video branch consumes the output.
-    let viewer_overlay = match &output {
-        Output::Window { overlay, .. } => Some(overlay.clone()),
+    let viewer_playback = match &output {
+        Output::Window(playback) => Some(playback.clone()),
         Output::File(_) => None,
     };
-    let viewer_hwnd = match &output {
-        Output::Window { hwnd, .. } => Some(*hwnd),
-        Output::File(_) => None,
-    };
-    let receive_audio = viewer_overlay
+    let viewer_overlay = viewer_playback
         .as_ref()
-        .and_then(|overlay| overlay.lock().ok())
-        .map(|state| !state.monitor_mode)
-        .unwrap_or(true);
+        .map(|playback| playback.overlay().clone());
     let overlay_for_audio = viewer_overlay.clone();
     let overlay_for_video = viewer_overlay.clone();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
+    let branch_errors = session_errors.clone();
     bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
         let kind = encoding_name(pad).unwrap_or_default();
         let result = match kind.as_str() {
-            "OPUS" if receive_audio => {
-                build_audio_branch(&pipeline, pad, overlay_for_audio.clone())
-            }
-            "OPUS" => Ok(()),
+            "OPUS" => build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
             "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
                 Some(output) => {
                     if let Some(overlay) = overlay_for_video.clone() {
@@ -523,80 +720,157 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         };
         if let Err(err) = result {
             eprintln!("[watch] could not build {kind} branch: {err}");
+            let _ = branch_errors.send(PipelineError {
+                source: String::new(),
+                message: format!("could not build {kind} receive branch: {err}"),
+            });
         }
     });
 
-    pipeline.set_state(gst::State::Playing)?;
-
-    loop {
-        let signal = if let Some(hwnd) = viewer_hwnd {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                client.incoming.recv(),
-            )
-            .await
-            {
-                Ok(signal) => signal,
-                Err(_) if !crate::window::is_alive(hwnd) => break,
-                Err(_) => continue,
-            }
-        } else {
-            client.incoming.recv().await
-        };
-        let Some(signal) = signal else { break };
-        match signal {
-            Signal::Sdp { kind, sdp, .. } if kind == "offer" => {
-                let desc = parse_sdp(&kind, &sdp)?;
-                bin.emit_by_name::<()>("set-remote-description", &[&desc, &None::<gst::Promise>]);
-                create_answer(&bin, client.outgoing.clone());
-            }
-            Signal::Ice {
-                mline, candidate, ..
-            } => {
-                bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
-            }
-            Signal::StreamInfo { host_name } => {
-                if let Some(overlay) = &viewer_overlay {
-                    if let Ok(mut state) = overlay.lock() {
-                        state.host = host_name.clone();
-                    }
-                }
-                if let Some(name) = host_name {
-                    println!("[watch] {name}'s stream");
-                }
-            }
-
-            Signal::Authenticated { name } => println!("[watch] signed in as {name}"),
-
-            Signal::Error { message } => {
-                anyhow::bail!("{message}");
-            }
-            _ => {}
-        }
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(error.into());
     }
 
-    pipeline.set_state(gst::State::Null)?;
+    let session_result: Result<()> = async {
+        loop {
+            let signal = if let Some(playback) = &viewer_playback {
+                tokio::select! {
+                    Some(error) = bus_errors.recv() => {
+                        if !playback.is_alive() {
+                            break;
+                        }
+                        anyhow::bail!(error.message)
+                    },
+                    signal = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        client.incoming.recv(),
+                    ) => match signal {
+                        Ok(signal) => signal,
+                        Err(_) if !playback.is_alive() => break,
+                        Err(_) => continue,
+                    },
+                }
+            } else {
+                tokio::select! {
+                    Some(error) = bus_errors.recv() => anyhow::bail!(error.message),
+                    signal = client.incoming.recv() => signal,
+                }
+            };
+            let Some(signal) = signal else { break };
+            match signal {
+                Signal::Sdp { kind, sdp, .. } if kind == "offer" => {
+                    let desc = parse_sdp(&kind, &sdp)?;
+                    let bin_for_answer = bin.clone();
+                    let outgoing = client.outgoing.clone();
+                    let session_errors = session_errors.clone();
+                    let installed = gst::Promise::with_change_func(move |reply| {
+                        match check_promise_reply(reply, "installing remote offer") {
+                            Ok(_) => {
+                                create_answer(&bin_for_answer, outgoing, session_errors.clone())
+                            }
+                            Err(error) => {
+                                let _ = session_errors.send(PipelineError {
+                                    source: String::new(),
+                                    message: format!("could not install host offer: {error}"),
+                                });
+                            }
+                        }
+                    });
+                    bin.emit_by_name::<()>("set-remote-description", &[&desc, &installed]);
+                }
+                Signal::Ice {
+                    mline, candidate, ..
+                } => {
+                    bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
+                }
+                Signal::StreamInfo { host_name } => {
+                    if let Some(overlay) = &viewer_overlay {
+                        if let Ok(mut state) = overlay.lock() {
+                            state.host = host_name.clone();
+                        }
+                    }
+                    if let Some(name) = host_name {
+                        println!("[watch] {name}'s stream");
+                    }
+                }
+
+                Signal::Authenticated { name } => println!("[watch] signed in as {name}"),
+
+                Signal::Error { message } => {
+                    anyhow::bail!("{message}");
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let stop_result = pipeline.set_state(gst::State::Null);
+    client.close().await;
+    session_result?;
+    stop_result?;
     Ok(())
 }
 
-fn create_answer(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>) {
+fn create_answer(
+    bin: &gst::Element,
+    out: mpsc::UnboundedSender<Signal>,
+    errors: mpsc::UnboundedSender<PipelineError>,
+) {
     let bin_clone = bin.clone();
     let promise = gst::Promise::with_change_func(move |reply| {
-        let Ok(Some(reply)) = reply else {
-            eprintln!("[watch] create-answer failed");
+        let reply = match check_promise_reply(reply, "creating answer") {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                let _ = errors.send(PipelineError {
+                    source: String::new(),
+                    message: "creating answer returned no description".into(),
+                });
+                return;
+            }
+            Err(error) => {
+                let _ = errors.send(PipelineError {
+                    source: String::new(),
+                    message: error.to_string(),
+                });
+                return;
+            }
+        };
+        let Ok(answer_value) = reply.value("answer") else {
+            let _ = errors.send(PipelineError {
+                source: String::new(),
+                message: "creating answer returned no description".into(),
+            });
             return;
         };
-        let answer = reply
-            .value("answer")
-            .unwrap()
-            .get::<gst_webrtc::WebRTCSessionDescription>()
-            .unwrap();
-        bin_clone.emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
-        let _ = out.send(Signal::Sdp {
-            peer: String::new(),
-            kind: "answer".into(),
-            sdp: answer.sdp().as_text().unwrap_or_default(),
+        let Ok(answer) = answer_value.get::<gst_webrtc::WebRTCSessionDescription>() else {
+            let _ = errors.send(PipelineError {
+                source: String::new(),
+                message: "creating answer returned an invalid description".into(),
+            });
+            return;
+        };
+        let sdp = answer.sdp().as_text().unwrap_or_default();
+        let installed = gst::Promise::with_change_func(move |reply| {
+            match check_promise_reply(reply, "installing local answer") {
+                Ok(_) => {
+                    let _ = out.send(Signal::Sdp {
+                        peer: String::new(),
+                        kind: "answer".into(),
+                        sdp,
+                    });
+                }
+                Err(error) => {
+                    let _ = errors.send(PipelineError {
+                        source: String::new(),
+                        message: error.to_string(),
+                    });
+                }
+            }
         });
+        bin_clone.emit_by_name::<()>("set-local-description", &[&answer, &installed]);
     });
     bin.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
 }

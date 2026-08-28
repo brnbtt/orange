@@ -286,6 +286,22 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
 pub struct SignalClient {
     pub outgoing: mpsc::UnboundedSender<Signal>,
     pub incoming: mpsc::UnboundedReceiver<Signal>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_done: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl SignalClient {
+    /// Send a WebSocket close frame before the media process exits. Waiting
+    /// only for the writer keeps shutdown prompt while ensuring the relay can
+    /// remove viewer state immediately instead of waiting for a TCP timeout.
+    pub async fn close(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(done) = self.shutdown_done.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), done).await;
+        }
+    }
 }
 
 /// rustls refuses to pick a crypto backend when more than one could apply, and
@@ -307,14 +323,28 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Signal>();
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Signal>();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_done_tx, shutdown_done_rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
-        while let Some(signal) = out_rx.recv().await {
-            let text = tokio_tungstenite::tungstenite::Message::Text(signal.to_json());
-            if sink.send(text).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                signal = out_rx.recv() => {
+                    let Some(signal) = signal else { break };
+                    let text = tokio_tungstenite::tungstenite::Message::Text(signal.to_json());
+                    if sink.send(text).await.is_err() {
+                        break;
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    let _ = sink
+                        .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                        .await;
+                    break;
+                }
             }
         }
+        let _ = shutdown_done_tx.send(());
     });
 
     tokio::spawn(async move {
@@ -335,5 +365,7 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
     Ok(SignalClient {
         outgoing: out_tx,
         incoming: in_rx,
+        shutdown: Some(shutdown_tx),
+        shutdown_done: Some(shutdown_done_rx),
     })
 }
