@@ -79,6 +79,7 @@ struct Orange {
     /// Drives the transient "Copied" confirmation on the share code.
     copied_at: Option<Instant>,
     copied_code: Option<String>,
+    own_codes: Vec<String>,
 }
 
 impl Orange {
@@ -120,6 +121,7 @@ impl Orange {
             sized_for: None,
             copied_at: None,
             copied_code: None,
+            own_codes: Vec::new(),
         }
     }
 
@@ -192,6 +194,12 @@ impl Orange {
         if let Some(code) = self.code() {
             if self.copied_code.as_deref() != Some(&code) {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.clone()));
+                if !self.own_codes.contains(&code) {
+                    self.own_codes.push(code.clone());
+                    if self.own_codes.len() > 16 {
+                        self.own_codes.remove(0);
+                    }
+                }
                 self.copied_code = Some(code);
                 self.copied_at = Some(Instant::now());
             }
@@ -337,6 +345,11 @@ impl Orange {
         }
         if self.watches.iter().any(|watch| watch.code == code) {
             self.error = Some(format!("Already watching {code}"));
+            return;
+        }
+        if !monitor && self.own_codes.contains(&code) {
+            self.error =
+                Some("That is one of your own stream codes. Use Live monitor instead.".into());
             return;
         }
         if !supervisor::gstreamer_available() {

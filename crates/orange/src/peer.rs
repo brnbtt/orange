@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_sdp as gst_sdp;
+use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,7 +218,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     pipeline.set_state(gst::State::Playing)?;
 
     // One peer connection per viewer, keyed by the relay's peer id.
-    let mut viewers: HashMap<String, gst::Element> = HashMap::new();
+    let mut viewers: HashMap<String, ViewerBranch> = HashMap::new();
 
     // --- signalling loop --------------------------------------------------
     while let Some(signal) = client.incoming.recv().await {
@@ -234,8 +235,8 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                     &peer,
                     client.outgoing.clone(),
                 ) {
-                    Ok(bin) => {
-                        viewers.insert(peer.clone(), bin);
+                    Ok(branch) => {
+                        viewers.insert(peer.clone(), branch);
                         println!(
                             "[host] {} joined ({} watching)",
                             name.clone().unwrap_or_else(|| format!("viewer {peer}")),
@@ -246,18 +247,19 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 }
             }
             Signal::ViewerLeft { peer } => {
-                if let Some(bin) = viewers.remove(&peer) {
-                    remove_viewer(&pipeline, &bin);
+                if let Some(branch) = viewers.remove(&peer) {
+                    remove_viewer(&pipeline, branch);
                     println!("[host] viewer {peer} left ({} remaining)", viewers.len());
                 }
             }
             Signal::Sdp { peer, kind, sdp } if kind == "answer" => {
-                if let Some(bin) = viewers.get(&peer) {
+                if let Some(branch) = viewers.get(&peer) {
                     let desc = parse_sdp(&kind, &sdp)?;
-                    bin.emit_by_name::<()>(
+                    branch.bin.emit_by_name::<()>(
                         "set-remote-description",
                         &[&desc, &None::<gst::Promise>],
                     );
+                    force_key_unit(&tee);
                     println!("[host] streaming to {peer}");
                 }
             }
@@ -266,8 +268,10 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 mline,
                 candidate,
             } => {
-                if let Some(bin) = viewers.get(&peer) {
-                    bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
+                if let Some(branch) = viewers.get(&peer) {
+                    branch
+                        .bin
+                        .emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
                 }
             }
             Signal::Authenticated { name } => println!("[host] signed in as {name}"),
@@ -304,12 +308,24 @@ fn build_audio_tee(pipeline: &gst::Pipeline, pid: u32) -> Result<gst::Element> {
 ///
 /// The queue matters: without one per branch, a slow viewer would stall the
 /// tee and with it every other viewer and the encoder itself.
+struct TeeBranch {
+    tee: gst::Element,
+    tee_pad: gst::Pad,
+    queue: gst::Element,
+    bin_pad: gst::Pad,
+}
+
+struct ViewerBranch {
+    bin: gst::Element,
+    links: Vec<TeeBranch>,
+}
+
 fn link_tee_branch(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
     bin: &gst::Element,
     max_buffers: u32,
-) -> Result<()> {
+) -> Result<TeeBranch> {
     let queue = gst::ElementFactory::make("queue")
         .property("max-size-buffers", max_buffers)
         .property_from_str("leaky", "downstream")
@@ -327,7 +343,12 @@ fn link_tee_branch(
     tee_pad.link(&queue.static_pad("sink").unwrap())?;
 
     queue.sync_state_with_parent()?;
-    Ok(())
+    Ok(TeeBranch {
+        tee: tee.clone(),
+        tee_pad,
+        queue,
+        bin_pad: sink_pad,
+    })
 }
 
 fn add_viewer(
@@ -336,13 +357,13 @@ fn add_viewer(
     audio_tee: Option<&gst::Element>,
     peer: &str,
     out: mpsc::UnboundedSender<Signal>,
-) -> Result<gst::Element> {
+) -> Result<ViewerBranch> {
     let bin = make_webrtcbin(&format!("viewer-{peer}"))?;
     pipeline.add(&bin)?;
 
-    link_tee_branch(pipeline, tee, &bin, 200)?;
+    let mut links = vec![link_tee_branch(pipeline, tee, &bin, 200)?];
     if let Some(audio_tee) = audio_tee {
-        link_tee_branch(pipeline, audio_tee, &bin, 50)?;
+        links.push(link_tee_branch(pipeline, audio_tee, &bin, 50)?);
     }
 
     watch_connection(&bin, format!("host->{peer}"));
@@ -351,12 +372,29 @@ fn add_viewer(
     bin.sync_state_with_parent()?;
 
     create_offer(&bin, out, peer.to_string());
-    Ok(bin)
+    Ok(ViewerBranch { bin, links })
 }
 
-fn remove_viewer(pipeline: &gst::Pipeline, bin: &gst::Element) {
-    let _ = bin.set_state(gst::State::Null);
-    let _ = pipeline.remove(bin);
+fn remove_viewer(pipeline: &gst::Pipeline, branch: ViewerBranch) {
+    let _ = branch.bin.set_state(gst::State::Null);
+    for link in branch.links {
+        let _ = link.queue.set_state(gst::State::Null);
+        let _ = link.tee_pad.unlink(&link.queue.static_pad("sink").unwrap());
+        let _ = link.queue.static_pad("src").unwrap().unlink(&link.bin_pad);
+        link.tee.release_request_pad(&link.tee_pad);
+        branch.bin.release_request_pad(&link.bin_pad);
+        let _ = pipeline.remove(&link.queue);
+    }
+    let _ = pipeline.remove(&branch.bin);
+}
+
+fn force_key_unit(tee: &gst::Element) {
+    let event = gst_video::UpstreamForceKeyUnitEvent::builder()
+        .all_headers(true)
+        .build();
+    if let Some(sink) = tee.static_pad("sink") {
+        let _ = sink.send_event(event);
+    }
 }
 
 fn create_offer(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
