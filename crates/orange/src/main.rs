@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gst::prelude::*;
 use gstreamer as gst;
+use gstreamer_video::prelude::VideoOverlayExtManual;
 use pipeline::{CaptureSettings, Codec};
 use std::time::{Duration, Instant};
 
@@ -88,6 +89,30 @@ enum Command {
         /// Write to a file instead of rendering. For headless verification.
         #[arg(long)]
         out: Option<String>,
+    },
+    /// Open the viewer window with a synthetic stream. Design harness.
+    ///
+    /// Same window, same overlay, same sink as `watch`, but with no capture,
+    /// no encode and no network - so the controls can be iterated on in
+    /// seconds rather than by waiting out a full loopback.
+    Preview {
+        /// Stream resolution to design against, e.g. 3840x2160. This is the
+        /// overlay's coordinate space, so the bar's proportions follow it.
+        #[arg(long, default_value = "1920x1080")]
+        size: String,
+        /// The viewer window's size on screen.
+        #[arg(long, default_value = "1280x720")]
+        window: String,
+        /// videotestsrc pattern: smpte, ball, snow, black, white, gradient.
+        #[arg(long, default_value = "smpte")]
+        pattern: String,
+        /// Use a still image as the backdrop instead, so the controls can be
+        /// judged over real content rather than colour bars.
+        #[arg(long)]
+        image: Option<String>,
+        /// Hold the controls open instead of fading them after three seconds.
+        #[arg(long)]
+        pin: bool,
     },
 }
 
@@ -218,6 +243,121 @@ fn main() -> Result<()> {
             };
             runtime()?.block_on(peer::run_watch(&code, &server, output))
         }
+        Command::Preview {
+            size,
+            window: window_size,
+            pattern,
+            image,
+            pin,
+        } => {
+            let (vw, vh) = parse_scale(&size)?;
+            let (ww, wh) = parse_scale(&window_size)?;
+
+            let overlay = std::sync::Arc::new(std::sync::Mutex::new(
+                overlay::OverlayState::default(),
+            ));
+            if pin {
+                overlay.lock().unwrap().pinned = true;
+            }
+
+            let win = window::spawn("orange - preview", ww as i32, wh as i32, overlay.clone())?;
+            println!("Preview: {vw}x{vh} video in a {ww}x{wh} window.");
+            println!(
+                "Move the mouse to wake the controls{}. Esc or the X closes.",
+                if pin { " (pinned open)" } else { "" }
+            );
+
+            let pipeline =
+                build_preview_pipeline((vw, vh), &pattern, image.as_deref(), win.hwnd, &overlay)?;
+            run_until_closed(&pipeline, win.hwnd)
+        }
+    }
+}
+
+/// A stand-in for the decoded stream, feeding the real overlay and sink.
+///
+/// The tail of this pipeline is deliberately identical to the one
+/// `webrtc::build_receive_branch` assembles, so the harness cannot flatter the
+/// design in ways the real viewer will not reproduce.
+fn build_preview_pipeline(
+    size: (u32, u32),
+    pattern: &str,
+    image: Option<&str>,
+    hwnd: isize,
+    overlay: &overlay::SharedOverlay,
+) -> Result<gst::Pipeline> {
+    let (w, h) = size;
+
+    let source = match image {
+        // GStreamer's parser treats backslashes as escapes, so a Windows path
+        // arrives mangled. Forward slashes survive and Windows accepts them.
+        Some(path) => format!(
+            "filesrc location=\"{}\" ! decodebin ! imagefreeze",
+            path.replace('\\', "/")
+        ),
+        None => format!("videotestsrc pattern={pattern}"),
+    };
+    let description = format!(
+        "{source} ! videoconvert ! videoscale \
+         ! video/x-raw,width={w},height={h},framerate=60/1,pixel-aspect-ratio=1/1 \
+         ! d3d11upload"
+    );
+
+    let pipeline = gst::Pipeline::new();
+    let source = gst::parse::bin_from_description(&description, true)
+        .context("failed to build the preview source")?;
+
+    let composition = gst::ElementFactory::make("overlaycomposition")
+        .build()
+        .context("overlaycomposition missing")?;
+    overlay::attach(&composition, overlay);
+
+    let sink = gst::ElementFactory::make("d3d11videosink")
+        // Unlike the real viewer, sync to the clock: there is no live source
+        // to pace this pipeline, and without it the sink spins a core.
+        .property("sync", true)
+        .property("force-aspect-ratio", true)
+        .build()?;
+    let overlay_iface = sink
+        .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
+        .context("d3d11videosink does not implement GstVideoOverlay")?;
+    // SAFETY: `hwnd` is our own window, alive for as long as this runs.
+    unsafe { overlay_iface.set_window_handle(hwnd as usize) };
+
+    pipeline.add_many([source.upcast_ref(), &composition, &sink])?;
+    gst::Element::link_many([source.upcast_ref(), &composition, &sink])?;
+    Ok(pipeline)
+}
+
+/// Run until the viewer window goes away, rather than for a fixed duration.
+fn run_until_closed(pipeline: &gst::Pipeline, hwnd: isize) -> Result<()> {
+    pipeline.set_state(gst::State::Playing)?;
+
+    let bus = pipeline.bus().expect("pipeline without bus");
+    let mut error = None;
+
+    while window::is_alive(hwnd) {
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
+            continue;
+        };
+        match msg.view() {
+            gst::MessageView::Error(err) => {
+                error = Some(anyhow::anyhow!(
+                    "{} ({})",
+                    err.error(),
+                    err.debug().unwrap_or_default()
+                ));
+                break;
+            }
+            gst::MessageView::Eos(_) => break,
+            _ => {}
+        }
+    }
+
+    pipeline.set_state(gst::State::Null)?;
+    match error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 

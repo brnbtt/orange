@@ -239,28 +239,7 @@ pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Ou
             let composition = gst::ElementFactory::make("overlaycomposition")
                 .build()
                 .context("overlaycomposition missing")?;
-
-            // Learn the video size; it is the coordinate space the overlay and
-            // all hit testing work in.
-            let state = overlay.clone();
-            composition.connect("caps-changed", false, move |values| {
-                if let Ok(caps) = values[1].get::<gst::Caps>() {
-                    if let Some(s) = caps.structure(0) {
-                        let w = s.get::<i32>("width").unwrap_or(0);
-                        let h = s.get::<i32>("height").unwrap_or(0);
-                        if let Ok(mut state) = state.lock() {
-                            state.video = (w.max(0) as u32, h.max(0) as u32);
-                        }
-                    }
-                }
-                None
-            });
-
-            let state = overlay.clone();
-            composition.connect("draw", false, move |values| {
-                let mut state = state.lock().ok()?;
-                crate::overlay::render(&mut state).map(|c| c.to_value())
-            });
+            crate::overlay::attach(&composition, &overlay);
 
             let sink = gst::ElementFactory::make("d3d11videosink")
                 .property("sync", false)

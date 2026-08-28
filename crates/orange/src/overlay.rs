@@ -9,6 +9,7 @@
 //! The bar is rasterised with `tiny-skia` only when something changes - hover,
 //! volume, visibility - not per frame, so the cost is negligible.
 
+use gst::prelude::{ObjectExt, ToValue};
 use gstreamer as gst;
 use gstreamer_video as gst_video;
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,10 @@ pub struct OverlayState {
     /// Cached rasterisation, invalidated when any of the above changes.
     cache: Option<(u64, gst_video::VideoOverlayComposition)>,
     pub close_requested: bool,
+    /// Hold the bar open instead of hiding it after `HIDE_AFTER`. Only the
+    /// design harness sets this; chasing a fading bar with the mouse makes
+    /// layout work impossible.
+    pub pinned: bool,
 }
 
 impl Default for OverlayState {
@@ -73,6 +78,7 @@ impl Default for OverlayState {
             hits: Vec::new(),
             cache: None,
             close_requested: false,
+            pinned: false,
         }
     }
 }
@@ -81,11 +87,14 @@ pub type SharedOverlay = Arc<Mutex<OverlayState>>;
 
 impl OverlayState {
     fn visible(&self) -> bool {
-        self.shown_at.elapsed() < HIDE_AFTER
+        self.pinned || self.shown_at.elapsed() < HIDE_AFTER
     }
 
     /// Fade factor, so the bar dissolves rather than vanishing.
     fn opacity(&self) -> f32 {
+        if self.pinned {
+            return 1.0;
+        }
         let elapsed = self.shown_at.elapsed();
         if elapsed >= HIDE_AFTER {
             return 0.0;
@@ -273,6 +282,34 @@ fn draw_close(pixmap: &mut Pixmap, x: f32, y: f32, alpha: f32) {
     }
 }
 
+/// Bind an `overlaycomposition` element to shared overlay state.
+///
+/// Both the real viewer and the design harness call this, so what you see
+/// while iterating on the layout is what a viewer actually gets.
+pub fn attach(composition: &gst::Element, overlay: &SharedOverlay) {
+    // Learn the video size; it is the coordinate space the overlay and all
+    // hit testing work in.
+    let state = overlay.clone();
+    composition.connect("caps-changed", false, move |values| {
+        if let Ok(caps) = values[1].get::<gst::Caps>() {
+            if let Some(s) = caps.structure(0) {
+                let w = s.get::<i32>("width").unwrap_or(0);
+                let h = s.get::<i32>("height").unwrap_or(0);
+                if let Ok(mut state) = state.lock() {
+                    state.video = (w.max(0) as u32, h.max(0) as u32);
+                }
+            }
+        }
+        None
+    });
+
+    let state = overlay.clone();
+    composition.connect("draw", false, move |_values| {
+        let mut state = state.lock().ok()?;
+        render(&mut state).map(|c| c.to_value())
+    });
+}
+
 /// Rasterise the control bar and wrap it as an overlay composition.
 ///
 /// Returns `None` when the bar is hidden, which tells the sink there is
@@ -400,21 +437,29 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
 
 /// Wrap the rasterised pixels as something the sink can composite.
 ///
-/// tiny-skia produces premultiplied RGBA; GStreamer wants that flagged
-/// explicitly or the edges of anti-aliased shapes come out wrong.
+/// Two conversions matter here. tiny-skia produces premultiplied alpha, which
+/// GStreamer wants flagged explicitly or anti-aliased edges come out wrong.
+/// And it lays pixels out as RGBA, whereas an overlay composition on a
+/// little-endian machine must be BGRA - `GST_VIDEO_OVERLAY_COMPOSITION_FORMAT_RGB`
+/// is an alias for it. Getting that wrong makes `new_raw` return NULL, which
+/// aborts the process from inside a C callback with no usable message.
 fn to_composition(
     pixmap: Pixmap,
     width: u32,
     height: u32,
 ) -> Option<gst_video::VideoOverlayComposition> {
-    let data = pixmap.take();
+    let mut data = pixmap.take();
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
     let mut buffer = gst::Buffer::from_mut_slice(data);
     {
         let buffer = buffer.get_mut()?;
         gst_video::VideoMeta::add(
             buffer,
             gst_video::VideoFrameFlags::empty(),
-            gst_video::VideoFormat::Rgba,
+            gst_video::VideoFormat::Bgra,
             width,
             height,
         )
