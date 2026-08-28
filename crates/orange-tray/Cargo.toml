@@ -9,6 +9,9 @@ description = "Host-side tray UI for orange"
 name = "orange-tray"
 path = "src/main.rs"
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 anyhow.workspace = true
 gpui = "0.2"

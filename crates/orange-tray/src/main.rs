@@ -771,6 +771,16 @@ fn main() {
             .unwrap();
         cx.activate(true);
 
+        // Closing the window hides it instead of quitting: a tray app should
+        // keep streaming when its window is dismissed. Quit lives in the tray
+        // menu.
+        let _ = window.update(cx, |_, window, cx| {
+            window.on_window_should_close(cx, |window, _cx| {
+                window.minimize_window();
+                false
+            });
+        });
+
         // The tray runs its own Win32 message loop on another thread, so its
         // events arrive over a channel and are drained on a timer here.
         if let Some(events) = tray_events {
