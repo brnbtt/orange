@@ -59,6 +59,8 @@ pub struct CaptureSettings {
     pub fps: u32,
     /// Downscale on the GPU. `None` keeps the window's native size.
     pub scale: Option<(u32, u32)>,
+    /// Capture audio from this process only. `None` disables audio.
+    pub audio_pid: Option<u32>,
 }
 
 impl Default for CaptureSettings {
@@ -69,8 +71,45 @@ impl Default for CaptureSettings {
             bitrate: 30_000,
             fps: 60,
             scale: None,
+            audio_pid: None,
         }
     }
+}
+
+/// Audio capture, scoped to one process.
+///
+/// `loopback-target-pid` with `include-process-tree` records only the game and
+/// its children, so voice chat, music and notification sounds never reach the
+/// stream. Capturing the whole output device would pick all of that up.
+///
+/// Opus at 128 kbps stereo is transparent enough for games and is a rounding
+/// error next to the video bitrate.
+pub fn build_audio_chain(pid: u32) -> String {
+    format!(
+        "wasapi2src loopback=true loopback-mode=include-process-tree \
+         loopback-target-pid={pid} loopback-silence-on-device-mute=true \
+         low-latency=true \
+         ! queue max-size-buffers=10 leaky=downstream \
+         ! audioconvert ! audioresample \
+         ! opusenc bitrate=128000 frame-size=10 \
+         ! rtpopuspay"
+    )
+}
+
+/// Verify the audio elements exist before trying to build the chain.
+pub fn check_audio_elements() -> Result<()> {
+    let required = ["wasapi2src", "audioconvert", "opusenc", "rtpopuspay"];
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|name| gst::ElementFactory::find(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "missing audio elements: {}",
+            missing.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Verify the elements we depend on are actually present, and say precisely

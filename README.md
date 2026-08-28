@@ -13,10 +13,31 @@ Milestone 1 of 6. Capture and encode work; there is no networking yet.
 | 2 | WebRTC transport, no transcode | **done** (loopback) |
 | 3 | Signalling relay, host/watch as separate processes | **done** (one machine) |
 | 4 | Multiple simultaneous viewers, single encode | **done** |
-| 5 | Two machines across the internet | next |
-| 6 | Viewer window: borderless + rounded, video embedded | **in progress** |
-| 7 | Game audio (`wasapi2src` + `opusenc`) | |
-| 8 | Installer, tray, autostart | |
+| 5 | Relay deployed to Azure | **done** |
+| 6 | Viewer window: borderless + rounded, video embedded | **done** |
+| 7 | Per-process game audio | **done** |
+| 8 | Overlay controls on the video | next |
+| 9 | Host tray UI (window picker, quality, share code) | |
+| 10 | Two machines across the internet | |
+| 11 | Installer, autostart | |
+
+## Audio is scoped to the game
+
+`wasapi2src` can record a single process tree rather than the whole output
+device:
+
+```
+wasapi2src loopback=true loopback-mode=include-process-tree loopback-target-pid=<game>
+```
+
+**Your voice chat, music and notification sounds never enter the stream.** The
+PID comes from the captured window automatically, so there is nothing to
+configure. Opus at 128 kbps stereo is transparent for games and a rounding
+error next to the video bitrate.
+
+Pass `--no-audio` to disable it. Audio failing never blocks the stream — if the
+process makes no sound or capture fails, video continues and the reason is
+logged.
 
 ## Measured, not assumed
 

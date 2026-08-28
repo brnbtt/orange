@@ -21,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Debug, Clone)]
 pub struct CaptureTarget {
     pub hwnd: isize,
+    pub pid: u32,
     pub title: String,
     pub process: String,
     pub width: i32,
@@ -44,9 +45,24 @@ unsafe fn window_title(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..read as usize])
 }
 
-unsafe fn process_name(hwnd: HWND) -> String {
+unsafe fn pid_of(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    pid
+}
+
+/// The process that owns a window, so audio capture can be scoped to just it.
+///
+/// This is what keeps Discord voice, music and notification sounds out of the
+/// stream: `wasapi2src` can record a single process tree rather than the whole
+/// output device.
+pub fn pid_for_hwnd(hwnd: isize) -> Option<u32> {
+    let pid = unsafe { pid_of(HWND(hwnd as *mut _)) };
+    (pid != 0).then_some(pid)
+}
+
+unsafe fn process_name(hwnd: HWND) -> String {
+    let pid = pid_of(hwnd);
     if pid == 0 {
         return String::new();
     }
@@ -100,6 +116,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
     let target = CaptureTarget {
         hwnd: hwnd.0 as isize,
+        pid: pid_of(hwnd),
         title: window_title(hwnd),
         process: process_name(hwnd),
         width: rect.right - rect.left,

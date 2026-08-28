@@ -15,9 +15,9 @@ use gstreamer_webrtc as gst_webrtc;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
+use crate::pipeline::{build_audio_chain, build_capture_chain, check_audio_elements, check_elements, CaptureSettings};
 use orange_signal::{connect, Signal};
-use crate::webrtc::{build_receive_branch, rtp_caps, Output};
+use crate::webrtc::{audio_rtp_caps, build_audio_branch, build_receive_branch, encoding_name, rtp_caps, Output};
 
 /// Public STUN lets peers discover their external address. Without it, two
 /// machines behind different routers will never find each other.
@@ -138,6 +138,23 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
 
     pipeline.add_many([capture.upcast_ref(), &pay, &caps_filter, &tee])?;
     gst::Element::link_many([capture.upcast_ref(), &pay, &caps_filter, &tee])?;
+
+    // Audio is optional: if the process makes no sound, or capture fails, the
+    // stream should still work rather than refusing to start.
+    let audio_tee = match settings.audio_pid {
+        Some(pid) => match build_audio_tee(&pipeline, pid) {
+            Ok(tee) => {
+                println!("[host] capturing audio from pid {pid}");
+                Some(tee)
+            }
+            Err(err) => {
+                eprintln!("[host] audio disabled: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+
     watch_bus(&pipeline, "host");
     pipeline.set_state(gst::State::Playing)?;
 
@@ -152,7 +169,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 println!("  Viewers run:  orange watch --code {code}\n");
             }
             Signal::ViewerJoined { peer } => {
-                match add_viewer(&pipeline, &tee, &peer, client.outgoing.clone()) {
+                match add_viewer(&pipeline, &tee, audio_tee.as_ref(), &peer, client.outgoing.clone()) {
                     Ok(bin) => {
                         viewers.insert(peer.clone(), bin);
                         println!("[host] viewer {peer} joined ({} total)", viewers.len());
@@ -195,32 +212,73 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
 }
 
 /// Attach a new viewer branch to the running pipeline and start negotiating.
-fn add_viewer(
+/// Build the audio capture chain and return its tee, so each viewer can take
+/// a branch from it.
+fn build_audio_tee(pipeline: &gst::Pipeline, pid: u32) -> Result<gst::Element> {
+    check_audio_elements()?;
+
+    let chain = gst::parse::bin_from_description(&build_audio_chain(pid), true)
+        .context("failed to build audio chain")?;
+    let caps_filter = gst::ElementFactory::make("capsfilter")
+        .property("caps", audio_rtp_caps())
+        .build()?;
+    let tee = gst::ElementFactory::make("tee")
+        .property("allow-not-linked", true)
+        .build()?;
+
+    pipeline.add_many([chain.upcast_ref(), &caps_filter, &tee])?;
+    gst::Element::link_many([chain.upcast_ref(), &caps_filter, &tee])?;
+    Ok(tee)
+}
+
+/// Take a branch off a tee, through its own queue, into a viewer's webrtcbin.
+///
+/// The queue matters: without one per branch, a slow viewer would stall the
+/// tee and with it every other viewer and the encoder itself.
+fn link_tee_branch(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
-    peer: &str,
-    out: mpsc::UnboundedSender<Signal>,
-) -> Result<gst::Element> {
-    // A queue per branch so one slow viewer cannot stall the others or the
-    // encoder. Leaky because dropping frames beats blocking the whole tee.
+    bin: &gst::Element,
+    max_buffers: u32,
+) -> Result<()> {
     let queue = gst::ElementFactory::make("queue")
-        .property("max-size-buffers", 200u32)
+        .property("max-size-buffers", max_buffers)
         .property_from_str("leaky", "downstream")
         .build()?;
-    let bin = make_webrtcbin(&format!("viewer-{peer}"))?;
+    pipeline.add(&queue)?;
 
-    pipeline.add_many([&queue, &bin])?;
-    queue.link(&bin)?;
+    let sink_pad = bin
+        .request_pad_simple("sink_%u")
+        .context("webrtcbin refused a sink pad")?;
+    queue.static_pad("src").unwrap().link(&sink_pad)?;
 
     let tee_pad = tee
         .request_pad_simple("src_%u")
         .context("tee refused a source pad")?;
     tee_pad.link(&queue.static_pad("sink").unwrap())?;
 
+    queue.sync_state_with_parent()?;
+    Ok(())
+}
+
+fn add_viewer(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    audio_tee: Option<&gst::Element>,
+    peer: &str,
+    out: mpsc::UnboundedSender<Signal>,
+) -> Result<gst::Element> {
+    let bin = make_webrtcbin(&format!("viewer-{peer}"))?;
+    pipeline.add(&bin)?;
+
+    link_tee_branch(pipeline, tee, &bin, 200)?;
+    if let Some(audio_tee) = audio_tee {
+        link_tee_branch(pipeline, audio_tee, &bin, 50)?;
+    }
+
     watch_connection(&bin, format!("host->{peer}"));
     forward_ice(&bin, out.clone(), peer.to_string());
 
-    queue.sync_state_with_parent()?;
     bin.sync_state_with_parent()?;
 
     create_offer(&bin, out, peer.to_string());
@@ -270,19 +328,28 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     watch_connection(&bin, "watch".to_string());
     forward_ice(&bin, client.outgoing.clone(), String::new());
 
-    // The receive branch cannot be built until media arrives and we know the
-    // pad exists.
+    // Media arrives as separate pads: one for video, one for audio. Only the
+    // video pad consumes the output target.
     let pipeline_weak = pipeline.downgrade();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
     bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
-        let Some(output) = output.lock().unwrap().take() else {
-            return;
+        let kind = encoding_name(pad).unwrap_or_default();
+        let result = match kind.as_str() {
+            "OPUS" => build_audio_branch(&pipeline, pad),
+            "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
+                Some(output) => build_receive_branch(&pipeline, pad, output),
+                None => Ok(()),
+            },
+            other => {
+                eprintln!("[watch] ignoring unexpected stream '{other}'");
+                Ok(())
+            }
         };
-        if let Err(err) = build_receive_branch(&pipeline, pad, output) {
-            eprintln!("[watch] could not build receive branch: {err}");
+        if let Err(err) = result {
+            eprintln!("[watch] could not build {kind} branch: {err}");
         }
     });
 

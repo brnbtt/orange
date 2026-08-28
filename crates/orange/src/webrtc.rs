@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
 
-/// RTP caps for our encoded stream. AV1 has no static payload type, so we pick
+/// RTP caps for our encoded video. AV1 has no static payload type, so we pick
 /// one from the dynamic range and both ends agree on it.
 pub fn rtp_caps() -> gst::Caps {
     gst::Caps::builder("application/x-rtp")
@@ -30,6 +30,17 @@ pub fn rtp_caps() -> gst::Caps {
         .field("encoding-name", "AV1")
         .field("payload", 96i32)
         .field("clock-rate", 90_000i32)
+        .build()
+}
+
+/// RTP caps for Opus audio, on a separate payload type from the video.
+pub fn audio_rtp_caps() -> gst::Caps {
+    gst::Caps::builder("application/x-rtp")
+        .field("media", "audio")
+        .field("encoding-name", "OPUS")
+        .field("payload", 97i32)
+        .field("clock-rate", 48_000i32)
+        .field("encoding-params", "2")
         .build()
 }
 
@@ -203,6 +214,13 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
     crate::run_pipeline(&pipeline, seconds)
 }
 
+/// Which codec a newly-arrived pad carries, so the right branch is built.
+pub fn encoding_name(pad: &gst::Pad) -> Option<String> {
+    let caps = pad.current_caps().or_else(|| pad.allowed_caps())?;
+    let structure = caps.structure(0)?;
+    structure.get::<String>("encoding-name").ok()
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Output) -> Result<()> {
     let depay = gst::ElementFactory::make("rtpav1depay").build()?;
@@ -255,6 +273,38 @@ pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Ou
     }
 
     pad.link(&depay.static_pad("sink").unwrap())?;
-    println!("[webrtc] receiving stream");
+    println!("[webrtc] receiving video");
+    Ok(())
+}
+
+/// Attach the audio branch: depayload -> decode -> volume -> speakers.
+///
+/// The `volume` element is named so the viewer UI can find it later and drive
+/// it from an overlay control.
+pub fn build_audio_branch(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()> {
+    let depay = gst::ElementFactory::make("rtpopusdepay").build()?;
+    let dec = gst::ElementFactory::make("opusdec").build()?;
+    let convert = gst::ElementFactory::make("audioconvert").build()?;
+    let resample = gst::ElementFactory::make("audioresample").build()?;
+    let volume = gst::ElementFactory::make("volume")
+        .name("viewer-volume")
+        .property("volume", 1.0f64)
+        .build()?;
+    let sink = gst::ElementFactory::make("wasapi2sink")
+        .property("low-latency", true)
+        .build()
+        .or_else(|_| gst::ElementFactory::make("autoaudiosink").build())?;
+
+    let all = [depay.clone(), dec, convert, resample, volume, sink];
+    for e in &all {
+        pipeline.add(e)?;
+    }
+    gst::Element::link_many(all.iter().collect::<Vec<_>>().as_slice())?;
+    for e in &all {
+        e.sync_state_with_parent()?;
+    }
+
+    pad.link(&depay.static_pad("sink").unwrap())?;
+    println!("[webrtc] receiving audio");
     Ok(())
 }

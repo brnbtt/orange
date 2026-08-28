@@ -80,6 +80,9 @@ enum Command {
 
 #[derive(clap::Args)]
 struct QualityArgs {
+    /// Disable audio capture.
+    #[arg(long)]
+    no_audio: bool,
     #[arg(long, default_value = "av1")]
     codec: String,
     /// Kilobits per second.
@@ -100,6 +103,9 @@ impl QualityArgs {
             bitrate: self.bitrate,
             fps: self.fps,
             scale: self.scale.as_deref().map(parse_scale).transpose()?,
+            // Scope audio to the captured window's process, so voice chat and
+            // music stay out of the stream.
+            audio_pid: if self.no_audio { None } else { targets::pid_for_hwnd(hwnd) },
         })
     }
 }
