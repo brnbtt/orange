@@ -12,7 +12,6 @@ pub struct Session {
     pub name: String,
     #[allow(dead_code)]
     pub id: String,
-    #[allow(dead_code)]
     pub avatar_url: Option<String>,
 }
 

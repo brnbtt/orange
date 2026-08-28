@@ -16,6 +16,7 @@ embed-resource = "3"
 anyhow.workspace = true
 gpui = "0.2"
 image = "0.25"
+reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
 

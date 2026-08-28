@@ -55,6 +55,9 @@ struct Orange {
     thumbnails: std::collections::HashMap<i64, std::sync::Arc<gpui::RenderImage>>,
     /// Results arriving from the capture thread.
     thumb_rx: Option<std::sync::mpsc::Receiver<(i64, capture::Thumbnail)>>,
+    /// Discord avatar decoded off the UI thread.
+    avatar: Option<std::sync::Arc<gpui::RenderImage>>,
+    avatar_rx: Option<std::sync::mpsc::Receiver<capture::Thumbnail>>,
     quality: usize,
     stream: Option<Supervisor>,
     logging_in: Option<LoginAttempt>,
@@ -80,6 +83,7 @@ impl Orange {
         .detach();
 
         let session = session::load();
+        let avatar_rx = request_avatar(session.as_ref().and_then(|s| s.avatar_url.clone()));
         Self {
             screen: if session.is_some() {
                 Screen::Home
@@ -90,6 +94,8 @@ impl Orange {
             windows: Vec::new(),
             thumbnails: std::collections::HashMap::new(),
             thumb_rx: None,
+            avatar: None,
+            avatar_rx,
             quality: 1,
             stream: None,
             logging_in: None,
@@ -102,11 +108,23 @@ impl Orange {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         self.drain_thumbnails();
+        if let Some(rx) = &self.avatar_rx {
+            match rx.try_recv() {
+                Ok(pixels) => {
+                    self.avatar = capture::to_image(pixels);
+                    self.avatar_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.avatar_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
 
         // Login happens in a child process; notice when it lands, and when it
         // dies without producing a session.
         if self.logging_in.is_some() {
             if let Some(session) = session::load() {
+                self.avatar = None;
+                self.avatar_rx = request_avatar(session.avatar_url.clone());
                 self.session = Some(session);
                 self.logging_in = None;
                 self.screen = Screen::Home;
@@ -284,8 +302,81 @@ impl Orange {
 
 // --- shared pieces ----------------------------------------------------------
 
+fn request_avatar(url: Option<String>) -> Option<std::sync::mpsc::Receiver<capture::Thumbnail>> {
+    let url = url?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let pixels = (|| {
+            let bytes = reqwest::blocking::Client::builder()
+                .user_agent("orange/0.1")
+                .build()
+                .ok()?
+                .get(url)
+                .send()
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .bytes()
+                .ok()?;
+            let image = image::load_from_memory(&bytes).ok()?.into_rgba8();
+            let mut raw =
+                image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Lanczos3)
+                    .into_raw();
+            // GPUI's image renderer expects BGRA.
+            for pixel in raw.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            Some((64, 64, raw))
+        })();
+        if let Some(pixels) = pixels {
+            let _ = tx.send(pixels);
+        }
+    });
+    Some(rx)
+}
+
 fn label(text: impl Into<SharedString>, color: u32) -> gpui::Div {
     div().text_color(rgb(color)).child(text.into())
+}
+
+fn avatar(image: Option<std::sync::Arc<gpui::RenderImage>>, name: &str, size: f32) -> gpui::Div {
+    let initial = name
+        .chars()
+        .next()
+        .map(|ch| ch.to_uppercase().collect::<String>())
+        .unwrap_or_else(|| "?".into());
+    div()
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        .rounded_full()
+        .overflow_hidden()
+        .bg(rgb(SURFACE_HOVER))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .child(
+            label(initial, TEXT)
+                .font_family("Bahnschrift")
+                .text_size(px(size * 0.42))
+                .font_weight(FontWeight::SEMIBOLD),
+        )
+        .children(image.map(|image| {
+            gpui::img(image)
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(size))
+                .h(px(size))
+                .with_animation(
+                    SharedString::from("avatar-in"),
+                    Animation::new(Duration::from_millis(180)),
+                    |element, delta| element.opacity(delta),
+                )
+        }))
 }
 
 /// Technical microcopy from the identity board: compact, monospaced and used
@@ -380,31 +471,59 @@ fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui
 /// The mark: a scanline eclipse crescent, from the logo exploration.
 ///
 /// Embedded as a PNG rather than drawn, because the scanline texture cannot be
-/// expressed with GPUI primitives without hundreds of elements. Decoded once
-/// and cached.
+/// expressed with GPUI primitives without hundreds of elements. Hero-sized
+/// instances receive a subtle traveling light through the rays; titlebar-sized
+/// instances stay static because animation at 18px would only read as flicker.
 fn logo(px_size: f32) -> impl IntoElement {
-    static LOGO: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
+    static STATIC: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
+        std::sync::OnceLock::new();
+    static ANIMATED: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
         std::sync::OnceLock::new();
 
-    let image = LOGO
+    let animated = px_size >= 48.0;
+    let image = (if animated { &ANIMATED } else { &STATIC })
         .get_or_init(|| {
             let bytes = include_bytes!("../logo.png");
-            let decoded = image::load_from_memory(bytes).ok()?.into_rgba8();
-            // GPUI wants BGRA; the PNG decodes as RGBA, so swap the channels.
-            let mut raw = decoded.into_raw();
-            for px in raw.chunks_exact_mut(4) {
-                px.swap(0, 2);
+            let base = image::load_from_memory(bytes).ok()?.into_rgba8().into_raw();
+            let frame_count = if animated { 18 } else { 1 };
+            let mut frames = Vec::with_capacity(frame_count);
+            for frame_index in 0..frame_count {
+                let mut raw = base.clone();
+                if animated {
+                    let phase = frame_index as f32 / frame_count as f32 * std::f32::consts::TAU;
+                    for (index, pixel) in raw.chunks_exact_mut(4).enumerate() {
+                        if pixel[3] == 0 {
+                            continue;
+                        }
+                        let x = (index % 128) as f32;
+                        let y = (index / 128) as f32;
+                        let wave = ((x * 0.115 - y * 0.018 - phase).sin() + 1.0) * 0.5;
+                        let intensity = 0.58 + 0.42 * wave * wave;
+                        pixel[3] = (pixel[3] as f32 * intensity).round() as u8;
+                    }
+                }
+                // GPUI wants BGRA; the PNG decodes as RGBA.
+                for pixel in raw.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                let buffer = image::RgbaImage::from_raw(128, 128, raw)?;
+                frames.push(if animated {
+                    image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(55, 1))
+                } else {
+                    image::Frame::new(buffer)
+                });
             }
-            let (w, h) = (128, 128);
-            let buffer = image::RgbaImage::from_raw(w, h, raw)?;
-            Some(std::sync::Arc::new(gpui::RenderImage::new(vec![
-                image::Frame::new(buffer),
-            ])))
+            Some(std::sync::Arc::new(gpui::RenderImage::new(frames)))
         })
         .clone();
 
     match image {
         Some(image) => gpui::img(image)
+            .id(if animated {
+                "logo-animated"
+            } else {
+                "logo-static"
+            })
             .w(px(px_size))
             .h(px(px_size))
             .into_any_element(),
@@ -549,10 +668,10 @@ impl Orange {
     /// left out of those regions, or the hit test would swallow their clicks.
     fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let breadcrumb = match self.screen {
-            Screen::PickWindow => Some("/ SOURCE"),
-            Screen::Streaming => Some("/ UPLINK"),
-            Screen::Watching => Some("/ DOWNLINK"),
-            Screen::Settings => Some("/ SYSTEM"),
+            Screen::PickWindow => Some("/ SHARE"),
+            Screen::Streaming => Some("/ STREAMING"),
+            Screen::Watching => Some("/ WATCHING"),
+            Screen::Settings => Some("/ SETTINGS"),
             _ => None,
         };
 
@@ -664,7 +783,7 @@ impl Orange {
                     .gap_1p5()
                     .items_center()
                     .child(
-                        label("DIRECT WINDOW LINK", TEXT)
+                        label("Share games directly with friends", TEXT)
                             .font_family("Bahnschrift")
                             .text_xl()
                             .font_weight(FontWeight::SEMIBOLD),
@@ -717,11 +836,12 @@ impl Orange {
     }
 
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let agent = self
+        let user_name = self
             .session
             .as_ref()
             .map(|session| session.name.clone())
-            .unwrap_or_else(|| "ANONYMOUS".into());
+            .unwrap_or_else(|| "Anonymous".into());
+        let avatar_image = self.avatar.clone();
 
         div()
             .flex()
@@ -733,9 +853,9 @@ impl Orange {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(micro("ORANGE / DIRECT LINK", MUTED))
+                    .child(micro("READY", GREEN))
                     .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
-                    .child(micro("01", ORANGE)),
+                    .child(micro("PEER-TO-PEER", MUTED)),
             )
             .child(
                 div()
@@ -749,7 +869,7 @@ impl Orange {
                     .child(wordmark(23.0))
                     .child(accent_rule(28.0))
                     .child(
-                        label("HIGH-FIDELITY STREAMING", MUTED)
+                        label("Share a game window directly with friends", MUTED)
                             .font_family("Cascadia Mono")
                             .text_size(px(10.0)),
                     ),
@@ -782,14 +902,27 @@ impl Orange {
                     .pt_3()
                     .border_t_1()
                     .border_color(rgb(BORDER))
-                    .child(micro(
-                        format!("AGENT / {}", agent.to_ascii_uppercase()),
-                        FAINT,
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(avatar(avatar_image, &user_name, 26.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(micro("SIGNED IN AS", FAINT))
+                                    .child(label(user_name, TEXT).text_xs()),
+                            ),
+                    )
                     .child(
                         quiet("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
                             session::clear();
                             this.session = None;
+                            this.avatar = None;
+                            this.avatar_rx = None;
                             this.screen = Screen::SignedOut;
                             cx.notify();
                         })),
@@ -822,7 +955,7 @@ impl Orange {
                             .flex()
                             .flex_col()
                             .gap_0p5()
-                            .child(micro("SOURCE SELECT / 01", ORANGE))
+                            .child(micro(format!("{} SHARE OPTIONS", count), ORANGE))
                             .child(
                                 label("Choose what to share", TEXT)
                                     .font_family("Bahnschrift")
@@ -1049,7 +1182,7 @@ impl Orange {
             .gap_3()
             .flex_1()
             .min_h(px(0.0))
-            .child(micro("UPLINK / SESSION ACTIVE", ORANGE))
+            .child(micro("YOUR STREAM IS LIVE", GREEN))
             .child(
                 div()
                     .flex()
@@ -1158,7 +1291,7 @@ impl Orange {
             .flex_col()
             .gap_3()
             .flex_1()
-            .child(micro("DOWNLINK / REMOTE FEED", ORANGE))
+            .child(micro("STREAM OPEN IN VIEWER", GREEN))
             .child(
                 div()
                     .flex()
@@ -1187,37 +1320,49 @@ impl Orange {
 
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let signed_in = self.session.as_ref().map(|s| s.name.clone());
+        let identity = match &signed_in {
+            Some(name) => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(avatar(self.avatar.clone(), name, 32.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(label("Discord", TEXT))
+                        .child(label(name.clone(), FAINT).text_xs()),
+                )
+                .into_any_element(),
+            None => div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(label("Discord", TEXT))
+                .child(label("Not signed in", FAINT).text_xs())
+                .into_any_element(),
+        };
 
         div()
             .flex()
             .flex_col()
             .gap_3()
             .flex_1()
-            .child(micro("SYSTEM / CONNECTION", ORANGE))
+            .child(micro("ACCOUNT AND RELAY", ORANGE))
             .child(
                 card()
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(label("Discord", TEXT))
-                            .child(
-                                label(
-                                    signed_in.clone().unwrap_or_else(|| "Not signed in".into()),
-                                    FAINT,
-                                )
-                                .text_xs(),
-                            ),
-                    )
+                    .child(identity)
                     .child(match signed_in {
                         Some(_) => quiet("so", "Sign out")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 session::clear();
                                 this.session = None;
+                                this.avatar = None;
+                                this.avatar_rx = None;
                                 cx.notify();
                             }))
                             .into_any_element(),
