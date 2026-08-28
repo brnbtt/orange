@@ -1,0 +1,5 @@
+target/
+.git/
+*.mkv
+*.mp4
+*.png

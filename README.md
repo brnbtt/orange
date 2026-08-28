@@ -12,10 +12,11 @@ Milestone 1 of 6. Capture and encode work; there is no networking yet.
 | 1 | Window enumeration, GPU capture, hardware encode | **done** |
 | 2 | WebRTC transport, no transcode | **done** (loopback) |
 | 3 | Signalling relay, host/watch as separate processes | **done** (one machine) |
-| 4 | Two machines across the internet | next |
-| 5 | Viewer window: borderless, rounded, overlay controls | |
-| 6 | Game audio (`wasapi2src` + `opusenc`) | |
-| 7 | Installer, tray, autostart | |
+| 4 | Multiple simultaneous viewers, single encode | **done** |
+| 5 | Two machines across the internet | next |
+| 6 | Viewer window: borderless, rounded, overlay controls | |
+| 7 | Game audio (`wasapi2src` + `opusenc`) | |
+| 8 | Installer, tray, autostart | |
 
 ## Measured, not assumed
 
@@ -107,10 +108,42 @@ Point both ends at the same relay with `--server ws://host:9000`.
 
 ### The relay carries no video
 
-It knows nothing about media. It matches two peers by room code and forwards a
-few kilobytes of SDP and ICE, then gets out of the way — video goes directly
-peer to peer. That is what keeps hosting costs near zero, and why a tiny VM is
-enough regardless of how many people are watching.
+It knows nothing about media. It matches peers by room code and forwards a few
+kilobytes of SDP and ICE, then gets out of the way — video goes directly peer
+to peer. That is what keeps hosting costs near zero.
+
+### How many viewers?
+
+The relay is not the limit. It handles thousands of concurrent connections on
+the cheapest tier, because a whole session costs it perhaps 10-20 KB of
+handshake plus an idle socket.
+
+**The limit is the host's upload bandwidth.** The window is captured and encoded
+*once* — a `tee` fans the encoded stream out — so GPU and CPU cost stay flat no
+matter how many people watch. Bandwidth does not:
+
+| Bitrate | 2 viewers | 4 viewers | 8 viewers |
+| --- | --- | --- | --- |
+| 25 Mbps (1440p60, excellent) | 50 Mbps | 100 Mbps | 200 Mbps |
+| 8 Mbps (1080p60, good) | 16 Mbps | 32 Mbps | 64 Mbps |
+| 4 Mbps (720p60, fine) | 8 Mbps | 16 Mbps | 32 Mbps |
+
+On 100 Mbps upload that is roughly **4 viewers at 25 Mbps, or a dozen at 8
+Mbps**. Lower the bitrate as the audience grows; the tray UI should make that
+tradeoff visible rather than hiding it.
+
+Beyond that, an SFU would be needed — the host uploads once and a server fans
+out — but that server *does* carry video, at roughly 9 GB per hour per viewer
+in egress. That is a completely different cost structure and not worth it for a
+group of friends.
+
+### One replica, on purpose
+
+Rooms live in memory, so the deployment pins `min-replicas = max-replicas = 1`.
+Two replicas behind one ingress could put a host and viewer on different
+instances, and they would never find each other. Scaling horizontally would
+need shared state (Redis or similar) — unnecessary at this size, but it is why
+the relay is a single point of failure.
 
 **The room code is the only credential.** Anyone you give it to can watch, and
 can pass it on. That is the deliberate cost of "no accounts, no logins".
@@ -118,6 +151,19 @@ can pass it on. That is the deliberate cost of "no accounts, no logins".
 Public STUN (`stun.l.google.com:19302`) is used for address discovery. Peers
 that cannot hole-punch will need a TURN server, which *does* relay video and
 therefore costs real bandwidth.
+
+## Deploying the relay
+
+```powershell
+az login
+.\deploy\azure.ps1
+#   wss://orange-relay.<region>.azurecontainerapps.io
+```
+
+Azure Container Apps terminates TLS and provides an HTTPS hostname, so clients
+get `wss://` with no certificate work. The relay crate deliberately has no
+GStreamer dependency — three direct dependencies total — so the container stays
+small.
 
 ## Gotchas found the hard way
 

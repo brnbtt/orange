@@ -1,0 +1,15 @@
+[package]
+name = "orange-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Signalling relay for orange. Carries handshakes, never video."
+
+[[bin]]
+name = "orange-relay"
+path = "src/main.rs"
+
+[dependencies]
+orange-signal = { path = "../orange-signal" }
+anyhow.workspace = true
+tokio.workspace = true

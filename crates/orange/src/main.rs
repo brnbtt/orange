@@ -2,9 +2,10 @@
 
 mod peer;
 mod pipeline;
-mod signal;
 mod targets;
 mod webrtc;
+
+use orange_signal as signal;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

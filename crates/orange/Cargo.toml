@@ -1,0 +1,29 @@
+[package]
+name = "orange"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Low-overhead window streaming for friends"
+
+[[bin]]
+name = "orange"
+path = "src/main.rs"
+
+[dependencies]
+orange-signal = { path = "../orange-signal" }
+gstreamer = "0.25"
+gstreamer-video = "0.25"
+gstreamer-webrtc = "0.25"
+gstreamer-sdp = "0.25"
+anyhow.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+]

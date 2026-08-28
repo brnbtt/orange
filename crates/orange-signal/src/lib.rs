@@ -19,6 +19,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Messages exchanged between peers and the relay.
+///
+/// Anything carrying a `peer` field is routed: a host may be talking to several
+/// viewers at once, so SDP and ICE must say which conversation they belong to.
+/// Viewers do not know their own id - the relay stamps it on the way through.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Signal {
@@ -28,12 +32,24 @@ pub enum Signal {
     Hosting { code: String },
     /// Viewer -> server: join a room.
     Join { code: String },
-    /// Server -> host: someone arrived, start negotiating.
-    ViewerJoined,
+    /// Server -> host: a viewer arrived, start negotiating with it.
+    ViewerJoined { peer: String },
+    /// Server -> host: a viewer disconnected, tear its branch down.
+    ViewerLeft { peer: String },
     /// Either direction: session description.
-    Sdp { kind: String, sdp: String },
+    Sdp {
+        #[serde(default)]
+        peer: String,
+        kind: String,
+        sdp: String,
+    },
     /// Either direction: ICE candidate.
-    Ice { mline: u32, candidate: String },
+    Ice {
+        #[serde(default)]
+        peer: String,
+        mline: u32,
+        candidate: String,
+    },
     /// Server -> peer: something went wrong.
     Error { message: String },
 }
@@ -41,6 +57,33 @@ pub enum Signal {
 impl Signal {
     pub fn to_text(&self) -> Result<Message> {
         Ok(Message::Text(serde_json::to_string(self)?))
+    }
+
+    /// Overwrite the routing id. Used by the relay so a viewer cannot claim to
+    /// be a different peer.
+    fn with_peer(self, id: &str) -> Self {
+        match self {
+            Signal::Sdp { kind, sdp, .. } => Signal::Sdp {
+                peer: id.to_string(),
+                kind,
+                sdp,
+            },
+            Signal::Ice {
+                mline, candidate, ..
+            } => Signal::Ice {
+                peer: id.to_string(),
+                mline,
+                candidate,
+            },
+            other => other,
+        }
+    }
+
+    fn peer_id(&self) -> Option<&str> {
+        match self {
+            Signal::Sdp { peer, .. } | Signal::Ice { peer, .. } => Some(peer),
+            _ => None,
+        }
     }
 }
 
@@ -61,10 +104,19 @@ type Tx = mpsc::UnboundedSender<Message>;
 #[derive(Default)]
 struct Room {
     host: Option<Tx>,
-    viewer: Option<Tx>,
+    /// Several viewers can watch one host simultaneously, each with its own
+    /// peer connection.
+    viewers: HashMap<String, Tx>,
 }
 
 type Rooms = Arc<Mutex<HashMap<String, Room>>>;
+
+/// Identifier for one viewer's connection within a room.
+fn generate_peer_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    format!("{:08x}", rng.gen::<u32>())
+}
 
 /// Run the relay. One process, no state beyond the live rooms.
 pub async fn serve(addr: &str) -> Result<()> {
@@ -99,8 +151,8 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
         }
     });
 
-    // Which room this connection belongs to, and whether it is the host.
-    let mut joined: Option<(String, bool)> = None;
+    // Which room this connection belongs to. Viewers also carry their peer id.
+    let mut joined: Option<(String, Role)> = None;
 
     while let Some(msg) = source.next().await {
         let msg = msg?;
@@ -125,22 +177,23 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
                     code.clone(),
                     Room {
                         host: Some(tx.clone()),
-                        viewer: None,
+                        viewers: HashMap::new(),
                     },
                 );
-                joined = Some((code.clone(), true));
+                joined = Some((code.clone(), Role::Host));
                 tx.send(Signal::Hosting { code }.to_text()?)?;
             }
             Signal::Join { code } => {
                 let code = code.trim().to_ascii_uppercase();
+                let peer = generate_peer_id();
                 let mut rooms = rooms.lock().await;
                 match rooms.get_mut(&code) {
                     Some(room) if room.host.is_some() => {
-                        room.viewer = Some(tx.clone());
-                        joined = Some((code.clone(), false));
-                        // Tell the host to start negotiating; only it can offer.
+                        room.viewers.insert(peer.clone(), tx.clone());
+                        joined = Some((code.clone(), Role::Viewer(peer.clone())));
+                        // Only the host offers, so it must be told to start.
                         if let Some(host) = &room.host {
-                            let _ = host.send(Signal::ViewerJoined.to_text()?);
+                            let _ = host.send(Signal::ViewerJoined { peer }.to_text()?);
                         }
                     }
                     _ => {
@@ -153,28 +206,57 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) -> Result<()> {
                     }
                 }
             }
-            // Everything else is relayed untouched to the other party.
+            // Everything else is relayed to the other party in the conversation.
             other => {
-                let Some((code, is_host)) = &joined else {
+                let Some((code, role)) = &joined else {
                     bail!("message before joining a room");
                 };
                 let rooms = rooms.lock().await;
-                if let Some(room) = rooms.get(code) {
-                    let target = if *is_host { &room.viewer } else { &room.host };
-                    if let Some(target) = target {
-                        let _ = target.send(other.to_text()?);
+                let Some(room) = rooms.get(code) else { continue };
+
+                match role {
+                    // Host addresses a specific viewer.
+                    Role::Host => {
+                        if let Some(target) = other.peer_id().and_then(|id| room.viewers.get(id)) {
+                            let _ = target.send(other.to_text()?);
+                        }
+                    }
+                    // Viewer always talks to the host, stamped with its own id
+                    // so it cannot impersonate another viewer.
+                    Role::Viewer(peer) => {
+                        if let Some(host) = &room.host {
+                            let _ = host.send(other.with_peer(peer).to_text()?);
+                        }
                     }
                 }
             }
         }
     }
 
-    // Tear the room down when the host leaves; a room without a host is useless.
-    if let Some((code, true)) = joined {
-        rooms.lock().await.remove(&code);
-        println!("[signal] room {code} closed");
+    // Clean up. A room without a host is useless, so it goes; a departing
+    // viewer just frees its branch on the host.
+    match joined {
+        Some((code, Role::Host)) => {
+            rooms.lock().await.remove(&code);
+            println!("[signal] room {code} closed");
+        }
+        Some((code, Role::Viewer(peer))) => {
+            let mut rooms = rooms.lock().await;
+            if let Some(room) = rooms.get_mut(&code) {
+                room.viewers.remove(&peer);
+                if let Some(host) = &room.host {
+                    let _ = host.send(Signal::ViewerLeft { peer }.to_text()?);
+                }
+            }
+        }
+        None => {}
     }
     Ok(())
+}
+
+enum Role {
+    Host,
+    Viewer(String),
 }
 
 /// Client side of the relay, shared by host and viewer.
@@ -184,7 +266,9 @@ pub struct SignalClient {
 }
 
 pub async fn connect(url: &str) -> Result<SignalClient> {
-    let (ws, _) = tokio_tungstenite::connect_async(url)
+    // `connect_async` handles ws:// directly; wss:// needs the TLS connector,
+    // which is what Azure's ingress terminates on.
+    let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(url, None, false, None)
         .await
         .with_context(|| format!("could not reach signalling server at {url}"))?;
     let (mut sink, mut source) = ws.split();
