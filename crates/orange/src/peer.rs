@@ -430,9 +430,7 @@ fn force_key_unit(tee: &gst::Element) {
     let event = gst_video::UpstreamForceKeyUnitEvent::builder()
         .all_headers(true)
         .build();
-    if let Some(sink) = tee.static_pad("sink") {
-        let _ = sink.send_event(event);
-    }
+    let _ = tee.send_event(event);
 }
 
 fn create_offer(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
@@ -491,6 +489,11 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         Output::Window { hwnd, .. } => Some(*hwnd),
         Output::File(_) => None,
     };
+    let receive_audio = viewer_overlay
+        .as_ref()
+        .and_then(|overlay| overlay.lock().ok())
+        .map(|state| !state.monitor_mode)
+        .unwrap_or(true);
     let overlay_for_audio = viewer_overlay.clone();
     let overlay_for_video = viewer_overlay.clone();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
@@ -500,7 +503,10 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         };
         let kind = encoding_name(pad).unwrap_or_default();
         let result = match kind.as_str() {
-            "OPUS" => build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
+            "OPUS" if receive_audio => {
+                build_audio_branch(&pipeline, pad, overlay_for_audio.clone())
+            }
+            "OPUS" => Ok(()),
             "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
                 Some(output) => {
                     if let Some(overlay) = overlay_for_video.clone() {

@@ -98,8 +98,6 @@ pub struct OverlayState {
     pub bitrate_kbps: Option<u32>,
     /// Persistent compact status used by the bottom-right self-monitor.
     pub monitor_mode: bool,
-    /// Native viewer HWND, populated by the window thread.
-    pub window: Option<isize>,
     shown_at: Instant,
     hot: Option<Control>,
     hits: Vec<Hit>,
@@ -128,7 +126,6 @@ impl Default for OverlayState {
             fps: None,
             bitrate_kbps: None,
             monitor_mode: false,
-            window: None,
             // Start hidden; the first mouse move reveals the controls.
             shown_at: Instant::now() - HIDE_AFTER * 2,
             hot: None,
@@ -626,11 +623,23 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
         let expanded = state.hot == Some(Control::Stats);
         let received = state.quality_label();
         let quality = if state.monitor_mode {
-            format!("LIVE  \u{00b7}  {received}")
+            String::from("LIVE")
         } else {
             received.clone()
         };
-        let detail = if expanded { state.detail_label() } else { None };
+        let detail = if expanded {
+            let detail = state.detail_label();
+            if state.monitor_mode {
+                Some(match detail {
+                    Some(detail) => format!("{received}  \u{00b7}  {detail}"),
+                    None => received,
+                })
+            } else {
+                detail
+            }
+        } else {
+            None
+        };
         let has_text = text::available();
         let label_size = LABEL * raster_scale;
         let mut text_w = text::width(&quality, label_size, Weight::Semibold) / raster_scale;
@@ -784,7 +793,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // A speaker on its own until pointed at, then the slider grows out of it
     // to the right. The volume control is the one thing a viewer actually
     // reaches for, so it gets the largest target of the four.
-    if alpha > 0.0 {
+    if alpha > 0.0 && !state.monitor_mode {
         let open = state.audio_open();
         let gap = 12.0;
         let h = BUTTON;
@@ -904,7 +913,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
 
     // --- view, bottom-right -------------------------------------------------
     // Fullscreen, where every video player puts it.
-    if alpha > 0.0 {
+    if alpha > 0.0 && !state.monitor_mode {
         let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
         let x = fw - (MARGIN + BUTTON) * render_scale;
         let y = fh - (MARGIN + BUTTON) * render_scale;
@@ -1029,7 +1038,7 @@ fn to_composition(panels: Vec<Panel>) -> Option<gst_video::VideoOverlayCompositi
 ///
 /// Both the real viewer and the design harness call this, so what you see
 /// while iterating on the layout is what a viewer actually gets.
-pub fn attach(composition: &gst::Element, overlay: &SharedOverlay) {
+pub fn attach(composition: &gst::Element, overlay: &SharedOverlay, hwnd: isize) {
     // Learn the video size and frame rate; the former is the coordinate space
     // the overlay and all hit testing work in, and both are shown to the
     // viewer.
@@ -1046,7 +1055,7 @@ pub fn attach(composition: &gst::Element, overlay: &SharedOverlay) {
                     .map(|f| f.numer() as f64 / f.denom() as f64);
                 let mut resize = None;
                 if let Ok(mut state) = state.lock() {
-                    let first = state.video == (0, 0);
+                    let previous = state.video;
                     state.video = (w.max(0) as u32, h.max(0) as u32);
                     if fps.is_some() {
                         state.fps = fps;
@@ -1054,11 +1063,11 @@ pub fn attach(composition: &gst::Element, overlay: &SharedOverlay) {
                     // Show the controls once, on the first frame. A viewer who
                     // never happens to move the mouse would otherwise have no
                     // way to learn they exist.
-                    if first && state.video != (0, 0) {
-                        state.wake();
-                        resize = state
-                            .window
-                            .map(|hwnd| (hwnd, state.video.0, state.video.1));
+                    if state.video != (0, 0) && state.video != previous {
+                        if previous == (0, 0) {
+                            state.wake();
+                        }
+                        resize = Some((hwnd, state.video.0, state.video.1));
                     }
                 }
                 if let Some((hwnd, width, height)) = resize {

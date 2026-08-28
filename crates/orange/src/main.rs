@@ -379,7 +379,7 @@ fn build_preview_pipeline(
     let composition = gst::ElementFactory::make("overlaycomposition")
         .build()
         .context("overlaycomposition missing")?;
-    overlay::attach(&composition, overlay);
+    overlay::attach(&composition, overlay, hwnd);
 
     let sink = gst::ElementFactory::make("d3d11videosink")
         // Unlike the real viewer, sync to the clock: there is no live source

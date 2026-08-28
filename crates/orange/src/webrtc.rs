@@ -250,7 +250,7 @@ pub fn build_receive_branch(
             let composition = gst::ElementFactory::make("overlaycomposition")
                 .build()
                 .context("overlaycomposition missing")?;
-            crate::overlay::attach(&composition, &overlay);
+            crate::overlay::attach(&composition, &overlay, hwnd);
 
             let sink = gst::ElementFactory::make("d3d11videosink")
                 .property("sync", false)

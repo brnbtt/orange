@@ -49,8 +49,12 @@ enum Screen {
 
 struct WatchSession {
     code: String,
-    monitor: bool,
     supervisor: Supervisor,
+}
+
+struct Notice {
+    text: String,
+    expires_at: Instant,
 }
 
 struct Orange {
@@ -69,9 +73,10 @@ struct Orange {
     active_target: Option<WindowTarget>,
     active_preview: Option<std::sync::Arc<gpui::RenderImage>>,
     host: Option<Supervisor>,
+    monitor: Option<WatchSession>,
     watches: Vec<WatchSession>,
     logging_in: Option<LoginAttempt>,
-    error: Option<String>,
+    notice: Option<Notice>,
     server: String,
     /// Last screen the window was sized for, so resize happens once per
     /// transition rather than every frame.
@@ -114,9 +119,10 @@ impl Orange {
             active_target: None,
             active_preview: None,
             host: None,
+            monitor: None,
             watches: Vec::new(),
             logging_in: None,
-            error: None,
+            notice: None,
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
             sized_for: None,
             copied_at: None,
@@ -148,17 +154,22 @@ impl Orange {
                 self.logging_in = None;
                 self.screen = Screen::Home;
             } else if let Some(reason) = self.logging_in.as_mut().and_then(|a| a.failure()) {
-                self.error = Some(reason);
+                self.show_error(reason);
                 self.logging_in = None;
             }
         }
 
         if self.host.as_mut().is_some_and(|host| !host.running()) {
-            if let Some(status) = self.host.as_ref().and_then(|host| host.status.lock().ok()) {
-                self.error = status.error.clone();
+            let host_error = self
+                .host
+                .as_ref()
+                .and_then(|host| host.status.lock().ok())
+                .and_then(|status| status.error.clone());
+            if let Some(error) = host_error {
+                self.show_error(error);
             }
             self.host = None;
-            self.watches.retain(|watch| !watch.monitor);
+            self.monitor = None;
             self.active_target = None;
             self.active_preview = None;
             self.screen = if self.watches.is_empty() {
@@ -183,11 +194,18 @@ impl Orange {
                 false
             }
         });
-        if watch_error.is_some() {
-            self.error = watch_error;
+        if let Some(error) = watch_error {
+            self.show_error(error);
         }
         if self.screen == Screen::Watching && self.watches.is_empty() {
             self.screen = Screen::Home;
+        }
+        if self
+            .monitor
+            .as_mut()
+            .is_some_and(|monitor| !monitor.supervisor.running())
+        {
+            self.monitor = None;
         }
 
         // A newly-issued room code is immediately ready to paste into chat.
@@ -205,11 +223,29 @@ impl Orange {
                 self.copied_at = Some(Instant::now());
             }
         }
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| Instant::now() >= notice.expires_at)
+        {
+            self.notice = None;
+        }
         cx.notify();
     }
 
     fn quality(&self) -> Quality {
         QUALITIES[self.quality.min(QUALITIES.len() - 1)]
+    }
+
+    fn show_error(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: message.into(),
+            expires_at: Instant::now() + Duration::from_secs(4),
+        });
+    }
+
+    fn clear_error(&mut self) {
+        self.notice = None;
     }
 
     fn save_preferences(&self) {
@@ -266,9 +302,9 @@ impl Orange {
                 self.thumbnails.clear();
                 self.thumb_rx = Some(rx);
                 self.windows = windows;
-                self.error = None;
+                self.clear_error();
             }
-            Err(err) => self.error = Some(err.to_string()),
+            Err(err) => self.show_error(err.to_string()),
         }
     }
 
@@ -298,24 +334,24 @@ impl Orange {
     }
 
     fn start_login(&mut self) {
-        self.error = None;
+        self.clear_error();
         match supervisor::start_login(&self.server) {
             Ok(attempt) => self.logging_in = Some(attempt),
-            Err(err) => self.error = Some(err.to_string()),
+            Err(err) => self.show_error(err.to_string()),
         }
     }
 
     fn start_stream(&mut self, target: WindowTarget) {
         if !supervisor::gstreamer_available() {
-            self.error = Some(
+            self.show_error(
                 "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
-                    .into(),
+                    .to_string(),
             );
             return;
         }
         // A self-monitor belongs to exactly one host room. Never carry one
         // into a replacement stream while its old room is winding down.
-        self.watches.retain(|watch| !watch.monitor);
+        self.monitor = None;
         let preview = self.thumbnails.get(&target.hwnd).cloned();
         match Supervisor::host(&target, &self.quality(), self.fps, &self.server) {
             Ok(stream) => {
@@ -325,54 +361,58 @@ impl Orange {
                 self.copied_code = None;
                 self.copied_at = None;
                 self.screen = Screen::Streaming;
-                self.error = None;
+                self.clear_error();
             }
-            Err(err) => self.error = Some(err.to_string()),
+            Err(err) => self.show_error(err.to_string()),
         }
     }
 
     fn join(&mut self, code: String) {
-        self.join_with_mode(code, false);
-    }
-
-    fn open_live_monitor(&mut self, code: String) {
-        self.join_with_mode(code, true);
-    }
-
-    fn join_with_mode(&mut self, code: String, monitor: bool) {
         let code = code.trim().to_ascii_uppercase();
         if code.is_empty() {
-            self.error = Some("No code on the clipboard".into());
+            self.show_error("No code on the clipboard");
             return;
         }
         if self.watches.iter().any(|watch| watch.code == code) {
-            self.error = Some(format!("Already watching {code}"));
+            self.show_error(format!("Already watching {code}"));
             return;
         }
-        if !monitor && self.own_codes.contains(&code) {
-            self.error = Some("That's your own code. Use Live monitor.".into());
+        if self.own_codes.contains(&code) {
+            self.show_error("That's your own code. Use Live monitor.");
             return;
         }
         if !supervisor::gstreamer_available() {
-            self.error = Some(
+            self.show_error(
                 "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
-                    .into(),
+                    .to_string(),
             );
             return;
         }
-        match Supervisor::watch(&code, &self.server, self.watches.len(), monitor) {
+        match Supervisor::watch(&code, &self.server, self.watches.len(), false) {
             Ok(stream) => {
                 self.watches.push(WatchSession {
                     code,
-                    monitor,
                     supervisor: stream,
                 });
                 if self.host.is_none() {
                     self.screen = Screen::Watching;
                 }
-                self.error = None;
+                self.clear_error();
             }
-            Err(err) => self.error = Some(err.to_string()),
+            Err(err) => self.show_error(err.to_string()),
+        }
+    }
+
+    fn open_live_monitor(&mut self, code: String) {
+        if self.monitor.is_some() {
+            return;
+        }
+        match Supervisor::watch(&code, &self.server, 0, true) {
+            Ok(supervisor) => {
+                self.monitor = Some(WatchSession { code, supervisor });
+                self.clear_error();
+            }
+            Err(err) => self.show_error(err.to_string()),
         }
     }
 
@@ -380,7 +420,7 @@ impl Orange {
         if let Some(mut host) = self.host.take() {
             host.stop();
         }
-        self.watches.retain(|watch| !watch.monitor);
+        self.monitor = None;
         self.active_target = None;
         self.active_preview = None;
         self.copied_code = None;
@@ -799,6 +839,7 @@ impl Render for Orange {
             .child(self.render_titlebar(cx))
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -808,23 +849,6 @@ impl Render for Orange {
                     .pt_4()
                     .pb_4()
                     .gap_4()
-                    .children(self.error.clone().map(|err| {
-                        div()
-                            .flex_shrink_0()
-                            .p_3()
-                            .rounded_md()
-                            .bg(rgb(0x241514))
-                            .border_1()
-                            .border_color(rgb(0x3d211f))
-                            .text_xs()
-                            .text_color(rgb(DANGER))
-                            .child(err)
-                            .with_animation(
-                                SharedString::from("error"),
-                                Animation::new(Duration::from_millis(160)),
-                                |element, delta| element.opacity(delta),
-                            )
-                    }))
                     .child(
                         div()
                             .flex()
@@ -832,7 +856,27 @@ impl Render for Orange {
                             .flex_1()
                             .min_h(px(0.0))
                             .child(fade_in(key, body)),
-                    ),
+                    )
+                    .children(self.notice.as_ref().map(|notice| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w_full()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x241514))
+                            .border_1()
+                            .border_color(rgb(0x3d211f))
+                            .text_xs()
+                            .text_color(rgb(DANGER))
+                            .child(notice.text.clone())
+                            .with_animation(
+                                SharedString::from("error"),
+                                Animation::new(Duration::from_millis(160)),
+                                |element, delta| element.opacity(delta),
+                            )
+                    })),
             )
     }
 }
@@ -1409,9 +1453,7 @@ impl Orange {
     fn render_streaming(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let code = self.code();
         let monitor_code = code.clone();
-        let monitor_open = code
-            .as_ref()
-            .is_some_and(|code| self.watches.iter().any(|watch| &watch.code == code));
+        let monitor_open = self.monitor.is_some();
         let viewers = self.viewers();
         let quality = self.quality();
         let source_name = self
@@ -1652,17 +1694,7 @@ impl Orange {
                             .flex_col()
                             .gap_0p5()
                             .child(label(code, TEXT).font_weight(FontWeight::SEMIBOLD))
-                            .child(
-                                label(
-                                    if watch.monitor {
-                                        "Live monitor · bottom-right"
-                                    } else {
-                                        "Open in its own viewer window"
-                                    },
-                                    FAINT,
-                                )
-                                .text_xs(),
-                            ),
+                            .child(label("Open in its own viewer window", FAINT).text_xs()),
                     )
                     .child(
                         div()
@@ -1912,6 +1944,7 @@ fn main() {
                         traffic_light_position: None,
                     }),
                     window_min_size: Some(size(px(360.0), px(480.0))),
+                    is_resizable: false,
                     ..Default::default()
                 },
                 |_, cx| cx.new(Orange::new),

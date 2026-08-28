@@ -94,6 +94,18 @@ pub struct VideoWindow {
     pub hwnd: isize,
 }
 
+#[derive(Clone, Copy)]
+enum WindowRole {
+    Viewer { cascade: u32 },
+    Monitor,
+}
+
+impl WindowRole {
+    fn is_monitor(self) -> bool {
+        matches!(self, Self::Monitor)
+    }
+}
+
 // The HWND is used from the GStreamer thread to hand to the sink. Win32 window
 // handles are process-wide, so this is sound; only message-loop calls are
 // thread-affine.
@@ -106,7 +118,13 @@ pub fn spawn(
     height: i32,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<VideoWindow> {
-    spawn_window(title, width, height, 0, false, overlay)
+    spawn_window(
+        title,
+        width,
+        height,
+        WindowRole::Viewer { cascade: 0 },
+        overlay,
+    )
 }
 
 pub fn spawn_cascaded(
@@ -116,26 +134,31 @@ pub fn spawn_cascaded(
     cascade: u32,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<VideoWindow> {
-    spawn_window(title, width, height, cascade, false, overlay)
+    spawn_window(
+        title,
+        width,
+        height,
+        WindowRole::Viewer { cascade },
+        overlay,
+    )
 }
 
 pub fn spawn_monitor(title: &str, overlay: crate::overlay::SharedOverlay) -> Result<VideoWindow> {
-    spawn_window(title, 480, 270, 0, true, overlay)
+    spawn_window(title, 480, 270, WindowRole::Monitor, overlay)
 }
 
 fn spawn_window(
     title: &str,
     width: i32,
     height: i32,
-    cascade: u32,
-    monitor: bool,
+    role: WindowRole,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<VideoWindow> {
     let (tx, rx) = mpsc::channel::<Result<isize>>();
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
     std::thread::spawn(move || unsafe {
-        match create_window(&title, width, height, cascade, monitor, overlay) {
+        match create_window(&title, width, height, role, overlay) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
                     return;
@@ -159,7 +182,7 @@ fn spawn_window(
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
     revealed: std::cell::Cell<bool>,
-    monitor_mode: bool,
+    role: WindowRole,
     /// Style and bounds to put back when leaving fullscreen. `Some` means we
     /// are currently fullscreen.
     restore: std::cell::Cell<Option<(WINDOW_STYLE, RECT)>>,
@@ -188,6 +211,20 @@ pub fn set_video_aspect(hwnd: isize, width: u32, height: u32) {
     }
 }
 
+fn fit_aspect(
+    max_width: i32,
+    max_height: i32,
+    source_width: u32,
+    source_height: u32,
+) -> (i32, i32) {
+    let ratio = source_width as f32 / source_height as f32;
+    if max_width as f32 / max_height as f32 > ratio {
+        ((max_height as f32 * ratio).round() as i32, max_height)
+    } else {
+        (max_width, (max_width as f32 / ratio).round() as i32)
+    }
+}
+
 unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
     if width == 0 || height == 0 {
         return;
@@ -200,28 +237,45 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
     if GetWindowRect(hwnd, &mut rect).is_err() {
         return;
     }
+    if ctx.role.is_monitor() {
+        return; // fixed PiP shell; the sink letterboxes source content inside it
+    }
     let old_w = rect.right - rect.left;
-    let new_h = (old_w as f32 * height as f32 / width as f32).round() as i32;
-    let (x, y) = if ctx.monitor_mode {
-        (rect.left, rect.bottom - new_h)
-    } else {
-        (rect.left, rect.top + (rect.bottom - rect.top - new_h) / 2)
-    };
+    let old_h = rect.bottom - rect.top;
+    let (new_w, new_h) = fit_aspect(old_w, old_h, width, height);
+    let x = rect.left + (old_w - new_w) / 2;
+    let y = rect.top + (old_h - new_h) / 2;
     let _ = SetWindowPos(
         hwnd,
         None,
         x,
         y,
-        old_w,
+        new_w,
         new_h,
         SWP_NOZORDER | SWP_NOACTIVATE,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_aspect;
+
+    #[test]
+    fn source_aspects_fit_inside_a_bounded_viewer_envelope() {
+        assert_eq!(fit_aspect(720, 405, 1920, 1080), (720, 405));
+        assert_eq!(fit_aspect(720, 405, 1980, 1793), (447, 405));
+        assert_eq!(fit_aspect(720, 405, 1080, 1920), (228, 405));
+        assert_eq!(fit_aspect(720, 405, 2560, 1080), (720, 304));
+    }
 }
 
 unsafe fn constrain_sizing(hwnd: HWND, edge: usize, rect: &mut RECT) -> bool {
     let Some(ctx) = context(hwnd) else {
         return false;
     };
+    if ctx.role.is_monitor() {
+        return false;
+    }
     let video = ctx.overlay.lock().ok().map(|state| state.video);
     let Some((width, height)) = video.filter(|(w, h)| *w > 0 && *h > 0) else {
         return false;
@@ -278,6 +332,9 @@ unsafe fn set_corner_style(hwnd: HWND, fullscreen: bool) {
 /// rather than the primary one, which is the part people notice.
 unsafe fn toggle_fullscreen(hwnd: HWND) {
     let Some(ctx) = context(hwnd) else { return };
+    if ctx.role.is_monitor() {
+        return;
+    }
 
     if let Some((style, bounds)) = ctx.restore.take() {
         SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
@@ -359,7 +416,7 @@ unsafe fn resize_hit_test(hwnd: HWND, x: i32, y: i32) -> Option<LRESULT> {
     let Some(ctx) = context(hwnd) else {
         return None;
     };
-    if ctx.restore.get().is_some() {
+    if ctx.role.is_monitor() || ctx.restore.get().is_some() {
         return None; // no resize edges in fullscreen
     }
 
@@ -401,8 +458,7 @@ unsafe fn create_window(
     title: &[u16],
     width: i32,
     height: i32,
-    cascade: u32,
-    monitor_mode: bool,
+    role: WindowRole,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
@@ -429,7 +485,7 @@ unsafe fn create_window(
     let width = (width as f32 * scale).round() as i32;
     let height = (height as f32 * scale).round() as i32;
 
-    let (x, y) = if monitor_mode {
+    let (x, y) = if role.is_monitor() {
         let monitor = MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -444,6 +500,9 @@ unsafe fn create_window(
     } else {
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let WindowRole::Viewer { cascade } = role else {
+            unreachable!()
+        };
         let offset = (cascade.min(5) as f32 * 32.0 * scale).round() as i32;
         (
             ((screen_w - width) / 2 + offset).min((screen_w - width).max(0)),
@@ -452,7 +511,7 @@ unsafe fn create_window(
     };
 
     let hwnd = CreateWindowExW(
-        if monitor_mode {
+        if role.is_monitor() {
             WS_EX_TOPMOST
         } else {
             WINDOW_EX_STYLE::default()
@@ -461,7 +520,11 @@ unsafe fn create_window(
         PCWSTR(title.as_ptr()),
         // WS_POPUP: no title bar, no border. WS_THICKFRAME is kept so the
         // window can still be resized from its edges.
-        WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX,
+        if role.is_monitor() {
+            WS_POPUP | WS_MINIMIZEBOX
+        } else {
+            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX
+        },
         x,
         y,
         width,
@@ -489,13 +552,10 @@ unsafe fn create_window(
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
         revealed: std::cell::Cell::new(false),
-        monitor_mode,
+        role,
         restore: std::cell::Cell::new(None),
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
-    if let Ok(mut overlay) = (*ctx).overlay.lock() {
-        overlay.window = Some(hwnd.0 as isize);
-    }
 
     sync_dpi(hwnd);
 
