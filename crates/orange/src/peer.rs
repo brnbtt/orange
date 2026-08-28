@@ -211,7 +211,10 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     };
 
     watch_bus(&pipeline, "host");
-    pipeline.set_state(gst::State::Playing)?;
+    // Do not let WGC emit its one guaranteed initial frame before a viewer
+    // branch exists. READY keeps the graph prepared without starting capture.
+    pipeline.set_state(gst::State::Ready)?;
+    let mut pipeline_started = false;
 
     // One peer connection per viewer, keyed by the relay's peer id.
     let mut viewers: HashMap<String, ViewerBranch> = HashMap::new();
@@ -233,6 +236,10 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 ) {
                     Ok(branch) => {
                         viewers.insert(peer.clone(), branch);
+                        if !pipeline_started {
+                            pipeline.set_state(gst::State::Playing)?;
+                            pipeline_started = true;
+                        }
                         crate::targets::request_redraw(settings.hwnd);
                         println!(
                             "[host] {} joined ({} watching)",
@@ -246,6 +253,10 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
             Signal::ViewerLeft { peer } => {
                 if let Some(branch) = viewers.remove(&peer) {
                     remove_viewer(&pipeline, branch);
+                    if viewers.is_empty() {
+                        pipeline.set_state(gst::State::Ready)?;
+                        pipeline_started = false;
+                    }
                     println!("[host] viewer {peer} left ({} remaining)", viewers.len());
                 }
             }

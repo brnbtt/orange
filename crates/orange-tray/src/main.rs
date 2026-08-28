@@ -350,8 +350,7 @@ impl Orange {
             return;
         }
         if !monitor && self.own_codes.contains(&code) {
-            self.error =
-                Some("That is one of your own stream codes. Use Live monitor instead.".into());
+            self.error = Some("That's your own code. Use Live monitor.".into());
             return;
         }
         if !supervisor::gstreamer_available() {
@@ -809,6 +808,23 @@ impl Render for Orange {
                     .pt_4()
                     .pb_4()
                     .gap_4()
+                    .children(self.error.clone().map(|err| {
+                        div()
+                            .flex_shrink_0()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x241514))
+                            .border_1()
+                            .border_color(rgb(0x3d211f))
+                            .text_xs()
+                            .text_color(rgb(DANGER))
+                            .child(err)
+                            .with_animation(
+                                SharedString::from("error"),
+                                Animation::new(Duration::from_millis(160)),
+                                |element, delta| element.opacity(delta),
+                            )
+                    }))
                     .child(
                         div()
                             .flex()
@@ -816,25 +832,7 @@ impl Render for Orange {
                             .flex_1()
                             .min_h(px(0.0))
                             .child(fade_in(key, body)),
-                    )
-                    .children(self.error.clone().map(|err| {
-                        fade_in(
-                            SharedString::from("error"),
-                            div()
-                                .flex()
-                                .gap_2()
-                                .items_start()
-                                .p_3()
-                                .rounded_lg()
-                                .bg(rgb(0x241514))
-                                .border_1()
-                                .border_color(rgb(0x3d211f))
-                                .text_xs()
-                                .text_color(rgb(DANGER))
-                                .child(err)
-                                .into_any_element(),
-                        )
-                    })),
+                    ),
             )
     }
 }
