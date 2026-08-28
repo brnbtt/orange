@@ -13,24 +13,24 @@ mod session;
 mod supervisor;
 mod tray;
 
-use gpui::{Animation, AnimationExt, 
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FontWeight, SharedString,
-    Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
+use gpui::{
+    div, prelude::*, px, rgb, size, Animation, AnimationExt, App, Application, Bounds, Context,
+    FontWeight, SharedString, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use std::time::{Duration, Instant};
 use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
 // Palette from the logo exploration.
-const BG: u32 = 0x0b080b;
-const SURFACE: u32 = 0x161418;
-const SURFACE_HOVER: u32 = 0x201d23;
+const BG: u32 = 0x0b0b0b;
+const SURFACE: u32 = 0x161616;
+const SURFACE_HOVER: u32 = 0x202020;
 const BORDER: u32 = 0x2a2a2a;
 const TEXT: u32 = 0xe6e0d1;
-const MUTED: u32 = 0x8b8880;
-const FAINT: u32 = 0x5c5a55;
+const MUTED: u32 = 0x99948a;
+const FAINT: u32 = 0x66625b;
 const ORANGE: u32 = 0xff5a1f;
 const ORANGE_DIM: u32 = 0x8a3110;
-const INK: u32 = 0x0b080b;
+const INK: u32 = 0x0b0b0b;
 const DANGER: u32 = 0xe0645f;
 const GREEN: u32 = 0x4ec97a;
 
@@ -288,6 +288,26 @@ fn label(text: impl Into<SharedString>, color: u32) -> gpui::Div {
     div().text_color(rgb(color)).child(text.into())
 }
 
+/// Technical microcopy from the identity board: compact, monospaced and used
+/// only for orientation/status so body text remains easy to scan.
+fn micro(text: impl Into<SharedString>, color: u32) -> gpui::Div {
+    label(text, color)
+        .font_family("Cascadia Mono")
+        .text_size(px(10.0))
+        .font_weight(FontWeight::MEDIUM)
+}
+
+fn wordmark(size: f32) -> gpui::Div {
+    label("O R A N G E", ORANGE)
+        .font_family("Bahnschrift")
+        .text_size(px(size))
+        .font_weight(FontWeight::SEMIBOLD)
+}
+
+fn accent_rule(width: f32) -> gpui::Div {
+    div().w(px(width)).h(px(2.0)).bg(rgb(ORANGE))
+}
+
 /// A raised surface with a hairline border. The border does most of the work:
 /// on a dark UI, background alone reads as mush.
 fn card() -> gpui::Div {
@@ -296,7 +316,7 @@ fn card() -> gpui::Div {
         .flex_col()
         .gap_1()
         .p_3()
-        .rounded_lg()
+        .rounded_md()
         .bg(rgb(SURFACE))
         .border_1()
         .border_color(rgb(BORDER))
@@ -310,10 +330,12 @@ fn primary(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gp
         .justify_center()
         .w_full()
         .px_4()
-        .py_2p5()
-        .rounded_lg()
+        .py_2()
+        .rounded_md()
         .bg(rgb(ORANGE))
         .text_color(rgb(INK))
+        .font_family("Bahnschrift")
+        .text_size(px(13.0))
         .font_weight(FontWeight::SEMIBOLD)
         .cursor_pointer()
         .hover(|s| s.bg(rgb(0xff6f38)))
@@ -331,12 +353,14 @@ fn secondary(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<
         .justify_center()
         .w_full()
         .px_4()
-        .py_2p5()
-        .rounded_lg()
+        .py_2()
+        .rounded_md()
         .bg(rgb(SURFACE))
         .border_1()
         .border_color(rgb(BORDER))
         .text_color(rgb(TEXT))
+        .font_family("Bahnschrift")
+        .text_size(px(13.0))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(0x3a3a3a)))
         .active(|s| s.bg(rgb(BG)))
@@ -420,11 +444,17 @@ fn live_dot() -> impl IntoElement {
 /// Fade content in. Keyed per screen so navigation reads as a transition
 /// rather than an instant swap.
 fn fade_in(id: impl Into<SharedString>, element: gpui::AnyElement) -> impl IntoElement {
-    div().child(element).with_animation(
-        id.into(),
-        Animation::new(Duration::from_millis(200)),
-        |el, delta| el.opacity(delta),
-    )
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.0))
+        .child(element)
+        .with_animation(
+            id.into(),
+            Animation::new(Duration::from_millis(200)),
+            |el, delta| el.opacity(delta),
+        )
 }
 
 impl Render for Orange {
@@ -519,8 +549,10 @@ impl Orange {
     /// left out of those regions, or the hit test would swallow their clicks.
     fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let breadcrumb = match self.screen {
-            Screen::PickWindow => Some("· share"),
-            Screen::Settings => Some("· settings"),
+            Screen::PickWindow => Some("/ SOURCE"),
+            Screen::Streaming => Some("/ UPLINK"),
+            Screen::Watching => Some("/ DOWNLINK"),
+            Screen::Settings => Some("/ SYSTEM"),
             _ => None,
         };
 
@@ -537,19 +569,16 @@ impl Orange {
                     .id("titlebar-brand")
                     .flex()
                     .items_center()
-                    .gap_2p5()
+                    .gap_2()
                     .window_control_area(gpui::WindowControlArea::Drag)
-                    .child(logo(16.0))
+                    .child(logo(18.0))
                     .child(
-                        div()
+                        label("O R A N G E", TEXT)
+                            .font_family("Bahnschrift")
                             .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(TEXT))
-                            .child("ORANGE"),
+                            .font_weight(FontWeight::SEMIBOLD),
                     )
-                    .children(breadcrumb.map(|text| {
-                        div().text_xs().text_color(rgb(FAINT)).child(text)
-                    })),
+                    .children(breadcrumb.map(|text| micro(text, ORANGE_DIM))),
             )
             // The empty middle is draggable too, so the whole bar behaves as
             // people expect - except where the controls are.
@@ -564,31 +593,29 @@ impl Orange {
                 div()
                     .flex()
                     .items_center()
-                    .child(titlebar_button("settings", "⚙", SURFACE_HOVER).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.screen = if this.screen == Screen::Settings {
-                                Screen::Home
-                            } else {
-                                Screen::Settings
-                            };
-                            cx.notify();
-                        }),
-                    ))
                     .child(
-                        titlebar_button("minimise", "—", SURFACE_HOVER).on_click(
-                            |_, window, _| {
-                                window.minimize_window();
+                        titlebar_button("settings", "⚙︎", SURFACE_HOVER).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.screen = if this.screen == Screen::Settings {
+                                    Screen::Home
+                                } else {
+                                    Screen::Settings
+                                };
+                                cx.notify();
                             },
-                        ),
+                        )),
                     )
+                    .child(titlebar_button("minimise", "−", SURFACE_HOVER).on_click(
+                        |_, window, _| {
+                            window.minimize_window();
+                        },
+                    ))
                     // Close hides the window completely - no taskbar entry -
                     // while the app keeps running in the tray. Minimise is a
                     // normal minimise; the two should not do the same thing.
-                    .child(
-                        titlebar_button("close", "✕", 0x8c2b28).on_click(|_, _, _| {
-                            tray::hide_main_window();
-                        }),
-                    ),
+                    .child(titlebar_button("close", "×", 0x8c2b28).on_click(|_, _, _| {
+                        tray::hide_main_window();
+                    })),
             )
     }
 }
@@ -610,7 +637,8 @@ fn titlebar_button(
         .w(px(38.0))
         .h(px(36.0))
         .rounded_md()
-        .text_xs()
+        .font_family("Segoe UI Symbol")
+        .text_size(px(15.0))
         .text_color(rgb(MUTED))
         .cursor_pointer()
         .hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(TEXT)))
@@ -628,6 +656,7 @@ impl Orange {
             .items_center()
             .px_2()
             .child(logo(56.0))
+            .child(wordmark(20.0))
             .child(
                 div()
                     .flex()
@@ -635,7 +664,8 @@ impl Orange {
                     .gap_1p5()
                     .items_center()
                     .child(
-                        label("Share a window", TEXT)
+                        label("DIRECT WINDOW LINK", TEXT)
+                            .font_family("Bahnschrift")
                             .text_xl()
                             .font_weight(FontWeight::SEMIBOLD),
                     )
@@ -668,9 +698,11 @@ impl Orange {
                     })),
                 ),
             )
-            .children(self.logging_in.is_some().then(|| {
-                label("Finish in your browser, then come back here.", FAINT).text_xs()
-            }))
+            .children(
+                self.logging_in.is_some().then(|| {
+                    label("Finish in your browser, then come back here.", FAINT).text_xs()
+                }),
+            )
             // Identity is optional in the protocol - it only attaches a name.
             // Blocking streaming behind it would be a self-imposed limit.
             .child(
@@ -685,11 +717,43 @@ impl Orange {
     }
 
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let agent = self
+            .session
+            .as_ref()
+            .map(|session| session.name.clone())
+            .unwrap_or_else(|| "ANONYMOUS".into());
+
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_4()
             .flex_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(micro("ORANGE / DIRECT LINK", MUTED))
+                    .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(micro("01", ORANGE)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .child(logo(88.0))
+                    .child(wordmark(23.0))
+                    .child(accent_rule(28.0))
+                    .child(
+                        label("HIGH-FIDELITY STREAMING", MUTED)
+                            .font_family("Cascadia Mono")
+                            .text_size(px(10.0)),
+                    ),
+            )
             .child(
                 primary("start", "Start streaming").on_click(cx.listener(|this, _, _, cx| {
                     this.refresh_windows();
@@ -710,14 +774,26 @@ impl Orange {
                 })),
             )
             .child(label("Paste a code first — it joins from your clipboard.", FAINT).text_xs())
-            .child(div().flex_1())
             .child(
-                quiet("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
-                    session::clear();
-                    this.session = None;
-                    this.screen = Screen::SignedOut;
-                    cx.notify();
-                })),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(micro(
+                        format!("AGENT / {}", agent.to_ascii_uppercase()),
+                        FAINT,
+                    ))
+                    .child(
+                        quiet("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
+                            session::clear();
+                            this.session = None;
+                            this.screen = Screen::SignedOut;
+                            cx.notify();
+                        })),
+                    ),
             )
     }
 
@@ -739,11 +815,19 @@ impl Orange {
             .child(
                 div()
                     .flex()
-                    .items_baseline()
+                    .items_end()
                     .justify_between()
                     .child(
-                        label("Choose what to share", TEXT)
-                            .font_weight(FontWeight::SEMIBOLD),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(micro("SOURCE SELECT / 01", ORANGE))
+                            .child(
+                                label("Choose what to share", TEXT)
+                                    .font_family("Bahnschrift")
+                                    .font_weight(FontWeight::SEMIBOLD),
+                            ),
                     )
                     .child(
                         quiet("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| {
@@ -784,7 +868,12 @@ impl Orange {
                                 let meta = if is_screen {
                                     "Everything you see".to_string()
                                 } else {
-                                    format!("{} · {}×{}", target.app_name(), target.width, target.height)
+                                    format!(
+                                        "{} · {}×{}",
+                                        target.app_name(),
+                                        target.width,
+                                        target.height
+                                    )
                                 };
                                 let thumb = self.thumbnails.get(&target.hwnd).cloned();
                                 let hwnd = target.hwnd;
@@ -796,7 +885,7 @@ impl Orange {
                                     .flex_col()
                                     .flex_shrink_0()
                                     .w(px(252.0))
-                                    .rounded_lg()
+                                    .rounded_md()
                                     .overflow_hidden()
                                     .bg(rgb(SURFACE))
                                     .border_1()
@@ -960,15 +1049,27 @@ impl Orange {
             .gap_3()
             .flex_1()
             .min_h(px(0.0))
+            .child(micro("UPLINK / SESSION ACTIVE", ORANGE))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(if code.is_some() { live_dot().into_any_element() } else { dot(MUTED).into_any_element() })
+                    .child(if code.is_some() {
+                        live_dot().into_any_element()
+                    } else {
+                        dot(MUTED).into_any_element()
+                    })
                     .child(
-                        label(if code.is_some() { "Live" } else { "Starting…" }, TEXT)
-                            .font_weight(FontWeight::SEMIBOLD),
+                        label(
+                            if code.is_some() {
+                                "Live"
+                            } else {
+                                "Starting…"
+                            },
+                            TEXT,
+                        )
+                        .font_weight(FontWeight::SEMIBOLD),
                     ),
             )
             .child(match code.clone() {
@@ -1016,14 +1117,17 @@ impl Orange {
                     .gap_1p5()
                     .flex_1()
                     .min_h(px(0.0))
-                    .child(label(
-                        if viewers.is_empty() {
-                            "Nobody watching yet".to_string()
-                        } else {
-                            format!("{} watching", viewers.len())
-                        },
-                        MUTED,
-                    ).text_xs())
+                    .child(
+                        label(
+                            if viewers.is_empty() {
+                                "Nobody watching yet".to_string()
+                            } else {
+                                format!("{} watching", viewers.len())
+                            },
+                            MUTED,
+                        )
+                        .text_xs(),
+                    )
                     .children(
                         viewers
                             .into_iter()
@@ -1054,6 +1158,7 @@ impl Orange {
             .flex_col()
             .gap_3()
             .flex_1()
+            .child(micro("DOWNLINK / REMOTE FEED", ORANGE))
             .child(
                 div()
                     .flex()
@@ -1088,6 +1193,7 @@ impl Orange {
             .flex_col()
             .gap_3()
             .flex_1()
+            .child(micro("SYSTEM / CONNECTION", ORANGE))
             .child(
                 card()
                     .flex_row()
@@ -1124,9 +1230,17 @@ impl Orange {
                     }),
             )
             .child(
-                card()
-                    .child(label("Relay", TEXT))
-                    .child(label(self.server.clone(), FAINT).text_xs()),
+                card().child(label("Relay", TEXT)).child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_family("Cascadia Mono")
+                        .text_size(px(10.0))
+                        .text_color(rgb(FAINT))
+                        .child(self.server.clone()),
+                ),
             )
             .child(div().flex_1())
             .child(
@@ -1152,7 +1266,9 @@ fn main() {
                             bytes.len(),
                             w.title
                         )),
-                        None => report.push_str(&format!("FAIL                      {}\n", w.title)),
+                        None => {
+                            report.push_str(&format!("FAIL                      {}\n", w.title))
+                        }
                     }
                 }
             }

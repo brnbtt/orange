@@ -3,11 +3,11 @@
 mod auth;
 mod overlay;
 mod peer;
-mod window;
 mod pipeline;
 mod targets;
 mod text;
 mod webrtc;
+mod window;
 
 use orange_signal as signal;
 
@@ -111,7 +111,10 @@ enum Command {
         /// judged over real content rather than colour bars.
         #[arg(long)]
         image: Option<String>,
-        /// Hold the controls open instead of fading them after three seconds.
+        /// Synthetic preview rate. Real capture follows the source display.
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+        /// Hold the controls open instead of fading after pointer activity stops.
         #[arg(long)]
         pin: bool,
     },
@@ -127,8 +130,9 @@ struct QualityArgs {
     /// Kilobits per second.
     #[arg(long, default_value_t = 25_000)]
     bitrate: u32,
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
+    /// Frames per second. Defaults to the captured window's display refresh.
+    #[arg(long)]
+    fps: Option<u32>,
     /// Downscale on the GPU, e.g. 1920x1080.
     #[arg(long)]
     scale: Option<String>,
@@ -136,11 +140,18 @@ struct QualityArgs {
 
 impl QualityArgs {
     fn settings(&self, hwnd: isize) -> Result<CaptureSettings> {
+        let fps = self
+            .fps
+            .or_else(|| window::target_refresh_rate(hwnd))
+            .unwrap_or(60);
+        if fps == 0 {
+            anyhow::bail!("fps must be greater than zero");
+        }
         Ok(CaptureSettings {
             hwnd,
             codec: Codec::parse(&self.codec)?,
             bitrate: self.bitrate,
-            fps: self.fps,
+            fps,
             scale: self.scale.as_deref().map(parse_scale).transpose()?,
             // Scope audio to the captured window's process, so voice chat and
             // music stay out of the stream. Whole-screen sharing captures
@@ -179,8 +190,8 @@ fn main() -> Result<()> {
         } => {
             let settings = quality.settings(hwnd)?;
             println!(
-                "Recording hwnd {hwnd} as {:?} at {} kbps -> {out}",
-                settings.codec, settings.bitrate
+                "Recording hwnd {hwnd} as {:?} at {} kbps / {} fps -> {out}",
+                settings.codec, settings.bitrate, settings.fps
             );
             let pipeline = pipeline::build_record_pipeline(&settings, &out)?;
             run_pipeline(&pipeline, seconds)?;
@@ -195,13 +206,17 @@ fn main() -> Result<()> {
         } => {
             let settings = quality.settings(hwnd)?;
             println!(
-                "Loopback hwnd {hwnd} as {:?} at {} kbps",
-                settings.codec, settings.bitrate
+                "Loopback hwnd {hwnd} as {:?} at {} kbps / {} fps",
+                settings.codec, settings.bitrate, settings.fps
             );
             let output = if show {
-                let overlay = std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
+                let overlay =
+                    std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
                 let win = window::spawn("orange - loopback", 1280, 720, overlay.clone())?;
-                webrtc::Output::Window { hwnd: win.hwnd, overlay }
+                webrtc::Output::Window {
+                    hwnd: win.hwnd,
+                    overlay,
+                }
             } else {
                 webrtc::Output::File(out.clone())
             };
@@ -230,8 +245,8 @@ fn main() -> Result<()> {
         } => {
             let settings = quality.settings(hwnd)?;
             println!(
-                "Hosting hwnd {hwnd} as {:?} at {} kbps",
-                settings.codec, settings.bitrate
+                "Hosting hwnd {hwnd} as {:?} at {} kbps / {} fps",
+                settings.codec, settings.bitrate, settings.fps
             );
             runtime()?.block_on(peer::run_host(&settings, &server))
         }
@@ -239,9 +254,15 @@ fn main() -> Result<()> {
             let output = match out {
                 Some(path) => webrtc::Output::File(path),
                 None => {
-                    let overlay = std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
-                    let win = window::spawn(&format!("orange - {code}"), 1280, 720, overlay.clone())?;
-                    webrtc::Output::Window { hwnd: win.hwnd, overlay }
+                    let overlay = std::sync::Arc::new(std::sync::Mutex::new(
+                        overlay::OverlayState::default(),
+                    ));
+                    let win =
+                        window::spawn(&format!("orange - {code}"), 1280, 720, overlay.clone())?;
+                    webrtc::Output::Window {
+                        hwnd: win.hwnd,
+                        overlay,
+                    }
                 }
             };
             runtime()?.block_on(peer::run_watch(&code, &server, output))
@@ -251,14 +272,17 @@ fn main() -> Result<()> {
             window: window_size,
             pattern,
             image,
+            fps,
             pin,
         } => {
             let (vw, vh) = parse_scale(&size)?;
             let (ww, wh) = parse_scale(&window_size)?;
+            if fps == 0 {
+                anyhow::bail!("fps must be greater than zero");
+            }
 
-            let overlay = std::sync::Arc::new(std::sync::Mutex::new(
-                overlay::OverlayState::default(),
-            ));
+            let overlay =
+                std::sync::Arc::new(std::sync::Mutex::new(overlay::OverlayState::default()));
             {
                 let mut state = overlay.lock().unwrap();
                 state.pinned = pin;
@@ -270,14 +294,20 @@ fn main() -> Result<()> {
             }
 
             let win = window::spawn("orange - preview", ww as i32, wh as i32, overlay.clone())?;
-            println!("Preview: {vw}x{vh} video in a {ww}x{wh} window.");
+            println!("Preview: {vw}x{vh} at {fps} fps in a {ww}x{wh} window.");
             println!(
                 "Move the mouse to wake the controls{}. Esc or the X closes.",
                 if pin { " (pinned open)" } else { "" }
             );
 
-            let pipeline =
-                build_preview_pipeline((vw, vh), &pattern, image.as_deref(), win.hwnd, &overlay)?;
+            let pipeline = build_preview_pipeline(
+                (vw, vh),
+                fps,
+                &pattern,
+                image.as_deref(),
+                win.hwnd,
+                &overlay,
+            )?;
             run_until_closed(&pipeline, win.hwnd)
         }
     }
@@ -290,6 +320,7 @@ fn main() -> Result<()> {
 /// design in ways the real viewer will not reproduce.
 fn build_preview_pipeline(
     size: (u32, u32),
+    fps: u32,
     pattern: &str,
     image: Option<&str>,
     hwnd: isize,
@@ -308,13 +339,13 @@ fn build_preview_pipeline(
     };
     let description = format!(
         "{source} ! videoconvert ! videoscale \
-         ! video/x-raw,width={w},height={h},framerate=60/1,pixel-aspect-ratio=1/1 \
+         ! video/x-raw,width={w},height={h},framerate={fps}/1,pixel-aspect-ratio=1/1 \
          ! d3d11upload"
     );
 
     let pipeline = gst::Pipeline::new();
     let source = gst::parse::bin_from_description(&description, true)
-        .context("failed to build the preview source")?;
+        .with_context(|| format!("failed to build the preview source: {description}"))?;
 
     let composition = gst::ElementFactory::make("overlaycomposition")
         .build()
@@ -341,6 +372,7 @@ fn build_preview_pipeline(
 /// Run until the viewer window goes away, rather than for a fixed duration.
 fn run_until_closed(pipeline: &gst::Pipeline, hwnd: isize) -> Result<()> {
     pipeline.set_state(gst::State::Playing)?;
+    window::reveal(hwnd);
 
     let bus = pipeline.bus().expect("pipeline without bus");
     let mut error = None;
@@ -405,7 +437,10 @@ fn cmd_list(json: bool) -> Result<()> {
         println!("No capturable windows found.");
         return Ok(());
     }
-    println!("{:<12} {:>11}  {:<24} {}", "HWND", "SIZE", "PROCESS", "TITLE");
+    println!(
+        "{:<12} {:>11}  {:<24} {}",
+        "HWND", "SIZE", "PROCESS", "TITLE"
+    );
     for t in windows {
         let size = format!("{}x{}", t.width, t.height);
         let title: String = t.title.chars().take(48).collect();

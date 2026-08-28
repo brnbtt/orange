@@ -4051,6 +4051,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "clap",
+ "embed-resource",
  "gstreamer",
  "gstreamer-sdp",
  "gstreamer-video",

@@ -17,18 +17,20 @@ use std::sync::mpsc;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, GetMonitorInfoW, HBRUSH, MonitorFromWindow, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, ScreenToClient,
+    CreateSolidBrush, EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, ScreenToClient,
+    DEVMODEW, ENUM_CURRENT_SETTINGS, HBRUSH, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F11};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_F11};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Opt out of DPI virtualisation, before any window exists.
@@ -44,13 +46,48 @@ pub fn set_dpi_aware() {
     }
 }
 
+/// Configured refresh rate of the monitor containing the captured window.
+/// Whole-screen capture (`hwnd == 0`) follows the primary display.
+pub fn target_refresh_rate(hwnd: isize) -> Option<u32> {
+    unsafe {
+        let monitor = MonitorFromWindow(
+            HWND(hwnd as *mut _),
+            if hwnd == 0 {
+                MONITOR_DEFAULTTOPRIMARY
+            } else {
+                MONITOR_DEFAULTTONEAREST
+            },
+        );
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+            return None;
+        }
+
+        let mut mode = DEVMODEW::default();
+        mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if !EnumDisplaySettingsW(
+            PCWSTR(info.szDevice.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut mode,
+        )
+        .as_bool()
+        {
+            return None;
+        }
+        (mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency)
+    }
+}
+
 /// Cosmetic only: the frame behind the video, visible for an instant before
 /// the first frame arrives and in the letterbox bars.
-const BACKGROUND: COLORREF = COLORREF(0x00141414); // BGR
+const BACKGROUND: COLORREF = COLORREF(0x000b0b0b); // BGR
 
 /// Drives cursor hiding. Windows only asks about the cursor when the mouse
 /// moves, and the point is to hide it when the mouse has stopped.
 const CURSOR_TIMER: usize = 1;
+const REVEAL_MESSAGE: u32 = WM_APP + 1;
+const REVEAL_MS: u32 = 180;
 
 pub struct VideoWindow {
     pub hwnd: isize,
@@ -95,9 +132,22 @@ pub fn spawn(
 /// Per-window state reachable from the window procedure.
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
+    revealed: std::cell::Cell<bool>,
     /// Style and bounds to put back when leaving fullscreen. `Some` means we
     /// are currently fullscreen.
     restore: std::cell::Cell<Option<(WINDOW_STYLE, RECT)>>,
+}
+
+/// Reveal a prepared video window on its owning thread.
+pub fn reveal(hwnd: isize) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            REVEAL_MESSAGE,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
 }
 
 /// Tell the overlay what display scaling it is being shown at.
@@ -111,6 +161,20 @@ unsafe fn sync_dpi(hwnd: HWND) {
             overlay.dpi = dpi as f32 / 96.0;
         }
     }
+}
+
+unsafe fn set_corner_style(hwnd: HWND, fullscreen: bool) {
+    let pref = if fullscreen {
+        DWMWCP_DONOTROUND
+    } else {
+        DWMWCP_ROUND
+    };
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &pref as *const _ as *const _,
+        std::mem::size_of_val(&pref) as u32,
+    );
 }
 
 /// Fill the monitor the window is currently on, or go back to where it was.
@@ -164,6 +228,7 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         overlay.fullscreen = ctx.restore.get().is_some();
         overlay.wake();
     }
+    set_corner_style(hwnd, ctx.restore.get().is_some());
 }
 
 /// Map a point in client coordinates to the video's coordinate space.
@@ -191,6 +256,48 @@ fn client_to_video(hwnd: HWND, cx: f32, cy: f32, video: (u32, u32)) -> Option<(f
     Some(((cx - ox) / scale, (cy - oy) / scale))
 }
 
+/// Resize hit-testing for a frame whose client area fills the whole window.
+///
+/// Keeping `WS_THICKFRAME` gives Windows native resize and snap behaviour, but
+/// `WM_NCCALCSIZE` removes its visible non-client strips. We therefore identify
+/// the edges ourselves instead of relying on the frame that is no longer there.
+unsafe fn resize_hit_test(hwnd: HWND, x: i32, y: i32) -> Option<LRESULT> {
+    let Some(ctx) = context(hwnd) else {
+        return None;
+    };
+    if ctx.restore.get().is_some() {
+        return None; // no resize edges in fullscreen
+    }
+
+    let mut rect = RECT::default();
+    GetWindowRect(hwnd, &mut rect).ok()?;
+    if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom {
+        return None;
+    }
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    let edge_x =
+        GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    let edge_y =
+        GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    let left = x < rect.left + edge_x;
+    let right = x >= rect.right - edge_x;
+    let top = y < rect.top + edge_y;
+    let bottom = y >= rect.bottom - edge_y;
+
+    let hit = match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, _, _, _) => HTLEFT,
+        (_, true, _, _) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (_, _, _, true) => HTBOTTOM,
+        _ => return None,
+    };
+    Some(LRESULT(hit as isize))
+}
+
 unsafe fn context(hwnd: HWND) -> Option<&'static WindowContext> {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowContext;
     ptr.as_ref()
@@ -210,6 +317,7 @@ unsafe fn create_window(
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance.into(),
         lpszClassName: class_name,
+        hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16)).unwrap_or_default(),
         hCursor: LoadCursorW(None, IDC_ARROW)?,
         hbrBackground: HBRUSH(CreateSolidBrush(BACKGROUND).0),
         ..Default::default()
@@ -248,25 +356,29 @@ unsafe fn create_window(
         None,
     )?;
 
-    // Rounded corners, one call. Windows 11 only; older builds ignore it.
-    let pref = DWMWCP_ROUND;
+    // Rounded in a normal window, square and edge-to-edge in fullscreen.
+    // Windows 11 only; older builds ignore it.
+    set_corner_style(hwnd, false);
+    // Windows 11 otherwise paints a one-pixel white activation border around
+    // the custom frame, most visibly across the top over dark video.
+    let border = DWMWA_COLOR_NONE;
     let _ = DwmSetWindowAttribute(
         hwnd,
-        DWMWA_WINDOW_CORNER_PREFERENCE,
-        &pref as *const _ as *const _,
-        std::mem::size_of_val(&pref) as u32,
+        DWMWA_BORDER_COLOR,
+        &border as *const _ as *const _,
+        std::mem::size_of_val(&border) as u32,
     );
 
     // Leaked deliberately and reclaimed in WM_DESTROY.
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
+        revealed: std::cell::Cell::new(false),
         restore: std::cell::Cell::new(None),
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
 
     sync_dpi(hwnd);
 
-    let _ = ShowWindow(hwnd, SW_SHOW);
     SetTimer(Some(hwnd), CURSOR_TIMER, 250, None);
     Ok(hwnd)
 }
@@ -310,6 +422,19 @@ unsafe fn run_message_loop() {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            REVEAL_MESSAGE => {
+                if let Some(ctx) = context(hwnd) {
+                    if !ctx.revealed.replace(true) {
+                        if AnimateWindow(hwnd, REVEAL_MS, AW_BLEND | AW_ACTIVATE).is_err() {
+                            let _ = ShowWindow(hwnd, SW_SHOW);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            // Let video occupy the complete window while retaining
+            // `WS_THICKFRAME` for native resizing and snap layouts.
+            WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
             // Hit testing does double duty. It fires on every mouse move, so
             // it wakes the controls and updates hover; and it decides whether
             // this point should drag the window or receive a normal click.
@@ -317,13 +442,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // Without the second part, HTCAPTION would swallow every click and
             // the controls would be impossible to press.
             WM_NCHITTEST => {
-                let hit = DefWindowProcW(hwnd, msg, wparam, lparam);
-                if hit.0 != HTCLIENT as isize {
-                    return hit; // resize borders keep their behaviour
-                }
-
                 let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                if let Some(hit) = resize_hit_test(hwnd, screen_x, screen_y) {
+                    return hit;
+                }
                 let mut point = POINT {
                     x: screen_x,
                     y: screen_y,
@@ -356,6 +479,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
                 let mut close = false;
                 let mut fullscreen = false;
+                let mut volume_dragging = false;
                 if let Some(ctx) = context(hwnd) {
                     if let Ok(mut overlay) = ctx.overlay.lock() {
                         let video = overlay.video;
@@ -363,6 +487,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             overlay.on_click(vx, vy);
                             close = overlay.close_requested;
                             fullscreen = std::mem::take(&mut overlay.fullscreen_requested);
+                            volume_dragging = overlay.volume_dragging();
                         }
                     }
                 }
@@ -371,6 +496,40 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 } else if fullscreen {
                     toggle_fullscreen(hwnd);
+                } else if volume_dragging {
+                    SetCapture(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let x = (lparam.0 & 0xFFFF) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                if let Some(ctx) = context(hwnd) {
+                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                        if overlay.volume_dragging() {
+                            let video = overlay.video;
+                            if let Some((vx, _)) = client_to_video(hwnd, x, y, video) {
+                                overlay.drag_volume(vx);
+                            }
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let released = context(hwnd)
+                    .and_then(|ctx| ctx.overlay.lock().ok().map(|mut o| o.end_volume_drag()))
+                    .unwrap_or(false);
+                if released {
+                    let _ = ReleaseCapture();
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE => {
+                if let Some(ctx) = context(hwnd) {
+                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                        overlay.end_volume_drag();
+                    }
                 }
                 LRESULT(0)
             }

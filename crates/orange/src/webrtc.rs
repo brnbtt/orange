@@ -117,11 +117,14 @@ fn connect_signalling(peers: Arc<Mutex<Peers>>) {
                     .unwrap();
                 receiver2
                     .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
-                sender2
-                    .emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
+                sender2.emit_by_name::<()>(
+                    "set-remote-description",
+                    &[&answer, &None::<gst::Promise>],
+                );
                 println!("[webrtc] negotiation complete");
             });
-            receiver.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
+            receiver
+                .emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
         });
 
         sender_for_offer.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
@@ -225,7 +228,15 @@ pub fn encoding_name(pad: &gst::Pad) -> Option<String> {
 }
 
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
-pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Output) -> Result<()> {
+pub fn build_receive_branch(
+    pipeline: &gst::Pipeline,
+    pad: &gst::Pad,
+    output: Output,
+) -> Result<()> {
+    let reveal_hwnd = match &output {
+        Output::Window { hwnd, .. } => Some(*hwnd),
+        Output::File(_) => None,
+    };
     let depay = gst::ElementFactory::make("rtpav1depay").build()?;
     let parse = gst::ElementFactory::make("av1parse").build()?;
     let dec = gst::ElementFactory::make("d3d11av1dec")
@@ -281,6 +292,9 @@ pub fn build_receive_branch(pipeline: &gst::Pipeline, pad: &gst::Pad, output: Ou
     }
 
     pad.link(&depay.static_pad("sink").unwrap())?;
+    if let Some(hwnd) = reveal_hwnd {
+        crate::window::reveal(hwnd);
+    }
     println!("[webrtc] receiving video");
     Ok(())
 }
@@ -301,7 +315,7 @@ pub fn build_audio_branch(
     let resample = gst::ElementFactory::make("audioresample").build()?;
     let volume = gst::ElementFactory::make("volume")
         .name("viewer-volume")
-        .property("volume", 1.0f64)
+        .property("volume", 0.3f64)
         .build()?;
     let sink = gst::ElementFactory::make("wasapi2sink")
         .property("low-latency", true)

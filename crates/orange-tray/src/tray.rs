@@ -97,9 +97,18 @@ unsafe fn create() -> Result<HWND> {
         uID: 1,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_TRAY,
-        // The application icon, so the tray matches the exe.
-        hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16))
-            .or_else(|_| LoadIconW(None, IDI_APPLICATION))?,
+        // Load the optical small-size entry from the multi-resolution icon;
+        // asking for the system tray metric avoids a blurry 32px downscale.
+        hIcon: LoadImageW(
+            Some(instance.into()),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR,
+        )
+        .map(|handle| HICON(handle.0))
+        .or_else(|_| LoadIconW(None, IDI_APPLICATION))?,
         ..Default::default()
     };
 
@@ -145,7 +154,7 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     uID: 1,
                     ..Default::default()
                 };
-                Shell_NotifyIconW(NIM_DELETE, &data);
+                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
                 PostQuitMessage(0);
                 LRESULT(0)
             }

@@ -32,29 +32,30 @@ use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use crate::text::{self, Weight};
 
 /// How long the controls stay up after the last mouse movement.
-const HIDE_AFTER: Duration = Duration::from_secs(3);
-const FADE: Duration = Duration::from_millis(500);
+const HIDE_AFTER: Duration = Duration::from_millis(1_000);
+const FADE: Duration = Duration::from_millis(200);
 
 // Design tokens, in logical pixels: what they measure on screen at 100%
 // display scaling, whatever the stream resolution.
-const MARGIN: f32 = 22.0;
-const BUTTON: f32 = 42.0;
-const ICON: f32 = 19.0;
+const MARGIN: f32 = 18.0;
+const BUTTON: f32 = 40.0;
+const ICON: f32 = 18.0;
 const CHIP: f32 = 34.0;
 const PAD: f32 = 13.0;
 const TRACK: f32 = 110.0;
 const LABEL: f32 = 13.0;
+const CONTROL_RADIUS: f32 = 12.0;
 
 // The app's palette, matching the tray.
-const INK: (f32, f32, f32) = (0.043, 0.031, 0.043);
+const INK: (f32, f32, f32) = (0.043, 0.043, 0.043);
 const CREAM: (f32, f32, f32) = (0.902, 0.878, 0.820);
 const ORANGE: (f32, f32, f32) = (1.0, 0.353, 0.122);
 const DANGER: (f32, f32, f32) = (0.878, 0.392, 0.373);
-const GREEN: (f32, f32, f32) = (0.306, 0.788, 0.478);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     Mute,
+    AudioGap,
     VolumeTrack,
     Fullscreen,
     Close,
@@ -89,6 +90,7 @@ pub struct OverlayState {
     pub dpi: f32,
     pub volume: f64,
     pub muted: bool,
+    volume_dragging: bool,
     pub fullscreen: bool,
     pub viewers: Option<usize>,
     pub host: Option<String>,
@@ -113,8 +115,9 @@ impl Default for OverlayState {
             video: (0, 0),
             client: (0, 0),
             dpi: 1.0,
-            volume: 1.0,
+            volume: 0.3,
             muted: false,
+            volume_dragging: false,
             fullscreen: false,
             viewers: None,
             host: None,
@@ -136,12 +139,12 @@ pub type SharedOverlay = Arc<Mutex<OverlayState>>;
 
 impl OverlayState {
     pub fn visible(&self) -> bool {
-        self.pinned || self.shown_at.elapsed() < HIDE_AFTER
+        self.pinned || self.volume_dragging || self.shown_at.elapsed() < HIDE_AFTER
     }
 
     /// Fade factor, so the controls dissolve rather than vanishing.
     fn opacity(&self) -> f32 {
-        if self.pinned {
+        if self.pinned || self.volume_dragging {
             return 1.0;
         }
         let elapsed = self.shown_at.elapsed();
@@ -178,7 +181,11 @@ impl OverlayState {
             return dpi * (vh as f32 / 1080.0).max(1.0);
         }
         let fit = (cw as f32 / vw as f32).min(ch as f32 / vh as f32);
-        if fit > 0.0 { dpi / fit } else { dpi }
+        if fit > 0.0 {
+            dpi / fit
+        } else {
+            dpi
+        }
     }
 
     pub fn wake(&mut self) {
@@ -200,11 +207,23 @@ impl OverlayState {
     pub fn on_mouse_move(&mut self, x: f32, y: f32) -> bool {
         self.wake();
         let previous = self.hot;
-        self.hot = self
+        let next = self
             .hits
             .iter()
             .find(|h| h.contains(x, y))
             .map(|h| h.control);
+        // The closed audio control carries a latent corridor where its slider
+        // will appear. It only activates while leaving an audio control, so
+        // moving through quickly is safe without an invisible hover target
+        // opening the slider from elsewhere in the window.
+        self.hot = match (previous, next) {
+            (
+                Some(Control::Mute | Control::AudioGap | Control::VolumeTrack),
+                Some(Control::AudioGap),
+            ) => Some(Control::AudioGap),
+            (_, Some(Control::AudioGap)) => None,
+            (_, next) => next,
+        };
         previous != self.hot
     }
 
@@ -218,11 +237,12 @@ impl OverlayState {
             Control::Mute => self.muted = !self.muted,
             Control::Close => self.close_requested = true,
             Control::Fullscreen => self.fullscreen_requested = true,
-            Control::Stats => {}
+            Control::Stats | Control::AudioGap => {}
             Control::VolumeTrack => {
                 let t = ((x - hit.x) / hit.w).clamp(0.0, 1.0);
                 self.volume = t as f64;
                 self.muted = false;
+                self.volume_dragging = true;
             }
         }
         self.cache = None;
@@ -232,7 +252,43 @@ impl OverlayState {
     /// speaker or the slider keeps it open, so the cursor can travel between
     /// them without it collapsing underfoot.
     fn audio_open(&self) -> bool {
-        matches!(self.hot, Some(Control::Mute) | Some(Control::VolumeTrack))
+        self.volume_dragging
+            || matches!(
+                self.hot,
+                Some(Control::Mute | Control::AudioGap | Control::VolumeTrack)
+            )
+    }
+
+    pub fn volume_dragging(&self) -> bool {
+        self.volume_dragging
+    }
+
+    /// Continue a slider drag even after the pointer leaves its visual bounds.
+    pub fn drag_volume(&mut self, x: f32) -> bool {
+        if !self.volume_dragging {
+            return false;
+        }
+        let Some(track) = self
+            .hits
+            .iter()
+            .find(|hit| hit.control == Control::VolumeTrack)
+            .copied()
+        else {
+            return false;
+        };
+        let next = ((x - track.x) / track.w).clamp(0.0, 1.0) as f64;
+        let changed = (next - self.volume).abs() > f64::EPSILON || self.muted;
+        self.volume = next;
+        self.muted = false;
+        self.wake();
+        if changed {
+            self.cache = None;
+        }
+        changed
+    }
+
+    pub fn end_volume_drag(&mut self) -> bool {
+        std::mem::take(&mut self.volume_dragging)
     }
 
     /// A short description of what is being received: the product's whole
@@ -283,6 +339,7 @@ impl OverlayState {
         ((self.opacity() * 24.0) as u32).hash(&mut hasher);
         ((self.volume * 100.0) as u32).hash(&mut hasher);
         self.muted.hash(&mut hasher);
+        self.volume_dragging.hash(&mut hasher);
         self.fullscreen.hash(&mut hasher);
         self.hot.map(|c| c as u8).hash(&mut hasher);
         self.quality_label().hash(&mut hasher);
@@ -383,21 +440,20 @@ fn speaker(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, muted: bool, color: Colo
             }
         }
     } else {
-        for (i, r) in [s * 0.16, s * 0.28].iter().enumerate() {
-            let (cx, cy) = (x + s * 0.58, y + s * 0.50);
-            let mut pb = PathBuilder::new();
-            pb.move_to(cx + r, cy - r * 0.72);
-            pb.quad_to(cx + r * 1.5, cy, cx + r, cy + r * 0.72);
-            if let Some(path) = pb.finish() {
-                let faded = Color::from_rgba(
-                    color.red(),
-                    color.green(),
-                    color.blue(),
-                    color.alpha() * (1.0 - i as f32 * 0.35),
-                )
-                .unwrap_or(color);
-                stroke(pixmap, &path, faded, s * 0.09);
-            }
+        // One deliberate wave stays legible after the video sink scales the
+        // overlay. Two nested hairline waves looked soft and busy at 150% DPI.
+        let mut pb = PathBuilder::new();
+        pb.move_to(x + s * 0.64, y + s * 0.29);
+        pb.cubic_to(
+            x + s * 0.88,
+            y + s * 0.38,
+            x + s * 0.88,
+            y + s * 0.62,
+            x + s * 0.64,
+            y + s * 0.71,
+        );
+        if let Some(path) = pb.finish() {
+            stroke(pixmap, &path, color, s * 0.10);
         }
     }
 }
@@ -409,6 +465,27 @@ fn cross(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
         pb.line_to(x + s * b.0, y + s * b.1);
         if let Some(path) = pb.finish() {
             stroke(pixmap, &path, color, s * 0.11);
+        }
+    }
+}
+
+/// Compact broadcast mark for a live stream: a source dot with one signal
+/// wave on each side. It remains recognizable at the collapsed 18px size.
+fn live_mark(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
+    let cx = x + s / 2.0;
+    let cy = y + s / 2.0;
+    circle(pixmap, cx, cy, s * 0.12, color);
+    for side in [-1.0f32, 1.0] {
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx + side * s * 0.24, cy - s * 0.22);
+        pb.quad_to(
+            cx + side * s * 0.42,
+            cy,
+            cx + side * s * 0.24,
+            cy + s * 0.22,
+        );
+        if let Some(path) = pb.finish() {
+            stroke(pixmap, &path, color, s * 0.10);
         }
     }
 }
@@ -457,14 +534,33 @@ struct Panel {
     pixmap: Pixmap,
     x: f32,
     y: f32,
+    render_w: f32,
+    render_h: f32,
 }
 
 /// Build one cluster: allocate a pixmap of the right size, let `paint` fill
 /// it, and record where it goes.
-fn cluster(x: f32, y: f32, w: f32, h: f32, paint: impl FnOnce(&mut Pixmap)) -> Option<Panel> {
-    let mut pixmap = Pixmap::new(w.ceil().max(1.0) as u32, h.ceil().max(1.0) as u32)?;
+fn cluster(
+    x: f32,
+    y: f32,
+    render_w: f32,
+    render_h: f32,
+    raster_w: f32,
+    raster_h: f32,
+    paint: impl FnOnce(&mut Pixmap),
+) -> Option<Panel> {
+    let mut pixmap = Pixmap::new(
+        raster_w.ceil().max(1.0) as u32,
+        raster_h.ceil().max(1.0) as u32,
+    )?;
     paint(&mut pixmap);
-    Some(Panel { pixmap, x, y })
+    Some(Panel {
+        pixmap,
+        x,
+        y,
+        render_w,
+        render_h,
+    })
 }
 
 /// Rasterise the controls and wrap them as an overlay composition.
@@ -496,93 +592,110 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     }
 
     let alpha = state.opacity();
-    let s = state.scale();
+    // Placement is in video coordinates; painting is at the output's physical
+    // DPI. If both use video scale, tiny-skia's antialiasing is filtered again
+    // when the sink fits the stream to the window, which softens every icon.
+    let render_scale = state.scale();
+    let raster_scale = state.dpi.max(1.0);
     let (fw, fh) = (vw as f32, vh as f32);
-
-    // Screen-pixel design sizes, in video pixels.
-    let margin = MARGIN * s;
-    let button = BUTTON * s;
-    let icon = ICON * s;
-    let chip = CHIP * s;
-    let pad = PAD * s;
-    let label_size = LABEL * s;
 
     let ink = rgba(CREAM, alpha);
     let mut hits: Vec<Hit> = Vec::new();
     let mut panels: Vec<Panel> = Vec::new();
 
     let hot_alpha = |control: Control, base: f32| {
-        if state.hot == Some(control) { 1.0 } else { base }
+        if state.hot == Some(control) {
+            1.0
+        } else {
+            base
+        }
     };
 
     // --- status, top-left ---------------------------------------------------
-    // What you are receiving. Collapsed it is a dot and a quality label;
-    // hovering adds bitrate, host and viewer count.
+    // A broadcast mark at rest; hovering expands it to what is being received.
     {
+        let expanded = state.hot == Some(Control::Stats);
         let quality = state.quality_label();
-        let detail = if state.hot == Some(Control::Stats) {
-            state.detail_label()
-        } else {
-            None
-        };
-        let dot = 7.0 * s;
-        let gap = 9.0 * s;
+        let detail = if expanded { state.detail_label() } else { None };
         let has_text = text::available();
-
-        let mut text_w = text::width(&quality, label_size, Weight::Semibold);
+        let label_size = LABEL * raster_scale;
+        let mut text_w = text::width(&quality, label_size, Weight::Semibold) / raster_scale;
         if let Some(detail) = &detail {
-            text_w += text::width(&format!("  \u{00b7}  {detail}"), label_size, Weight::Regular);
+            text_w += text::width(
+                &format!("  \u{00b7}  {detail}"),
+                label_size,
+                Weight::Regular,
+            ) / raster_scale;
         }
 
-        let h = chip;
-        let w = if has_text {
-            pad + dot + gap + text_w + pad
+        // Logical dimensions first; each is independently converted for the
+        // destination rectangle and for the source pixmap.
+        let h = CHIP;
+        let w = if expanded && has_text {
+            CHIP + 8.0 + text_w + PAD
         } else {
-            pad + dot + pad
+            CHIP
         };
         // Centred on the close button's axis rather than sharing its top
         // edge: the chip is shorter, and aligning tops leaves it looking
         // like it slipped.
-        let (x, y) = (margin, margin + (button - h) / 2.0);
+        let x = MARGIN * render_scale;
+        let y = (MARGIN + (BUTTON - h) / 2.0) * render_scale;
 
-        if let Some(p) = cluster(x, y, w, h, |pixmap| {
-            panel(pixmap, 0.0, 0.0, w, h, h / 2.0, alpha);
-            circle(pixmap, pad + dot / 2.0, h / 2.0, dot / 2.0, rgba(GREEN, alpha));
-            if !has_text {
-                return;
-            }
-            let baseline = h / 2.0 + text::cap_height(label_size) / 2.0;
-            let mut caret = pad + dot + gap;
-            text::draw(
-                pixmap,
-                caret,
-                baseline,
-                &quality,
-                label_size,
-                Weight::Semibold,
-                ink,
-            );
-            if let Some(detail) = &detail {
-                caret += text::width(&quality, label_size, Weight::Semibold);
-                let joined = format!("  \u{00b7}  {detail}");
+        if let Some(p) = cluster(
+            x,
+            y,
+            w * render_scale,
+            h * render_scale,
+            w * raster_scale,
+            h * raster_scale,
+            |pixmap| {
+                let (w, h) = (w * raster_scale, h * raster_scale);
+                let icon = ICON * raster_scale;
+                panel(pixmap, 0.0, 0.0, w, h, CONTROL_RADIUS * raster_scale, alpha);
+                live_mark(
+                    pixmap,
+                    (CHIP * raster_scale - icon) / 2.0,
+                    (h - icon) / 2.0,
+                    icon,
+                    rgba(ORANGE, alpha),
+                );
+                if !expanded || !has_text {
+                    return;
+                }
+                let baseline = h / 2.0 + text::cap_height(label_size) / 2.0;
+                let mut caret = (CHIP + 8.0) * raster_scale;
                 text::draw(
                     pixmap,
                     caret,
                     baseline,
-                    &joined,
+                    &quality,
                     label_size,
-                    Weight::Regular,
-                    rgba(CREAM, 0.62 * alpha),
+                    Weight::Semibold,
+                    ink,
                 );
-            }
-        }) {
+                if let Some(detail) = &detail {
+                    caret += text::width(&quality, label_size, Weight::Semibold);
+                    let joined = format!("  \u{00b7}  {detail}");
+                    text::draw(
+                        pixmap,
+                        caret,
+                        baseline,
+                        &joined,
+                        label_size,
+                        Weight::Regular,
+                        rgba(CREAM, 0.62 * alpha),
+                    );
+                }
+            },
+        ) {
             panels.push(p);
             hits.push(Hit {
                 control: Control::Stats,
                 x,
                 y,
-                w,
-                h,
+                w: w * render_scale,
+                h: h * render_scale,
             });
         }
     }
@@ -591,17 +704,37 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // Where a window's close button would be, since this frame has no title
     // bar of its own. Tinted red on hover: it ends the session.
     {
-        let (w, h) = (button, button);
-        let (x, y) = (fw - margin - w, margin);
+        let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
+        let (x, y) = (fw - MARGIN * render_scale - w, MARGIN * render_scale);
         let hovered = state.hot == Some(Control::Close);
-        if let Some(p) = cluster(x, y, w, h, |pixmap| {
-            panel(pixmap, 0.0, 0.0, w, h, h / 2.0, alpha);
-            if hovered {
-                fill_round(pixmap, 0.0, 0.0, w, h, h / 2.0, rgba(DANGER, 0.22 * alpha));
-            }
-            let color = if hovered { rgba(DANGER, alpha) } else { ink };
-            cross(pixmap, (w - icon) / 2.0, (h - icon) / 2.0, icon, color);
-        }) {
+        if let Some(p) = cluster(
+            x,
+            y,
+            w,
+            h,
+            BUTTON * raster_scale,
+            BUTTON * raster_scale,
+            |pixmap| {
+                let w = BUTTON * raster_scale;
+                let h = w;
+                let icon = ICON * raster_scale;
+                let control_radius = CONTROL_RADIUS * raster_scale;
+                panel(pixmap, 0.0, 0.0, w, h, control_radius, alpha);
+                if hovered {
+                    fill_round(
+                        pixmap,
+                        0.0,
+                        0.0,
+                        w,
+                        h,
+                        control_radius,
+                        rgba(DANGER, 0.22 * alpha),
+                    );
+                }
+                let color = if hovered { rgba(DANGER, alpha) } else { ink };
+                cross(pixmap, (w - icon) / 2.0, (h - icon) / 2.0, icon, color);
+            },
+        ) {
             panels.push(p);
             hits.push(Hit {
                 control: Control::Close,
@@ -619,99 +752,164 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // reaches for, so it gets the largest target of the four.
     {
         let open = state.audio_open();
-        let track = TRACK * s;
-        let gap = 12.0 * s;
-        let h = button;
+        let gap = 12.0;
+        let h = BUTTON;
         // The slider grows out to the right of the speaker, which stays
         // exactly where it was. Recentring the icon in a wider pill would
         // make it jump sideways under the cursor that just opened it.
         let w = if open {
-            button + gap + track + pad
+            BUTTON + gap + TRACK + PAD
         } else {
-            button
+            BUTTON
         };
-        let (x, y) = (margin, fh - margin - h);
+        let x = MARGIN * render_scale;
+        let y = fh - (MARGIN + h) * render_scale;
 
-        let level = if state.muted { 0.0 } else { state.volume as f32 };
+        let level = if state.muted {
+            0.0
+        } else {
+            state.volume as f32
+        };
         let muted = state.muted;
 
-        if let Some(p) = cluster(x, y, w, h, |pixmap| {
-            panel(pixmap, 0.0, 0.0, w, h, h / 2.0, alpha);
-            speaker(
-                pixmap,
-                (button - icon) / 2.0,
-                (h - icon) / 2.0,
-                icon,
-                muted,
-                rgba(CREAM, hot_alpha(Control::Mute, 0.85) * alpha),
-            );
-            if !open {
-                return;
-            }
-            let tx = button + gap;
-            let th = 4.0 * s;
-            let ty = h / 2.0 - th / 2.0;
-            fill_round(pixmap, tx, ty, track, th, th / 2.0, rgba(CREAM, 0.22 * alpha));
-            if level > 0.0 {
+        if let Some(p) = cluster(
+            x,
+            y,
+            w * render_scale,
+            h * render_scale,
+            w * raster_scale,
+            h * raster_scale,
+            |pixmap| {
+                let w = w * raster_scale;
+                let h = h * raster_scale;
+                let button = BUTTON * raster_scale;
+                let gap = gap * raster_scale;
+                let track = TRACK * raster_scale;
+                let icon = ICON * raster_scale;
+                let control_radius = CONTROL_RADIUS * raster_scale;
+                panel(
+                    pixmap,
+                    0.0,
+                    0.0,
+                    w,
+                    h,
+                    if open { h * 0.36 } else { control_radius },
+                    alpha,
+                );
+                speaker(
+                    pixmap,
+                    (button - icon) / 2.0,
+                    (h - icon) / 2.0,
+                    icon,
+                    muted,
+                    rgba(CREAM, hot_alpha(Control::Mute, 0.85) * alpha),
+                );
+                if !open {
+                    return;
+                }
+                let tx = button + gap;
+                let th = 4.0 * raster_scale;
+                let ty = h / 2.0 - th / 2.0;
                 fill_round(
                     pixmap,
                     tx,
                     ty,
-                    track * level,
+                    track,
                     th,
                     th / 2.0,
-                    rgba(ORANGE, alpha),
+                    rgba(CREAM, 0.22 * alpha),
                 );
-            }
-            circle(
-                pixmap,
-                tx + track * level,
-                h / 2.0,
-                6.0 * s,
-                rgba(CREAM, alpha),
-            );
-        }) {
+                if level > 0.0 {
+                    fill_round(
+                        pixmap,
+                        tx,
+                        ty,
+                        track * level,
+                        th,
+                        th / 2.0,
+                        rgba(ORANGE, alpha),
+                    );
+                }
+                circle(
+                    pixmap,
+                    tx + track * level,
+                    h / 2.0,
+                    6.0 * raster_scale,
+                    rgba(CREAM, alpha),
+                );
+            },
+        ) {
             panels.push(p);
             hits.push(Hit {
                 control: Control::Mute,
                 x,
                 y,
-                w: button,
-                h,
+                w: BUTTON * render_scale,
+                h: h * render_scale,
             });
             if open {
                 hits.push(Hit {
                     control: Control::VolumeTrack,
-                    x: x + button + gap,
+                    x: x + (BUTTON + gap) * render_scale,
                     y,
-                    w: track,
-                    h,
+                    w: TRACK * render_scale,
+                    h: h * render_scale,
                 });
             }
+            // Covers both the visible gap and the future track. It comes after
+            // real controls so clicks use their exact geometry.
+            hits.push(Hit {
+                control: Control::AudioGap,
+                x: x + BUTTON * render_scale,
+                y,
+                w: (gap + TRACK + PAD) * render_scale,
+                h: h * render_scale,
+            });
         }
     }
 
     // --- view, bottom-right -------------------------------------------------
     // Fullscreen, where every video player puts it.
     {
-        let (w, h) = (button, button);
-        let (x, y) = (fw - margin - w, fh - margin - h);
+        let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
+        let x = fw - (MARGIN + BUTTON) * render_scale;
+        let y = fh - (MARGIN + BUTTON) * render_scale;
         let exiting = state.fullscreen;
         let hovered = state.hot == Some(Control::Fullscreen);
-        if let Some(p) = cluster(x, y, w, h, |pixmap| {
-            panel(pixmap, 0.0, 0.0, w, h, h / 2.0, alpha);
-            if hovered {
-                fill_round(pixmap, 0.0, 0.0, w, h, h / 2.0, rgba(CREAM, 0.10 * alpha));
-            }
-            expand(
-                pixmap,
-                (w - icon) / 2.0,
-                (h - icon) / 2.0,
-                icon,
-                exiting,
-                rgba(CREAM, hot_alpha(Control::Fullscreen, 0.85) * alpha),
-            );
-        }) {
+        if let Some(p) = cluster(
+            x,
+            y,
+            w,
+            h,
+            BUTTON * raster_scale,
+            BUTTON * raster_scale,
+            |pixmap| {
+                let w = BUTTON * raster_scale;
+                let h = w;
+                let icon = ICON * raster_scale;
+                let control_radius = CONTROL_RADIUS * raster_scale;
+                panel(pixmap, 0.0, 0.0, w, h, control_radius, alpha);
+                if hovered {
+                    fill_round(
+                        pixmap,
+                        0.0,
+                        0.0,
+                        w,
+                        h,
+                        control_radius,
+                        rgba(CREAM, 0.10 * alpha),
+                    );
+                }
+                expand(
+                    pixmap,
+                    (w - icon) / 2.0,
+                    (h - icon) / 2.0,
+                    icon,
+                    exiting,
+                    rgba(CREAM, hot_alpha(Control::Fullscreen, 0.85) * alpha),
+                );
+            },
+        ) {
             panels.push(p);
             hits.push(Hit {
                 control: Control::Fullscreen,
@@ -732,7 +930,13 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
 
 fn transparent_composition() -> Option<gst_video::VideoOverlayComposition> {
     let pixmap = Pixmap::new(1, 1)?;
-    to_composition(vec![Panel { pixmap, x: 0.0, y: 0.0 }])
+    to_composition(vec![Panel {
+        pixmap,
+        x: 0.0,
+        y: 0.0,
+        render_w: 1.0,
+        render_h: 1.0,
+    }])
 }
 
 /// Wrap the rasterised clusters as something the sink can composite.
@@ -747,7 +951,15 @@ fn to_composition(panels: Vec<Panel>) -> Option<gst_video::VideoOverlayCompositi
     let mut rectangles = Vec::with_capacity(panels.len());
 
     for panel in panels {
-        let (w, h) = (panel.pixmap.width(), panel.pixmap.height());
+        let (source_w, source_h) = (panel.pixmap.width(), panel.pixmap.height());
+        // Round both destination edges rather than the origin and width
+        // independently, or fractional scales can shift the far edge a pixel.
+        let left = panel.x.round() as i32;
+        let top = panel.y.round() as i32;
+        let right = (panel.x + panel.render_w).round() as i32;
+        let bottom = (panel.y + panel.render_h).round() as i32;
+        let render_w = (right - left).max(1) as u32;
+        let render_h = (bottom - top).max(1) as u32;
         let mut data = panel.pixmap.take();
         for pixel in data.chunks_exact_mut(4) {
             pixel.swap(0, 2);
@@ -760,18 +972,18 @@ fn to_composition(panels: Vec<Panel>) -> Option<gst_video::VideoOverlayCompositi
                 buffer,
                 gst_video::VideoFrameFlags::empty(),
                 gst_video::VideoFormat::Bgra,
-                w,
-                h,
+                source_w,
+                source_h,
             )
             .ok()?;
         }
 
         rectangles.push(gst_video::VideoOverlayRectangle::new_raw(
             &buffer,
-            panel.x.round() as i32,
-            panel.y.round() as i32,
-            w,
-            h,
+            left,
+            top,
+            render_w,
+            render_h,
             gst_video::VideoOverlayFormatFlags::PREMULTIPLIED_ALPHA,
         ));
     }

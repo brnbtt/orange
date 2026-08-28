@@ -9,6 +9,9 @@ description = "Low-overhead window streaming for friends"
 name = "orange"
 path = "src/main.rs"
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 orange-signal = { path = "../orange-signal" }
 gstreamer = "0.25"
