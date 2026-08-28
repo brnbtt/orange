@@ -272,20 +272,36 @@ fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui
         .child(text.into())
 }
 
-/// The mark. A glyph on a disc rather than an imported asset, so there is no
-/// icon pipeline to maintain for one shape.
+/// The mark: an eclipse. A ring that thickens downward, drawn as two circles
+/// rather than an imported asset so there is no icon pipeline for one shape.
+///
+/// Placeholder — the real logo is still being designed.
 fn logo(px_size: f32) -> gpui::Div {
     div()
-        .flex()
-        .items_center()
-        .justify_center()
+        .relative()
         .w(px(px_size))
         .h(px(px_size))
-        .rounded_full()
-        .bg(rgb(ORANGE))
-        .text_color(rgb(INK))
-        .text_size(px(px_size * 0.42))
-        .child("▶")
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(px_size))
+                .h(px(px_size))
+                .rounded_full()
+                .bg(rgb(ORANGE)),
+        )
+        .child(
+            // The eclipsing body, offset upward so the crescent gathers below.
+            div()
+                .absolute()
+                .top(px(-px_size * 0.16))
+                .left(px(px_size * 0.08))
+                .w(px(px_size * 0.84))
+                .h(px(px_size * 0.84))
+                .rounded_full()
+                .bg(rgb(BG)),
+        )
 }
 
 /// A small coloured dot, for status.
