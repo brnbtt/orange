@@ -1,0 +1,176 @@
+//! A real system tray icon.
+//!
+//! GPUI has no tray support, so this is raw Win32: a hidden message-only
+//! window owns the notification icon and receives its callbacks. It runs on
+//! its own thread because a window's message loop must live on the thread
+//! that created it.
+//!
+//! Clicks are reported back through a channel rather than touching the UI
+//! directly, so the GPUI side stays in charge of its own state.
+
+use anyhow::{Context, Result};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::OnceLock;
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+};
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// Private message id for icon callbacks.
+const WM_TRAY: u32 = WM_APP + 1;
+
+const ID_SHOW: usize = 1;
+const ID_QUIT: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayEvent {
+    /// Left click, or "Open" from the menu.
+    Show,
+    Quit,
+}
+
+static EVENTS: OnceLock<Sender<TrayEvent>> = OnceLock::new();
+
+/// Install the tray icon. Returns a receiver of user actions.
+pub fn install() -> Result<Receiver<TrayEvent>> {
+    let (tx, rx) = channel();
+    EVENTS
+        .set(tx)
+        .map_err(|_| anyhow::anyhow!("tray already installed"))?;
+
+    let (ready_tx, ready_rx) = channel::<Result<()>>();
+    std::thread::spawn(move || unsafe {
+        match create() {
+            Ok(_) => {
+                let _ = ready_tx.send(Ok(()));
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+            }
+        }
+    });
+
+    ready_rx.recv().context("tray thread died")??;
+    Ok(rx)
+}
+
+unsafe fn create() -> Result<HWND> {
+    let instance = GetModuleHandleW(None)?;
+    let class_name = w!("orange_tray_icon");
+
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(tray_proc),
+        hInstance: instance.into(),
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    RegisterClassW(&class);
+
+    // HWND_MESSAGE creates a message-only window: no pixels, never shown.
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        class_name,
+        w!("orange"),
+        WINDOW_STYLE::default(),
+        0,
+        0,
+        0,
+        0,
+        Some(HWND_MESSAGE),
+        None,
+        Some(instance.into()),
+        None,
+    )?;
+
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_TRAY,
+        // The application icon, so the tray matches the exe.
+        hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))?,
+        ..Default::default()
+    };
+
+    let tip: Vec<u16> = "orange".encode_utf16().chain(std::iter::once(0)).collect();
+    data.szTip[..tip.len()].copy_from_slice(&tip);
+
+    if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
+        anyhow::bail!("Shell_NotifyIcon refused to add the tray icon");
+    }
+    Ok(hwnd)
+}
+
+fn emit(event: TrayEvent) {
+    if let Some(tx) = EVENTS.get() {
+        let _ = tx.send(event);
+    }
+}
+
+extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_TRAY => {
+                // The mouse message arrives in the low word of lparam.
+                match (lparam.0 as u32) & 0xFFFF {
+                    x if x == WM_LBUTTONUP => emit(TrayEvent::Show),
+                    x if x == WM_RBUTTONUP => show_menu(hwnd),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                match wparam.0 & 0xFFFF {
+                    ID_SHOW => emit(TrayEvent::Show),
+                    ID_QUIT => emit(TrayEvent::Quit),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                let data = NOTIFYICONDATAW {
+                    cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                    hWnd: hwnd,
+                    uID: 1,
+                    ..Default::default()
+                };
+                Shell_NotifyIconW(NIM_DELETE, &data);
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+unsafe fn show_menu(hwnd: HWND) {
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, w!("Open orange"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
+
+    let mut point = POINT::default();
+    let _ = GetCursorPos(&mut point);
+    // Required, or the menu refuses to close when clicking elsewhere.
+    let _ = SetForegroundWindow(hwnd);
+    let _ = TrackPopupMenu(
+        menu,
+        TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
+        point.x,
+        point.y,
+        Some(0),
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+}

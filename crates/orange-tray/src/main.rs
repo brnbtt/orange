@@ -10,6 +10,7 @@
 
 mod session;
 mod supervisor;
+mod tray;
 
 use gpui::{
     div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FontWeight, SharedString,
@@ -316,7 +317,19 @@ impl Render for Orange {
                         .child(dot(GREEN))
                         .child(label(s.name.clone(), MUTED).text_xs())
                         .into_any_element(),
-                    None => div().into_any_element(),
+                    None => div()
+                        .id("header-signin")
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .child(dot(FAINT))
+                        .child(label("Not signed in", FAINT).text_xs())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.screen = Screen::SignedOut;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
                 })
                 .into_any_element()
         };
@@ -402,6 +415,17 @@ impl Orange {
             .children(self.logging_in.then(|| {
                 label("Finish in your browser, then come back here.", FAINT).text_xs()
             }))
+            // Identity is optional in the protocol - it only attaches a name.
+            // Blocking streaming behind it would be a self-imposed limit.
+            .child(
+                quiet("skip", "Continue without signing in").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.logging_in = false;
+                        this.screen = Screen::Home;
+                        cx.notify();
+                    },
+                )),
+            )
     }
 
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -709,20 +733,49 @@ impl Orange {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    // Installed before the UI so a failure here is visible as a missing icon
+    // rather than a half-started app.
+    let tray_events = tray::install().ok();
+
+    Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(400.0), px(540.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("orange".into()),
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("orange".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(Orange::new),
-        )
-        .unwrap();
+                },
+                |_, cx| cx.new(Orange::new),
+            )
+            .unwrap();
         cx.activate(true);
+
+        // The tray runs its own Win32 message loop on another thread, so its
+        // events arrive over a channel and are drained on a timer here.
+        if let Some(events) = tray_events {
+            cx.spawn(async move |cx| loop {
+                Timer::after(Duration::from_millis(200)).await;
+                while let Ok(event) = events.try_recv() {
+                    match event {
+                        tray::TrayEvent::Show => {
+                            let _ = cx.update(|cx| {
+                                let _ = window.update(cx, |_, window, _| {
+                                    window.activate_window();
+                                });
+                            });
+                        }
+                        tray::TrayEvent::Quit => {
+                            let _ = cx.update(|cx| cx.quit());
+                            return;
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
     });
 }
