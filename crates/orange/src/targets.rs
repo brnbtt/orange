@@ -9,6 +9,9 @@ use anyhow::Result;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, MAX_PATH, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Gdi::{
+    RedrawWindow, RDW_ALLCHILDREN, RDW_FRAME, RDW_INTERNALPAINT, RDW_INVALIDATE, RDW_UPDATENOW,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -190,4 +193,19 @@ pub fn list_windows() -> Result<Vec<CaptureTarget>> {
     // Biggest first: the game is almost always the largest window on screen.
     out.sort_by_key(|t| std::cmp::Reverse(t.width as i64 * t.height as i64));
     Ok(out)
+}
+
+/// Ask an idle window to produce a fresh WGC frame for a late-joining viewer.
+pub fn request_redraw(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let _ = RedrawWindow(
+            Some(HWND(hwnd as *mut _)),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_INTERNALPAINT | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+    }
 }

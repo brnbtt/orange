@@ -15,11 +15,13 @@ pub struct Session {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Preferences {
     pub quality: usize,
     /// `None` follows the captured window's display refresh rate.
     pub fps: Option<u32>,
+    pub own_codes: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -27,6 +29,7 @@ impl Default for Preferences {
         Self {
             quality: 1,
             fps: None,
+            own_codes: Vec::new(),
         }
     }
 }

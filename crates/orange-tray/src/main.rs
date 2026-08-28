@@ -121,7 +121,7 @@ impl Orange {
             sized_for: None,
             copied_at: None,
             copied_code: None,
-            own_codes: Vec::new(),
+            own_codes: preferences.own_codes,
         }
     }
 
@@ -199,6 +199,7 @@ impl Orange {
                     if self.own_codes.len() > 16 {
                         self.own_codes.remove(0);
                     }
+                    self.save_preferences();
                 }
                 self.copied_code = Some(code);
                 self.copied_at = Some(Instant::now());
@@ -215,6 +216,7 @@ impl Orange {
         session::save_preferences(session::Preferences {
             quality: self.quality,
             fps: self.fps,
+            own_codes: self.own_codes.clone(),
         });
     }
 

@@ -168,9 +168,9 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
 
 /// Host: capture a window and serve any number of viewers.
 ///
-/// The window is captured and encoded **once**. A `tee` after the payloader
-/// fans the encoded stream out to one `webrtcbin` per viewer, so adding a
-/// viewer costs upload bandwidth but no extra GPU or CPU work.
+/// The window is captured and encoded **once**. Encoded AV1 is fanned out to a
+/// fresh RTP payloader per viewer, so late joiners receive their own RTP stream
+/// and initialization while still sharing the expensive encoder.
 pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     check_elements(settings.codec)?;
     let mut client = connect(url).await?;
@@ -187,16 +187,12 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     let pipeline = gst::Pipeline::new();
     let capture = gst::parse::bin_from_description(&build_capture_chain(settings), true)
         .context("failed to build capture chain")?;
-    let pay = gst::ElementFactory::make("rtpav1pay").build()?;
-    let caps_filter = gst::ElementFactory::make("capsfilter")
-        .property("caps", rtp_caps())
-        .build()?;
     let tee = gst::ElementFactory::make("tee")
         .property("allow-not-linked", true)
         .build()?;
 
-    pipeline.add_many([capture.upcast_ref(), &pay, &caps_filter, &tee])?;
-    gst::Element::link_many([capture.upcast_ref(), &pay, &caps_filter, &tee])?;
+    pipeline.add_many([capture.upcast_ref(), &tee])?;
+    capture.link(&tee)?;
 
     // Audio is optional: if the process makes no sound, or capture fails, the
     // stream should still work rather than refusing to start.
@@ -237,6 +233,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 ) {
                     Ok(branch) => {
                         viewers.insert(peer.clone(), branch);
+                        crate::targets::request_redraw(settings.hwnd);
                         println!(
                             "[host] {} joined ({} watching)",
                             name.clone().unwrap_or_else(|| format!("viewer {peer}")),
@@ -259,6 +256,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         "set-remote-description",
                         &[&desc, &None::<gst::Promise>],
                     );
+                    crate::targets::request_redraw(settings.hwnd);
                     force_key_unit(&tee);
                     println!("[host] streaming to {peer}");
                 }
@@ -311,7 +309,7 @@ fn build_audio_tee(pipeline: &gst::Pipeline, pid: u32) -> Result<gst::Element> {
 struct TeeBranch {
     tee: gst::Element,
     tee_pad: gst::Pad,
-    queue: gst::Element,
+    elements: Vec<gst::Element>,
     bin_pad: gst::Pad,
 }
 
@@ -325,28 +323,41 @@ fn link_tee_branch(
     tee: &gst::Element,
     bin: &gst::Element,
     max_buffers: u32,
+    mut payload: Vec<gst::Element>,
 ) -> Result<TeeBranch> {
     let queue = gst::ElementFactory::make("queue")
         .property("max-size-buffers", max_buffers)
         .property_from_str("leaky", "downstream")
         .build()?;
-    pipeline.add(&queue)?;
+    let mut elements = vec![queue];
+    elements.append(&mut payload);
+    for element in &elements {
+        pipeline.add(element)?;
+    }
+    gst::Element::link_many(elements.iter().collect::<Vec<_>>().as_slice())?;
 
     let sink_pad = bin
         .request_pad_simple("sink_%u")
         .context("webrtcbin refused a sink pad")?;
-    queue.static_pad("src").unwrap().link(&sink_pad)?;
+    elements
+        .last()
+        .unwrap()
+        .static_pad("src")
+        .unwrap()
+        .link(&sink_pad)?;
 
     let tee_pad = tee
         .request_pad_simple("src_%u")
         .context("tee refused a source pad")?;
-    tee_pad.link(&queue.static_pad("sink").unwrap())?;
+    tee_pad.link(&elements[0].static_pad("sink").unwrap())?;
 
-    queue.sync_state_with_parent()?;
+    for element in &elements {
+        element.sync_state_with_parent()?;
+    }
     Ok(TeeBranch {
         tee: tee.clone(),
         tee_pad,
-        queue,
+        elements,
         bin_pad: sink_pad,
     })
 }
@@ -361,9 +372,13 @@ fn add_viewer(
     let bin = make_webrtcbin(&format!("viewer-{peer}"))?;
     pipeline.add(&bin)?;
 
-    let mut links = vec![link_tee_branch(pipeline, tee, &bin, 200)?];
+    let pay = gst::ElementFactory::make("rtpav1pay").build()?;
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property("caps", rtp_caps())
+        .build()?;
+    let mut links = vec![link_tee_branch(pipeline, tee, &bin, 200, vec![pay, caps])?];
     if let Some(audio_tee) = audio_tee {
-        links.push(link_tee_branch(pipeline, audio_tee, &bin, 50)?);
+        links.push(link_tee_branch(pipeline, audio_tee, &bin, 50, Vec::new())?);
     }
 
     watch_connection(&bin, format!("host->{peer}"));
@@ -378,12 +393,24 @@ fn add_viewer(
 fn remove_viewer(pipeline: &gst::Pipeline, branch: ViewerBranch) {
     let _ = branch.bin.set_state(gst::State::Null);
     for link in branch.links {
-        let _ = link.queue.set_state(gst::State::Null);
-        let _ = link.tee_pad.unlink(&link.queue.static_pad("sink").unwrap());
-        let _ = link.queue.static_pad("src").unwrap().unlink(&link.bin_pad);
+        for element in &link.elements {
+            let _ = element.set_state(gst::State::Null);
+        }
+        let _ = link
+            .tee_pad
+            .unlink(&link.elements[0].static_pad("sink").unwrap());
+        let _ = link
+            .elements
+            .last()
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .unlink(&link.bin_pad);
         link.tee.release_request_pad(&link.tee_pad);
         branch.bin.release_request_pad(&link.bin_pad);
-        let _ = pipeline.remove(&link.queue);
+        for element in link.elements {
+            let _ = pipeline.remove(&element);
+        }
     }
     let _ = pipeline.remove(&branch.bin);
 }
