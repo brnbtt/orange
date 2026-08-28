@@ -47,6 +47,11 @@ enum Screen {
     Settings,
 }
 
+struct WatchSession {
+    code: String,
+    supervisor: Supervisor,
+}
+
 struct Orange {
     screen: Screen,
     session: Option<session::Session>,
@@ -62,7 +67,8 @@ struct Orange {
     fps: Option<u32>,
     active_target: Option<WindowTarget>,
     active_preview: Option<std::sync::Arc<gpui::RenderImage>>,
-    stream: Option<Supervisor>,
+    host: Option<Supervisor>,
+    watches: Vec<WatchSession>,
     logging_in: Option<LoginAttempt>,
     error: Option<String>,
     server: String,
@@ -104,7 +110,8 @@ impl Orange {
             fps: preferences.fps,
             active_target: None,
             active_preview: None,
-            stream: None,
+            host: None,
+            watches: Vec::new(),
             logging_in: None,
             error: None,
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
@@ -141,18 +148,40 @@ impl Orange {
             }
         }
 
-        // A child that exited on its own returns us to the home screen.
-        if matches!(self.screen, Screen::Streaming | Screen::Watching) {
-            let alive = self.stream.as_mut().map(|s| s.running()).unwrap_or(false);
-            if !alive {
-                if let Some(status) = self.stream.as_ref().and_then(|s| s.status.lock().ok()) {
-                    self.error = status.error.clone();
-                }
-                self.stream = None;
-                self.active_target = None;
-                self.active_preview = None;
-                self.screen = Screen::Home;
+        if self.host.as_mut().is_some_and(|host| !host.running()) {
+            if let Some(status) = self.host.as_ref().and_then(|host| host.status.lock().ok()) {
+                self.error = status.error.clone();
             }
+            self.host = None;
+            self.active_target = None;
+            self.active_preview = None;
+            self.screen = if self.watches.is_empty() {
+                Screen::Home
+            } else {
+                Screen::Watching
+            };
+        }
+
+        let mut watch_error = None;
+        self.watches.retain_mut(|watch| {
+            if watch.supervisor.running() {
+                true
+            } else {
+                watch_error = watch
+                    .supervisor
+                    .status
+                    .lock()
+                    .ok()
+                    .and_then(|status| status.error.clone())
+                    .or(watch_error.take());
+                false
+            }
+        });
+        if watch_error.is_some() {
+            self.error = watch_error;
+        }
+        if self.screen == Screen::Watching && self.watches.is_empty() {
+            self.screen = Screen::Home;
         }
         cx.notify();
     }
@@ -265,7 +294,7 @@ impl Orange {
             Ok(stream) => {
                 self.active_target = Some(target);
                 self.active_preview = preview;
-                self.stream = Some(stream);
+                self.host = Some(stream);
                 self.screen = Screen::Streaming;
                 self.error = None;
             }
@@ -279,6 +308,10 @@ impl Orange {
             self.error = Some("No code on the clipboard".into());
             return;
         }
+        if self.watches.iter().any(|watch| watch.code == code) {
+            self.error = Some(format!("Already watching {code}"));
+            return;
+        }
         if !supervisor::gstreamer_available() {
             self.error = Some(
                 "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
@@ -286,34 +319,59 @@ impl Orange {
             );
             return;
         }
-        match Supervisor::watch(&code, &self.server) {
+        match Supervisor::watch(&code, &self.server, self.watches.len()) {
             Ok(stream) => {
-                self.stream = Some(stream);
-                self.screen = Screen::Watching;
+                self.watches.push(WatchSession {
+                    code,
+                    supervisor: stream,
+                });
+                if self.host.is_none() {
+                    self.screen = Screen::Watching;
+                }
                 self.error = None;
             }
             Err(err) => self.error = Some(err.to_string()),
         }
     }
 
-    fn stop(&mut self) {
-        if let Some(mut stream) = self.stream.take() {
-            stream.stop();
+    fn stop_host(&mut self) {
+        if let Some(mut host) = self.host.take() {
+            host.stop();
         }
         self.active_target = None;
         self.active_preview = None;
-        self.screen = Screen::Home;
+        self.screen = if self.watches.is_empty() {
+            Screen::Home
+        } else {
+            Screen::Watching
+        };
+    }
+
+    fn stop_watch(&mut self, index: usize) {
+        if index < self.watches.len() {
+            self.watches.remove(index);
+        }
+        if self.watches.is_empty() && self.host.is_none() {
+            self.screen = Screen::Home;
+        }
+    }
+
+    fn stop_all_watches(&mut self) {
+        self.watches.clear();
+        if self.host.is_none() {
+            self.screen = Screen::Home;
+        }
     }
 
     fn code(&self) -> Option<String> {
-        self.stream
+        self.host
             .as_ref()
             .and_then(|s| s.status.lock().ok())
             .and_then(|st| st.code.clone())
     }
 
     fn viewers(&self) -> Vec<String> {
-        self.stream
+        self.host
             .as_ref()
             .and_then(|s| s.status.lock().ok())
             .map(|st| st.viewers.clone())
@@ -1279,7 +1337,12 @@ impl Orange {
 
     fn render_streaming(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let code = self.code();
+        let monitor_code = code.clone();
+        let monitor_open = code
+            .as_ref()
+            .is_some_and(|code| self.watches.iter().any(|watch| &watch.code == code));
         let viewers = self.viewers();
+        let watch_count = self.watches.len();
         let quality = self.quality();
         let source_name = self
             .active_target
@@ -1384,7 +1447,25 @@ impl Orange {
                                     .text_ellipsis()
                                     .child(label(source_name, TEXT).text_xs()),
                             )
-                            .child(micro("SOURCE PREVIEW", ORANGE)),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(micro("SOURCE PREVIEW", ORANGE))
+                                    .children(monitor_code.map(|code| {
+                                        if monitor_open {
+                                            micro("LIVE MONITOR OPEN", GREEN).into_any_element()
+                                        } else {
+                                            quiet("live-monitor", "Open live monitor")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.join(code.clone());
+                                                    cx.notify();
+                                                }))
+                                                .into_any_element()
+                                        }
+                                    })),
+                            ),
                     ),
             )
             .child(match code.clone() {
@@ -1466,43 +1547,118 @@ impl Orange {
                     ),
             )
             .child(
+                secondary(
+                    "join-while-streaming",
+                    if watch_count == 0 {
+                        "Watch a friend's stream".to_string()
+                    } else {
+                        format!("Watch another stream · {watch_count} open")
+                    },
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let code = cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .unwrap_or_default();
+                    this.join(code);
+                    cx.notify();
+                })),
+            )
+            .child(
                 secondary("stop", "Stop streaming")
                     .text_color(rgb(DANGER))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.stop();
+                        this.stop_host();
                         cx.notify();
                     })),
             )
     }
 
     fn render_watching(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.watches.len();
+        let sessions = self
+            .watches
+            .iter()
+            .enumerate()
+            .map(|(index, watch)| {
+                let code = watch.code.clone();
+                card()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(label(code, TEXT).font_weight(FontWeight::SEMIBOLD))
+                            .child(label("Open in its own viewer window", FAINT).text_xs()),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("leave-watch-{index}")))
+                            .text_xs()
+                            .text_color(rgb(FAINT))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(DANGER)))
+                            .child("Close")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.stop_watch(index);
+                                cx.notify();
+                            })),
+                    )
+            })
+            .collect::<Vec<_>>();
+
         div()
             .flex()
             .flex_col()
             .gap_3()
             .flex_1()
-            .child(micro("STREAM OPEN IN VIEWER", GREEN))
+            .child(micro(
+                format!(
+                    "{} VIEWER WINDOW{} OPEN",
+                    count,
+                    if count == 1 { "" } else { "S" }
+                ),
+                GREEN,
+            ))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1p5()
                     .child(live_dot())
-                    .child(label("Watching", TEXT).font_weight(FontWeight::SEMIBOLD)),
+                    .child(label("Watching friends", TEXT).font_weight(FontWeight::SEMIBOLD)),
             )
             .child(
-                card()
-                    .items_center()
-                    .py_4()
-                    .child(label("The stream is in its own window", MUTED).text_xs())
-                    .child(label("Esc closes it · drag anywhere to move", FAINT).text_xs()),
+                div()
+                    .id("watch-list")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(sessions),
             )
-            .child(div().flex_1())
             .child(
-                secondary("leave", "Leave")
+                secondary("join-another", "Watch another stream").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        let code = cx
+                            .read_from_clipboard()
+                            .and_then(|item| item.text())
+                            .unwrap_or_default();
+                        this.join(code);
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                secondary("leave-all", "Close all viewer windows")
                     .text_color(rgb(DANGER))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.stop();
+                        this.stop_all_watches();
                         cx.notify();
                     })),
             )

@@ -105,11 +105,21 @@ pub fn spawn(
     height: i32,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<VideoWindow> {
+    spawn_cascaded(title, width, height, 0, overlay)
+}
+
+pub fn spawn_cascaded(
+    title: &str,
+    width: i32,
+    height: i32,
+    cascade: u32,
+    overlay: crate::overlay::SharedOverlay,
+) -> Result<VideoWindow> {
     let (tx, rx) = mpsc::channel::<Result<isize>>();
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
     std::thread::spawn(move || unsafe {
-        match create_window(&title, width, height, overlay) {
+        match create_window(&title, width, height, cascade, overlay) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
                     return;
@@ -307,6 +317,7 @@ unsafe fn create_window(
     title: &[u16],
     width: i32,
     height: i32,
+    cascade: u32,
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
@@ -336,8 +347,9 @@ unsafe fn create_window(
     // Centre on the primary monitor.
     let screen_w = GetSystemMetrics(SM_CXSCREEN);
     let screen_h = GetSystemMetrics(SM_CYSCREEN);
-    let x = (screen_w - width) / 2;
-    let y = (screen_h - height) / 2;
+    let offset = (cascade.min(5) as f32 * 32.0 * scale).round() as i32;
+    let x = ((screen_w - width) / 2 + offset).min((screen_w - width).max(0));
+    let y = ((screen_h - height) / 2 + offset).min((screen_h - height).max(0));
 
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE::default(),

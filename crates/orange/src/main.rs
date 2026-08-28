@@ -90,6 +90,9 @@ enum Command {
         /// Write to a file instead of rendering. For headless verification.
         #[arg(long)]
         out: Option<String>,
+        /// Offset this viewer from earlier viewer windows.
+        #[arg(long, default_value_t = 0)]
+        cascade: u32,
     },
     /// Open the viewer window with a synthetic stream. Design harness.
     ///
@@ -250,15 +253,25 @@ fn main() -> Result<()> {
             );
             runtime()?.block_on(peer::run_host(&settings, &server))
         }
-        Command::Watch { code, server, out } => {
+        Command::Watch {
+            code,
+            server,
+            out,
+            cascade,
+        } => {
             let output = match out {
                 Some(path) => webrtc::Output::File(path),
                 None => {
                     let overlay = std::sync::Arc::new(std::sync::Mutex::new(
                         overlay::OverlayState::default(),
                     ));
-                    let win =
-                        window::spawn(&format!("orange - {code}"), 1280, 720, overlay.clone())?;
+                    let win = window::spawn_cascaded(
+                        &format!("orange - {code}"),
+                        1280,
+                        720,
+                        cascade,
+                        overlay.clone(),
+                    )?;
                     webrtc::Output::Window {
                         hwnd: win.hwnd,
                         overlay,
