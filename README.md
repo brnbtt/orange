@@ -1,11 +1,20 @@
-# orange
+<p align="center">
+  <img src="crates/orange-tray/logo.png" width="88" alt="orange">
+</p>
 
-Low-overhead window streaming for friends. Share a game window at high bitrate
-without the compression Discord puts on it, and without costing yourself FPS.
+<h1 align="center">orange</h1>
+
+<p align="center">
+  Low-overhead window streaming for friends. Share a game window at high
+  bitrate without the compression Discord puts on it, and without costing
+  yourself FPS.
+</p>
 
 ## Status
 
-Milestone 1 of 6. Capture and encode work; there is no networking yet.
+Nine milestones done, and the tray UI is usable. Everything below has only ever
+run on a single machine: the two-machine path across the internet is the next
+real test, and the biggest unknown.
 
 | # | Milestone | State |
 | --- | --- | --- |
@@ -18,8 +27,8 @@ Milestone 1 of 6. Capture and encode work; there is no networking yet.
 | 7 | Per-process game audio | **done** |
 | 8 | Overlay controls on the video | **done** |
 | 9 | Discord identity | **done** |
-| 10 | Tray UI (window picker, quality, share code) | next |
-| 11 | Two machines across the internet | |
+| 10 | Tray UI (window picker, quality, share code) | **done** |
+| 11 | Two machines across the internet | next |
 | 12 | Installer, autostart | |
 
 ## Identity
