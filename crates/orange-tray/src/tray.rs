@@ -12,8 +12,9 @@ use anyhow::{Context, Result};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
@@ -151,6 +152,69 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
+}
+
+/// Hide the main window entirely, leaving the app alive in the tray.
+///
+/// GPUI exposes `minimize` but no per-window hide, so this goes through Win32.
+/// The handle is found by enumerating our own top-level windows and cached,
+/// because once hidden the window is no longer discoverable by visibility.
+pub fn hide_main_window() {
+    if let Some(hwnd) = main_window() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+/// Bring the main window back and focus it.
+pub fn show_main_window() {
+    if let Some(hwnd) = main_window() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+static MAIN_WINDOW: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+fn main_window() -> Option<HWND> {
+    if let Some(handle) = MAIN_WINDOW.get() {
+        return Some(HWND(*handle as *mut _));
+    }
+    let found = unsafe { find_main_window() }?;
+    let _ = MAIN_WINDOW.set(found.0 as isize);
+    Some(found)
+}
+
+unsafe extern "system" fn find_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+    let out = &mut *(lparam.0 as *mut Option<HWND>);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid != GetCurrentProcessId() || !IsWindowVisible(hwnd).as_bool() {
+        return windows::core::BOOL(1);
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return windows::core::BOOL(1);
+    }
+    // The message-only tray window has no size; the UI window does.
+    if rect.right - rect.left > 100 && rect.bottom - rect.top > 100 {
+        *out = Some(hwnd);
+        return windows::core::BOOL(0);
+    }
+    windows::core::BOOL(1)
+}
+
+unsafe fn find_main_window() -> Option<HWND> {
+    let mut found: Option<HWND> = None;
+    let _ = EnumWindows(
+        Some(find_proc),
+        LPARAM(&mut found as *mut Option<HWND> as isize),
+    );
+    found
 }
 
 unsafe fn show_menu(hwnd: HWND) {

@@ -427,11 +427,12 @@ impl Orange {
                             },
                         ),
                     )
-                    // Closing hides to tray rather than quitting, so an active
-                    // stream survives dismissing the window.
+                    // Close hides the window completely - no taskbar entry -
+                    // while the app keeps running in the tray. Minimise is a
+                    // normal minimise; the two should not do the same thing.
                     .child(
-                        titlebar_button("close", "✕", 0x8c2b28).on_click(|_, window, _| {
-                            window.minimize_window();
+                        titlebar_button("close", "✕", 0x8c2b28).on_click(|_, _, _| {
+                            tray::hide_main_window();
                         }),
                     ),
             )
@@ -934,6 +935,9 @@ fn main() {
                 while let Ok(event) = events.try_recv() {
                     match event {
                         tray::TrayEvent::Show => {
+                            // The window may be hidden rather than merely
+                            // unfocused, so un-hide before activating.
+                            tray::show_main_window();
                             let _ = cx.update(|cx| {
                                 let _ = window.update(cx, |_, window, _| {
                                     window.activate_window();
