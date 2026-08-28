@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/orange-signal", "crates/orange-relay", "crates/orange"]
+members = ["crates/orange-signal", "crates/orange-relay", "crates/orange", "crates/orange-tray"]
 
 [workspace.package]
 version = "0.1.0"
