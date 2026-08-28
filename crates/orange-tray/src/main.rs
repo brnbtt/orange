@@ -15,15 +15,23 @@ use gpui::{
     div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FontWeight, SharedString,
     Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use supervisor::{Quality, Supervisor, WindowTarget, QUALITIES};
 
-const BG: u32 = 0x121214;
-const PANEL: u32 = 0x1c1c20;
-const TEXT: u32 = 0xeeeeee;
-const MUTED: u32 = 0x8a8a92;
+// A deliberately small palette. Three surface levels give enough depth without
+// the UI turning into a gradient soup.
+const BG: u32 = 0x0e0e10;
+const SURFACE: u32 = 0x17171b;
+const SURFACE_HOVER: u32 = 0x1f1f25;
+const BORDER: u32 = 0x26262d;
+const TEXT: u32 = 0xf2f2f3;
+const MUTED: u32 = 0x82828c;
+const FAINT: u32 = 0x5a5a63;
 const ORANGE: u32 = 0xff7a00;
-const DANGER: u32 = 0xd9534f;
+const ORANGE_DIM: u32 = 0x8a4400;
+const INK: u32 = 0x140c04;
+const DANGER: u32 = 0xe0645f;
+const GREEN: u32 = 0x4ec97a;
 
 const DEFAULT_SERVER: &str =
     "wss://orange-relay.redmushroom-80c79f12.brazilsouth.azurecontainerapps.io/ws";
@@ -46,6 +54,8 @@ struct Orange {
     logging_in: bool,
     error: Option<String>,
     server: String,
+    /// Drives the transient "Copied" confirmation on the share code.
+    copied_at: Option<Instant>,
 }
 
 impl Orange {
@@ -74,6 +84,7 @@ impl Orange {
             logging_in: false,
             error: None,
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
+            copied_at: None,
         }
     }
 
@@ -182,14 +193,86 @@ fn label(text: impl Into<SharedString>, color: u32) -> gpui::Div {
     div().text_color(rgb(color)).child(text.into())
 }
 
+/// A raised surface with a hairline border. The border does most of the work:
+/// on a dark UI, background alone reads as mush.
 fn card() -> gpui::Div {
     div()
         .flex()
         .flex_col()
         .gap_1()
         .p_3()
-        .rounded_md()
-        .bg(rgb(PANEL))
+        .rounded_lg()
+        .bg(rgb(SURFACE))
+        .border_1()
+        .border_color(rgb(BORDER))
+}
+
+fn primary(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w_full()
+        .px_4()
+        .py_2p5()
+        .rounded_lg()
+        .bg(rgb(ORANGE))
+        .text_color(rgb(INK))
+        .font_weight(FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0xff8c1f)))
+        .child(text.into())
+}
+
+fn secondary(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w_full()
+        .px_4()
+        .py_2p5()
+        .rounded_lg()
+        .bg(rgb(SURFACE))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_color(rgb(TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+        .child(text.into())
+}
+
+fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .text_xs()
+        .text_color(rgb(FAINT))
+        .cursor_pointer()
+        .hover(|s| s.text_color(rgb(TEXT)))
+        .child(text.into())
+}
+
+/// The mark. A glyph on a disc rather than an imported asset, so there is no
+/// icon pipeline to maintain for one shape.
+fn logo(px_size: f32) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(px_size))
+        .h(px(px_size))
+        .rounded_full()
+        .bg(rgb(ORANGE))
+        .text_color(rgb(INK))
+        .text_size(px(px_size * 0.42))
+        .child("▶")
+}
+
+/// A small coloured dot, for status.
+fn dot(color: u32) -> gpui::Div {
+    div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(color))
 }
 
 impl Render for Orange {
@@ -202,6 +285,42 @@ impl Render for Orange {
             Screen::Watching => self.render_watching(cx).into_any_element(),
         };
 
+        // The header is deliberately quiet on the signed-out screen, where the
+        // centred mark carries the branding instead.
+        let header = if self.screen == Screen::SignedOut {
+            div().into_any_element()
+        } else {
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .pb_3()
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(logo(20.0))
+                        .child(
+                            label("orange", TEXT)
+                                .font_weight(FontWeight::SEMIBOLD),
+                        ),
+                )
+                .child(match &self.session {
+                    Some(s) => div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(dot(GREEN))
+                        .child(label(s.name.clone(), MUTED).text_xs())
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                })
+                .into_any_element()
+        };
+
         div()
             .flex()
             .flex_col()
@@ -210,27 +329,18 @@ impl Render for Orange {
             .p_4()
             .gap_3()
             .text_sm()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        label("orange", ORANGE)
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD),
-                    )
-                    .child(match &self.session {
-                        Some(s) => label(s.name.clone(), MUTED).text_xs().into_any_element(),
-                        None => div().into_any_element(),
-                    }),
-            )
+            .child(header)
             .child(body)
             .children(self.error.clone().map(|err| {
                 div()
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgb(0x2a1a1a))
+                    .flex()
+                    .gap_2()
+                    .items_start()
+                    .p_2p5()
+                    .rounded_lg()
+                    .bg(rgb(0x241514))
+                    .border_1()
+                    .border_color(rgb(0x3d211f))
                     .text_xs()
                     .text_color(rgb(DANGER))
                     .child(err)
@@ -243,43 +353,55 @@ impl Orange {
         div()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_5()
             .flex_1()
             .justify_center()
             .items_center()
-            .child(label("Share a window with friends", TEXT))
-            .child(
-                label(
-                    if self.logging_in {
-                        "Waiting for Discord in your browser..."
-                    } else {
-                        "Sign in so people can see who is streaming"
-                    },
-                    MUTED,
-                )
-                .text_xs(),
-            )
+            .px_2()
+            .child(logo(56.0))
             .child(
                 div()
-                    .id("signin")
-                    .px_4()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(ORANGE))
-                    .text_color(rgb(0x1a1a1a))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .child(if self.logging_in {
-                        "Waiting..."
-                    } else {
-                        "Sign in with Discord"
-                    })
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        label("Share a window", TEXT)
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(260.0))
+                            .text_center()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "High bitrate, low overhead, straight to your friends. \
+                                 Sign in so people know whose stream they are opening.",
+                            ),
+                    ),
+            )
+            .child(
+                div().w_full().max_w(px(260.0)).child(
+                    primary(
+                        "signin",
+                        if self.logging_in {
+                            "Waiting for Discord…"
+                        } else {
+                            "Sign in with Discord"
+                        },
+                    )
+                    .when(self.logging_in, |d| d.bg(rgb(ORANGE_DIM)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.start_login();
                         cx.notify();
                     })),
+                ),
             )
+            .children(self.logging_in.then(|| {
+                label("Finish in your browser, then come back here.", FAINT).text_xs()
+            }))
     }
 
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -287,110 +409,123 @@ impl Orange {
             .flex()
             .flex_col()
             .gap_2()
+            .flex_1()
             .child(
-                div()
-                    .id("start")
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(ORANGE))
-                    .text_color(rgb(0x1a1a1a))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .child("Start streaming")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.refresh_windows();
-                        this.screen = Screen::PickWindow;
-                        cx.notify();
-                    })),
+                primary("start", "Start streaming").on_click(cx.listener(|this, _, _, cx| {
+                    this.refresh_windows();
+                    this.screen = Screen::PickWindow;
+                    cx.notify();
+                })),
             )
             .child(
-                div()
-                    .id("join")
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(PANEL))
-                    .text_color(rgb(TEXT))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x26262c)))
-                    .child("Join a stream (paste code)")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        // A proper text field is deferred; the code is always
-                        // copied from Discord anyway, so paste is the flow.
-                        let code = cx
-                            .read_from_clipboard()
-                            .and_then(|item| item.text())
-                            .unwrap_or_default();
-                        this.join(code);
-                        cx.notify();
-                    })),
+                secondary("join", "Join a stream").on_click(cx.listener(|this, _, _, cx| {
+                    // A proper text field is deferred; the code is always
+                    // copied from Discord anyway, so paste is the flow.
+                    let code = cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .unwrap_or_default();
+                    this.join(code);
+                    cx.notify();
+                })),
             )
+            .child(label("Paste a code first — it joins from your clipboard.", FAINT).text_xs())
+            .child(div().flex_1())
             .child(
-                div()
-                    .id("signout")
-                    .mt_2()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(rgb(TEXT)))
-                    .child("Sign out")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        session::clear();
-                        this.session = None;
-                        this.screen = Screen::SignedOut;
-                        cx.notify();
-                    })),
+                quiet("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
+                    session::clear();
+                    this.session = None;
+                    this.screen = Screen::SignedOut;
+                    cx.notify();
+                })),
             )
     }
 
     fn render_pick(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let quality = self.quality();
         let selected = self.quality;
+        let count = self.windows.len();
 
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .flex_1()
-            .child(label("Choose a window", TEXT).font_weight(FontWeight::SEMIBOLD))
+            .min_h(px(0.0))
             .child(
-                div().flex().gap_2().children(
-                    QUALITIES
-                        .iter()
-                        .enumerate()
-                        .map(|(index, q)| {
-                            div()
-                                .id(SharedString::from(format!("q{index}")))
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .bg(rgb(if index == selected { ORANGE } else { PANEL }))
-                                .text_color(rgb(if index == selected { 0x1a1a1a } else { MUTED }))
-                                .child(q.label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.quality = index;
-                                    cx.notify();
-                                }))
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(label("Quality", MUTED).text_xs())
+                    .child(
+                        div().flex().gap_1p5().children(
+                            QUALITIES
+                                .iter()
+                                .enumerate()
+                                .map(|(index, q)| {
+                                    let active = index == selected;
+                                    div()
+                                        .id(SharedString::from(format!("q{index}")))
+                                        .flex_1()
+                                        .flex()
+                                        .justify_center()
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded_lg()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(rgb(if active { ORANGE } else { BORDER }))
+                                        .bg(rgb(if active { ORANGE } else { SURFACE }))
+                                        .text_color(rgb(if active { INK } else { MUTED }))
+                                        .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                        .hover(|s| s.border_color(rgb(ORANGE)))
+                                        .child(q.label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.quality = index;
+                                            cx.notify();
+                                        }))
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                    .child(
+                        label(
+                            format!("about {} Mbps upload for each viewer", quality.mbps),
+                            FAINT,
+                        )
+                        .text_xs(),
+                    ),
             )
             .child(
-                label(
-                    format!("~{} Mbps upload per viewer", quality.mbps),
-                    MUTED,
-                )
-                .text_xs(),
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(label("Window", MUTED).text_xs())
+                    .child(
+                        quiet("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_windows();
+                            cx.notify();
+                        })),
+                    ),
             )
             .child(
                 div()
                     .id("windows")
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_1p5()
                     .flex_1()
+                    .min_h(px(0.0))
                     .overflow_y_scroll()
+                    .when(count == 0, |d| {
+                        d.child(
+                            card()
+                                .items_center()
+                                .child(label("No windows found", MUTED).text_xs()),
+                        )
+                    })
                     .children(
                         self.windows
                             .iter()
@@ -401,14 +536,27 @@ impl Orange {
                                 } else {
                                     target.title.clone()
                                 };
-                                let meta =
-                                    format!("{} · {}x{}", target.app_name(), target.width, target.height);
+                                let meta = format!(
+                                    "{} · {}×{}",
+                                    target.app_name(),
+                                    target.width,
+                                    target.height
+                                );
                                 card()
                                     .id(SharedString::from(format!("w{}", target.hwnd)))
+                                    .gap_0p5()
+                                    .py_2p5()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x26262c)))
-                                    .child(label(title, TEXT))
-                                    .child(label(meta, MUTED).text_xs())
+                                    .hover(|s| {
+                                        s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE_DIM))
+                                    })
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_color(rgb(TEXT))
+                                            .child(title),
+                                    )
+                                    .child(label(meta, FAINT).text_xs())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.start_stream(target.clone());
                                         cx.notify();
@@ -418,76 +566,108 @@ impl Orange {
                     ),
             )
             .child(
-                div()
-                    .id("back")
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .cursor_pointer()
-                    .child("Back")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.screen = Screen::Home;
-                        cx.notify();
-                    })),
+                quiet("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
+                    this.screen = Screen::Home;
+                    cx.notify();
+                })),
             )
     }
 
     fn render_streaming(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let code = self.code();
         let viewers = self.viewers();
+        let just_copied = self
+            .copied_at
+            .map(|t| t.elapsed() < Duration::from_secs(2))
+            .unwrap_or(false);
 
         div()
             .flex()
             .flex_col()
             .gap_3()
             .flex_1()
-            .child(label("You are live", TEXT).font_weight(FontWeight::SEMIBOLD))
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(dot(if code.is_some() { GREEN } else { MUTED }))
+                    .child(
+                        label(if code.is_some() { "Live" } else { "Starting…" }, TEXT)
+                            .font_weight(FontWeight::SEMIBOLD),
+                    ),
+            )
             .child(match code.clone() {
                 Some(code) => card()
                     .id("code")
+                    .items_center()
+                    .py_4()
+                    .gap_2()
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x26262c)))
+                    .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE_DIM)))
                     .child(
-                        label(code.clone(), ORANGE)
-                            .text_2xl()
-                            .font_weight(FontWeight::BOLD),
+                        div()
+                            .text_color(rgb(ORANGE))
+                            .text_size(px(30.0))
+                            .font_weight(FontWeight::BOLD)
+                            .child(code.clone()),
                     )
-                    .child(label("Click to copy", MUTED).text_xs())
-                    .on_click(cx.listener(move |_, _, _, cx| {
+                    .child(
+                        label(
+                            if just_copied {
+                                "Copied to clipboard"
+                            } else {
+                                "Click to copy"
+                            },
+                            if just_copied { GREEN } else { FAINT },
+                        )
+                        .text_xs(),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.clone()));
+                        this.copied_at = Some(Instant::now());
+                        cx.notify();
                     }))
                     .into_any_element(),
                 None => card()
-                    .child(label("Starting...", MUTED))
+                    .items_center()
+                    .py_4()
+                    .child(label("Connecting…", MUTED).text_xs())
                     .into_any_element(),
             })
             .child(
-                label(
-                    if viewers.is_empty() {
-                        "Nobody watching yet".to_string()
-                    } else {
-                        format!("{} watching", viewers.len())
-                    },
-                    MUTED,
-                )
-                .text_xs(),
-            )
-            .children(
-                viewers
-                    .into_iter()
-                    .map(|name| label(name, TEXT).text_xs())
-                    .collect::<Vec<_>>(),
-            )
-            .child(div().flex_1())
-            .child(
                 div()
-                    .id("stop")
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(PANEL))
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(label(
+                        if viewers.is_empty() {
+                            "Nobody watching yet".to_string()
+                        } else {
+                            format!("{} watching", viewers.len())
+                        },
+                        MUTED,
+                    ).text_xs())
+                    .children(
+                        viewers
+                            .into_iter()
+                            .map(|name| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(dot(ORANGE))
+                                    .child(label(name, TEXT).text_xs())
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+            )
+            .child(
+                secondary("stop", "Stop streaming")
                     .text_color(rgb(DANGER))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x2a1a1a)))
-                    .child("Stop streaming")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.stop();
                         cx.notify();
@@ -501,18 +681,25 @@ impl Orange {
             .flex_col()
             .gap_3()
             .flex_1()
-            .child(label("Watching", TEXT).font_weight(FontWeight::SEMIBOLD))
-            .child(label("The stream opens in its own window.", MUTED).text_xs())
-            .child(div().flex_1())
             .child(
                 div()
-                    .id("leave")
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(PANEL))
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(dot(GREEN))
+                    .child(label("Watching", TEXT).font_weight(FontWeight::SEMIBOLD)),
+            )
+            .child(
+                card()
+                    .items_center()
+                    .py_4()
+                    .child(label("The stream is in its own window", MUTED).text_xs())
+                    .child(label("Esc closes it · drag anywhere to move", FAINT).text_xs()),
+            )
+            .child(div().flex_1())
+            .child(
+                secondary("leave", "Leave")
                     .text_color(rgb(DANGER))
-                    .cursor_pointer()
-                    .child("Leave")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.stop();
                         cx.notify();
