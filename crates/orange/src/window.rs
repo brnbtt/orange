@@ -19,12 +19,16 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH, ScreenToClient};
+use windows::Win32::Graphics::Gdi::{
+    CreateSolidBrush, GetMonitorInfoW, HBRUSH, MonitorFromWindow, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, ScreenToClient,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F11};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Opt out of DPI virtualisation, before any window exists.
@@ -43,6 +47,10 @@ pub fn set_dpi_aware() {
 /// Cosmetic only: the frame behind the video, visible for an instant before
 /// the first frame arrives and in the letterbox bars.
 const BACKGROUND: COLORREF = COLORREF(0x00141414); // BGR
+
+/// Drives cursor hiding. Windows only asks about the cursor when the mouse
+/// moves, and the point is to hide it when the mouse has stopped.
+const CURSOR_TIMER: usize = 1;
 
 pub struct VideoWindow {
     pub hwnd: isize,
@@ -87,6 +95,75 @@ pub fn spawn(
 /// Per-window state reachable from the window procedure.
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
+    /// Style and bounds to put back when leaving fullscreen. `Some` means we
+    /// are currently fullscreen.
+    restore: std::cell::Cell<Option<(WINDOW_STYLE, RECT)>>,
+}
+
+/// Tell the overlay what display scaling it is being shown at.
+unsafe fn sync_dpi(hwnd: HWND) {
+    let dpi = GetDpiForWindow(hwnd);
+    if dpi == 0 {
+        return;
+    }
+    if let Some(ctx) = context(hwnd) {
+        if let Ok(mut overlay) = ctx.overlay.lock() {
+            overlay.dpi = dpi as f32 / 96.0;
+        }
+    }
+}
+
+/// Fill the monitor the window is currently on, or go back to where it was.
+///
+/// Borderless already, so this is only a matter of dropping the resize frame
+/// and taking the monitor's bounds - and of using *this* window's monitor
+/// rather than the primary one, which is the part people notice.
+unsafe fn toggle_fullscreen(hwnd: HWND) {
+    let Some(ctx) = context(hwnd) else { return };
+
+    if let Some((style, bounds)) = ctx.restore.take() {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+            SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    } else {
+        let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
+        let mut bounds = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut bounds);
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+
+        ctx.restore.set(Some((style, bounds)));
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !WS_THICKFRAME).0 as isize);
+        let screen = info.rcMonitor;
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            screen.left,
+            screen.top,
+            screen.right - screen.left,
+            screen.bottom - screen.top,
+            SWP_FRAMECHANGED,
+        );
+    }
+
+    if let Ok(mut overlay) = ctx.overlay.lock() {
+        overlay.fullscreen = ctx.restore.get().is_some();
+        overlay.wake();
+    }
 }
 
 /// Map a point in client coordinates to the video's coordinate space.
@@ -181,11 +258,45 @@ unsafe fn create_window(
     );
 
     // Leaked deliberately and reclaimed in WM_DESTROY.
-    let ctx = Box::into_raw(Box::new(WindowContext { overlay }));
+    let ctx = Box::into_raw(Box::new(WindowContext {
+        overlay,
+        restore: std::cell::Cell::new(None),
+    }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
 
+    sync_dpi(hwnd);
+
     let _ = ShowWindow(hwnd, SW_SHOW);
+    SetTimer(Some(hwnd), CURSOR_TIMER, 250, None);
     Ok(hwnd)
+}
+
+/// Whether the pointer is inside this window's client area.
+///
+/// Checked before hiding it, so a timer tick never blanks the cursor while it
+/// is over somebody else's window.
+unsafe fn cursor_inside(hwnd: HWND) -> bool {
+    let mut point = POINT::default();
+    if GetCursorPos(&mut point).is_err() {
+        return false;
+    }
+    if ScreenToClient(hwnd, &mut point).as_bool() {
+        let mut rect = RECT::default();
+        if GetClientRect(hwnd, &mut rect).is_ok() {
+            return point.x >= rect.left
+                && point.x < rect.right
+                && point.y >= rect.top
+                && point.y < rect.bottom;
+        }
+    }
+    false
+}
+
+/// Whether the controls are currently on screen. The cursor follows them.
+unsafe fn controls_visible(hwnd: HWND) -> bool {
+    context(hwnd)
+        .and_then(|ctx| ctx.overlay.lock().ok().map(|o| o.visible()))
+        .unwrap_or(true)
 }
 
 unsafe fn run_message_loop() {
@@ -243,38 +354,68 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                let mut close = false;
+                let mut fullscreen = false;
                 if let Some(ctx) = context(hwnd) {
                     if let Ok(mut overlay) = ctx.overlay.lock() {
                         let video = overlay.video;
                         if let Some((vx, vy)) = client_to_video(hwnd, x, y, video) {
                             overlay.on_click(vx, vy);
-                            if overlay.close_requested {
-                                let _ =
-                                    PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                            }
+                            close = overlay.close_requested;
+                            fullscreen = std::mem::take(&mut overlay.fullscreen_requested);
                         }
+                    }
+                }
+                // Outside the lock: toggling fullscreen takes it again.
+                if close {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                } else if fullscreen {
+                    toggle_fullscreen(hwnd);
+                }
+                LRESULT(0)
+            }
+            // Keep the overlay's idea of the window in step, so the controls
+            // stay the same size on screen as the window is resized.
+            WM_SIZE => {
+                let width = (lparam.0 & 0xFFFF) as u16 as u32;
+                let height = ((lparam.0 >> 16) & 0xFFFF) as u16 as u32;
+                if let Some(ctx) = context(hwnd) {
+                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                        overlay.client = (width, height);
                     }
                 }
                 LRESULT(0)
             }
-            WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
-                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            WM_KEYDOWN if wparam.0 == VK_F11.0 as usize => {
+                toggle_fullscreen(hwnd);
                 LRESULT(0)
             }
-            // Double click toggles maximise, matching what people expect from
-            // a borderless media window.
-            WM_LBUTTONDBLCLK => {
-                let mut placement = WINDOWPLACEMENT {
-                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                    ..Default::default()
-                };
-                let _ = GetWindowPlacement(hwnd, &mut placement);
-                let cmd = if placement.showCmd == SW_MAXIMIZE.0 as u32 {
-                    SW_RESTORE
+            // Escape leaves fullscreen if we are in it, and only closes the
+            // viewer otherwise. Quitting outright would be a nasty surprise.
+            WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+                let fullscreen = context(hwnd)
+                    .map(|ctx| ctx.restore.get().is_some())
+                    .unwrap_or(false);
+                if fullscreen {
+                    toggle_fullscreen(hwnd);
                 } else {
-                    SW_MAXIMIZE
-                };
-                let _ = ShowWindow(hwnd, cmd);
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                LRESULT(0)
+            }
+            // Double click toggles fullscreen, matching what people expect
+            // from a video window.
+            //
+            // Both variants are needed: anywhere that is not a control hit
+            // tests as HTCAPTION, and Windows then delivers double clicks as
+            // non-client messages, where the default handling would maximise
+            // rather than go fullscreen.
+            WM_LBUTTONDBLCLK => {
+                toggle_fullscreen(hwnd);
+                LRESULT(0)
+            }
+            WM_NCLBUTTONDBLCLK if wparam.0 == HTCAPTION as usize => {
+                toggle_fullscreen(hwnd);
                 LRESULT(0)
             }
             // Dragged onto a monitor with different scaling. Windows hands us
@@ -291,9 +432,28 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     suggested.bottom - suggested.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
+                sync_dpi(hwnd);
+                LRESULT(0)
+            }
+            // The pointer hides along with the controls, and comes back with
+            // them. Windows asks about the cursor on movement; the timer
+            // handles the case where the mouse has simply stopped.
+            WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT as u32 => {
+                if controls_visible(hwnd) {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                } else {
+                    let _ = SetCursor(None);
+                    LRESULT(1)
+                }
+            }
+            WM_TIMER if wparam.0 == CURSOR_TIMER => {
+                if !controls_visible(hwnd) && cursor_inside(hwnd) {
+                    let _ = SetCursor(None);
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), CURSOR_TIMER);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
@@ -310,23 +470,4 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 /// Whether the window still exists, so the viewer can exit when it is closed.
 pub fn is_alive(hwnd: isize) -> bool {
     unsafe { IsWindow(Some(HWND(hwnd as *mut _))).as_bool() }
-}
-
-/// Keep the video sized to the window. Called on resize.
-#[allow(dead_code)]
-pub fn client_size(hwnd: isize) -> Option<(i32, i32)> {
-    unsafe {
-        let mut rect = RECT::default();
-        GetClientRect(HWND(hwnd as *mut _), &mut rect).ok()?;
-        Some((rect.right - rect.left, rect.bottom - rect.top))
-    }
-}
-
-#[allow(dead_code)]
-pub fn cursor_pos() -> Option<POINT> {
-    unsafe {
-        let mut p = POINT::default();
-        GetCursorPos(&mut p).ok()?;
-        Some(p)
-    }
 }

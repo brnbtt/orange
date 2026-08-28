@@ -6,6 +6,7 @@ mod peer;
 mod window;
 mod pipeline;
 mod targets;
+mod text;
 mod webrtc;
 
 use orange_signal as signal;
@@ -258,8 +259,14 @@ fn main() -> Result<()> {
             let overlay = std::sync::Arc::new(std::sync::Mutex::new(
                 overlay::OverlayState::default(),
             ));
-            if pin {
-                overlay.lock().unwrap().pinned = true;
+            {
+                let mut state = overlay.lock().unwrap();
+                state.pinned = pin;
+                // Stand-in values so the status cluster has something to lay
+                // out. The real viewer fills these from the stream.
+                state.host = Some(String::from("brnbtt"));
+                state.bitrate_kbps = Some(29_000);
+                state.viewers = Some(3);
             }
 
             let win = window::spawn("orange - preview", ww as i32, wh as i32, overlay.clone())?;
