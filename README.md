@@ -16,10 +16,68 @@ Milestone 1 of 6. Capture and encode work; there is no networking yet.
 | 5 | Relay deployed to Azure | **done** |
 | 6 | Viewer window: borderless + rounded, video embedded | **done** |
 | 7 | Per-process game audio | **done** |
-| 8 | Overlay controls on the video | next |
-| 9 | Host tray UI (window picker, quality, share code) | |
-| 10 | Two machines across the internet | |
-| 11 | Installer, autostart | |
+| 8 | Overlay controls on the video | **done** |
+| 9 | Discord identity | **done** |
+| 10 | Tray UI (window picker, quality, share code) | next |
+| 11 | Two machines across the internet | |
+| 12 | Installer, autostart | |
+
+## Identity
+
+```
+tray → browser → Discord consent
+                     ↓
+             relay /auth/callback     client_secret lives ONLY here
+                     ↓ exchange code, GET /users/@me
+               session token
+                     ↑
+tray polls /auth/poll?state=… ──┘     no local server, no fixed port
+```
+
+```powershell
+orange login     # opens the browser, stores the session
+orange logout
+```
+
+Two decisions worth keeping:
+
+- **The desktop app never holds `client_secret`.** Anything shipped to a user's
+  machine can be extracted from it, so the code-for-token exchange happens on
+  the relay and the app only ever receives an opaque session token.
+- **Polling, not a loopback redirect.** Discord requires redirect URIs to match
+  exactly, which would pin the app to a hardcoded port that may be in use.
+  The browser lands back on the relay; the app polls with a nonce it generated.
+
+Once signed in, hosts see `Ale joined (2 watching)` instead of `cd6da841`, and
+viewers see whose stream they opened.
+
+**Identity is not an access boundary.** Possession of the room code still grants
+access; logging in only attaches a name. Guild-based authorisation would change
+that, and needs the `guilds` scope.
+
+### Friends lists
+
+Discord's `relationships.read` scope exists but is **gated behind Social SDK
+approval**. The approval-free equivalent is `identify` + `guilds`: match users
+who share a Discord server. Functionally the same for a group of friends.
+
+### Relay configuration
+
+```powershell
+az containerapp secret set --name orange-relay --resource-group orange-rg `
+  --secrets discord-secret=<SECRET>
+
+az containerapp update --name orange-relay --resource-group orange-rg `
+  --set-env-vars DISCORD_CLIENT_ID=<ID> `
+                 DISCORD_CLIENT_SECRET=secretref:discord-secret `
+                 DISCORD_REDIRECT_URI=https://<fqdn>/auth/callback
+```
+
+Unconfigured, the relay still works for anonymous peers and returns a readable
+503 from `/auth/start`, so local development needs no credentials.
+
+**Sessions are in memory.** Every relay restart or redeploy signs everyone out.
+That needs a datastore before this goes to real users.
 
 ## Audio is scoped to the game
 

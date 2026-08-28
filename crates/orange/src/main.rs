@@ -27,7 +27,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List windows that can be captured.
-    List,
+    List {
+        /// Emit JSON, for the tray UI to consume.
+        #[arg(long)]
+        json: bool,
+    },
     /// Record a window to a file. Diagnostic for the capture path.
     Record {
         #[arg(long)]
@@ -131,7 +135,7 @@ fn main() -> Result<()> {
     gst::init()?;
 
     match cli.command {
-        Command::List => cmd_list(),
+        Command::List { json } => cmd_list(json),
         Command::Record {
             hwnd,
             out,
@@ -219,8 +223,28 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .context("could not start async runtime")
 }
 
-fn cmd_list() -> Result<()> {
+fn cmd_list(json: bool) -> Result<()> {
     let windows = targets::list_windows()?;
+
+    if json {
+        // The tray consumes this, so keep it stable.
+        let items: Vec<_> = windows
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "hwnd": t.hwnd,
+                    "pid": t.pid,
+                    "title": t.title,
+                    "process": t.process,
+                    "width": t.width,
+                    "height": t.height,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&items)?);
+        return Ok(());
+    }
+
     if windows.is_empty() {
         println!("No capturable windows found.");
         return Ok(());
