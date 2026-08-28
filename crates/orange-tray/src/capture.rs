@@ -23,12 +23,19 @@ use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 /// Render the full window including hardware-accelerated content.
 const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(0x0000_0002);
 
+/// Raw thumbnail pixels: width, height, BGRA bytes.
+///
+/// Deliberately not a `RenderImage`: capture runs on a background thread, and
+/// keeping the result as plain data avoids requiring GPUI's image types to be
+/// `Send`. The UI thread turns it into an image when it arrives.
+pub type Thumbnail = (u32, u32, Vec<u8>);
+
 /// Capture a window and scale it to fit within `max_w` x `max_h`.
 ///
 /// Returns `None` for windows that refuse to draw, which is common enough
-/// (elevated processes, some DRM-protected surfaces) that callers must have a
+/// (elevated processes, some protected surfaces) that callers must have a
 /// fallback rather than treating it as an error.
-pub fn thumbnail(hwnd: isize, max_w: u32, max_h: u32) -> Option<Arc<RenderImage>> {
+pub fn thumbnail(hwnd: isize, max_w: u32, max_h: u32) -> Option<Thumbnail> {
     let hwnd = HWND(hwnd as *mut _);
 
     let (width, height) = unsafe {
@@ -58,7 +65,14 @@ pub fn thumbnail(hwnd: isize, max_w: u32, max_h: u32) -> Option<Arc<RenderImage>
     );
     let scaled = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
 
-    Some(Arc::new(RenderImage::new(vec![Frame::new(scaled)])))
+    Some((tw, th, scaled.into_raw()))
+}
+
+/// Turn captured pixels into something GPUI can draw. Must run on the UI thread.
+pub fn to_image(thumb: Thumbnail) -> Option<Arc<RenderImage>> {
+    let (w, h, bytes) = thumb;
+    let image = RgbaImage::from_raw(w, h, bytes)?;
+    Some(Arc::new(RenderImage::new(vec![Frame::new(image)])))
 }
 
 /// Draw the window into a top-down 32-bit DIB and return its pixels.

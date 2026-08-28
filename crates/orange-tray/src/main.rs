@@ -20,18 +20,17 @@ use gpui::{
 use std::time::{Duration, Instant};
 use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
-// A deliberately small palette. Three surface levels give enough depth without
-// the UI turning into a gradient soup.
-const BG: u32 = 0x0e0e10;
-const SURFACE: u32 = 0x17171b;
-const SURFACE_HOVER: u32 = 0x1f1f25;
-const BORDER: u32 = 0x26262d;
-const TEXT: u32 = 0xf2f2f3;
-const MUTED: u32 = 0x82828c;
-const FAINT: u32 = 0x5a5a63;
-const ORANGE: u32 = 0xff7a00;
-const ORANGE_DIM: u32 = 0x8a4400;
-const INK: u32 = 0x140c04;
+// Palette from the logo exploration.
+const BG: u32 = 0x0b080b;
+const SURFACE: u32 = 0x161418;
+const SURFACE_HOVER: u32 = 0x201d23;
+const BORDER: u32 = 0x2a2a2a;
+const TEXT: u32 = 0xe6e0d1;
+const MUTED: u32 = 0x8b8880;
+const FAINT: u32 = 0x5c5a55;
+const ORANGE: u32 = 0xff5a1f;
+const ORANGE_DIM: u32 = 0x8a3110;
+const INK: u32 = 0x0b080b;
 const DANGER: u32 = 0xe0645f;
 const GREEN: u32 = 0x4ec97a;
 
@@ -52,8 +51,10 @@ struct Orange {
     screen: Screen,
     session: Option<session::Session>,
     windows: Vec<WindowTarget>,
-    /// Thumbnails keyed by window handle, captured when the picker opens.
+    /// Thumbnails keyed by window handle, filled in asynchronously.
     thumbnails: std::collections::HashMap<i64, std::sync::Arc<gpui::RenderImage>>,
+    /// Results arriving from the capture thread.
+    thumb_rx: Option<std::sync::mpsc::Receiver<(i64, capture::Thumbnail)>>,
     quality: usize,
     stream: Option<Supervisor>,
     logging_in: Option<LoginAttempt>,
@@ -85,6 +86,7 @@ impl Orange {
             session,
             windows: Vec::new(),
             thumbnails: std::collections::HashMap::new(),
+            thumb_rx: None,
             quality: 1,
             stream: None,
             logging_in: None,
@@ -95,6 +97,8 @@ impl Orange {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
+        self.drain_thumbnails();
+
         // Login happens in a child process; notice when it lands, and when it
         // dies without producing a session.
         if self.logging_in.is_some() {
@@ -132,21 +136,54 @@ impl Orange {
                 // Never offer our own windows as a capture target.
                 windows.retain(|w| !w.process.to_lowercase().starts_with("orange"));
 
-                // Thumbnails are captured here rather than lazily during
-                // render: PrintWindow is synchronous and would stutter the UI
-                // if it ran inside a paint.
-                self.thumbnails.clear();
-                for target in &windows {
-                    if let Some(image) = capture::thumbnail(target.hwnd as isize, 320, 180) {
-                        self.thumbnails.insert(target.hwnd, image);
+                // Capture off the UI thread. PrintWindow is synchronous and
+                // costs tens of milliseconds per window, so doing this inline
+                // froze the app for as long as it took to walk the list.
+                let handles: Vec<i64> = windows.iter().map(|w| w.hwnd).collect();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    for hwnd in handles {
+                        if let Some(thumb) = capture::thumbnail(hwnd as isize, 320, 180) {
+                            // A closed picker drops the receiver; stop early.
+                            if tx.send((hwnd, thumb)).is_err() {
+                                return;
+                            }
+                        }
                     }
-                }
+                });
 
+                self.thumbnails.clear();
+                self.thumb_rx = Some(rx);
                 self.windows = windows;
                 self.error = None;
             }
             Err(err) => self.error = Some(err.to_string()),
         }
+    }
+
+    /// Move any captured thumbnails into the map. Runs on the UI thread, which
+    /// is where GPUI's image types have to be built.
+    fn drain_thumbnails(&mut self) -> bool {
+        let Some(rx) = &self.thumb_rx else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok((hwnd, thumb)) => {
+                    if let Some(image) = capture::to_image(thumb) {
+                        self.thumbnails.insert(hwnd, image);
+                        changed = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.thumb_rx = None;
+                    break;
+                }
+            }
+        }
+        changed
     }
 
     fn start_login(&mut self) {
@@ -288,36 +325,45 @@ fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui
         .child(text.into())
 }
 
-/// The mark: an eclipse. A ring that thickens downward, drawn as two circles
-/// rather than an imported asset so there is no icon pipeline for one shape.
+/// The mark: a scanline eclipse crescent, from the logo exploration.
 ///
-/// Placeholder — the real logo is still being designed.
-fn logo(px_size: f32) -> gpui::Div {
-    div()
-        .relative()
-        .w(px(px_size))
-        .h(px(px_size))
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .w(px(px_size))
-                .h(px(px_size))
-                .rounded_full()
-                .bg(rgb(ORANGE)),
-        )
-        .child(
-            // The eclipsing body, offset upward so the crescent gathers below.
-            div()
-                .absolute()
-                .top(px(-px_size * 0.16))
-                .left(px(px_size * 0.08))
-                .w(px(px_size * 0.84))
-                .h(px(px_size * 0.84))
-                .rounded_full()
-                .bg(rgb(BG)),
-        )
+/// Embedded as a PNG rather than drawn, because the scanline texture cannot be
+/// expressed with GPUI primitives without hundreds of elements. Decoded once
+/// and cached.
+fn logo(px_size: f32) -> impl IntoElement {
+    static LOGO: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
+        std::sync::OnceLock::new();
+
+    let image = LOGO
+        .get_or_init(|| {
+            let bytes = include_bytes!("../logo.png");
+            let decoded = image::load_from_memory(bytes).ok()?.into_rgba8();
+            // GPUI wants BGRA; the PNG decodes as RGBA, so swap the channels.
+            let mut raw = decoded.into_raw();
+            for px in raw.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            let (w, h) = (128, 128);
+            let buffer = image::RgbaImage::from_raw(w, h, raw)?;
+            Some(std::sync::Arc::new(gpui::RenderImage::new(vec![
+                image::Frame::new(buffer),
+            ])))
+        })
+        .clone();
+
+    match image {
+        Some(image) => gpui::img(image)
+            .w(px(px_size))
+            .h(px(px_size))
+            .into_any_element(),
+        // If the asset ever fails to decode, a plain disc beats nothing.
+        None => div()
+            .w(px(px_size))
+            .h(px(px_size))
+            .rounded_full()
+            .bg(rgb(ORANGE))
+            .into_any_element(),
+    }
 }
 
 /// A small coloured dot, for status.
