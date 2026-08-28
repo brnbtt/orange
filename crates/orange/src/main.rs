@@ -164,6 +164,8 @@ fn parse_scale(s: &str) -> Result<(u32, u32)> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Before anything creates a window or asks Windows about the screen.
+    window::set_dpi_aware();
     gst::init()?;
 
     match cli.command {

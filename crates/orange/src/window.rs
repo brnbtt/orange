@@ -21,8 +21,24 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH, ScreenToClient};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// Opt out of DPI virtualisation, before any window exists.
+///
+/// Without this Windows lies to us about the screen size and stretches our
+/// window's backing surface to fit the real one. On a 4K display at 150% that
+/// means `d3d11videosink` renders into a 2560x1440 surface which DWM then
+/// upscales - throwing away precisely the detail this project exists to
+/// deliver. The bitrate is spent and then discarded at the last step.
+pub fn set_dpi_aware() {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
 
 /// Cosmetic only: the frame behind the video, visible for an instant before
 /// the first frame arrives and in the letterbox bars.
@@ -123,6 +139,14 @@ unsafe fn create_window(
     };
     // A zero return can mean "already registered", which is fine.
     RegisterClassW(&class);
+
+    // Callers pass logical sizes. Now that the process is DPI aware, scale
+    // them so the window covers the same area of screen as before - the
+    // difference being that it is now backed by real pixels rather than an
+    // upscale of two thirds as many.
+    let scale = GetDpiForSystem() as f32 / 96.0;
+    let width = (width as f32 * scale).round() as i32;
+    let height = (height as f32 * scale).round() as i32;
 
     // Centre on the primary monitor.
     let screen_w = GetSystemMetrics(SM_CXSCREEN);
@@ -251,6 +275,22 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     SW_MAXIMIZE
                 };
                 let _ = ShowWindow(hwnd, cmd);
+                LRESULT(0)
+            }
+            // Dragged onto a monitor with different scaling. Windows hands us
+            // the rectangle the window should occupy at the new scale; taking
+            // it keeps the video at native resolution on both displays.
+            WM_DPICHANGED => {
+                let suggested = &*(lparam.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
                 LRESULT(0)
             }
             WM_DESTROY => {
