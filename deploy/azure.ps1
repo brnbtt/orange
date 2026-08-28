@@ -1,5 +1,8 @@
 # Deploys the orange signalling relay to Azure Container Apps.
 #
+# The Dockerfile lives at the repo root because `az containerapp up --source` 
+# requires it there; it will not accept a path to one elsewhere.
+#
 # Container Apps is a good fit here: it terminates TLS and hands out an HTTPS
 # hostname for free (so clients get wss:// with no certificate work), it
 # supports WebSockets, and the relay is small enough to sit in the cheapest
@@ -41,6 +44,7 @@ az group create --name $ResourceGroup --location $Location --only-show-errors | 
 Step "Building and deploying (this takes a few minutes the first time)"
 Push-Location $root
 try {
+    # Note: `containerapp up` rejects --only-show-errors, unlike most az commands.
     az containerapp up `
         --name $AppName `
         --resource-group $ResourceGroup `
@@ -48,8 +52,7 @@ try {
         --environment $Environment `
         --source . `
         --ingress external `
-        --target-port 9000 `
-        --only-show-errors | Out-Null
+        --target-port 9000
     if ($LASTEXITCODE -ne 0) { throw "az containerapp up failed" }
 }
 finally { Pop-Location }

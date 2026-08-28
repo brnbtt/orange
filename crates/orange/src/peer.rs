@@ -32,6 +32,63 @@ fn make_webrtcbin(name: &str) -> Result<gst::Element> {
         .context("webrtcbin missing")
 }
 
+/// Surface pipeline errors.
+///
+/// Without this, a failure inside the receive branch (a decoder refusing caps,
+/// an element failing to start) is completely silent: the peer connection
+/// reports Connected and nothing ever explains why no frames appear.
+fn watch_bus(pipeline: &gst::Pipeline, label: &'static str) {
+    let Some(bus) = pipeline.bus() else { return };
+    std::thread::spawn(move || loop {
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(500)) else {
+            continue;
+        };
+        match msg.view() {
+            gst::MessageView::Error(err) => {
+                eprintln!(
+                    "[{label}] ERROR from {}: {} ({})",
+                    msg.src().map(|s| s.path_string()).unwrap_or_default(),
+                    err.error(),
+                    err.debug().unwrap_or_default()
+                );
+            }
+            gst::MessageView::Warning(w) => {
+                eprintln!("[{label}] warning: {} ({})", w.error(), w.debug().unwrap_or_default());
+            }
+            gst::MessageView::Eos(_) => {
+                println!("[{label}] end of stream");
+                break;
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Log ICE and DTLS state transitions.
+///
+/// Without this, a failed connection is indistinguishable from a working one:
+/// `pad-added` fires when the transceiver is created, which happens whether or
+/// not any media ever arrives. The states below are the difference between
+/// "negotiated" and "actually connected".
+fn watch_connection(bin: &gst::Element, label: String) {
+    let l = label.clone();
+    bin.connect_notify(Some("ice-connection-state"), move |bin, _| {
+        let state = bin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
+        println!("[{l}] ice: {state:?}");
+    });
+
+    let l = label.clone();
+    bin.connect_notify(Some("ice-gathering-state"), move |bin, _| {
+        let state = bin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+        println!("[{l}] gathering: {state:?}");
+    });
+
+    bin.connect_notify(Some("connection-state"), move |bin, _| {
+        let state = bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+        println!("[{label}] peer connection: {state:?}");
+    });
+}
+
 /// Forward locally-gathered ICE candidates to the other peer.
 fn forward_ice(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
     bin.connect("on-ice-candidate", false, move |values| {
@@ -81,6 +138,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
 
     pipeline.add_many([capture.upcast_ref(), &pay, &caps_filter, &tee])?;
     gst::Element::link_many([capture.upcast_ref(), &pay, &caps_filter, &tee])?;
+    watch_bus(&pipeline, "host");
     pipeline.set_state(gst::State::Playing)?;
 
     // One peer connection per viewer, keyed by the relay's peer id.
@@ -159,6 +217,7 @@ fn add_viewer(
         .context("tee refused a source pad")?;
     tee_pad.link(&queue.static_pad("sink").unwrap())?;
 
+    watch_connection(&bin, format!("host->{peer}"));
     forward_ice(&bin, out.clone(), peer.to_string());
 
     queue.sync_state_with_parent()?;
@@ -206,7 +265,9 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let pipeline = gst::Pipeline::new();
     let bin = make_webrtcbin("viewer")?;
     pipeline.add(&bin)?;
+    watch_bus(&pipeline, "watch");
 
+    watch_connection(&bin, "watch".to_string());
     forward_ice(&bin, client.outgoing.clone(), String::new());
 
     // The receive branch cannot be built until media arrives and we know the

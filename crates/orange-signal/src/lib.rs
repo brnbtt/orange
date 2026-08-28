@@ -265,7 +265,19 @@ pub struct SignalClient {
     pub incoming: mpsc::UnboundedReceiver<Signal>,
 }
 
+/// rustls refuses to pick a crypto backend for you when more than one could
+/// apply, and panics at first use rather than failing gracefully. Install one
+/// explicitly, once, before any TLS happens.
+fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub async fn connect(url: &str) -> Result<SignalClient> {
+    install_crypto_provider();
+
     // `connect_async` handles ws:// directly; wss:// needs the TLS connector,
     // which is what Azure's ingress terminates on.
     let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(url, None, false, None)
