@@ -39,7 +39,7 @@ pub fn audio_rtp_caps() -> gst::Caps {
     gst::Caps::builder("application/x-rtp")
         .field("media", "audio")
         .field("encoding-name", "OPUS")
-        .field("payload", 97i32)
+        .field("payload", 111i32)
         .field("clock-rate", 48_000i32)
         .field("encoding-params", "2")
         .build()
@@ -416,5 +416,18 @@ mod tests {
             "120"
         );
         assert_eq!(frame_rate_from_rtp_caps(&caps), Some(120));
+    }
+
+    #[test]
+    fn audio_payload_does_not_collide_with_video_rtx() {
+        gst::init().unwrap();
+        let payload = audio_rtp_caps()
+            .structure(0)
+            .unwrap()
+            .get::<i32>("payload")
+            .unwrap();
+
+        assert_eq!(payload, 111);
+        assert_ne!(payload, 97);
     }
 }
