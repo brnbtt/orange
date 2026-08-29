@@ -76,7 +76,6 @@ struct Orange {
     active_target: Option<WindowTarget>,
     active_preview: Option<std::sync::Arc<gpui::RenderImage>>,
     host: Option<Supervisor>,
-    monitor: Option<WatchSession>,
     watches: Vec<WatchSession>,
     logging_in: Option<LoginAttempt>,
     notice: Option<Notice>,
@@ -123,7 +122,6 @@ impl Orange {
             active_target: None,
             active_preview: None,
             host: None,
-            monitor: None,
             watches: Vec::new(),
             logging_in: None,
             notice: None,
@@ -174,7 +172,6 @@ impl Orange {
                 self.show_error(error);
             }
             self.host = None;
-            self.monitor = None;
             self.active_target = None;
             self.active_preview = None;
             self.screen = if self.watches.is_empty() {
@@ -205,22 +202,6 @@ impl Orange {
         if self.screen == Screen::Watching && self.watches.is_empty() {
             self.screen = Screen::Home;
         }
-        if self
-            .monitor
-            .as_mut()
-            .is_some_and(|monitor| !monitor.supervisor.running())
-        {
-            let monitor_error = self
-                .monitor
-                .as_ref()
-                .and_then(|monitor| monitor.supervisor.status.lock().ok())
-                .and_then(|status| status.error.clone());
-            self.monitor = None;
-            if let Some(error) = monitor_error {
-                self.show_error(error);
-            }
-        }
-
         // A newly-issued room code is immediately ready to paste into chat.
         if let Some(code) = self.code() {
             if self.copied_code.as_deref() != Some(&code) {
@@ -359,9 +340,6 @@ impl Orange {
             );
             return;
         }
-        // A self-monitor belongs to exactly one host room. Never carry one
-        // into a replacement stream while its old room is winding down.
-        self.monitor = None;
         let preview = self.thumbnails.get(&target.hwnd).cloned();
         match Supervisor::host(&target, &self.quality(), self.fps, &self.server) {
             Ok(stream) => {
@@ -388,7 +366,7 @@ impl Orange {
             return;
         }
         if self.own_codes.contains(&code) {
-            self.show_error("That's your own code. Use Live monitor.");
+            self.show_error("That's your own active or previous stream code.");
             return;
         }
         if !supervisor::gstreamer_available() {
@@ -413,24 +391,10 @@ impl Orange {
         }
     }
 
-    fn open_live_monitor(&mut self, code: String) {
-        if self.monitor.is_some() {
-            return;
-        }
-        match Supervisor::live_monitor(&code, &self.server) {
-            Ok(supervisor) => {
-                self.monitor = Some(WatchSession { code, supervisor });
-                self.clear_error();
-            }
-            Err(err) => self.show_error(err.to_string()),
-        }
-    }
-
     fn stop_host(&mut self) {
         if let Some(mut host) = self.host.take() {
             host.stop();
         }
-        self.monitor = None;
         self.active_target = None;
         self.active_preview = None;
         self.copied_code = None;
@@ -1468,8 +1432,6 @@ impl Orange {
 
     fn render_streaming(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let code = self.code();
-        let monitor_code = code.clone();
-        let monitor_open = self.monitor.is_some();
         let viewers = self.viewers();
         let quality = self.quality();
         let source_name = self
@@ -1580,20 +1542,7 @@ impl Orange {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_3()
-                                    .child(micro("SOURCE PREVIEW", ORANGE))
-                                    .children(monitor_code.map(|code| {
-                                        if monitor_open {
-                                            micro("LIVE MONITOR OPEN", GREEN).into_any_element()
-                                        } else {
-                                            quiet("live-monitor", "Open live monitor")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_live_monitor(code.clone());
-                                                    cx.notify();
-                                                }))
-                                                .into_any_element()
-                                        }
-                                    })),
+                                    .child(micro("SOURCE PREVIEW", ORANGE)),
                             ),
                     ),
             )
@@ -2021,6 +1970,9 @@ mod tests {
 
     #[test]
     fn picker_cards_use_content_height_instead_of_filling_the_viewport() {
-        assert_eq!(PICKER_CARD_HEIGHT, PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT);
+        assert_eq!(
+            PICKER_CARD_HEIGHT,
+            PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT
+        );
     }
 }

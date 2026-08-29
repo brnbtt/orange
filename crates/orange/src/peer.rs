@@ -31,6 +31,7 @@ use orange_signal::{connect, Signal};
 /// machines behind different routers will never find each other.
 const STUN: &str = "stun://stun.l.google.com:19302";
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
+const IDLE_REDRAW_AFTER: Duration = Duration::from_millis(100);
 
 struct PipelineError {
     source: String,
@@ -41,8 +42,8 @@ fn should_report_pipeline_error(playback_alive: Option<bool>) -> bool {
     playback_alive != Some(false)
 }
 
-fn should_request_idle_redraw(viewer_count: usize) -> bool {
-    viewer_count > 0
+fn should_request_idle_redraw(viewer_count: usize, frame_silence: Duration) -> bool {
+    viewer_count > 0 && frame_silence >= IDLE_REDRAW_AFTER
 }
 
 fn make_webrtcbin(name: &str) -> Result<gst::Element> {
@@ -134,6 +135,31 @@ fn watch_connection(bin: &gst::Element, label: String) {
     });
 }
 
+fn enable_nack(transceiver: &gst_webrtc::WebRTCRTPTransceiver) {
+    transceiver.set_property("do-nack", true);
+}
+
+fn enable_incoming_video_nack(bin: &gst::Element) {
+    bin.connect("on-new-transceiver", false, move |values| {
+        let Ok(transceiver) = values[1].get::<gst_webrtc::WebRTCRTPTransceiver>() else {
+            return None;
+        };
+        let kind = transceiver.property::<gst_webrtc::WebRTCKind>("kind");
+        if kind == gst_webrtc::WebRTCKind::Video {
+            enable_nack(&transceiver);
+        }
+        let transceiver_for_kind = transceiver.clone();
+        transceiver.connect_notify(Some("kind"), move |transceiver, _| {
+            if transceiver.property::<gst_webrtc::WebRTCKind>("kind")
+                == gst_webrtc::WebRTCKind::Video
+            {
+                enable_nack(&transceiver_for_kind);
+            }
+        });
+        None
+    });
+}
+
 fn check_promise_reply<'a>(
     reply: std::result::Result<Option<&'a gst::StructureRef>, gst::PromiseError>,
     operation: &str,
@@ -216,6 +242,7 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::time::Duration;
 
     #[test]
@@ -227,9 +254,31 @@ mod tests {
 
     #[test]
     fn idle_redraw_heartbeat_only_runs_with_viewers() {
-        assert!(!super::should_request_idle_redraw(0));
-        assert!(super::should_request_idle_redraw(1));
+        assert!(!super::should_request_idle_redraw(
+            0,
+            Duration::from_millis(500)
+        ));
+        assert!(!super::should_request_idle_redraw(
+            1,
+            Duration::from_millis(20)
+        ));
+        assert!(super::should_request_idle_redraw(
+            1,
+            Duration::from_millis(150)
+        ));
         assert!(super::IDLE_REDRAW_INTERVAL <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn video_transceiver_enables_retransmission() {
+        gst::init().unwrap();
+        let bin = super::make_webrtcbin("nack-test").unwrap();
+        let pad = bin.request_pad_simple("sink_%u").unwrap();
+        let transceiver = pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+
+        super::enable_nack(&transceiver);
+
+        assert!(transceiver.property::<bool>("do-nack"));
     }
 }
 
@@ -260,6 +309,21 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
 
     pipeline.add_many([capture.upcast_ref(), &tee])?;
     capture.link(&tee)?;
+    let capture_clock = Instant::now();
+    let last_video_frame = Arc::new(AtomicU64::new(0));
+    let last_video_frame_for_probe = last_video_frame.clone();
+    tee.static_pad("sink")
+        .context("video tee has no sink pad")?
+        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            last_video_frame_for_probe.store(
+                capture_clock
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+            gst::PadProbeReturn::Ok
+        });
 
     // Audio is optional: if the process makes no sound, or capture fails, the
     // stream should still work rather than refusing to start.
@@ -308,8 +372,18 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         }
                         anyhow::bail!(error.message)
                     },
-                    _ = idle_redraw.tick(), if should_request_idle_redraw(viewers.len()) => {
-                        crate::targets::request_redraw(settings.hwnd);
+                    _ = idle_redraw.tick(), if !viewers.is_empty() => {
+                        let now = capture_clock
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64;
+                        let last = last_video_frame.load(Ordering::Relaxed);
+                        if should_request_idle_redraw(
+                            viewers.len(),
+                            Duration::from_millis(now.saturating_sub(last)),
+                        ) {
+                            crate::targets::request_redraw(settings.hwnd);
+                        }
                         continue;
                     }
                     Some((peer, error)) = failed_viewers.recv() => {
@@ -499,6 +573,7 @@ fn link_tee_branch(
     tee: &gst::Element,
     bin: &gst::Element,
     max_buffers: u32,
+    retransmit: bool,
     mut payload: Vec<gst::Element>,
 ) -> Result<TeeBranch> {
     let queue = gst::ElementFactory::make("queue")
@@ -511,6 +586,10 @@ fn link_tee_branch(
     let sink_pad = bin
         .request_pad_simple("sink_%u")
         .context("webrtcbin refused a sink pad")?;
+    if retransmit {
+        let transceiver = sink_pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+        enable_nack(&transceiver);
+    }
     let Some(tee_pad) = tee.request_pad_simple("src_%u") else {
         bin.release_request_pad(&sink_pad);
         anyhow::bail!("tee refused a source pad");
@@ -575,6 +654,7 @@ fn add_viewer(
             tee,
             &branch.bin,
             200,
+            true,
             vec![pay, caps],
         )?);
         if let Some(audio_tee) = audio_tee {
@@ -583,6 +663,7 @@ fn add_viewer(
                 audio_tee,
                 &branch.bin,
                 50,
+                false,
                 Vec::new(),
             )?);
         }
@@ -724,6 +805,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch", viewer_playback.clone())?;
 
     watch_connection(&bin, "watch".to_string());
+    enable_incoming_video_nack(&bin);
     forward_ice(&bin, client.outgoing.clone(), String::new());
 
     // Media arrives as separate pads: one for video, one for audio. Only the

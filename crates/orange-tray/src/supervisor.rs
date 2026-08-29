@@ -211,11 +211,6 @@ impl Supervisor {
         Self::playback(code, server, cascade, "friend")
     }
 
-    /// Start the host-owned live-monitor playback session.
-    pub fn live_monitor(code: &str, server: &str) -> Result<Self> {
-        Self::playback(code, server, 0, "monitor")
-    }
-
     fn playback(code: &str, server: &str, cascade: usize, profile: &str) -> Result<Self> {
         let mut command = orange_command()?;
         command

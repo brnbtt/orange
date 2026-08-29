@@ -16,7 +16,7 @@ embed-resource = "3"
 orange-signal = { path = "../orange-signal" }
 gstreamer = "0.25"
 gstreamer-video = "0.25"
-gstreamer-webrtc = "0.25"
+gstreamer-webrtc = { version = "0.25", features = ["v1_20"] }
 gstreamer-sdp = "0.25"
 anyhow.workspace = true
 tokio.workspace = true

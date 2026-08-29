@@ -157,6 +157,7 @@ pub fn check_elements(codec: Codec) -> Result<()> {
 /// knows the rate to run at; `d3d11convert` does not do framerate conversion,
 /// so requesting it further downstream would fail to negotiate.
 pub fn build_capture_chain(settings: &CaptureSettings) -> String {
+    let gop_size = settings.fps.saturating_mul(2).min(i32::MAX as u32);
     let scale_caps = match settings.scale {
         Some((w, h)) => format!("! video/x-raw(memory:D3D11Memory),width={w},height={h} "),
         None => String::new(),
@@ -178,11 +179,13 @@ pub fn build_capture_chain(settings: &CaptureSettings) -> String {
          ! queue max-size-buffers=3 leaky=downstream \
          ! d3d11convert \
          {scale_caps}\
-         ! {encoder} bitrate={bitrate} \
+         ! {encoder} bitrate={bitrate} gop-size={gop_size} \
+           preset=p5 tune=low-latency rc-mode=cbr spatial-aq=true \
          ! {parser}",
         fps = settings.fps,
         encoder = settings.codec.encoder(),
         bitrate = settings.bitrate,
+        gop_size = gop_size,
         parser = settings.codec.parser(),
     )
 }
@@ -213,4 +216,29 @@ pub fn build_record_pipeline(settings: &CaptureSettings, output: &str) -> Result
         .context("failed to link capture chain to file sink")?;
 
     Ok(pipeline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_encoder_uses_a_bounded_recovery_gop() {
+        let settings = CaptureSettings {
+            fps: 60,
+            ..CaptureSettings::default()
+        };
+
+        assert!(build_capture_chain(&settings).contains("gop-size=120"));
+    }
+
+    #[test]
+    fn streaming_encoder_uses_consistent_low_latency_quality_settings() {
+        let chain = build_capture_chain(&CaptureSettings::default());
+
+        assert!(chain.contains("preset=p5"));
+        assert!(chain.contains("tune=low-latency"));
+        assert!(chain.contains("rc-mode=cbr"));
+        assert!(chain.contains("spatial-aq=true"));
+    }
 }
