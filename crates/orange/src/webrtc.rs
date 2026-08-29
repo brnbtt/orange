@@ -273,6 +273,23 @@ fn frame_rate_from_rtp_caps(caps: &gst::CapsRef) -> Option<u32> {
         .filter(|rate| (1..=480).contains(rate))
 }
 
+fn av1_decoder_factory(selection: Option<&str>, file_output: bool) -> &'static str {
+    match (selection, file_output) {
+        (_, true) => "d3d11av1dec",
+        (Some("software"), false) => "dav1ddec",
+        _ => "d3d11av1dec",
+    }
+}
+
+fn build_av1_decoder(selection: Option<&str>, file_output: bool) -> Result<gst::Element> {
+    let factory = av1_decoder_factory(selection, file_output);
+    gst::ElementFactory::make(factory)
+        .property("automatic-request-sync-points", true)
+        .property("discard-corrupted-frames", true)
+        .build()
+        .with_context(|| format!("{factory} is unavailable"))
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
@@ -286,9 +303,11 @@ pub fn build_receive_branch(
     };
     let depay = gst::ElementFactory::make("rtpav1depay").build()?;
     let parse = gst::ElementFactory::make("av1parse").build()?;
-    let dec = gst::ElementFactory::make("d3d11av1dec")
-        .build()
-        .context("d3d11av1dec missing - no hardware AV1 decode on this GPU?")?;
+    let decoder_selection = std::env::var("ORANGE_AV1_DECODER").ok();
+    let dec = build_av1_decoder(
+        decoder_selection.as_deref(),
+        matches!(&output, Output::File(_)),
+    )?;
     let advertised_rate = pad
         .current_caps()
         .as_ref()
@@ -450,5 +469,26 @@ mod tests {
 
         assert_eq!(payload, 111);
         assert_ne!(payload, 97);
+    }
+
+    #[test]
+    fn software_decoder_can_be_selected_for_diagnostic_comparison() {
+        assert_eq!(av1_decoder_factory(Some("software"), false), "dav1ddec");
+        assert_eq!(av1_decoder_factory(Some("software"), true), "d3d11av1dec");
+        assert_eq!(av1_decoder_factory(Some("hardware"), false), "d3d11av1dec");
+        assert_eq!(
+            av1_decoder_factory(Some("unexpected"), false),
+            "d3d11av1dec"
+        );
+        assert_eq!(av1_decoder_factory(None, false), "d3d11av1dec");
+    }
+
+    #[test]
+    fn av1_decoder_rejects_corrupt_output_and_requests_recovery() {
+        gst::init().unwrap();
+        let decoder = build_av1_decoder(Some("software"), false).unwrap();
+
+        assert!(decoder.property::<bool>("automatic-request-sync-points"));
+        assert!(decoder.property::<bool>("discard-corrupted-frames"));
     }
 }

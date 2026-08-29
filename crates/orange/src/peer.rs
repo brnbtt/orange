@@ -441,10 +441,6 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         if let Some(branch) = viewers.remove(&peer) {
                             let label = branch.label.clone();
                             remove_viewer(&pipeline, branch);
-                            if viewers.is_empty() {
-                                pipeline.set_state(gst::State::Ready)?;
-                                pipeline_started = false;
-                            }
                             print_viewer_status("left", &peer, &label);
                             println!(
                                 "[host] {label} left ({} remaining)",
@@ -495,10 +491,6 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         if let Some(branch) = viewers.remove(&peer) {
                             let label = branch.label.clone();
                             remove_viewer(&pipeline, branch);
-                            if viewers.is_empty() {
-                                pipeline.set_state(gst::State::Ready)?;
-                                pipeline_started = false;
-                            }
                             println!("[host] {label} left ({} remaining)", viewers.len());
                             print_viewer_status("left", &peer, &label);
                         }
@@ -681,9 +673,6 @@ fn link_tee_branch(
             .static_pad("src")
             .unwrap()
             .link(&branch.bin_pad)?;
-        branch
-            .tee_pad
-            .link(&branch.elements[0].static_pad("sink").unwrap())?;
 
         Ok(())
     })();
@@ -744,6 +733,8 @@ fn add_viewer(
             for element in &link.elements {
                 element.sync_state_with_parent()?;
             }
+            link.tee_pad
+                .link(&link.elements[0].static_pad("sink").unwrap())?;
         }
         Ok(())
     })();
@@ -775,6 +766,9 @@ fn add_viewer(
 }
 
 fn remove_viewer(pipeline: &gst::Pipeline, branch: ViewerBranch) {
+    for link in &branch.links {
+        block_and_unlink_tee_branch(link);
+    }
     let _ = branch.bin.set_state(gst::State::Null);
     for link in branch.links {
         remove_tee_branch(pipeline, &branch.bin, link);
@@ -782,12 +776,33 @@ fn remove_viewer(pipeline: &gst::Pipeline, branch: ViewerBranch) {
     let _ = pipeline.remove(&branch.bin);
 }
 
+fn block_and_unlink_tee_branch(branch: &TeeBranch) {
+    let Some(sink_pad) = branch.elements[0].static_pad("sink") else {
+        return;
+    };
+    if !branch.tee_pad.is_linked() {
+        return;
+    }
+
+    let (blocked, wait_for_block) = std::sync::mpsc::sync_channel(1);
+    let probe = branch
+        .tee_pad
+        .add_probe(gst::PadProbeType::IDLE, move |_, _| {
+            let _ = blocked.try_send(());
+            gst::PadProbeReturn::Ok
+        });
+    if probe.is_some() {
+        let _ = wait_for_block.recv_timeout(Duration::from_secs(1));
+    }
+    let _ = branch.tee_pad.unlink(&sink_pad);
+    if let Some(probe) = probe {
+        branch.tee_pad.remove_probe(probe);
+    }
+}
+
 fn remove_tee_branch(pipeline: &gst::Pipeline, bin: &gst::Element, branch: TeeBranch) {
     for element in &branch.elements {
         let _ = element.set_state(gst::State::Null);
-    }
-    if let Some(sink_pad) = branch.elements[0].static_pad("sink") {
-        let _ = branch.tee_pad.unlink(&sink_pad);
     }
     if let Some(src_pad) = branch.elements.last().unwrap().static_pad("src") {
         let _ = src_pad.unlink(&branch.bin_pad);
