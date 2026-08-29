@@ -290,6 +290,14 @@ fn build_av1_decoder(selection: Option<&str>, file_output: bool) -> Result<gst::
         .with_context(|| format!("{factory} is unavailable"))
 }
 
+fn build_av1_depayloader() -> Result<gst::Element> {
+    gst::ElementFactory::make("rtpav1depay")
+        .property("request-keyframe", true)
+        .property("wait-for-keyframe", true)
+        .build()
+        .context("rtpav1depay is unavailable")
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
@@ -301,7 +309,7 @@ pub fn build_receive_branch(
         Output::Window(playback) => Some(playback.clone()),
         Output::File(_) => None,
     };
-    let depay = gst::ElementFactory::make("rtpav1depay").build()?;
+    let depay = build_av1_depayloader()?;
     let parse = gst::ElementFactory::make("av1parse").build()?;
     let decoder_selection = std::env::var("ORANGE_AV1_DECODER").ok();
     let dec = build_av1_decoder(
@@ -490,5 +498,14 @@ mod tests {
 
         assert!(decoder.property::<bool>("automatic-request-sync-points"));
         assert!(decoder.property::<bool>("discard-corrupted-frames"));
+    }
+
+    #[test]
+    fn av1_depayloader_requests_and_waits_for_recovery_keyframes() {
+        gst::init().unwrap();
+        let depay = build_av1_depayloader().unwrap();
+
+        assert!(depay.property::<bool>("request-keyframe"));
+        assert!(depay.property::<bool>("wait-for-keyframe"));
     }
 }
