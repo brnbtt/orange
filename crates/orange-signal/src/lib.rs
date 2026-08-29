@@ -153,113 +153,115 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
     let mut joined: Option<(String, Role)> = None;
     let mut identity: Option<Identity> = None;
 
-    while let Some(msg) = source.next().await {
-        let Message::Text(text) = msg? else { continue };
-        let signal: Signal = match serde_json::from_str(&text) {
-            Ok(s) => s,
-            Err(err) => {
-                let _ = tx.send(Message::Text(
-                    Signal::Error {
-                        message: format!("bad message: {err}"),
-                    }
-                    .to_json(),
-                ));
-                continue;
-            }
-        };
-
-        match signal {
-            Signal::Authenticate { session } => {
-                match auth.identify(&session).await {
-                    Some(found) => {
-                        let _ = tx.send(Message::Text(
-                            Signal::Authenticated {
-                                name: found.name.clone(),
-                            }
-                            .to_json(),
-                        ));
-                        identity = Some(found);
-                    }
-                    None => {
-                        // Not fatal: anonymous peers are still allowed.
-                        let _ = tx.send(Message::Text(
-                            Signal::Error {
-                                message: "session expired, continuing anonymously".into(),
-                            }
-                            .to_json(),
-                        ));
-                    }
+    let session_result: Result<()> = async {
+        while let Some(msg) = source.next().await {
+            let Message::Text(text) = msg? else { continue };
+            let signal: Signal = match serde_json::from_str(&text) {
+                Ok(s) => s,
+                Err(err) => {
+                    let _ = tx.send(Message::Text(
+                        Signal::Error {
+                            message: format!("bad message: {err}"),
+                        }
+                        .to_json(),
+                    ));
+                    continue;
                 }
-            }
-            Signal::Host => {
-                let code = generate_code();
-                let name = identity.as_ref().map(|i| i.name.clone());
-                rooms.lock().await.insert(
-                    code.clone(),
-                    Room {
-                        host: Some(tx.clone()),
-                        host_name: name,
-                        viewers: HashMap::new(),
-                    },
-                );
-                joined = Some((code.clone(), Role::Host));
-                tx.send(Message::Text(Signal::Hosting { code }.to_json()))?;
-            }
-            Signal::Join { code } => {
-                let code = code.trim().to_ascii_uppercase();
-                let peer = generate_peer_id();
-                let mut rooms = rooms.lock().await;
-                match rooms.get_mut(&code) {
-                    Some(room) if room.host.is_some() => {
-                        room.viewers.insert(peer.clone(), tx.clone());
-                        let host_name = room.host_name.clone();
-                        joined = Some((code.clone(), Role::Viewer(peer.clone())));
+            };
 
-                        let _ = tx.send(Message::Text(
-                            Signal::StreamInfo { host_name }.to_json(),
-                        ));
-                        if let Some(host) = &room.host {
-                            let _ = host.send(Message::Text(
-                                Signal::ViewerJoined {
-                                    peer,
-                                    name: identity.as_ref().map(|i| i.name.clone()),
+            match signal {
+                Signal::Authenticate { session } => {
+                    match auth.identify(&session).await {
+                        Some(found) => {
+                            let _ = tx.send(Message::Text(
+                                Signal::Authenticated {
+                                    name: found.name.clone(),
                                 }
                                 .to_json(),
                             ));
+                            identity = Some(found);
                         }
-                    }
-                    _ => {
-                        tx.send(Message::Text(
-                            Signal::Error {
-                                message: format!("no stream with code {code}"),
-                            }
-                            .to_json(),
-                        ))?;
+                        None => {
+                            // Identity is optional. An expired token must not
+                            // prevent older clients from hosting or watching.
+                        }
                     }
                 }
-            }
-            other => {
-                let Some((code, role)) = &joined else {
-                    bail!("message before joining a room");
-                };
-                let rooms = rooms.lock().await;
-                let Some(room) = rooms.get(code) else { continue };
+                Signal::Host => {
+                    let code = generate_code();
+                    let name = identity.as_ref().map(|i| i.name.clone());
+                    rooms.lock().await.insert(
+                        code.clone(),
+                        Room {
+                            host: Some(tx.clone()),
+                            host_name: name,
+                            viewers: HashMap::new(),
+                        },
+                    );
+                    joined = Some((code.clone(), Role::Host));
+                    tx.send(Message::Text(Signal::Hosting { code }.to_json()))?;
+                }
+                Signal::Join { code } => {
+                    let code = code.trim().to_ascii_uppercase();
+                    let peer = generate_peer_id();
+                    let mut rooms = rooms.lock().await;
+                    match rooms.get_mut(&code) {
+                        Some(room) if room.host.is_some() => {
+                            room.viewers.insert(peer.clone(), tx.clone());
+                            let host_name = room.host_name.clone();
+                            joined = Some((code.clone(), Role::Viewer(peer.clone())));
 
-                match role {
-                    Role::Host => {
-                        if let Some(target) = other.peer_id().and_then(|id| room.viewers.get(id)) {
-                            let _ = target.send(Message::Text(other.to_json()));
+                            let _ =
+                                tx.send(Message::Text(Signal::StreamInfo { host_name }.to_json()));
+                            if let Some(host) = &room.host {
+                                let _ = host.send(Message::Text(
+                                    Signal::ViewerJoined {
+                                        peer,
+                                        name: identity.as_ref().map(|i| i.name.clone()),
+                                    }
+                                    .to_json(),
+                                ));
+                            }
+                        }
+                        _ => {
+                            tx.send(Message::Text(
+                                Signal::Error {
+                                    message: format!("no stream with code {code}"),
+                                }
+                                .to_json(),
+                            ))?;
                         }
                     }
-                    Role::Viewer(peer) => {
-                        if let Some(host) = &room.host {
-                            let _ = host.send(Message::Text(other.with_peer(peer).to_json()));
+                }
+                other => {
+                    let Some((code, role)) = &joined else {
+                        bail!("message before joining a room");
+                    };
+                    let rooms = rooms.lock().await;
+                    let Some(room) = rooms.get(code) else {
+                        continue;
+                    };
+
+                    match role {
+                        Role::Host => {
+                            if let Some(target) =
+                                other.peer_id().and_then(|id| room.viewers.get(id))
+                            {
+                                let _ = target.send(Message::Text(other.to_json()));
+                            }
+                        }
+                        Role::Viewer(peer) => {
+                            if let Some(host) = &room.host {
+                                let _ = host.send(Message::Text(other.with_peer(peer).to_json()));
+                            }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
+    .await;
 
     match joined {
         Some((code, Role::Host)) => {
@@ -277,7 +279,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
         }
         None => {}
     }
-    Ok(())
+    session_result
 }
 
 // --- client -----------------------------------------------------------------
@@ -368,4 +370,111 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
         shutdown: Some(shutdown_tx),
         shutdown_done: Some(shutdown_done_rx),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+
+    async fn receive_signal(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Signal {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("timed out waiting for relay")
+            .expect("relay closed unexpectedly")
+            .expect("websocket read failed");
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+            panic!("expected text signal");
+        };
+        serde_json::from_str(&text).expect("relay sent malformed signal")
+    }
+
+    #[tokio::test]
+    async fn abrupt_viewer_disconnect_notifies_host() {
+        let rooms = Rooms::default();
+        let app = server::router(server::AppState {
+            rooms: rooms.clone(),
+            auth: auth::Auth::new(None),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+
+        let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Host.to_json(),
+        ))
+        .await
+        .unwrap();
+        let Signal::Hosting { code } = receive_signal(&mut host).await else {
+            panic!("host did not receive a room code");
+        };
+
+        let (mut viewer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                Signal::Join { code }.to_json(),
+            ))
+            .await
+            .unwrap();
+        let _ = receive_signal(&mut viewer).await;
+        let Signal::ViewerJoined { peer, .. } = receive_signal(&mut host).await else {
+            panic!("host did not receive viewer join");
+        };
+
+        drop(viewer);
+
+        let Signal::ViewerLeft { peer: departed } = receive_signal(&mut host).await else {
+            panic!("host did not receive viewer departure");
+        };
+        assert_eq!(departed, peer);
+        assert!(rooms
+            .lock()
+            .await
+            .values()
+            .all(|room| room.viewers.is_empty()));
+
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_authentication_still_allows_anonymous_hosting() {
+        let rooms = Rooms::default();
+        let app = server::router(server::AppState {
+            rooms,
+            auth: auth::Auth::new(None),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+
+        let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Authenticate {
+                session: "expired".into(),
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Host.to_json(),
+        ))
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            receive_signal(&mut host).await,
+            Signal::Hosting { .. }
+        ));
+
+        relay.abort();
+    }
 }

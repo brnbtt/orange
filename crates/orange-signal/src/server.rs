@@ -39,14 +39,7 @@ pub async fn serve(addr: &str) -> Result<()> {
         auth,
     };
 
-    let app = Router::new()
-        .route("/", get(|| async { "orange relay" }))
-        .route("/health", get(|| async { "ok" }))
-        .route("/auth/start", get(auth_start))
-        .route("/auth/callback", get(auth_callback))
-        .route("/auth/poll", get(auth_poll))
-        .route("/ws", get(ws_upgrade))
-        .with_state(state);
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -54,6 +47,17 @@ pub async fn serve(addr: &str) -> Result<()> {
     println!("orange relay listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+pub(crate) fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(|| async { "orange relay" }))
+        .route("/health", get(|| async { "ok" }))
+        .route("/auth/start", get(auth_start))
+        .route("/auth/callback", get(auth_callback))
+        .route("/auth/poll", get(auth_poll))
+        .route("/ws", get(ws_upgrade))
+        .with_state(state)
 }
 
 #[derive(Serialize)]
@@ -65,11 +69,7 @@ struct StartResponse {
 async fn auth_start(State(app): State<AppState>) -> impl IntoResponse {
     match app.auth.start().await {
         Ok((url, state)) => Json(StartResponse { url, state }).into_response(),
-        Err(err) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            err.to_string(),
-        )
-            .into_response(),
+        Err(err) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
     }
 }
 
