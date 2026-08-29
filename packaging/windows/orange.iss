@@ -54,7 +54,6 @@ begin
   Result :=
     FileExists(AddBackslash(Root) + 'bin\gstreamer-1.0-0.dll') and
     FileExists(AddBackslash(Root) + 'lib\gstreamer-1.0\gstd3d11.dll') and
-    FileExists(AddBackslash(Root) + 'lib\gstreamer-1.0\gstimagefreeze.dll') and
     FileExists(AddBackslash(Root) + 'lib\gstreamer-1.0\gstwebrtc.dll') and
     FileExists(AddBackslash(Root) + 'lib\gstreamer-1.0\gstnvcodec.dll');
 end;

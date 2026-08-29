@@ -30,6 +30,7 @@ use orange_signal::{connect, Signal};
 /// Public STUN lets peers discover their external address. Without it, two
 /// machines behind different routers will never find each other.
 const STUN: &str = "stun://stun.l.google.com:19302";
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 
 struct PipelineError {
     source: String,
@@ -38,6 +39,10 @@ struct PipelineError {
 
 fn should_report_pipeline_error(playback_alive: Option<bool>) -> bool {
     playback_alive != Some(false)
+}
+
+fn should_request_idle_redraw(viewer_count: usize) -> bool {
+    viewer_count > 0
 }
 
 fn make_webrtcbin(name: &str) -> Result<gst::Element> {
@@ -211,11 +216,20 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     #[test]
     fn closed_playback_suppresses_teardown_bus_errors() {
         assert!(!super::should_report_pipeline_error(Some(false)));
         assert!(super::should_report_pipeline_error(Some(true)));
         assert!(super::should_report_pipeline_error(None));
+    }
+
+    #[test]
+    fn idle_redraw_heartbeat_only_runs_with_viewers() {
+        assert!(!super::should_request_idle_redraw(0));
+        assert!(super::should_request_idle_redraw(1));
+        assert!(super::IDLE_REDRAW_INTERVAL <= Duration::from_millis(50));
     }
 }
 
@@ -275,6 +289,8 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
 
     // One peer connection per viewer, keyed by the relay's peer id.
     let mut viewers: HashMap<String, ViewerBranch> = HashMap::new();
+    let mut idle_redraw = tokio::time::interval(IDLE_REDRAW_INTERVAL);
+    idle_redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // --- signalling loop --------------------------------------------------
     let session_result: Result<()> =
@@ -292,6 +308,10 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         }
                         anyhow::bail!(error.message)
                     },
+                    _ = idle_redraw.tick(), if should_request_idle_redraw(viewers.len()) => {
+                        crate::targets::request_redraw(settings.hwnd);
+                        continue;
+                    }
                     Some((peer, error)) = failed_viewers.recv() => {
                         if let Some(branch) = viewers.remove(&peer) {
                             let label = branch.label.clone();
