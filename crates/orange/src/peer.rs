@@ -36,6 +36,7 @@ use orange_signal::{connect, Signal};
 const STUN: &str = "stun://stun.l.google.com:19302";
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_AFTER: Duration = Duration::from_millis(100);
+const RECOVERY_KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
 static NEXT_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_KEYFRAME_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
@@ -414,6 +415,8 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     let mut viewers: HashMap<String, ViewerBranch> = HashMap::new();
     let mut idle_redraw = tokio::time::interval(IDLE_REDRAW_INTERVAL);
     idle_redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut recovery_keyframe = tokio::time::interval(RECOVERY_KEYFRAME_INTERVAL);
+    recovery_keyframe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // --- signalling loop --------------------------------------------------
     let session_result: Result<()> =
@@ -443,6 +446,10 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         ) {
                             crate::targets::request_redraw(settings.hwnd);
                         }
+                        continue;
+                    }
+                    _ = recovery_keyframe.tick(), if !viewers.is_empty() => {
+                        force_key_unit(&tee);
                         continue;
                     }
                     Some((peer, error)) = failed_viewers.recv() => {
