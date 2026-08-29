@@ -27,7 +27,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
 
 use crate::text::{self, Weight};
 
@@ -39,18 +39,25 @@ const FADE: Duration = Duration::from_millis(200);
 // display scaling, whatever the stream resolution.
 const MARGIN: f32 = 18.0;
 const BUTTON: f32 = 40.0;
-const ICON: f32 = 18.0;
+const ICON: f32 = 19.0;
 const CHIP: f32 = 34.0;
 const PAD: f32 = 13.0;
 const TRACK: f32 = 110.0;
 const LABEL: f32 = 13.0;
-const CONTROL_RADIUS: f32 = 12.0;
+const CONTROL_RADIUS: f32 = 10.0;
 
 // The app's palette, matching the tray.
-const INK: (f32, f32, f32) = (0.043, 0.043, 0.043);
+const SURFACE: (f32, f32, f32) = (0.086, 0.086, 0.086);
+const BORDER: (f32, f32, f32) = (0.165, 0.165, 0.165);
 const CREAM: (f32, f32, f32) = (0.902, 0.878, 0.820);
 const ORANGE: (f32, f32, f32) = (1.0, 0.353, 0.122);
 const DANGER: (f32, f32, f32) = (0.878, 0.392, 0.373);
+
+const ICON_SPEAKER_HIGH: &str = "M155.51,24.81a8,8,0,0,0-8.42.88L77.25,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V32A8,8,0,0,0,155.51,24.81ZM32,96H72v64H32ZM144,207.64,88,164.09V91.91l56-43.55Zm54-106.08a40,40,0,0,1,0,52.88,8,8,0,0,1-12-10.58,24,24,0,0,0,0-31.72,8,8,0,0,1,12-10.58ZM248,128a79.9,79.9,0,0,1-20.37,53.34,8,8,0,0,1-11.92-10.67,64,64,0,0,0,0-85.33,8,8,0,1,1,11.92-10.67A79.83,79.83,0,0,1,248,128Z";
+const ICON_SPEAKER_SLASH: &str = "M53.92,34.62A8,8,0,1,0,42.08,45.38L73.55,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V175.09l42.08,46.29a8,8,0,1,0,11.84-10.76ZM32,96H72v64H32ZM144,207.64,88,164.09V95.89l56,61.6Zm42-63.77a24,24,0,0,0,0-31.72,8,8,0,1,1,12-10.57,40,40,0,0,1,0,52.88,8,8,0,0,1-12-10.59Zm-80.16-76a8,8,0,0,1,1.4-11.23l39.85-31A8,8,0,0,1,160,32v74.83a8,8,0,0,1-16,0V48.36l-26.94,21A8,8,0,0,1,105.84,67.91ZM248,128a79.9,79.9,0,0,1-20.37,53.34,8,8,0,0,1-11.92-10.67,64,64,0,0,0,0-85.33,8,8,0,1,1,11.92-10.67A79.83,79.83,0,0,1,248,128Z";
+const ICON_X: &str = "M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z";
+const ICON_ARROWS_OUT: &str = "M216,48V96a8,8,0,0,1-16,0V67.31l-42.34,42.35a8,8,0,0,1-11.32-11.32L188.69,56H160a8,8,0,0,1,0-16h48A8,8,0,0,1,216,48ZM98.34,146.34,56,188.69V160a8,8,0,0,0-16,0v48a8,8,0,0,0,8,8H96a8,8,0,0,0,0-16H67.31l42.35-42.34a8,8,0,0,0-11.32-11.32ZM208,152a8,8,0,0,0-8,8v28.69l-42.34-42.35a8,8,0,0,0-11.32,11.32L188.69,200H160a8,8,0,0,0,0,16h48a8,8,0,0,0,8-8V160A8,8,0,0,0,208,152ZM67.31,56H96a8,8,0,0,0,0-16H48a8,8,0,0,0-8,8V96a8,8,0,0,0,16,0V67.31l42.34,42.35a8,8,0,0,0,11.32-11.32Z";
+const ICON_ARROWS_IN: &str = "M144,104V64a8,8,0,0,1,16,0V84.69l42.34-42.35a8,8,0,0,1,11.32,11.32L171.31,96H192a8,8,0,0,1,0,16H152A8,8,0,0,1,144,104Zm-40,40H64a8,8,0,0,0,0,16H84.69L42.34,202.34a8,8,0,0,0,11.32,11.32L96,171.31V192a8,8,0,0,0,16,0V152A8,8,0,0,0,104,144Zm67.31,16H192a8,8,0,0,0,0-16H152a8,8,0,0,0-8,8v40a8,8,0,0,0,16,0V171.31l42.34,42.35a8,8,0,0,0,11.32-11.32ZM104,56a8,8,0,0,0-8,8V84.69L53.66,42.34A8,8,0,0,0,42.34,53.66L84.69,96H64a8,8,0,0,0,0,16h40a8,8,0,0,0,8-8V64A8,8,0,0,0,104,56Z";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
@@ -405,127 +412,115 @@ fn circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) {
     }
 }
 
+fn status_text_origin(height: f32, gap: f32, scale: f32) -> f32 {
+    (height + gap) * scale
+}
+
+fn audio_track_width(logical_width: f32) -> f32 {
+    (logical_width - (MARGIN * 2.0 + BUTTON + 12.0 + PAD)).clamp(0.0, TRACK)
+}
+
+fn audio_gap_width(open: bool, gap: f32, track: f32, logical_width: f32) -> f32 {
+    if open {
+        gap + track + PAD
+    } else {
+        (logical_width - MARGIN * 2.0 - BUTTON * 2.0).clamp(0.0, gap + 24.0)
+    }
+}
+
+fn status_expanded(hovered: bool) -> bool {
+    hovered
+}
+
+fn status_max_width(logical_width: f32) -> f32 {
+    (logical_width - MARGIN * 2.0 - BUTTON - 8.0).max(0.0)
+}
+
+fn status_leading_width(persistent_live: bool, height: f32) -> f32 {
+    if persistent_live {
+        20.0
+    } else {
+        height
+    }
+}
+
 /// The panel every cluster sits on.
 ///
 /// Dark enough that white sits on it cleanly over white video - the scrim has
 /// to survive the worst case, not the average one - but small enough that
 /// being nearly opaque hides almost nothing.
 fn panel(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, alpha: f32) {
-    fill_round(pixmap, x, y, w, h, r, rgba(INK, 0.84 * alpha));
+    fill_round(pixmap, x, y, w, h, r, rgba(SURFACE, 0.94 * alpha));
+    if let Some(path) = rounded_rect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, r) {
+        stroke(pixmap, &path, rgba(BORDER, 0.92 * alpha), 1.0);
+    }
 }
 
 // --- icons ------------------------------------------------------------------
 
-/// A speaker, drawn by hand to avoid dragging in an icon set.
-fn speaker(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, muted: bool, color: Color) {
-    let mut pb = PathBuilder::new();
-    pb.move_to(x + s * 0.06, y + s * 0.34);
-    pb.line_to(x + s * 0.26, y + s * 0.34);
-    pb.line_to(x + s * 0.50, y + s * 0.12);
-    pb.line_to(x + s * 0.50, y + s * 0.88);
-    pb.line_to(x + s * 0.26, y + s * 0.66);
-    pb.line_to(x + s * 0.06, y + s * 0.66);
-    pb.close();
-    if let Some(path) = pb.finish() {
-        fill(pixmap, &path, color);
-    }
+fn draw_svg_icon(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, path: &str, color: Color) {
+    let dimension = s.ceil().max(1.0) as u32;
+    let to_byte = |channel: f32| (channel * 255.0).round().clamp(0.0, 255.0) as u8;
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{dimension}" height="{dimension}" viewBox="0 0 256 256" fill="#{:02x}{:02x}{:02x}" fill-opacity="{}"><path d="{path}"/></svg>"##,
+        to_byte(color.red()),
+        to_byte(color.green()),
+        to_byte(color.blue()),
+        color.alpha()
+    );
+    let Ok(tree) = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()) else {
+        return;
+    };
+    let Some(mut icon) = Pixmap::new(dimension, dimension) else {
+        return;
+    };
+    resvg::render(&tree, Transform::identity(), &mut icon.as_mut());
+    pixmap.draw_pixmap(
+        x.round() as i32,
+        y.round() as i32,
+        icon.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+}
 
-    if muted {
-        for (dx, dy) in [(1.0, 1.0), (1.0, -1.0)] {
-            let (cx, cy, r) = (x + s * 0.76, y + s * 0.50, s * 0.17);
-            let mut pb = PathBuilder::new();
-            pb.move_to(cx - r * dx, cy - r * dy);
-            pb.line_to(cx + r * dx, cy + r * dy);
-            if let Some(path) = pb.finish() {
-                stroke(pixmap, &path, color, s * 0.10);
-            }
-        }
-    } else {
-        // One deliberate wave stays legible after the video sink scales the
-        // overlay. Two nested hairline waves looked soft and busy at 150% DPI.
-        let mut pb = PathBuilder::new();
-        pb.move_to(x + s * 0.64, y + s * 0.29);
-        pb.cubic_to(
-            x + s * 0.88,
-            y + s * 0.38,
-            x + s * 0.88,
-            y + s * 0.62,
-            x + s * 0.64,
-            y + s * 0.71,
-        );
-        if let Some(path) = pb.finish() {
-            stroke(pixmap, &path, color, s * 0.10);
-        }
-    }
+fn speaker(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, muted: bool, color: Color) {
+    draw_svg_icon(
+        pixmap,
+        x,
+        y,
+        s,
+        if muted {
+            ICON_SPEAKER_SLASH
+        } else {
+            ICON_SPEAKER_HIGH
+        },
+        color,
+    );
 }
 
 fn cross(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
-    for (a, b) in [((0.22, 0.22), (0.78, 0.78)), ((0.78, 0.22), (0.22, 0.78))] {
-        let mut pb = PathBuilder::new();
-        pb.move_to(x + s * a.0, y + s * a.1);
-        pb.line_to(x + s * b.0, y + s * b.1);
-        if let Some(path) = pb.finish() {
-            stroke(pixmap, &path, color, s * 0.11);
-        }
-    }
+    draw_svg_icon(pixmap, x, y, s, ICON_X, color);
 }
 
-/// Compact broadcast mark for a live stream: a source dot with one signal
-/// wave on each side. It remains recognizable at the collapsed 18px size.
 fn live_mark(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
-    let cx = x + s / 2.0;
-    let cy = y + s / 2.0;
-    circle(pixmap, cx, cy, s * 0.12, color);
-    for side in [-1.0f32, 1.0] {
-        let mut pb = PathBuilder::new();
-        pb.move_to(cx + side * s * 0.24, cy - s * 0.22);
-        pb.quad_to(
-            cx + side * s * 0.42,
-            cy,
-            cx + side * s * 0.24,
-            cy + s * 0.22,
-        );
-        if let Some(path) = pb.finish() {
-            stroke(pixmap, &path, color, s * 0.10);
-        }
-    }
+    circle(pixmap, x + s / 2.0, y + s / 2.0, s * 0.24, color);
 }
 
-/// Corner brackets: pointing outwards to enter fullscreen, inwards to leave.
-///
-/// The arms are kept well short of meeting. Brackets that almost touch read
-/// as a plain square at the sizes these are drawn at.
 fn expand(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, exiting: bool, color: Color) {
-    let arm = s * 0.26;
-    let inset = s * 0.08;
-    let width = s * 0.11;
-
-    for (sx, sy) in [(1.0f32, 1.0f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
-        // The corner of the icon box this bracket belongs to. Leaving
-        // fullscreen pulls the elbows inward so they point back at the centre.
-        let pull = if exiting { s * 0.22 } else { 0.0 };
-        let cx = if sx > 0.0 {
-            x + inset + pull
+    draw_svg_icon(
+        pixmap,
+        x,
+        y,
+        s,
+        if exiting {
+            ICON_ARROWS_IN
         } else {
-            x + s - inset - pull
-        };
-        let cy = if sy > 0.0 {
-            y + inset + pull
-        } else {
-            y + s - inset - pull
-        };
-        // Entering: elbow at the corner, arms running along the edges.
-        // Leaving: elbow inboard, arms running back out towards the corner.
-        let direction = if exiting { -1.0 } else { 1.0 };
-
-        let mut pb = PathBuilder::new();
-        pb.move_to(cx + sx * arm * direction, cy);
-        pb.line_to(cx, cy);
-        pb.line_to(cx, cy + sy * arm * direction);
-        if let Some(path) = pb.finish() {
-            stroke(pixmap, &path, color, width);
-        }
-    }
+            ICON_ARROWS_OUT
+        },
+        color,
+    );
 }
 
 // --- layout -----------------------------------------------------------------
@@ -587,7 +582,6 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // transparent pixel rather than no object at all.
     let persistent_live = state.profile.persistent_live_status();
     if !state.visible() && !persistent_live {
-        state.hits.clear();
         let composition = transparent_composition()?;
         state.cache = Some((signature, composition.clone()));
         return Some(composition);
@@ -601,6 +595,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     let render_scale = state.scale();
     let raster_scale = state.dpi.max(1.0);
     let (fw, fh) = (vw as f32, vh as f32);
+    let logical_width = fw / render_scale;
 
     let ink = rgba(CREAM, alpha);
     let status_ink = rgba(CREAM, status_alpha);
@@ -616,21 +611,21 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     };
 
     // --- status, top-left ---------------------------------------------------
-    // A broadcast mark at rest; hovering expands it to what is being received.
+    // A compact stream mark at rest; hovering expands into real receive data.
     {
-        let expanded = state.hot == Some(Control::Stats);
+        let expanded = status_expanded(state.hot == Some(Control::Stats));
         let received = state.quality_label();
         let quality = if persistent_live {
             String::from("LIVE")
         } else {
             received.clone()
         };
-        let detail = if expanded {
+        let mut detail = if expanded {
             let detail = state.detail_label();
             if persistent_live {
                 Some(match detail {
                     Some(detail) => format!("{received}  \u{00b7}  {detail}"),
-                    None => received,
+                    None => received.clone(),
                 })
             } else {
                 detail
@@ -638,25 +633,38 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
         } else {
             None
         };
-        let has_text = text::available();
-        let label_size = LABEL * raster_scale;
-        let mut text_w = text::width(&quality, label_size, Weight::Semibold) / raster_scale;
-        if let Some(detail) = &detail {
-            text_w += text::width(
-                &format!("  \u{00b7}  {detail}"),
-                label_size,
-                Weight::Regular,
-            ) / raster_scale;
-        }
-
         // Logical dimensions first; each is independently converted for the
         // destination rectangle and for the source pixmap.
-        let h = if persistent_live { 30.0 } else { CHIP };
+        let h = if persistent_live { 28.0 } else { CHIP };
+        let leading = status_leading_width(persistent_live, h);
+        let has_text = text::available();
         let show_label = (expanded || persistent_live) && has_text;
-        let label_gap = if persistent_live { 4.0 } else { 8.0 };
-        let end_pad = if persistent_live { 8.0 } else { PAD };
+        let label_gap = if persistent_live { 0.0 } else { 8.0 };
+        let end_pad = if persistent_live { 10.0 } else { PAD };
+        let max_w = status_max_width(logical_width).max(h);
+        let label_size = LABEL * raster_scale;
+        let measure = |detail: Option<&String>| {
+            let mut width = text::width(&quality, label_size, Weight::Semibold) / raster_scale;
+            if let Some(detail) = detail {
+                width += text::width(
+                    &format!("  \u{00b7}  {detail}"),
+                    label_size,
+                    Weight::Regular,
+                ) / raster_scale;
+            }
+            width
+        };
+        let mut text_w = measure(detail.as_ref());
+        if expanded && persistent_live && leading + label_gap + text_w + end_pad > max_w {
+            detail = Some(received);
+            text_w = measure(detail.as_ref());
+        }
+        if expanded && leading + label_gap + text_w + end_pad > max_w {
+            detail = None;
+            text_w = measure(None);
+        }
         let w = if show_label {
-            h + label_gap + text_w + end_pad
+            (leading + label_gap + text_w + end_pad).min(max_w)
         } else {
             h
         };
@@ -674,40 +682,39 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
             w * raster_scale,
             h * raster_scale,
             |pixmap| {
-                let (w, h) = (w * raster_scale, h * raster_scale);
-                let icon = ICON * raster_scale;
+                let (raster_w, raster_h) = (w * raster_scale, h * raster_scale);
                 panel(
                     pixmap,
                     0.0,
                     0.0,
-                    w,
-                    h,
-                    CONTROL_RADIUS * raster_scale,
+                    raster_w,
+                    raster_h,
+                    if persistent_live { 8.0 } else { CONTROL_RADIUS } * raster_scale,
                     status_alpha,
                 );
                 if persistent_live {
-                    if let Some(path) = rounded_rect(
-                        0.5 * raster_scale,
-                        0.5 * raster_scale,
-                        w - raster_scale,
-                        h - raster_scale,
-                        CONTROL_RADIUS * raster_scale,
-                    ) {
-                        stroke(pixmap, &path, rgba(ORANGE, 0.42), raster_scale);
-                    }
+                    circle(
+                        pixmap,
+                        10.0 * raster_scale,
+                        raster_h / 2.0,
+                        3.0 * raster_scale,
+                        rgba(ORANGE, status_alpha),
+                    );
+                } else {
+                    let icon = ICON * raster_scale;
+                    live_mark(
+                        pixmap,
+                        (raster_h - icon) / 2.0,
+                        (raster_h - icon) / 2.0,
+                        icon,
+                        rgba(ORANGE, status_alpha),
+                    );
                 }
-                live_mark(
-                    pixmap,
-                    (h - icon) / 2.0,
-                    (h - icon) / 2.0,
-                    icon,
-                    rgba(ORANGE, status_alpha),
-                );
                 if !show_label {
                     return;
                 }
-                let baseline = h / 2.0 + text::cap_height(label_size) / 2.0;
-                let mut caret = (h + label_gap) * raster_scale;
+                let baseline = raster_h / 2.0 + text::cap_height(label_size) / 2.0;
+                let mut caret = status_text_origin(leading, label_gap, raster_scale);
                 text::draw(
                     pixmap,
                     caret,
@@ -715,7 +722,11 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                     &quality,
                     label_size,
                     Weight::Semibold,
-                    status_ink,
+                    if persistent_live {
+                        rgba(ORANGE, status_alpha)
+                    } else {
+                        status_ink
+                    },
                 );
                 if let Some(detail) = &detail {
                     caret += text::width(&quality, label_size, Weight::Semibold);
@@ -794,14 +805,15 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
     // to the right. The volume control is the one thing a viewer actually
     // reaches for, so it gets the largest target of the four.
     if alpha > 0.0 {
-        let open = state.audio_open();
+        let track = audio_track_width(logical_width);
+        let open = state.audio_open() && track >= 36.0;
         let gap = 12.0;
         let h = BUTTON;
         // The slider grows out to the right of the speaker, which stays
         // exactly where it was. Recentring the icon in a wider pill would
         // make it jump sideways under the cursor that just opened it.
         let w = if open {
-            BUTTON + gap + TRACK + PAD
+            BUTTON + gap + track + PAD
         } else {
             BUTTON
         };
@@ -827,7 +839,7 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                 let h = h * raster_scale;
                 let button = BUTTON * raster_scale;
                 let gap = gap * raster_scale;
-                let track = TRACK * raster_scale;
+                let track = track * raster_scale;
                 let icon = ICON * raster_scale;
                 let control_radius = CONTROL_RADIUS * raster_scale;
                 panel(
@@ -895,25 +907,28 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
                     control: Control::VolumeTrack,
                     x: x + (BUTTON + gap) * render_scale,
                     y,
-                    w: TRACK * render_scale,
+                    w: track * render_scale,
                     h: h * render_scale,
                 });
             }
-            // Covers both the visible gap and the future track. It comes after
-            // real controls so clicks use their exact geometry.
-            hits.push(Hit {
-                control: Control::AudioGap,
-                x: x + BUTTON * render_scale,
-                y,
-                w: (gap + TRACK + PAD) * render_scale,
-                h: h * render_scale,
-            });
+            let gap_width = audio_gap_width(open, gap, track, logical_width);
+            if gap_width > 0.0 {
+                hits.push(Hit {
+                    control: Control::AudioGap,
+                    x: x + BUTTON * render_scale,
+                    y,
+                    w: gap_width * render_scale,
+                    h: h * render_scale,
+                });
+            }
         }
     }
 
     // --- view, bottom-right -------------------------------------------------
     // Fullscreen, where every video player puts it.
-    if alpha > 0.0 {
+    let audio_displaces_fullscreen =
+        state.audio_open() && logical_width < MARGIN * 2.0 + BUTTON * 2.0 + 12.0 + PAD + TRACK;
+    if alpha > 0.0 && !audio_displaces_fullscreen {
         let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
         let x = fw - (MARGIN + BUTTON) * render_scale;
         let y = fh - (MARGIN + BUTTON) * render_scale;
@@ -964,6 +979,15 @@ pub fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposi
         }
     }
 
+    if !state.visible() && persistent_live {
+        hits.extend(
+            state
+                .hits
+                .iter()
+                .copied()
+                .filter(|hit| hit.control != Control::Stats),
+        );
+    }
     state.hits = hits;
 
     let composition = to_composition(panels)?;
@@ -1084,4 +1108,105 @@ pub fn attach(composition: &gst::Element, playback: &crate::window::PlaybackWind
         let mut state = state.lock().ok()?;
         render(&mut state).map(|c| c.to_value())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_text_origin_scales_logical_height_once() {
+        assert_eq!(status_text_origin(30.0, 4.0, 1.5), 51.0);
+        assert_eq!(status_text_origin(34.0, 8.0, 2.0), 84.0);
+    }
+
+    #[test]
+    fn narrow_audio_layout_reserves_room_for_a_useful_slider() {
+        assert_eq!(audio_track_width(480.0), 110.0);
+        assert_eq!(audio_track_width(152.0), 51.0);
+    }
+
+    #[test]
+    fn closed_audio_control_has_no_invisible_slider_hit_region() {
+        assert_eq!(audio_gap_width(false, 12.0, 110.0, 152.0), 36.0);
+        assert_eq!(audio_gap_width(true, 12.0, 51.0, 152.0), 76.0);
+    }
+
+    #[test]
+    fn faded_controls_keep_their_hit_geometry() {
+        gst::init().unwrap();
+        let mut state =
+            OverlayState::new(crate::window::PlaybackProfile::FriendViewer { cascade: 0 });
+        state.video = (1920, 1080);
+        state.client = (1280, 720);
+        state.pinned = true;
+        render(&mut state).unwrap();
+        assert!(!state.hits.is_empty());
+
+        state.pinned = false;
+        state.shown_at = Instant::now() - HIDE_AFTER * 2;
+        render(&mut state).unwrap();
+
+        assert!(!state.hits.is_empty());
+    }
+
+    #[test]
+    fn live_status_expands_on_hover() {
+        assert!(status_expanded(true));
+        assert!(!status_expanded(false));
+    }
+
+    #[test]
+    fn live_status_uses_a_compact_typographic_lead() {
+        assert_eq!(status_leading_width(true, 28.0), 20.0);
+        assert_eq!(status_leading_width(false, 34.0), 34.0);
+    }
+
+    #[test]
+    fn live_monitor_keeps_all_control_hits_while_faded() {
+        gst::init().unwrap();
+        let mut state = OverlayState::new(crate::window::PlaybackProfile::LiveMonitor);
+        state.video = (1406, 1541);
+        state.client = (246, 270);
+        state.pinned = true;
+        render(&mut state).unwrap();
+        assert!(state.hits.iter().any(|hit| hit.control == Control::Close));
+        assert!(state.hits.iter().any(|hit| hit.control == Control::Mute));
+        assert!(state
+            .hits
+            .iter()
+            .any(|hit| hit.control == Control::Fullscreen));
+
+        state.pinned = false;
+        state.shown_at = Instant::now() - HIDE_AFTER * 2;
+        render(&mut state).unwrap();
+
+        assert!(state.hits.iter().any(|hit| hit.control == Control::Close));
+        assert!(state.hits.iter().any(|hit| hit.control == Control::Mute));
+        assert!(state
+            .hits
+            .iter()
+            .any(|hit| hit.control == Control::Fullscreen));
+    }
+
+    #[test]
+    fn status_width_stops_before_the_close_control() {
+        assert_eq!(status_max_width(480.0), 396.0);
+        assert_eq!(status_max_width(152.0), 68.0);
+    }
+
+    #[test]
+    fn canonical_overlay_icons_render_visible_pixels() {
+        for path in [
+            ICON_SPEAKER_HIGH,
+            ICON_SPEAKER_SLASH,
+            ICON_X,
+            ICON_ARROWS_OUT,
+            ICON_ARROWS_IN,
+        ] {
+            let mut pixmap = Pixmap::new(24, 24).unwrap();
+            draw_svg_icon(&mut pixmap, 2.0, 2.0, 20.0, path, rgba(CREAM, 1.0));
+            assert!(pixmap.data().chunks_exact(4).any(|pixel| pixel[3] > 0));
+        }
+    }
 }

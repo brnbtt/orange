@@ -36,6 +36,10 @@ struct PipelineError {
     message: String,
 }
 
+fn should_report_pipeline_error(playback_alive: Option<bool>) -> bool {
+    playback_alive != Some(false)
+}
+
 fn make_webrtcbin(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make("webrtcbin")
         .name(name)
@@ -53,6 +57,7 @@ fn make_webrtcbin(name: &str) -> Result<gst::Element> {
 fn watch_bus(
     pipeline: &gst::Pipeline,
     label: &'static str,
+    playback: Option<crate::window::PlaybackWindow>,
 ) -> Result<(
     mpsc::UnboundedSender<PipelineError>,
     mpsc::UnboundedReceiver<PipelineError>,
@@ -63,6 +68,10 @@ fn watch_bus(
     bus.set_sync_handler(move |_, msg| {
         match msg.view() {
             gst::MessageView::Error(err) => {
+                if !should_report_pipeline_error(playback.as_ref().map(|window| window.is_alive()))
+                {
+                    return gst::BusSyncReply::Drop;
+                }
                 if err.error().to_string().contains("Output window was closed") {
                     return gst::BusSyncReply::Drop;
                 }
@@ -200,6 +209,16 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
     Ok(gst_webrtc::WebRTCSessionDescription::new(sdp_type, msg))
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn closed_playback_suppresses_teardown_bus_errors() {
+        assert!(!super::should_report_pipeline_error(Some(false)));
+        assert!(super::should_report_pipeline_error(Some(true)));
+        assert!(super::should_report_pipeline_error(None));
+    }
+}
+
 /// Host: capture a window and serve any number of viewers.
 ///
 /// The window is captured and encoded **once**. Encoded AV1 is fanned out to a
@@ -244,7 +263,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
         None => None,
     };
 
-    let (_session_errors, mut bus_errors) = watch_bus(&pipeline, "host")?;
+    let (_session_errors, mut bus_errors) = watch_bus(&pipeline, "host", None)?;
     let (viewer_failures, mut failed_viewers) = mpsc::unbounded_channel();
     // Do not let WGC emit its one guaranteed initial frame before a viewer
     // branch exists. READY keeps the graph prepared without starting capture.
@@ -310,6 +329,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                             audio_tee.as_ref(),
                             &peer,
                             label.clone(),
+                            settings.fps,
                             client.outgoing.clone(),
                             viewer_failures.clone(),
                         ) {
@@ -513,6 +533,7 @@ fn add_viewer(
     audio_tee: Option<&gst::Element>,
     peer: &str,
     label: String,
+    frame_rate: u32,
     out: mpsc::UnboundedSender<Signal>,
     failures: mpsc::UnboundedSender<(String, String)>,
 ) -> Result<ViewerBranch> {
@@ -527,7 +548,7 @@ fn add_viewer(
     let result = (|| -> Result<()> {
         let pay = gst::ElementFactory::make("rtpav1pay").build()?;
         let caps = gst::ElementFactory::make("capsfilter")
-            .property("caps", rtp_caps())
+            .property("caps", rtp_caps(frame_rate))
             .build()?;
         branch.links.push(link_tee_branch(
             pipeline,
@@ -676,7 +697,11 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let pipeline = gst::Pipeline::new();
     let bin = make_webrtcbin("viewer")?;
     pipeline.add(&bin)?;
-    let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch")?;
+    let viewer_playback = match &output {
+        Output::Window(playback) => Some(playback.clone()),
+        Output::File(_) => None,
+    };
+    let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch", viewer_playback.clone())?;
 
     watch_connection(&bin, "watch".to_string());
     forward_ice(&bin, client.outgoing.clone(), String::new());
@@ -686,10 +711,6 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let pipeline_weak = pipeline.downgrade();
     // The audio branch needs the overlay to follow its volume control, so keep
     // a handle before the video branch consumes the output.
-    let viewer_playback = match &output {
-        Output::Window(playback) => Some(playback.clone()),
-        Output::File(_) => None,
-    };
     let viewer_overlay = viewer_playback
         .as_ref()
         .map(|playback| playback.overlay().clone());

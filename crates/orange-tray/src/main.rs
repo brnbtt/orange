@@ -33,6 +33,9 @@ const ORANGE_DIM: u32 = 0x8a3110;
 const INK: u32 = 0x0b0b0b;
 const DANGER: u32 = 0xe0645f;
 const GREEN: u32 = 0x4ec97a;
+const PICKER_PREVIEW_HEIGHT: f32 = 142.0;
+const PICKER_DETAILS_HEIGHT: f32 = 52.0;
+const PICKER_CARD_HEIGHT: f32 = PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT;
 
 const DEFAULT_SERVER: &str =
     "wss://orange-relay.redmushroom-80c79f12.brazilsouth.azurecontainerapps.io/ws";
@@ -85,6 +88,7 @@ struct Orange {
     copied_at: Option<Instant>,
     copied_code: Option<String>,
     own_codes: Vec<String>,
+    logo_epoch: u64,
 }
 
 impl Orange {
@@ -128,6 +132,7 @@ impl Orange {
             copied_at: None,
             copied_code: None,
             own_codes: preferences.own_codes,
+            logo_epoch: 0,
         }
     }
 
@@ -672,7 +677,15 @@ fn option_pill(
 /// instances receive a periodic transmit sweep that pushes their scanlines
 /// outward as rays; titlebar-sized instances stay static because animation at
 /// 18px would only read as flicker.
-fn logo(px_size: f32) -> impl IntoElement {
+fn logo_element_id(animated: bool, epoch: u64) -> SharedString {
+    if animated {
+        SharedString::from(format!("logo-animated-{epoch}"))
+    } else {
+        SharedString::from("logo-static")
+    }
+}
+
+fn logo(px_size: f32, epoch: u64) -> impl IntoElement {
     static STATIC: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
         std::sync::OnceLock::new();
     static ANIMATED: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
@@ -744,11 +757,7 @@ fn logo(px_size: f32) -> impl IntoElement {
 
     match image {
         Some(image) => gpui::img(image)
-            .id(if animated {
-                "logo-animated"
-            } else {
-                "logo-static"
-            })
+            .id(logo_element_id(animated, epoch))
             .w(px(px_size))
             .h(px(px_size))
             .into_any_element(),
@@ -918,7 +927,7 @@ impl Orange {
                     .items_center()
                     .gap_2()
                     .window_control_area(gpui::WindowControlArea::Drag)
-                    .child(logo(18.0))
+                    .child(logo(18.0, 0))
                     .child(
                         label("O R A N G E", TEXT)
                             .font_family("Bahnschrift")
@@ -1002,7 +1011,7 @@ impl Orange {
             .justify_center()
             .items_center()
             .px_2()
-            .child(logo(56.0))
+            .child(logo(56.0, self.logo_epoch))
             .child(wordmark(20.0))
             .child(
                 div()
@@ -1101,7 +1110,7 @@ impl Orange {
                     .items_center()
                     .justify_center()
                     .gap_3()
-                    .child(logo(112.0))
+                    .child(logo(112.0, self.logo_epoch))
                     .child(wordmark(23.0))
                     .child(accent_rule(28.0))
                     .child(
@@ -1227,6 +1236,7 @@ impl Orange {
                     .flex()
                     .flex_row()
                     .flex_wrap()
+                    .items_start()
                     .gap_3()
                     .flex_1()
                     .min_h(px(0.0))
@@ -1272,6 +1282,7 @@ impl Orange {
                                     .flex_col()
                                     .flex_shrink_0()
                                     .w(px(252.0))
+                                    .h(px(PICKER_CARD_HEIGHT))
                                     .rounded_md()
                                     .overflow_hidden()
                                     .bg(rgb(SURFACE))
@@ -1298,7 +1309,7 @@ impl Orange {
                                         // nothing inside a scrolling parent.
                                         div()
                                             .flex_shrink_0()
-                                            .h(px(142.0))
+                                            .h(px(PICKER_PREVIEW_HEIGHT))
                                             .w_full()
                                             .flex()
                                             .items_center()
@@ -1307,7 +1318,7 @@ impl Orange {
                                             .overflow_hidden()
                                             .child(match (thumb, capturing) {
                                                 (Some(image), _) => gpui::img(image)
-                                                    .h(px(142.0))
+                                                    .h(px(PICKER_PREVIEW_HEIGHT))
                                                     .with_animation(
                                                         SharedString::from(format!("fade{hwnd}")),
                                                         Animation::new(Duration::from_millis(260)),
@@ -1331,7 +1342,7 @@ impl Orange {
                                             .justify_center()
                                             .gap_0p5()
                                             .flex_shrink_0()
-                                            .h(px(52.0))
+                                            .h(px(PICKER_DETAILS_HEIGHT))
                                             .px_3()
                                             .child(
                                                 div()
@@ -1979,7 +1990,9 @@ fn main() {
                             // unfocused, so un-hide before activating.
                             tray::show_main_window();
                             let _ = cx.update(|cx| {
-                                let _ = window.update(cx, |_, window, _| {
+                                let _ = window.update(cx, |view, window, cx| {
+                                    view.logo_epoch = view.logo_epoch.wrapping_add(1);
+                                    cx.notify();
                                     window.activate_window();
                                 });
                             });
@@ -1994,4 +2007,20 @@ fn main() {
             .detach();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animated_logo_identity_changes_when_the_window_reopens() {
+        assert_ne!(logo_element_id(true, 0), logo_element_id(true, 1));
+        assert_eq!(logo_element_id(false, 0), logo_element_id(false, 1));
+    }
+
+    #[test]
+    fn picker_cards_use_content_height_instead_of_filling_the_viewport() {
+        assert_eq!(PICKER_CARD_HEIGHT, PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT);
+    }
 }

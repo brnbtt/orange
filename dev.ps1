@@ -5,7 +5,14 @@
 # GStreamer is not on PATH by default, and gstreamer-rs needs pkg-config to
 # find its .pc files at build time.
 
-$gst = "$env:LOCALAPPDATA\Programs\gstreamer\1.0\msvc_x86_64"
+$gst = @(
+    $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
+    "$env:LOCALAPPDATA\Programs\gstreamer\1.0\msvc_x86_64"
+    "C:\gstreamer\1.0\msvc_x86_64"
+    "$env:ProgramFiles\gstreamer\1.0\msvc_x86_64"
+) | Where-Object {
+    $_ -and (Test-Path (Join-Path $_ "bin\gstreamer-1.0-0.dll"))
+} | Select-Object -First 1
 
 if (-not (Test-Path $gst)) {
     Write-Error "GStreamer not found at $gst. Install with: winget install gstreamerproject.gstreamer"

@@ -145,6 +145,24 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait
 cargo build
 ```
 
+## Install
+
+Build the friend-facing Windows installer with:
+
+```powershell
+.\package.ps1
+```
+
+The result is `dist\orange-setup-<version>.exe`. It installs `orange` for the
+current user and creates a Start menu shortcut. If the required GStreamer media
+runtime is missing, setup downloads the pinned official x64 runtime from the
+GStreamer project and verifies its SHA-256 hash before installing it. Rust,
+Visual Studio, and the source tree are not needed on the receiving machine.
+
+The current build targets 64-bit Windows 10/11. Hosting requires an NVIDIA GPU
+with AV1 NVENC support; watching requires hardware AV1 decode exposed through
+the Windows D3D11 media stack.
+
 ## Transport: why `webrtcbin`, not `webrtcsink`
 
 `webrtcsink` is the friendlier element — it handles negotiation and codec

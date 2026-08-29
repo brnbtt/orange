@@ -24,12 +24,13 @@ use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
 
 /// RTP caps for our encoded video. AV1 has no static payload type, so we pick
 /// one from the dynamic range and both ends agree on it.
-pub fn rtp_caps() -> gst::Caps {
+pub fn rtp_caps(frame_rate: u32) -> gst::Caps {
     gst::Caps::builder("application/x-rtp")
         .field("media", "video")
         .field("encoding-name", "AV1")
         .field("payload", 96i32)
         .field("clock-rate", 90_000i32)
+        .field("a-framerate", frame_rate.to_string())
         .build()
 }
 
@@ -163,7 +164,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         .build()
         .context("rtpav1pay missing")?;
     let caps_filter = gst::ElementFactory::make("capsfilter")
-        .property("caps", rtp_caps())
+        .property("caps", rtp_caps(settings.fps))
         .build()?;
     let send_bin = gst::ElementFactory::make("webrtcbin")
         .name("sender")
@@ -262,6 +263,132 @@ fn attach_receive_elements(
     Ok(())
 }
 
+fn frame_rate_from_caps(caps: &gst::CapsRef) -> Option<u32> {
+    let rate = caps.structure(0)?.get::<gst::Fraction>("framerate").ok()?;
+    (rate.numer() > 0 && rate.denom() > 0)
+        .then(|| (rate.numer() as f64 / rate.denom() as f64).round() as u32)
+}
+
+fn frame_rate_from_rtp_caps(caps: &gst::CapsRef) -> Option<u32> {
+    caps.structure(0)?
+        .get::<String>("a-framerate")
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|rate| (1..=480).contains(rate))
+}
+
+fn frame_rate_from_delta(delta: gst::ClockTime) -> Option<u32> {
+    let nanoseconds = delta.nseconds();
+    if nanoseconds == 0 {
+        return None;
+    }
+    let rate = (1_000_000_000f64 / nanoseconds as f64).round() as u32;
+    (15..=480).contains(&rate).then_some(rate)
+}
+
+fn frame_rate_caps(rate: u32) -> gst::Caps {
+    let mut caps = gst::Caps::new_empty();
+    {
+        let caps = caps.make_mut();
+        caps.append_structure_full(
+            gst::Structure::builder("video/x-raw")
+                .field("framerate", gst::Fraction::new(rate as i32, 1))
+                .build(),
+            Some(gst::CapsFeatures::new(["memory:D3D11Memory"])),
+        );
+        caps.append_structure(
+            gst::Structure::builder("video/x-raw")
+                .field("framerate", gst::Fraction::new(rate as i32, 1))
+                .build(),
+        );
+    }
+    caps
+}
+
+fn build_frame_repeater(initial_rate: Option<u32>) -> Result<gst::Element> {
+    let repeat = gst::ElementFactory::make("imagefreeze")
+        .name("idle-frame-repeat")
+        .property("is-live", true)
+        .property("allow-replace", true)
+        .build()
+        .context("imagefreeze missing")?;
+    let caps_filter = gst::ElementFactory::make("capsfilter")
+        .name("idle-frame-caps")
+        .build()?;
+    if let Some(rate) = initial_rate {
+        caps_filter.set_property("caps", frame_rate_caps(rate));
+    }
+    let bin = gst::Bin::with_name("idle-frame-repeater");
+    bin.add_many([&repeat, &caps_filter])?;
+    repeat.link(&caps_filter)?;
+
+    let sink_pad = repeat
+        .static_pad("sink")
+        .context("imagefreeze has no sink pad")?;
+    let (rate_tx, rate_rx) = std::sync::mpsc::channel::<u32>();
+    let last_pts = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let last_pts_for_probe = last_pts.clone();
+    sink_pad.add_probe(
+        gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::BUFFER,
+        move |_, info| {
+            match &info.data {
+                Some(gst::PadProbeData::Event(event)) => {
+                    if let gst::EventView::Caps(caps) = event.view() {
+                        if let Some(rate) = frame_rate_from_caps(caps.caps()) {
+                            let _ = rate_tx.send(rate);
+                        }
+                        if let Ok(mut previous) = last_pts_for_probe.lock() {
+                            *previous = None;
+                        }
+                    }
+                }
+                Some(gst::PadProbeData::Buffer(buffer)) => {
+                    if let Some(pts) = buffer.pts() {
+                        if let Ok(mut previous) = last_pts_for_probe.lock() {
+                            if let Some(delta) =
+                                (*previous).and_then(|value| pts.checked_sub(value))
+                            {
+                                if let Some(rate) = frame_rate_from_delta(delta) {
+                                    let _ = rate_tx.send(rate);
+                                }
+                            }
+                            *previous = Some(pts);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+    let caps_for_updates = caps_filter.clone();
+    std::thread::spawn(move || {
+        let mut applied = None;
+        while let Ok(rate) = rate_rx.recv() {
+            if applied.is_some_and(|current: u32| current.abs_diff(rate) <= 1) {
+                continue;
+            }
+            caps_for_updates.set_property("caps", frame_rate_caps(rate));
+            applied = Some(rate);
+        }
+    });
+    let src_pad = caps_filter
+        .static_pad("src")
+        .context("capsfilter has no source pad")?;
+    bin.add_pad(
+        &gst::GhostPad::builder_with_target(&sink_pad)?
+            .name("sink")
+            .build(),
+    )?;
+    bin.add_pad(
+        &gst::GhostPad::builder_with_target(&src_pad)?
+            .name("src")
+            .build(),
+    )?;
+    Ok(bin.upcast())
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
@@ -277,6 +404,11 @@ pub fn build_receive_branch(
     let dec = gst::ElementFactory::make("d3d11av1dec")
         .build()
         .context("d3d11av1dec missing - no hardware AV1 decode on this GPU?")?;
+    let initial_rate = pad
+        .current_caps()
+        .as_ref()
+        .and_then(|caps| frame_rate_from_rtp_caps(caps));
+    let repeat = build_frame_repeater(initial_rate)?;
 
     let tail: Vec<gst::Element> = match output {
         Output::Window(playback) => {
@@ -315,7 +447,7 @@ pub fn build_receive_branch(
         }
     };
 
-    let mut all: Vec<gst::Element> = vec![depay.clone(), parse.clone(), dec.clone()];
+    let mut all: Vec<gst::Element> = vec![depay, parse, dec, repeat];
     all.extend(tail);
 
     attach_receive_elements(pipeline, pad, &all)?;
@@ -378,4 +510,137 @@ pub fn build_audio_branch(
     }
     println!("[webrtc] receiving audio");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_repeater_keeps_idle_overlays_live_and_accepts_replacements() {
+        gst::init().unwrap();
+        let repeat = build_frame_repeater(None).unwrap();
+        let repeat = repeat.downcast::<gst::Bin>().unwrap();
+        let repeat = repeat.by_name("idle-frame-repeat").unwrap();
+
+        assert!(repeat.property::<bool>("is-live"));
+        assert!(repeat.property::<bool>("allow-replace"));
+    }
+
+    #[test]
+    fn frame_repeater_preserves_the_negotiated_source_rate() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .unwrap();
+        let source_caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("framerate", gst::Fraction::new(60, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let repeat = build_frame_repeater(Some(60)).unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        pipeline
+            .add_many([&source, &source_caps, &repeat, &sink])
+            .unwrap();
+        gst::Element::link_many([&source, &source_caps, &repeat, &sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let caps = sink.static_pad("sink").unwrap().current_caps().unwrap();
+        let fps = caps
+            .structure(0)
+            .unwrap()
+            .get::<gst::Fraction>("framerate")
+            .unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert_eq!(fps, gst::Fraction::new(60, 1));
+    }
+
+    #[test]
+    fn frame_repeater_negotiates_d3d11_memory() {
+        use std::str::FromStr;
+
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("d3d11testsrc")
+            .property("is-live", true)
+            .build()
+            .unwrap();
+        let source_caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::from_str(
+                    "video/x-raw(memory:D3D11Memory),width=640,height=360,framerate=60/1",
+                )
+                .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let repeat = build_frame_repeater(Some(60)).unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        pipeline
+            .add_many([&source, &source_caps, &repeat, &sink])
+            .unwrap();
+        gst::Element::link_many([&source, &source_caps, &repeat, &sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        let caps = sink.static_pad("sink").unwrap().current_caps();
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        let caps = caps.expect("D3D11 frame repeater did not negotiate");
+        assert!(caps.features(0).unwrap().contains("memory:D3D11Memory"));
+        assert_eq!(
+            caps.structure(0)
+                .unwrap()
+                .get::<gst::Fraction>("framerate")
+                .unwrap(),
+            gst::Fraction::new(60, 1)
+        );
+    }
+
+    #[test]
+    fn unknown_decoder_rate_is_not_applied_as_zero() {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("framerate", gst::Fraction::new(0, 1))
+            .build();
+
+        assert_eq!(frame_rate_from_caps(&caps), None);
+    }
+
+    #[test]
+    fn decoded_timestamp_delta_recovers_source_rate() {
+        assert_eq!(
+            frame_rate_from_delta(gst::ClockTime::from_nseconds(16_666_667)),
+            Some(60)
+        );
+        assert_eq!(
+            frame_rate_from_delta(gst::ClockTime::from_nseconds(8_333_333)),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn rtp_caps_advertise_the_configured_frame_rate() {
+        gst::init().unwrap();
+        let caps = rtp_caps(120);
+
+        assert_eq!(
+            caps.structure(0)
+                .unwrap()
+                .get::<String>("a-framerate")
+                .unwrap(),
+            "120"
+        );
+        assert_eq!(frame_rate_from_rtp_caps(&caps), Some(120));
+    }
 }
