@@ -20,6 +20,7 @@ use gstreamer_video::prelude::VideoOverlayExtManual;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::{Arc, Mutex};
 
+use crate::media_diagnostics::{track_pad, MediaProgress, MediaStage};
 use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
 
 /// RTP caps for our encoded video. AV1 has no static payload type, so we pick
@@ -205,7 +206,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
             return; // only handle the first stream
         };
 
-        if let Err(err) = build_receive_branch(&pipeline, pad, output) {
+        if let Err(err) = build_receive_branch(&pipeline, pad, output, None) {
             eprintln!("[webrtc] could not build receive branch: {err}");
         }
     });
@@ -277,6 +278,7 @@ pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
     output: Output,
+    progress: Option<Arc<MediaProgress>>,
 ) -> Result<()> {
     let reveal_playback = match &output {
         Output::Window(playback) => Some(playback.clone()),
@@ -291,6 +293,25 @@ pub fn build_receive_branch(
         .current_caps()
         .as_ref()
         .and_then(|caps| frame_rate_from_rtp_caps(caps));
+    if let Some(progress) = progress {
+        track_pad(
+            &depay
+                .static_pad("src")
+                .context("depayloader has no src pad")?,
+            MediaStage::Depay,
+            progress.clone(),
+        );
+        track_pad(
+            &parse.static_pad("src").context("parser has no src pad")?,
+            MediaStage::Parsed,
+            progress.clone(),
+        );
+        track_pad(
+            &dec.static_pad("src").context("decoder has no src pad")?,
+            MediaStage::Decoded,
+            progress,
+        );
+    }
 
     let tail: Vec<gst::Element> = match output {
         Output::Window(playback) => {

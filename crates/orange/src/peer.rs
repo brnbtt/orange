@@ -19,6 +19,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+use crate::media_diagnostics::{
+    diagnostics_enabled, emit_diagnostic, flush_diagnostics, start_webrtc_diagnostics, track_pad,
+    DiagnosticsHandle, MediaProgress, MediaStage,
+};
 use crate::pipeline::{
     build_audio_chain, build_capture_chain, check_audio_elements, check_elements, CaptureSettings,
 };
@@ -32,6 +36,7 @@ use orange_signal::{connect, Signal};
 const STUN: &str = "stun://stun.l.google.com:19302";
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_AFTER: Duration = Duration::from_millis(100);
+static NEXT_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 
 struct PipelineError {
     source: String,
@@ -102,6 +107,7 @@ fn watch_bus(
             }
             gst::MessageView::Eos(_) => {
                 println!("[{label}] end of stream");
+                emit_diagnostic("pipeline-eos", label, serde_json::json!({}));
             }
             _ => {}
         }
@@ -116,22 +122,51 @@ fn watch_bus(
 /// `pad-added` fires when the transceiver is created, which happens whether or
 /// not any media ever arrives. The states below are the difference between
 /// "negotiated" and "actually connected".
-fn watch_connection(bin: &gst::Element, label: String) {
+type ConnectionFailure = Arc<dyn Fn(String) + Send + Sync>;
+
+fn is_terminal_connection_state(state: gst_webrtc::WebRTCPeerConnectionState) -> bool {
+    matches!(
+        state,
+        gst_webrtc::WebRTCPeerConnectionState::Failed
+            | gst_webrtc::WebRTCPeerConnectionState::Closed
+    )
+}
+
+fn watch_connection(
+    bin: &gst::Element,
+    label: String,
+    diagnostic_role: String,
+    on_failure: Option<ConnectionFailure>,
+) {
     let l = label.clone();
+    let role = diagnostic_role.clone();
     bin.connect_notify(Some("ice-connection-state"), move |bin, _| {
         let state = bin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
         println!("[{l}] ice: {state:?}");
+        emit_diagnostic("ice-state", &role, format!("{state:?}"));
     });
 
     let l = label.clone();
+    let role = diagnostic_role.clone();
     bin.connect_notify(Some("ice-gathering-state"), move |bin, _| {
         let state = bin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
         println!("[{l}] gathering: {state:?}");
+        emit_diagnostic("ice-gathering-state", &role, format!("{state:?}"));
     });
 
     bin.connect_notify(Some("connection-state"), move |bin, _| {
         let state = bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
         println!("[{label}] peer connection: {state:?}");
+        emit_diagnostic(
+            "peer-connection-state",
+            &diagnostic_role,
+            format!("{state:?}"),
+        );
+        if is_terminal_connection_state(state) {
+            if let Some(on_failure) = &on_failure {
+                on_failure(format!("peer connection entered {state:?}"));
+            }
+        }
     });
 }
 
@@ -279,6 +314,22 @@ mod tests {
         super::enable_nack(&transceiver);
 
         assert!(transceiver.property::<bool>("do-nack"));
+    }
+
+    #[test]
+    fn failed_or_closed_peer_connections_end_the_session() {
+        assert!(super::is_terminal_connection_state(
+            gst_webrtc::WebRTCPeerConnectionState::Failed
+        ));
+        assert!(super::is_terminal_connection_state(
+            gst_webrtc::WebRTCPeerConnectionState::Closed
+        ));
+        assert!(!super::is_terminal_connection_state(
+            gst_webrtc::WebRTCPeerConnectionState::Disconnected
+        ));
+        assert!(!super::is_terminal_connection_state(
+            gst_webrtc::WebRTCPeerConnectionState::Connected
+        ));
     }
 }
 
@@ -511,6 +562,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     }
     let stop_result = pipeline.set_state(gst::State::Null);
     client.close().await;
+    flush_diagnostics();
     session_result?;
     stop_result?;
     Ok(())
@@ -566,6 +618,7 @@ struct ViewerBranch {
     bin: gst::Element,
     links: Vec<TeeBranch>,
     label: String,
+    _diagnostics: Option<DiagnosticsHandle>,
 }
 
 fn link_tee_branch(
@@ -574,12 +627,20 @@ fn link_tee_branch(
     bin: &gst::Element,
     max_buffers: u32,
     retransmit: bool,
+    progress: Option<Arc<MediaProgress>>,
     mut payload: Vec<gst::Element>,
 ) -> Result<TeeBranch> {
     let queue = gst::ElementFactory::make("queue")
         .property("max-size-buffers", max_buffers)
         .property_from_str("leaky", "downstream")
         .build()?;
+    if let Some(progress) = &progress {
+        let progress = progress.clone();
+        queue.connect("overrun", false, move |_| {
+            progress.record_queue_overrun();
+            None
+        });
+    }
     let mut elements = vec![queue];
     elements.append(&mut payload);
 
@@ -600,6 +661,13 @@ fn link_tee_branch(
         elements,
         bin_pad: sink_pad,
     };
+    if let Some(progress) = progress {
+        track_pad(
+            &branch.elements.last().unwrap().static_pad("src").unwrap(),
+            MediaStage::Rtp,
+            progress,
+        );
+    }
 
     let result = (|| -> Result<()> {
         for element in &branch.elements {
@@ -642,7 +710,9 @@ fn add_viewer(
         bin,
         links: Vec::new(),
         label,
+        _diagnostics: None,
     };
+    let progress = diagnostics_enabled().then(|| Arc::new(MediaProgress::new()));
 
     let result = (|| -> Result<()> {
         let pay = gst::ElementFactory::make("rtpav1pay").build()?;
@@ -655,6 +725,7 @@ fn add_viewer(
             &branch.bin,
             200,
             true,
+            progress.clone(),
             vec![pay, caps],
         )?);
         if let Some(audio_tee) = audio_tee {
@@ -664,6 +735,7 @@ fn add_viewer(
                 &branch.bin,
                 50,
                 false,
+                None,
                 Vec::new(),
             )?);
         }
@@ -680,7 +752,22 @@ fn add_viewer(
         return Err(error);
     }
 
-    watch_connection(&branch.bin, format!("host->{peer}"));
+    let diagnostic_label = format!(
+        "host-viewer-{}",
+        NEXT_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let failed_peer = peer.to_string();
+    let connection_failures = failures.clone();
+    let on_connection_failure: ConnectionFailure = Arc::new(move |error| {
+        let _ = connection_failures.send((failed_peer.clone(), error));
+    });
+    watch_connection(
+        &branch.bin,
+        format!("host->{peer}"),
+        diagnostic_label.clone(),
+        Some(on_connection_failure),
+    );
+    branch._diagnostics = start_webrtc_diagnostics(&branch.bin, diagnostic_label, progress, None);
     forward_ice(&branch.bin, out.clone(), peer.to_string());
 
     create_offer(&branch.bin, out, failures, peer.to_string());
@@ -804,7 +891,19 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     };
     let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch", viewer_playback.clone())?;
 
-    watch_connection(&bin, "watch".to_string());
+    let connection_errors = session_errors.clone();
+    let on_connection_failure: ConnectionFailure = Arc::new(move |error| {
+        let _ = connection_errors.send(PipelineError {
+            source: String::new(),
+            message: error,
+        });
+    });
+    watch_connection(
+        &bin,
+        "watch".to_string(),
+        "watch".to_string(),
+        Some(on_connection_failure),
+    );
     enable_incoming_video_nack(&bin);
     forward_ice(&bin, client.outgoing.clone(), String::new());
 
@@ -818,6 +917,8 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         .map(|playback| playback.overlay().clone());
     let overlay_for_audio = viewer_overlay.clone();
     let overlay_for_video = viewer_overlay.clone();
+    let media_progress = diagnostics_enabled().then(|| Arc::new(MediaProgress::new()));
+    let media_progress_for_pad = media_progress.clone();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
     let branch_errors = session_errors.clone();
     bin.connect_pad_added(move |_, pad| {
@@ -829,10 +930,13 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
             "OPUS" => build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
             "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
                 Some(output) => {
+                    if let Some(progress) = &media_progress_for_pad {
+                        track_pad(pad, MediaStage::Rtp, progress.clone());
+                    }
                     if let Some(overlay) = overlay_for_video.clone() {
                         watch_incoming_bitrate(pad, overlay);
                     }
-                    build_receive_branch(&pipeline, pad, output)
+                    build_receive_branch(&pipeline, pad, output, media_progress_for_pad.clone())
                 }
                 None => Ok(()),
             },
@@ -854,6 +958,12 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         let _ = pipeline.set_state(gst::State::Null);
         return Err(error.into());
     }
+    let _diagnostics = start_webrtc_diagnostics(
+        &bin,
+        "watch".to_string(),
+        media_progress,
+        viewer_playback.clone(),
+    );
 
     let session_result: Result<()> = async {
         loop {
@@ -930,8 +1040,10 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     }
     .await;
 
+    drop(_diagnostics);
     let stop_result = pipeline.set_state(gst::State::Null);
     client.close().await;
+    flush_diagnostics();
     session_result?;
     stop_result?;
     Ok(())

@@ -174,6 +174,21 @@ impl PlaybackWindow {
         is_alive(self.hwnd)
     }
 
+    pub fn is_responsive(&self) -> bool {
+        unsafe {
+            SendMessageTimeoutW(
+                HWND(self.hwnd as *mut _),
+                WM_NULL,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                250,
+                None,
+            )
+            .0 != 0
+        }
+    }
+
     pub fn reveal(&self) {
         reveal(self.hwnd);
     }

@@ -1,6 +1,7 @@
 //! orange - low-overhead window streaming for friends.
 
 mod auth;
+mod media_diagnostics;
 mod overlay;
 mod peer;
 mod pipeline;
