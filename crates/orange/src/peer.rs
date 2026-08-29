@@ -53,6 +53,28 @@ fn should_request_idle_redraw(viewer_count: usize, frame_silence: Duration) -> b
     viewer_count > 0 && frame_silence >= IDLE_REDRAW_AFTER
 }
 
+fn recovery_gop_size(frames: u64, elapsed: Duration, configured_fps: u32) -> Option<u32> {
+    if frames == 0 || elapsed.is_zero() {
+        return None;
+    }
+    let measured_fps = (frames as f64 / elapsed.as_secs_f64()).round() as u32;
+    Some(
+        measured_fps
+            .clamp(1, configured_fps.max(1))
+            .saturating_mul(2)
+            .min(i32::MAX as u32),
+    )
+}
+
+fn initial_host_gop_size(configured_fps: u32) -> u32 {
+    configured_fps.max(1).saturating_mul(2).min(120)
+}
+
+fn gop_update(current: u32, measured: u32) -> Option<u32> {
+    let threshold = (current / 10).max(4);
+    (current.abs_diff(measured) > threshold).then_some(measured)
+}
+
 fn make_webrtcbin(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make("webrtcbin")
         .name(name)
@@ -340,6 +362,31 @@ mod tests {
             gst_webrtc::WebRTCPeerConnectionState::Connected
         ));
     }
+
+    #[test]
+    fn recovery_gop_tracks_the_measured_frame_rate() {
+        assert_eq!(
+            super::recovery_gop_size(120, Duration::from_secs(2), 240),
+            Some(120)
+        );
+        assert_eq!(
+            super::recovery_gop_size(480, Duration::from_secs(2), 240),
+            Some(480)
+        );
+        assert_eq!(
+            super::recovery_gop_size(30, Duration::from_secs(2), 240),
+            Some(30)
+        );
+        assert_eq!(
+            super::recovery_gop_size(0, Duration::from_secs(2), 240),
+            None
+        );
+        assert_eq!(super::initial_host_gop_size(240), 120);
+        assert_eq!(super::initial_host_gop_size(30), 60);
+        assert_eq!(super::gop_update(120, 480), Some(480));
+        assert_eq!(super::gop_update(480, 475), None);
+        assert_eq!(super::gop_update(480, 120), Some(120));
+    }
 }
 
 /// Host: capture a window and serve any number of viewers.
@@ -363,6 +410,11 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     let pipeline = gst::Pipeline::new();
     let capture = gst::parse::bin_from_description(&build_capture_chain(settings), true)
         .context("failed to build capture chain")?;
+    let encoder = capture
+        .by_name("stream-encoder")
+        .context("capture chain has no named encoder")?;
+    let initial_gop_size = initial_host_gop_size(settings.fps);
+    encoder.set_property("gop-size", initial_gop_size as i32);
     let tee = gst::ElementFactory::make("tee")
         .property("allow-not-linked", true)
         .build()?;
@@ -371,7 +423,9 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     capture.link(&tee)?;
     let capture_clock = Instant::now();
     let last_video_frame = Arc::new(AtomicU64::new(0));
+    let encoded_frames = Arc::new(AtomicU64::new(0));
     let last_video_frame_for_probe = last_video_frame.clone();
+    let encoded_frames_for_probe = encoded_frames.clone();
     tee.static_pad("sink")
         .context("video tee has no sink pad")?
         .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
@@ -382,6 +436,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                     .min(u128::from(u64::MAX)) as u64,
                 Ordering::Relaxed,
             );
+            encoded_frames_for_probe.fetch_add(1, Ordering::Relaxed);
             gst::PadProbeReturn::Ok
         });
 
@@ -417,150 +472,184 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     idle_redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut recovery_keyframe = tokio::time::interval(RECOVERY_KEYFRAME_INTERVAL);
     recovery_keyframe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut gop_sampled_at = Instant::now();
+    let mut current_gop_size = initial_gop_size;
 
     // --- signalling loop --------------------------------------------------
-    let session_result: Result<()> =
-        async {
-            loop {
-                let signal = tokio::select! {
-                    Some(error) = bus_errors.recv() => {
-                        if let Some(peer) = viewers
-                            .keys()
-                            .find(|peer| error.source.contains(&format!("viewer-{peer}")))
-                            .cloned()
-                        {
-                            let _ = viewer_failures.send((peer, error.message));
-                            continue;
-                        }
-                        anyhow::bail!(error.message)
-                    },
-                    _ = idle_redraw.tick(), if !viewers.is_empty() => {
-                        let now = capture_clock
-                            .elapsed()
-                            .as_millis()
-                            .min(u128::from(u64::MAX)) as u64;
-                        let last = last_video_frame.load(Ordering::Relaxed);
-                        if should_request_idle_redraw(
-                            viewers.len(),
-                            Duration::from_millis(now.saturating_sub(last)),
-                        ) {
-                            crate::targets::request_redraw(settings.hwnd);
-                        }
+    let session_result: Result<()> = async {
+        loop {
+            let signal = tokio::select! {
+                Some(error) = bus_errors.recv() => {
+                    if let Some(peer) = viewers
+                        .keys()
+                        .find(|peer| error.source.contains(&format!("viewer-{peer}")))
+                        .cloned()
+                    {
+                        let _ = viewer_failures.send((peer, error.message));
                         continue;
                     }
-                    _ = recovery_keyframe.tick(), if !viewers.is_empty() => {
-                        force_key_unit(&tee);
+                    anyhow::bail!(error.message)
+                },
+                _ = idle_redraw.tick(), if !viewers.is_empty() => {
+                    let now = capture_clock
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    let last = last_video_frame.load(Ordering::Relaxed);
+                    if should_request_idle_redraw(
+                        viewers.len(),
+                        Duration::from_millis(now.saturating_sub(last)),
+                    ) {
+                        crate::targets::request_redraw(settings.hwnd);
+                    }
+                    continue;
+                }
+                _ = recovery_keyframe.tick(), if !viewers.is_empty() => {
+                    let elapsed = gop_sampled_at.elapsed();
+                    gop_sampled_at = Instant::now();
+                    let frames = encoded_frames.swap(0, Ordering::Relaxed);
+                    if let Some(measured_gop_size) =
+                        recovery_gop_size(frames, elapsed, settings.fps)
+                    {
+                        if let Some(gop_size) = gop_update(current_gop_size, measured_gop_size) {
+                            encoder.set_property("gop-size", gop_size as i32);
+                            current_gop_size = gop_size;
+                        }
+                        emit_diagnostic(
+                            "encoder-gop",
+                            "host",
+                            serde_json::json!({
+                                "sampled_frames": frames,
+                                "sampled_ms": elapsed.as_millis(),
+                                "measured_gop_size": measured_gop_size,
+                                "active_gop_size": current_gop_size,
+                            }),
+                        );
+                    }
+                    force_key_unit(&tee);
+                    continue;
+                }
+                Some((peer, error)) = failed_viewers.recv() => {
+                    if let Some(branch) = viewers.remove(&peer) {
+                        let label = branch.label.clone();
+                        remove_viewer(&pipeline, branch);
+                        print_viewer_status("left", &peer, &label);
+                        println!(
+                            "[host] {label} left ({} remaining)",
+                            viewers.len()
+                        );
+                    }
+                    eprintln!("[host] viewer {peer} negotiation failed: {error}");
+                    continue;
+                }
+                signal = client.incoming.recv() => signal,
+            };
+            let Some(signal) = signal else { break };
+            match signal {
+                Signal::Hosting { code } => {
+                    println!("\n  Share this code:  {code}\n");
+                    println!("  Viewers run:  orange watch --code {code}\n");
+                }
+                Signal::ViewerJoined { peer, name } => {
+                    if viewers.contains_key(&peer) {
+                        eprintln!("[host] ignoring duplicate join from viewer {peer}");
                         continue;
                     }
-                    Some((peer, error)) = failed_viewers.recv() => {
-                        if let Some(branch) = viewers.remove(&peer) {
-                            let label = branch.label.clone();
-                            remove_viewer(&pipeline, branch);
-                            print_viewer_status("left", &peer, &label);
-                            println!(
-                                "[host] {label} left ({} remaining)",
-                                viewers.len()
-                            );
+                    let first_active_viewer = viewers.is_empty();
+                    if first_active_viewer {
+                        encoded_frames.store(0, Ordering::Relaxed);
+                        gop_sampled_at = Instant::now();
+                        recovery_keyframe.reset();
+                        if current_gop_size != initial_gop_size {
+                            encoder.set_property("gop-size", initial_gop_size as i32);
+                            current_gop_size = initial_gop_size;
                         }
-                        eprintln!("[host] viewer {peer} negotiation failed: {error}");
-                        continue;
                     }
-                    signal = client.incoming.recv() => signal,
-                };
-                let Some(signal) = signal else { break };
-                match signal {
-                    Signal::Hosting { code } => {
-                        println!("\n  Share this code:  {code}\n");
-                        println!("  Viewers run:  orange watch --code {code}\n");
-                    }
-                    Signal::ViewerJoined { peer, name } => {
-                        if viewers.contains_key(&peer) {
-                            eprintln!("[host] ignoring duplicate join from viewer {peer}");
-                            continue;
-                        }
-                        let label = name.unwrap_or_else(|| format!("viewer {peer}"));
-                        match add_viewer(
-                            &pipeline,
-                            &tee,
-                            audio_tee.as_ref(),
-                            &peer,
-                            label.clone(),
-                            settings.fps,
-                            client.outgoing.clone(),
-                            viewer_failures.clone(),
-                        ) {
-                            Ok(branch) => {
-                                viewers.insert(peer.clone(), branch);
-                                if !pipeline_started {
-                                    pipeline.set_state(gst::State::Playing)?;
-                                    pipeline_started = true;
-                                }
-                                crate::targets::request_redraw(settings.hwnd);
-                                println!("[host] {label} joined ({} watching)", viewers.len());
-                                print_viewer_status("joined", &peer, &label);
+                    let label = name.unwrap_or_else(|| format!("viewer {peer}"));
+                    match add_viewer(
+                        &pipeline,
+                        &tee,
+                        audio_tee.as_ref(),
+                        &peer,
+                        label.clone(),
+                        settings.fps,
+                        client.outgoing.clone(),
+                        viewer_failures.clone(),
+                    ) {
+                        Ok(branch) => {
+                            viewers.insert(peer.clone(), branch);
+                            if !pipeline_started {
+                                pipeline.set_state(gst::State::Playing)?;
+                                pipeline_started = true;
                             }
-                            Err(err) => eprintln!("[host] could not add viewer {peer}: {err}"),
+                            crate::targets::request_redraw(settings.hwnd);
+                            println!("[host] {label} joined ({} watching)", viewers.len());
+                            print_viewer_status("joined", &peer, &label);
                         }
+                        Err(err) => eprintln!("[host] could not add viewer {peer}: {err}"),
                     }
-                    Signal::ViewerLeft { peer } => {
-                        if let Some(branch) = viewers.remove(&peer) {
-                            let label = branch.label.clone();
-                            remove_viewer(&pipeline, branch);
-                            println!("[host] {label} left ({} remaining)", viewers.len());
-                            print_viewer_status("left", &peer, &label);
-                        }
+                }
+                Signal::ViewerLeft { peer } => {
+                    if let Some(branch) = viewers.remove(&peer) {
+                        let label = branch.label.clone();
+                        remove_viewer(&pipeline, branch);
+                        println!("[host] {label} left ({} remaining)", viewers.len());
+                        print_viewer_status("left", &peer, &label);
                     }
-                    Signal::Sdp { peer, kind, sdp } if kind == "answer" => {
-                        if let Some(branch) = viewers.get(&peer) {
-                            let desc = match parse_sdp(&kind, &sdp) {
-                                Ok(desc) => desc,
-                                Err(error) => {
-                                    let _ = viewer_failures
-                                        .send((peer.clone(), format!("malformed answer: {error}")));
-                                    continue;
+                }
+                Signal::Sdp { peer, kind, sdp } if kind == "answer" => {
+                    if let Some(branch) = viewers.get(&peer) {
+                        let desc = match parse_sdp(&kind, &sdp) {
+                            Ok(desc) => desc,
+                            Err(error) => {
+                                let _ = viewer_failures
+                                    .send((peer.clone(), format!("malformed answer: {error}")));
+                                continue;
+                            }
+                        };
+                        let viewer_failures = viewer_failures.clone();
+                        let hwnd = settings.hwnd;
+                        let peer = peer.clone();
+                        let installed =
+                            gst::Promise::with_change_func(move |reply| match check_promise_reply(
+                                reply,
+                                "installing remote answer",
+                            ) {
+                                Ok(_) => {
+                                    crate::targets::request_redraw(hwnd);
+                                    println!("[host] streaming to {peer}");
                                 }
-                            };
-                            let viewer_failures = viewer_failures.clone();
-                            let hwnd = settings.hwnd;
-                            let peer = peer.clone();
-                            let installed = gst::Promise::with_change_func(move |reply| {
-                                match check_promise_reply(reply, "installing remote answer") {
-                                    Ok(_) => {
-                                        crate::targets::request_redraw(hwnd);
-                                        println!("[host] streaming to {peer}");
-                                    }
-                                    Err(error) => {
-                                        let _ = viewer_failures.send((
-                                            peer.clone(),
-                                            format!("could not install answer: {error}"),
-                                        ));
-                                    }
+                                Err(error) => {
+                                    let _ = viewer_failures.send((
+                                        peer.clone(),
+                                        format!("could not install answer: {error}"),
+                                    ));
                                 }
                             });
-                            branch
-                                .bin
-                                .emit_by_name::<()>("set-remote-description", &[&desc, &installed]);
-                        }
+                        branch
+                            .bin
+                            .emit_by_name::<()>("set-remote-description", &[&desc, &installed]);
                     }
-                    Signal::Ice {
-                        peer,
-                        mline,
-                        candidate,
-                    } => {
-                        if let Some(branch) = viewers.get(&peer) {
-                            branch
-                                .bin
-                                .emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
-                        }
-                    }
-                    Signal::Authenticated { name } => println!("[host] signed in as {name}"),
-                    Signal::Error { message } => eprintln!("[host] server: {message}"),
-                    _ => {}
                 }
+                Signal::Ice {
+                    peer,
+                    mline,
+                    candidate,
+                } => {
+                    if let Some(branch) = viewers.get(&peer) {
+                        branch
+                            .bin
+                            .emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
+                    }
+                }
+                Signal::Authenticated { name } => println!("[host] signed in as {name}"),
+                Signal::Error { message } => eprintln!("[host] server: {message}"),
+                _ => {}
             }
-            Ok(())
         }
-        .await;
+        Ok(())
+    }
+    .await;
 
     for (_, branch) in viewers.drain() {
         remove_viewer(&pipeline, branch);

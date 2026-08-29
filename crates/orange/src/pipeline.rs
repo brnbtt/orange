@@ -179,7 +179,7 @@ pub fn build_capture_chain(settings: &CaptureSettings) -> String {
          ! queue max-size-buffers=3 leaky=downstream \
          ! d3d11convert \
          {scale_caps}\
-         ! {encoder} bitrate={bitrate} gop-size={gop_size} \
+         ! {encoder} name=stream-encoder bitrate={bitrate} gop-size={gop_size} \
            preset=p5 tune=low-latency rc-mode=cbr spatial-aq=true \
          ! {parser}",
         fps = settings.fps,
@@ -230,6 +230,16 @@ mod tests {
         };
 
         assert!(build_capture_chain(&settings).contains("gop-size=120"));
+    }
+
+    #[test]
+    fn recording_gop_tracks_high_refresh_input() {
+        let settings = CaptureSettings {
+            fps: 240,
+            ..CaptureSettings::default()
+        };
+
+        assert!(build_capture_chain(&settings).contains("gop-size=480"));
     }
 
     #[test]
