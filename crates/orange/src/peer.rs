@@ -15,7 +15,7 @@ use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -37,6 +37,7 @@ const STUN: &str = "stun://stun.l.google.com:19302";
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_AFTER: Duration = Duration::from_millis(100);
 static NEXT_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
+static LAST_KEYFRAME_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 struct PipelineError {
     source: String,
@@ -123,6 +124,7 @@ fn watch_bus(
 /// not any media ever arrives. The states below are the difference between
 /// "negotiated" and "actually connected".
 type ConnectionFailure = Arc<dyn Fn(String) + Send + Sync>;
+type ConnectionReady = Arc<dyn Fn() + Send + Sync>;
 
 fn is_terminal_connection_state(state: gst_webrtc::WebRTCPeerConnectionState) -> bool {
     matches!(
@@ -136,6 +138,7 @@ fn watch_connection(
     bin: &gst::Element,
     label: String,
     diagnostic_role: String,
+    on_connected: Option<ConnectionReady>,
     on_failure: Option<ConnectionFailure>,
 ) {
     let l = label.clone();
@@ -162,6 +165,11 @@ fn watch_connection(
             &diagnostic_role,
             format!("{state:?}"),
         );
+        if state == gst_webrtc::WebRTCPeerConnectionState::Connected {
+            if let Some(on_connected) = &on_connected {
+                on_connected();
+            }
+        }
         if is_terminal_connection_state(state) {
             if let Some(on_failure) = &on_failure {
                 on_failure(format!("peer connection entered {state:?}"));
@@ -505,7 +513,6 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                                     continue;
                                 }
                             };
-                            let tee = tee.clone();
                             let viewer_failures = viewer_failures.clone();
                             let hwnd = settings.hwnd;
                             let peer = peer.clone();
@@ -513,7 +520,6 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                                 match check_promise_reply(reply, "installing remote answer") {
                                     Ok(_) => {
                                         crate::targets::request_redraw(hwnd);
-                                        force_key_unit(&tee);
                                         println!("[host] streaming to {peer}");
                                     }
                                     Err(error) => {
@@ -655,6 +661,11 @@ fn link_tee_branch(
     };
     if let Some(progress) = progress {
         track_pad(
+            &branch.elements[0].static_pad("sink").unwrap(),
+            MediaStage::Parsed,
+            progress.clone(),
+        );
+        track_pad(
             &branch.elements.last().unwrap().static_pad("src").unwrap(),
             MediaStage::Rtp,
             progress,
@@ -752,10 +763,20 @@ fn add_viewer(
     let on_connection_failure: ConnectionFailure = Arc::new(move |error| {
         let _ = connection_failures.send((failed_peer.clone(), error));
     });
+    let tee_for_connected = tee.downgrade();
+    let bin_for_connected = branch.bin.downgrade();
+    let started_keyframes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let on_connected: ConnectionReady = Arc::new(move || {
+        if started_keyframes.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        request_startup_keyframes(tee_for_connected.clone(), bin_for_connected.clone());
+    });
     watch_connection(
         &branch.bin,
         format!("host->{peer}"),
         diagnostic_label.clone(),
+        Some(on_connected),
         Some(on_connection_failure),
     );
     branch._diagnostics = start_webrtc_diagnostics(&branch.bin, diagnostic_label, progress, None);
@@ -815,10 +836,42 @@ fn remove_tee_branch(pipeline: &gst::Pipeline, bin: &gst::Element, branch: TeeBr
 }
 
 fn force_key_unit(tee: &gst::Element) {
+    let mut last_request = LAST_KEYFRAME_REQUEST
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    if last_request.is_some_and(|last| now.duration_since(last) < Duration::from_millis(200)) {
+        return;
+    }
     let event = gst_video::UpstreamForceKeyUnitEvent::builder()
         .all_headers(true)
         .build();
-    let _ = tee.send_event(event);
+    if tee.send_event(event) {
+        *last_request = Some(now);
+    }
+}
+
+fn request_startup_keyframes(
+    tee: gst::glib::WeakRef<gst::Element>,
+    bin: gst::glib::WeakRef<gst::Element>,
+) {
+    if let Some(tee) = tee.upgrade() {
+        force_key_unit(&tee);
+    }
+    std::thread::spawn(move || {
+        for delay in [250, 500, 750] {
+            std::thread::sleep(Duration::from_millis(delay));
+            let Some(tee) = tee.upgrade() else { break };
+            let Some(bin) = bin.upgrade() else { break };
+            if bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state")
+                != gst_webrtc::WebRTCPeerConnectionState::Connected
+            {
+                break;
+            }
+            force_key_unit(&tee);
+        }
+    });
 }
 
 fn print_viewer_status(event: &str, peer: &str, label: &str) {
@@ -917,6 +970,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         &bin,
         "watch".to_string(),
         "watch".to_string(),
+        None,
         Some(on_connection_failure),
     );
     enable_incoming_video_nack(&bin);
