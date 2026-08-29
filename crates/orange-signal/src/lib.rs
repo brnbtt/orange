@@ -265,7 +265,17 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
 
     match joined {
         Some((code, Role::Host)) => {
-            rooms.lock().await.remove(&code);
+            let room = rooms.lock().await.remove(&code);
+            if let Some(room) = room {
+                for viewer in room.viewers.into_values() {
+                    let _ = viewer.send(Message::Text(
+                        Signal::Error {
+                            message: "The stream ended".into(),
+                        }
+                        .to_json(),
+                    ));
+                }
+            }
             println!("[signal] room {code} closed");
         }
         Some((code, Role::Viewer(peer))) => {
@@ -474,6 +484,48 @@ mod tests {
             receive_signal(&mut host).await,
             Signal::Hosting { .. }
         ));
+
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn abrupt_host_disconnect_notifies_existing_viewers() {
+        let rooms = Rooms::default();
+        let app = server::router(server::AppState {
+            rooms: rooms.clone(),
+            auth: auth::Auth::new(None),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+
+        let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Host.to_json(),
+        ))
+        .await
+        .unwrap();
+        let Signal::Hosting { code } = receive_signal(&mut host).await else {
+            panic!("host did not receive a room code");
+        };
+        let (mut viewer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                Signal::Join { code }.to_json(),
+            ))
+            .await
+            .unwrap();
+        let _ = receive_signal(&mut viewer).await;
+        let _ = receive_signal(&mut host).await;
+
+        drop(host);
+
+        let Signal::Error { message } = receive_signal(&mut viewer).await else {
+            panic!("viewer did not receive stream termination");
+        };
+        assert_eq!(message, "The stream ended");
+        assert!(rooms.lock().await.is_empty());
 
         relay.abort();
     }
