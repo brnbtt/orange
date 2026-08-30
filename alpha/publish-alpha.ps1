@@ -158,7 +158,8 @@ This portable build requires the GStreamer MSVC x64 runtime.
         })
         Test-AlphaPublishManifest -Manifest $manifest | Out-Null
         $manifestPath = Join-Path $output "orange-alpha.json"
-        $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+        $manifestJson = $manifest | ConvertTo-Json -Depth 8
+        [IO.File]::WriteAllText($manifestPath, $manifestJson, (New-Object Text.UTF8Encoding($false)))
 
         $launcherStage = Join-Path $output "launcher"
         $launcherArchive = Join-Path $output "orange-alpha-launcher.zip"

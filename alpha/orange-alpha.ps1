@@ -148,6 +148,22 @@ function Read-AlphaManifest {
     return ConvertTo-AlphaManifest -Json (Get-Content -LiteralPath $Path -Raw) -AllowLocalAssets:$AllowLocalAssets
 }
 
+function ConvertFrom-AlphaWebContent {
+    param([Parameter(Mandatory = $true)]$Content)
+
+    if ($Content -is [byte[]]) {
+        $text = [Text.Encoding]::UTF8.GetString($Content)
+    } else {
+        $text = [string]$Content
+    }
+    $text = $text.TrimStart([char]0xFEFF)
+    if ($text.Length -ge 3 -and [int][char]$text[0] -eq 0xEF -and
+        [int][char]$text[1] -eq 0xBB -and [int][char]$text[2] -eq 0xBF) {
+        $text = $text.Substring(3)
+    }
+    return $text
+}
+
 function Get-AlphaManifest {
     param(
         [string]$ManifestPath,
@@ -158,7 +174,7 @@ function Get-AlphaManifest {
         return Read-AlphaManifest -Path $ManifestPath -AllowLocalAssets:$AllowLocalAssets
     }
     $response = Invoke-WebRequest -Uri $script:AlphaManifestUrl -UseBasicParsing
-    return ConvertTo-AlphaManifest -Json $response.Content
+    return ConvertTo-AlphaManifest -Json (ConvertFrom-AlphaWebContent -Content $response.Content)
 }
 
 function Write-AlphaJsonAtomically {

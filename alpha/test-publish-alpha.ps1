@@ -5,6 +5,8 @@ if (-not (Test-Path -LiteralPath $publisher -PathType Leaf)) {
     throw "Expected RED: publisher script is absent"
 }
 . $publisher -LibraryOnly
+$launcher = Join-Path $PSScriptRoot "orange-alpha.ps1"
+. $launcher
 
 $root = Join-Path $env:TEMP ("orange-alpha-publish-test-" + [guid]::NewGuid().ToString("N"))
 $stage = Join-Path $root "stage"
@@ -28,6 +30,12 @@ try {
     if ($script:AlphaManifestUrl -cne "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha.json") {
         throw "launcher does not use the public alpha manifest"
     }
+    $manifestJson = $manifest | ConvertTo-Json -Depth 8
+    $manifestBytes = [byte[]]([Text.Encoding]::UTF8.GetPreamble() + [Text.Encoding]::UTF8.GetBytes($manifestJson))
+    $decodedManifest = ConvertFrom-AlphaWebContent -Content $manifestBytes
+    if ($decodedManifest -cne $manifestJson) { throw "byte response was not decoded as UTF-8 without BOM" }
+    $legacyDecoded = ([char]0x00EF).ToString() + [char]0x00BB + [char]0x00BF + $manifestJson
+    if ((ConvertFrom-AlphaWebContent -Content $legacyDecoded) -cne $manifestJson) { throw "PowerShell 5.1 BOM mojibake was not removed" }
 
     $probe = Test-NativeCommandSucceeds -Command "cmd.exe" -Arguments @("/d", "/c", "exit 7")
     if ($probe) { throw "nonzero native probe was reported as successful" }
