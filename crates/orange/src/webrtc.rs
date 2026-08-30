@@ -236,19 +236,21 @@ fn attach_receive_elements(
     elements: &[gst::Element],
 ) -> Result<()> {
     let mut added = 0;
+    let block_probe = pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_, _| {
+        gst::PadProbeReturn::Ok
+    });
     let result = (|| -> Result<()> {
         for element in elements {
             pipeline.add(element)?;
             added += 1;
         }
         gst::Element::link_many(elements)?;
+        pad.link(&elements[0].static_pad("sink").unwrap())?;
         for element in elements {
             element.sync_state_with_parent()?;
         }
-        pad.link(&elements[0].static_pad("sink").unwrap())?;
         Ok(())
     })();
-
     if let Err(error) = result {
         if let Some(sink_pad) = elements
             .first()
@@ -260,7 +262,13 @@ fn attach_receive_elements(
             let _ = element.set_state(gst::State::Null);
             let _ = pipeline.remove(element);
         }
+        if let Some(block_probe) = block_probe {
+            pad.remove_probe(block_probe);
+        }
         return Err(error);
+    }
+    if let Some(block_probe) = block_probe {
+        pad.remove_probe(block_probe);
     }
     Ok(())
 }
@@ -307,6 +315,29 @@ fn build_live_video_queue() -> Result<gst::Element> {
         .property_from_str("leaky", "downstream")
         .build()
         .context("video presentation queue is unavailable")
+}
+
+fn build_video_sink() -> Result<gst::Element> {
+    gst::ElementFactory::make("d3d11videosink")
+        .property("async", false)
+        .property("sync", false)
+        .property("force-aspect-ratio", true)
+        .build()
+        .context("d3d11videosink is unavailable")
+}
+
+fn build_audio_sink() -> Result<gst::Element> {
+    gst::ElementFactory::make("wasapi2sink")
+        .property("async", false)
+        .property("low-latency", true)
+        .build()
+        .or_else(|_| {
+            gst::ElementFactory::make("wasapisink")
+                .property("async", false)
+                .property("low-latency", true)
+                .build()
+        })
+        .context("audio sink is unavailable")
 }
 
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
@@ -366,10 +397,7 @@ pub fn build_receive_branch(
             crate::overlay::attach(&composition, &playback);
             let queue = build_live_video_queue()?;
 
-            let sink = gst::ElementFactory::make("d3d11videosink")
-                .property("sync", false)
-                .property("force-aspect-ratio", true)
-                .build()?;
+            let sink = build_video_sink()?;
             let overlay_iface = sink
                 .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
                 .context("d3d11videosink does not implement GstVideoOverlay")?;
@@ -428,10 +456,7 @@ pub fn build_audio_branch(
         .name("viewer-volume")
         .property("volume", initial_volume)
         .build()?;
-    let sink = gst::ElementFactory::make("wasapi2sink")
-        .property("low-latency", true)
-        .build()
-        .or_else(|_| gst::ElementFactory::make("autoaudiosink").build())?;
+    let sink = build_audio_sink()?;
 
     let all = [depay, dec, convert, resample, volume.clone(), sink];
     attach_receive_elements(pipeline, pad, &all)?;
@@ -529,5 +554,16 @@ mod tests {
         assert_eq!(queue.property::<u32>("max-size-buffers"), 1);
         assert_eq!(queue.property::<u32>("max-size-bytes"), 0);
         assert_eq!(queue.property::<u64>("max-size-time"), 0);
+    }
+
+    #[test]
+    fn live_sinks_do_not_wait_for_preroll() {
+        gst::init().unwrap();
+        let video = build_video_sink().unwrap();
+        let audio = build_audio_sink().unwrap();
+
+        assert!(!video.property::<bool>("async"));
+        assert!(!video.property::<bool>("sync"));
+        assert!(!audio.property::<bool>("async"));
     }
 }
