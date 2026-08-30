@@ -147,6 +147,23 @@ cargo build
 
 ## Install
 
+The beta uses a one-click per-user installer. Open
+`orange-setup-0.2.0-beta.1.exe`; it installs prerequisites when needed,
+installs Orange under `%LOCALAPPDATA%\Programs\orange`, creates a Start menu
+shortcut, and opens the app. There are no destination, shortcut, or completion
+pages to step through.
+
+Installed beta builds check the public update channel at startup and every six
+hours. When a newer beta is available, Orange shows an update banner. Clicking
+`Update now` downloads and verifies the installer, closes Orange, applies the
+update silently, and reopens the app. Failed checks and downloads do not stop
+streaming.
+
+The first beta is not Authenticode-signed, so Windows SmartScreen may warn on
+the initial install. HTTPS host pinning and SHA-256 verification protect update
+downloads, but production promotion remains blocked on obtaining a trusted
+code-signing certificate.
+
 Build the friend-facing Windows installer with:
 
 ```powershell
