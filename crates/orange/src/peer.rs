@@ -583,7 +583,17 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
             };
             let Some(signal) = signal else { break };
             match signal {
-                Signal::Hosting { code } => {
+                Signal::Hosting {
+                    code,
+                    diagnostic_session,
+                } => {
+                    if let Some(diagnostic_session) = diagnostic_session {
+                        emit_diagnostic(
+                            "diagnostic-session",
+                            "host",
+                            serde_json::json!({ "id": diagnostic_session }),
+                        );
+                    }
                     println!("\n  Share this code:  {code}\n");
                     println!("  Viewers run:  orange watch --code {code}\n");
                 }
@@ -1243,7 +1253,17 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                 } => {
                     bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
                 }
-                Signal::StreamInfo { host_name } => {
+                Signal::StreamInfo {
+                    host_name,
+                    diagnostic_session,
+                } => {
+                    if let Some(diagnostic_session) = diagnostic_session {
+                        emit_diagnostic(
+                            "diagnostic-session",
+                            "watch",
+                            serde_json::json!({ "id": diagnostic_session }),
+                        );
+                    }
                     if let Some(overlay) = &viewer_overlay {
                         if let Ok(mut state) = overlay.lock() {
                             state.host = host_name.clone();
