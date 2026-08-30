@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 /// Child processes are console applications; without this each one flashes a
 /// black window in front of the user.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const MAX_DIAGNOSTIC_FILES: usize = 64;
+const MAX_DIAGNOSTIC_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WindowTarget {
@@ -115,19 +117,38 @@ fn prune_diagnostics(directory: &std::path::Path) {
         return;
     };
     let retention = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    let mut files = Vec::new();
     for entry in entries.flatten() {
-        let old = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
-            .is_ok_and(|age| age > retention);
-        if old
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "jsonl")
-        {
-            let _ = std::fs::remove_file(entry.path());
+        let path = entry.path();
+        let matches = path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("orange-media-"));
+        if !matches {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if modified.elapsed().is_ok_and(|age| age > retention) {
+            let _ = std::fs::remove_file(path);
+        } else {
+            files.push((modified, metadata.len(), path));
+        }
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    let mut bytes = files.iter().map(|(_, size, _)| size).sum::<u64>();
+    let mut count = files.len();
+    for (_, size, path) in files {
+        if count <= MAX_DIAGNOSTIC_FILES && bytes <= MAX_DIAGNOSTIC_BYTES {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            count -= 1;
+            bytes = bytes.saturating_sub(size);
         }
     }
 }
@@ -435,6 +456,31 @@ mod tests {
         assert_eq!(QUALITIES[1].scale_for(&target(2002, 1804)), "1198x1080");
         assert_eq!(QUALITIES[1].scale_for(&target(3440, 1440)), "1920x804");
         assert_eq!(QUALITIES[1].scale_for(&target(1280, 720)), "1280x720");
+    }
+
+    #[test]
+    fn beta_diagnostics_have_an_aggregate_file_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..70 {
+            std::fs::write(
+                directory.path().join(format!("orange-media-{index}.jsonl")),
+                b"x",
+            )
+            .unwrap();
+        }
+        std::fs::write(directory.path().join("keep.txt"), b"keep").unwrap();
+
+        prune_diagnostics(directory.path());
+
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+                .count(),
+            MAX_DIAGNOSTIC_FILES
+        );
+        assert!(directory.path().join("keep.txt").is_file());
     }
 
     #[test]

@@ -104,8 +104,7 @@ pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool)
         let Ok(jitterbuffer) = values[1].get::<gst::Element>() else {
             return None;
         };
-        let session = values[2].get::<u32>().unwrap_or_default();
-        configure_media_jitterbuffer(&jitterbuffer, session);
+        prepare_media_jitterbuffer(&jitterbuffer);
         None
     });
     if std::env::var("ORANGE_RTP_BUFFER_MODE").as_deref() == Ok("none") {
@@ -115,12 +114,41 @@ pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool)
     Ok(())
 }
 
-fn configure_media_jitterbuffer(jitterbuffer: &gst::Element, session: u32) {
+fn prepare_media_jitterbuffer(jitterbuffer: &gst::Element) {
     jitterbuffer.set_property("latency", 100u32);
     jitterbuffer.set_property("do-lost", true);
+    // Bundled audio and video can share one RTP session index, so classify from
+    // negotiated RTP caps instead. Defaulting to no silent drops is safe until
+    // the caps event identifies video.
+    jitterbuffer.set_property("drop-on-latency", false);
+    let jitterbuffer_weak = jitterbuffer.downgrade();
+    if let Some(sink) = jitterbuffer.static_pad("sink") {
+        sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            let Some(gst::PadProbeData::Event(event)) = &info.data else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let gst::EventView::Caps(caps) = event.view() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let encoding = caps
+                .caps()
+                .structure(0)
+                .and_then(|structure| structure.get::<String>("encoding-name").ok());
+            let Some(encoding) = encoding else {
+                return gst::PadProbeReturn::Ok;
+            };
+            if let Some(jitterbuffer) = jitterbuffer_weak.upgrade() {
+                configure_jitterbuffer_for_encoding(&jitterbuffer, &encoding);
+            }
+            gst::PadProbeReturn::Remove
+        });
+    }
+}
+
+fn configure_jitterbuffer_for_encoding(jitterbuffer: &gst::Element, encoding: &str) {
     // Video stays at the live edge. Opus must turn late packets into GAP events
     // so opusdec can conceal them instead of joining discontinuous waveforms.
-    jitterbuffer.set_property("drop-on-latency", session == 0);
+    jitterbuffer.set_property("drop-on-latency", encoding != "OPUS");
 }
 
 /// Surface pipeline errors.
@@ -544,13 +572,15 @@ mod tests {
         let video = gst::ElementFactory::make("rtpjitterbuffer")
             .build()
             .unwrap();
-        super::configure_media_jitterbuffer(&video, 0);
+        super::prepare_media_jitterbuffer(&video);
+        super::configure_jitterbuffer_for_encoding(&video, "H265");
         assert!(video.property::<bool>("drop-on-latency"));
 
         let audio = gst::ElementFactory::make("rtpjitterbuffer")
             .build()
             .unwrap();
-        super::configure_media_jitterbuffer(&audio, 1);
+        super::prepare_media_jitterbuffer(&audio);
+        super::configure_jitterbuffer_for_encoding(&audio, "OPUS");
         assert_eq!(audio.property::<u32>("latency"), 100);
         assert!(audio.property::<bool>("do-lost"));
         assert!(!audio.property::<bool>("drop-on-latency"));
