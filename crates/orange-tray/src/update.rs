@@ -18,6 +18,7 @@ const BETA_MANIFEST_URL: &str =
     "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-beta.json";
 const BETA_ASSET_HOST: &str = "orangealpha0d8d5893e69a3.blob.core.windows.net";
 const MAX_INSTALLER_BYTES: u64 = 250 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,10 +45,7 @@ pub(crate) enum UpdateStatus {
     Current,
     Available(UpdateInfo),
     Downloading(UpdateInfo),
-    Failed {
-        info: Option<UpdateInfo>,
-        message: String,
-    },
+    Failed { message: String },
 }
 
 impl UpdateStatus {
@@ -61,8 +59,7 @@ impl UpdateStatus {
     pub(crate) fn action_label(&self) -> Option<&'static str> {
         match self {
             Self::Available(_) => Some("Update now"),
-            Self::Failed { info: Some(_), .. } => Some("Retry update"),
-            Self::Failed { info: None, .. } => Some("Check again"),
+            Self::Failed { .. } => Some("Check again"),
             Self::Disabled | Self::Checking | Self::Current | Self::Downloading(_) => None,
         }
     }
@@ -98,9 +95,9 @@ pub(crate) fn cleanup_helpers() {
         if entry
             .file_name()
             .to_string_lossy()
-            .starts_with("orange-updater-")
+            .starts_with("orange-update-")
         {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
     let _ = std::fs::remove_dir(directory);
@@ -197,18 +194,25 @@ pub(crate) fn check_for_update(current_version: &str) -> Result<Option<UpdateInf
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let manifest_url = option_env!("ORANGE_UPDATE_MANIFEST_URL").unwrap_or(BETA_MANIFEST_URL);
-    let manifest = client
-        .get(manifest_url)
+    let mut response = client
+        .get(BETA_MANIFEST_URL)
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .send()
         .context("could not check for updates")?
         .error_for_status()
-        .context("update service rejected the check")?
-        .text()
-        .context("could not read update manifest")?;
+        .context("update service rejected the check")?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MANIFEST_BYTES)
+    {
+        bail!("update manifest is too large");
+    }
+    let mut manifest = Vec::new();
+    copy_bounded(&mut response, &mut manifest, MAX_MANIFEST_BYTES)?;
+    let manifest = String::from_utf8(manifest).context("update manifest is not UTF-8")?;
     parse_update_manifest(&manifest, current_version)
 }
 
@@ -234,6 +238,7 @@ pub(crate) fn download_update(info: &UpdateInfo) -> Result<PathBuf> {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(10 * 60))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let mut response = client
@@ -271,7 +276,7 @@ pub(crate) fn download_update(info: &UpdateInfo) -> Result<PathBuf> {
 fn copy_bounded(reader: &mut impl Read, writer: &mut impl Write, limit: u64) -> Result<u64> {
     let copied = std::io::copy(&mut reader.take(limit + 1), writer)?;
     if copied > limit {
-        bail!("update is larger than 250 MiB");
+        bail!("download exceeds its size limit");
     }
     Ok(copied)
 }
@@ -311,12 +316,13 @@ fn prepare_updater(
         bail!("orange-updater.exe is missing");
     }
     std::fs::create_dir_all(temporary_dir)?;
-    let executable = temporary_dir.join(format!("orange-updater-{}.exe", &info.build[..7]));
-    if executable.exists() {
-        std::fs::remove_file(&executable)?;
-    }
+    let handoff = tempfile::Builder::new()
+        .prefix("orange-update-")
+        .tempdir_in(temporary_dir)?;
+    let executable = handoff.path().join("orange-updater.exe");
     std::fs::copy(&source, &executable)
         .with_context(|| format!("could not prepare {}", executable.display()))?;
+    let _ = handoff.keep();
     let arguments = vec![
         OsString::from("--installer"),
         installer.as_os_str().to_owned(),
@@ -449,10 +455,9 @@ mod tests {
 
         let launch = prepare_updater(&info, &installer, &install_dir, &temporary, 42).unwrap();
 
-        assert_eq!(
-            launch.executable,
-            temporary.join("orange-updater-1111111.exe")
-        );
+        assert_eq!(launch.executable.file_name().unwrap(), "orange-updater.exe");
+        assert!(launch.executable.starts_with(&temporary));
+        assert_ne!(launch.executable.parent().unwrap(), temporary);
         assert!(launch.executable.is_file());
         assert_eq!(launch.arguments[0], "--installer");
         assert_eq!(launch.arguments[1], installer.as_os_str());
@@ -479,7 +484,6 @@ mod tests {
         assert_eq!(UpdateStatus::Downloading(info).action_label(), None);
         assert_eq!(
             UpdateStatus::Failed {
-                info: None,
                 message: "offline".into(),
             }
             .action_label(),

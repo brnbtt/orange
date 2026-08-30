@@ -3,6 +3,5 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=ORANGE_BUILD_ID");
     println!("cargo:rerun-if-env-changed=ORANGE_UPDATE_CHANNEL");
-    println!("cargo:rerun-if-env-changed=ORANGE_UPDATE_MANIFEST_URL");
     let _ = embed_resource::compile("app.rc", embed_resource::NONE);
 }

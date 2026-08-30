@@ -258,17 +258,13 @@ impl Orange {
                 self.update_rx = None;
             }
             Some(Ok(update::UpdateEvent::Checked(Err(_)))) | Some(Err(())) => {
-                let info = match &self.update_status {
-                    update::UpdateStatus::Downloading(info) => Some(info.clone()),
-                    _ => None,
-                };
-                let message = if info.is_some() {
+                let message = if matches!(self.update_status, update::UpdateStatus::Downloading(_))
+                {
                     "Update download failed"
                 } else {
                     "Could not check for updates"
                 };
                 self.update_status = update::UpdateStatus::Failed {
-                    info,
                     message: message.into(),
                 };
                 self.update_rx = None;
@@ -284,14 +280,12 @@ impl Orange {
                         }
                         Err(_) => {
                             self.update_status = update::UpdateStatus::Failed {
-                                info: Some(info),
                                 message: "Could not start the updater".into(),
                             };
                         }
                     },
                     Err(_) => {
                         self.update_status = update::UpdateStatus::Failed {
-                            info: Some(info),
                             message: "Update download failed".into(),
                         };
                     }
@@ -305,7 +299,9 @@ impl Orange {
             && Instant::now() >= self.next_update_check
             && matches!(
                 self.update_status,
-                update::UpdateStatus::Current | update::UpdateStatus::Failed { info: None, .. }
+                update::UpdateStatus::Current
+                    | update::UpdateStatus::Available(_)
+                    | update::UpdateStatus::Failed { .. }
             )
         {
             self.update_status = update::UpdateStatus::Checking;
@@ -316,15 +312,12 @@ impl Orange {
 
     fn request_update(&mut self) {
         match &self.update_status {
-            update::UpdateStatus::Available(info)
-            | update::UpdateStatus::Failed {
-                info: Some(info), ..
-            } => {
+            update::UpdateStatus::Available(info) => {
                 let info = info.clone();
                 self.update_rx = Some(update::start_download(info.clone()));
                 self.update_status = update::UpdateStatus::Downloading(info);
             }
-            update::UpdateStatus::Failed { info: None, .. } => {
+            update::UpdateStatus::Failed { .. } => {
                 self.update_status = update::UpdateStatus::Checking;
                 self.update_rx = update::start_check();
             }

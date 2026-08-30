@@ -119,6 +119,17 @@ fn wait_for_parent(pid: u32) -> Result<()> {
     Ok(())
 }
 
+fn parent_has_exited(pid: u32) -> bool {
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+            return true;
+        };
+        let result = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
 fn apply_update(args: UpdateArgs) -> Result<()> {
     verify_installer(&args.installer, &args.sha256)?;
     wait_for_parent(args.parent)?;
@@ -166,9 +177,10 @@ fn main() {
             let retry = args.clone();
             if let Err(error) = apply_update(args) {
                 write_failure(&error);
-                let _ = wait_for_parent(retry.parent);
-                let tray = retry.install_dir.join("orange-tray.exe");
-                let _ = Command::new(tray).current_dir(retry.install_dir).spawn();
+                if parent_has_exited(retry.parent) {
+                    let tray = retry.install_dir.join("orange-tray.exe");
+                    let _ = Command::new(tray).current_dir(retry.install_dir).spawn();
+                }
             }
         }
         Err(error) => write_failure(&error),
@@ -248,5 +260,10 @@ mod tests {
         let hash = sha256_file(&installer).unwrap();
         assert!(verify_installer(&installer, &hash).is_ok());
         assert!(verify_installer(&installer, &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn current_process_is_not_treated_as_exited() {
+        assert!(!parent_has_exited(std::process::id()));
     }
 }

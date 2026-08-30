@@ -76,19 +76,6 @@ begin
     HasGStreamerAt('C:\gstreamer\1.0\msvc_x86_64');
 end;
 
-function VCRuntimeReady: Boolean;
-var
-  Installed: Cardinal;
-begin
-  Result :=
-    RegQueryDWordValue(
-      HKLM64,
-      'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
-      'Installed',
-      Installed) and
-    (Installed = 1);
-end;
-
 procedure InitializeWizard;
 begin
   DownloadPage := CreateDownloadPage(
@@ -114,26 +101,26 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  if not VCRuntimeReady then
+  { The current redistributable is idempotent and verifies the minimum runtime
+    more reliably than the shared VS 14 registry key, which old 2015 runtimes
+    also satisfy. }
+  ExtractTemporaryFile('vc_redist.x64.exe');
+  if not Exec(
+    ExpandConstant('{tmp}\vc_redist.x64.exe'),
+    '/install /quiet /norestart',
+    '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
   begin
-    ExtractTemporaryFile('vc_redist.x64.exe');
-    if not Exec(
-      ExpandConstant('{tmp}\vc_redist.x64.exe'),
-      '/install /quiet /norestart',
-      '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
-    begin
-      Result := 'Could not start the Microsoft Visual C++ runtime installer.';
-      exit;
-    end;
-
-    if not ((ResultCode = 0) or (ResultCode = 1638) or (ResultCode = 3010)) then
-    begin
-      Result := Format('The Microsoft Visual C++ runtime installer failed with code %d.', [ResultCode]);
-      exit;
-    end;
-    if ResultCode = 3010 then
-      NeedsRestart := True;
+    Result := 'Could not start the Microsoft Visual C++ runtime installer.';
+    exit;
   end;
+
+  if not ((ResultCode = 0) or (ResultCode = 1638) or (ResultCode = 3010)) then
+  begin
+    Result := Format('The Microsoft Visual C++ runtime installer failed with code %d.', [ResultCode]);
+    exit;
+  end;
+  if ResultCode = 3010 then
+    NeedsRestart := True;
 
   if GStreamerReady then
     exit;

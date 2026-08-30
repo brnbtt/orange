@@ -29,6 +29,27 @@ try {
         if ($_.Exception.Message -eq "wrong channel was accepted") { throw }
     }
 
+    $badNotes = $manifest | ConvertTo-Json | ConvertFrom-Json
+    $badNotes.notes = "bad`tcontrol"
+    try {
+        Test-BetaManifest -Manifest $badNotes -InstallerPath $installer | Out-Null
+        throw "control character was accepted"
+    } catch {
+        if ($_.Exception.Message -eq "control character was accepted") { throw }
+    }
+
+    $oversized = Join-Path $root "orange-setup-0.2.0-beta.1-oversized.exe"
+    $stream = [IO.File]::Create($oversized)
+    try { $stream.SetLength((250MB) + 1) } finally { $stream.Dispose() }
+    Copy-Item -LiteralPath $oversized -Destination $installer -Force
+    $oversizedManifest = $manifest | ConvertTo-Json | ConvertFrom-Json
+    try {
+        Test-BetaManifest -Manifest $oversizedManifest -InstallerPath $installer | Out-Null
+        throw "oversized installer was accepted"
+    } catch {
+        if ($_.Exception.Message -eq "oversized installer was accepted") { throw }
+    }
+
     $source = Get-Content -LiteralPath $publisher -Raw
     $installerUpload = $source.IndexOf('"--name", $installerName')
     $manifestUpload = $source.IndexOf('"--name", "orange-beta.json"')
