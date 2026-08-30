@@ -89,6 +89,23 @@ pub(crate) fn enabled() -> bool {
     option_env!("ORANGE_UPDATE_CHANNEL") == Some("beta")
 }
 
+pub(crate) fn cleanup_helpers() {
+    let directory = std::env::temp_dir().join("orange-updates");
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("orange-updater-")
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(directory);
+}
+
 pub(crate) fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -182,8 +199,9 @@ pub(crate) fn check_for_update(current_version: &str) -> Result<Option<UpdateInf
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    let manifest_url = option_env!("ORANGE_UPDATE_MANIFEST_URL").unwrap_or(BETA_MANIFEST_URL);
     let manifest = client
-        .get(BETA_MANIFEST_URL)
+        .get(manifest_url)
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .send()
         .context("could not check for updates")?

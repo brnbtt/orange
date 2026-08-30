@@ -96,6 +96,7 @@ struct Orange {
 
 impl Orange {
     fn new(cx: &mut Context<Self>) -> Self {
+        update::cleanup_helpers();
         // The UI reflects state owned by child processes, so poll rather than
         // trying to push updates across process boundaries.
         cx.spawn(async move |this, cx| loop {

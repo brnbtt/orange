@@ -9,14 +9,12 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{
-    OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
-};
+use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct UpdateArgs {
     installer: PathBuf,
     sha256: String,
@@ -107,19 +105,23 @@ fn installer_succeeded(code: i32) -> bool {
     matches!(code, 0 | 3010)
 }
 
-fn wait_for_parent(pid: u32) {
+fn wait_for_parent(pid: u32) -> Result<()> {
     unsafe {
         if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            WaitForSingleObject(handle, INFINITE);
+            let result = WaitForSingleObject(handle, 2 * 60 * 1000);
             let _ = CloseHandle(handle);
+            if result != WAIT_OBJECT_0 {
+                bail!("Orange did not exit before the update timeout");
+            }
         }
     }
     std::thread::sleep(Duration::from_millis(200));
+    Ok(())
 }
 
 fn apply_update(args: UpdateArgs) -> Result<()> {
     verify_installer(&args.installer, &args.sha256)?;
-    wait_for_parent(args.parent);
+    wait_for_parent(args.parent)?;
     verify_installer(&args.installer, &args.sha256)?;
 
     let status = Command::new(&args.installer)
@@ -159,9 +161,17 @@ fn write_failure(error: &anyhow::Error) {
 }
 
 fn main() {
-    let result = UpdateArgs::parse(std::env::args_os()).and_then(apply_update);
-    if let Err(error) = result {
-        write_failure(&error);
+    match UpdateArgs::parse(std::env::args_os()) {
+        Ok(args) => {
+            let retry = args.clone();
+            if let Err(error) = apply_update(args) {
+                write_failure(&error);
+                let _ = wait_for_parent(retry.parent);
+                let tray = retry.install_dir.join("orange-tray.exe");
+                let _ = Command::new(tray).current_dir(retry.install_dir).spawn();
+            }
+        }
+        Err(error) => write_failure(&error),
     }
 }
 
