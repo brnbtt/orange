@@ -130,25 +130,37 @@ fn prepare_media_jitterbuffer(jitterbuffer: &gst::Element) {
             let gst::EventView::Caps(caps) = event.view() else {
                 return gst::PadProbeReturn::Ok;
             };
-            let encoding = caps
-                .caps()
-                .structure(0)
-                .and_then(|structure| structure.get::<String>("encoding-name").ok());
-            let Some(encoding) = encoding else {
-                return gst::PadProbeReturn::Ok;
-            };
             if let Some(jitterbuffer) = jitterbuffer_weak.upgrade() {
-                configure_jitterbuffer_for_encoding(&jitterbuffer, &encoding);
+                if !configure_jitterbuffer_for_caps(&jitterbuffer, caps.caps()) {
+                    return gst::PadProbeReturn::Ok;
+                }
             }
             gst::PadProbeReturn::Remove
         });
     }
 }
 
-fn configure_jitterbuffer_for_encoding(jitterbuffer: &gst::Element, encoding: &str) {
+fn configure_jitterbuffer_for_caps(jitterbuffer: &gst::Element, caps: &gst::CapsRef) -> bool {
+    let Some(structure) = caps.structure(0) else {
+        return false;
+    };
+    let payload = structure.get::<i32>("payload").ok().or_else(|| {
+        structure
+            .get::<u32>("payload")
+            .ok()
+            .map(|value| value as i32)
+    });
+    let encoding = structure.get::<String>("encoding-name").ok();
+    let is_audio = payload == Some(111) || encoding.as_deref() == Some("OPUS");
+    let is_video = matches!(payload, Some(96 | 97))
+        || matches!(encoding.as_deref(), Some("AV1" | "H264" | "H265"));
+    if !is_audio && !is_video {
+        return false;
+    }
     // Video stays at the live edge. Opus must turn late packets into GAP events
     // so opusdec can conceal them instead of joining discontinuous waveforms.
-    jitterbuffer.set_property("drop-on-latency", encoding != "OPUS");
+    jitterbuffer.set_property("drop-on-latency", is_video);
+    true
 }
 
 /// Surface pipeline errors.
@@ -573,14 +585,24 @@ mod tests {
             .build()
             .unwrap();
         super::prepare_media_jitterbuffer(&video);
-        super::configure_jitterbuffer_for_encoding(&video, "H265");
+        assert!(super::configure_jitterbuffer_for_caps(
+            &video,
+            &gst::Caps::builder("application/x-rtp")
+                .field("payload", 96i32)
+                .build()
+        ));
         assert!(video.property::<bool>("drop-on-latency"));
 
         let audio = gst::ElementFactory::make("rtpjitterbuffer")
             .build()
             .unwrap();
         super::prepare_media_jitterbuffer(&audio);
-        super::configure_jitterbuffer_for_encoding(&audio, "OPUS");
+        assert!(super::configure_jitterbuffer_for_caps(
+            &audio,
+            &gst::Caps::builder("application/x-rtp")
+                .field("payload", 111i32)
+                .build()
+        ));
         assert_eq!(audio.property::<u32>("latency"), 100);
         assert!(audio.property::<bool>("do-lost"));
         assert!(!audio.property::<bool>("drop-on-latency"));
