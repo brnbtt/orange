@@ -4,6 +4,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$previousBuildId = $env:ORANGE_BUILD_ID
+$previousChannel = $env:ORANGE_UPDATE_CHANNEL
 $iscc = @(
     (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
     (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe")
@@ -27,7 +29,9 @@ try {
         }
     }
 
-    cargo build --locked --release -p orange -p orange-tray
+    $env:ORANGE_BUILD_ID = (git rev-parse HEAD).Trim()
+    $env:ORANGE_UPDATE_CHANNEL = "beta"
+    cargo build --locked --release -p orange -p orange-tray -p orange-updater
     if ($LASTEXITCODE -ne 0) {
         throw "Release build failed."
     }
@@ -59,5 +63,7 @@ try {
     Write-Host "Installer: $root\dist\orange-setup-$version.exe" -ForegroundColor Green
 }
 finally {
+    $env:ORANGE_BUILD_ID = $previousBuildId
+    $env:ORANGE_UPDATE_CHANNEL = $previousChannel
     Pop-Location
 }

@@ -25,25 +25,28 @@ UninstallDisplayIcon={app}\orange-tray.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-CloseApplications=yes
+DisableWelcomePage=yes
+DisableDirPage=yes
+DisableProgramGroupPage=yes
+DisableReadyPage=yes
+DisableFinishedPage=yes
+DisableStartupPrompt=yes
+AllowCancelDuringInstall=no
+SetupLogging=yes
+CloseApplications=force
 RestartApplications=no
-
-[Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
-Name: "startup"; Description: "Start orange when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
 
 [Files]
 Source: "..\..\target\release\orange.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\orange-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\target\release\orange-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\package\vc_redist.x64.exe"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\orange"; Filename: "{app}\orange-tray.exe"
-Name: "{autodesktop}\orange"; Filename: "{app}\orange-tray.exe"; Tasks: desktopicon
-Name: "{userstartup}\orange"; Filename: "{app}\orange-tray.exe"; Tasks: startup
 
 [Run]
-Filename: "{app}\orange-tray.exe"; Description: "Open orange"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\orange-tray.exe"; Description: "Open orange"; Flags: nowait skipifsilent
 
 [Code]
 var
@@ -67,6 +70,19 @@ begin
     HasGStreamerAt('C:\gstreamer\1.0\msvc_x86_64');
 end;
 
+function VCRuntimeReady: Boolean;
+var
+  Installed: Cardinal;
+begin
+  Result :=
+    RegQueryDWordValue(
+      HKLM64,
+      'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+      'Installed',
+      Installed) and
+    (Installed = 1);
+end;
+
 procedure InitializeWizard;
 begin
   DownloadPage := CreateDownloadPage(
@@ -81,23 +97,26 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  ExtractTemporaryFile('vc_redist.x64.exe');
-  if not Exec(
-    ExpandConstant('{tmp}\vc_redist.x64.exe'),
-    '/install /quiet /norestart',
-    '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
+  if not VCRuntimeReady then
   begin
-    Result := 'Could not start the Microsoft Visual C++ runtime installer.';
-    exit;
-  end;
+    ExtractTemporaryFile('vc_redist.x64.exe');
+    if not Exec(
+      ExpandConstant('{tmp}\vc_redist.x64.exe'),
+      '/install /quiet /norestart',
+      '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
+    begin
+      Result := 'Could not start the Microsoft Visual C++ runtime installer.';
+      exit;
+    end;
 
-  if not ((ResultCode = 0) or (ResultCode = 1638) or (ResultCode = 3010)) then
-  begin
-    Result := Format('The Microsoft Visual C++ runtime installer failed with code %d.', [ResultCode]);
-    exit;
+    if not ((ResultCode = 0) or (ResultCode = 1638) or (ResultCode = 3010)) then
+    begin
+      Result := Format('The Microsoft Visual C++ runtime installer failed with code %d.', [ResultCode]);
+      exit;
+    end;
+    if ResultCode = 3010 then
+      NeedsRestart := True;
   end;
-  if ResultCode = 3010 then
-    NeedsRestart := True;
 
   if GStreamerReady then
     exit;
