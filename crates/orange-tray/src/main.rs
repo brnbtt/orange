@@ -83,7 +83,7 @@ struct Orange {
     server: String,
     /// Last screen the window was sized for, so resize happens once per
     /// transition rather than every frame.
-    sized_for: Option<Screen>,
+    sized_for: Option<(Screen, bool)>,
     /// Drives the transient "Copied" confirmation on the share code.
     copied_at: Option<Instant>,
     copied_code: Option<String>,
@@ -908,13 +908,17 @@ impl Render for Orange {
         // The picker needs room for a two-column grid; every other screen is a
         // narrow column. Resizing on transition keeps both comfortable rather
         // than compromising on one size for all of them.
-        let wanted = match self.screen {
+        let update_visible = self.update_status.is_visible();
+        let mut wanted = match self.screen {
             Screen::PickWindow => size(px(576.0), px(660.0)),
             Screen::Streaming => size(px(480.0), px(640.0)),
             _ => size(px(400.0), px(540.0)),
         };
-        if self.sized_for != Some(self.screen) {
-            self.sized_for = Some(self.screen);
+        if update_visible {
+            wanted.height += px(84.0);
+        }
+        if self.sized_for != Some((self.screen, update_visible)) {
+            self.sized_for = Some((self.screen, update_visible));
             window.resize(wanted);
         }
 
