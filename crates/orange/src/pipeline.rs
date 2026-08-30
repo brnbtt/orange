@@ -27,7 +27,7 @@ impl Codec {
     pub(crate) fn encoder(&self) -> &'static str {
         match self {
             Codec::Av1 => "nvd3d11av1enc",
-            Codec::H265 => "nvd3d11h265enc",
+            Codec::H265 => "mfh265enc",
             Codec::H264 => "mfh264enc",
         }
     }
@@ -108,7 +108,7 @@ impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
             hwnd: 0,
-            codec: Codec::H264,
+            codec: Codec::H265,
             bitrate: 30_000,
             fps: 60,
             scale: None,
@@ -136,7 +136,7 @@ pub fn build_audio_chain(pid: u32) -> String {
     };
     format!(
         "wasapi2src loopback=true {scope}\
-         loopback-silence-on-device-mute=true low-latency=true \
+         loopback-silence-on-device-mute=true buffer-time=100000 latency-time=20000 \
          ! queue max-size-buffers=10 leaky=downstream \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
@@ -251,12 +251,12 @@ fn set_from_str_if_supported(element: &gst::Element, property: &str, value: &str
 pub fn configure_encoder(element: &gst::Element, codec: Codec, fps: u32) {
     set_encoder_gop(element, gop_size(fps) as u32);
     match codec {
-        Codec::H264 => {
+        Codec::H264 | Codec::H265 => {
             set_if_supported(element, "low-latency", true);
             set_from_str_if_supported(element, "rc-mode", "cbr");
             set_if_supported(element, "quality-vs-speed", 50u32);
         }
-        Codec::Av1 | Codec::H265 => {
+        Codec::Av1 => {
             set_from_str_if_supported(element, "preset", "p5");
             set_from_str_if_supported(element, "tune", "low-latency");
             set_from_str_if_supported(element, "rc-mode", "cbr");
@@ -336,13 +336,13 @@ mod tests {
     }
 
     #[test]
-    fn default_streaming_codec_uses_cross_vendor_media_foundation() {
+    fn default_streaming_codec_uses_cross_vendor_h265() {
         let settings = CaptureSettings::default();
         let chain = build_capture_chain(&settings);
 
-        assert_eq!(settings.codec, Codec::H264);
-        assert!(chain.contains("mfh264enc"));
-        assert!(chain.contains("h264parse"));
+        assert_eq!(settings.codec, Codec::H265);
+        assert!(chain.contains("mfh265enc"));
+        assert!(chain.contains("h265parse"));
         assert!(!chain.contains("low-latency="));
         assert!(!chain.contains("quality-vs-speed="));
     }
@@ -353,5 +353,6 @@ mod tests {
 
         assert!(chain.contains("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"));
         assert!(!chain.contains("inband-fec=true"));
+        assert!(chain.contains("buffer-time=100000 latency-time=20000"));
     }
 }

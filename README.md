@@ -148,7 +148,7 @@ cargo build
 ## Install
 
 The beta uses a one-click per-user installer. Open
-`orange-setup-0.2.0-beta.3.exe`; it installs prerequisites when needed,
+`orange-setup-0.2.0-beta.4.exe`; it installs prerequisites when needed,
 installs Orange under `%LOCALAPPDATA%\Programs\orange`, creates a Start menu
 shortcut, and opens the app. There are no destination, shortcut, or completion
 pages to step through.
@@ -176,10 +176,9 @@ runtime is missing, setup downloads the pinned official x64 runtime from the
 GStreamer project and verifies its SHA-256 hash before installing it. Rust,
 Visual Studio, and the source tree are not needed on the receiving machine.
 
-The current build targets 64-bit Windows 10/11. Beta streaming defaults to
-H.264 through Windows Media Foundation so AMD, Intel, and NVIDIA hosts can use
-their hardware encoder. AV1 remains an opt-in CLI mode for RTX 40/50 hosts and
-compatible hardware decoders.
+The current build targets 64-bit Windows 10/11. Beta streaming uses H.265
+through Windows Media Foundation so recent AMD, Intel, and NVIDIA hosts share
+one efficient hardware path with substantially better quality than H.264.
 
 ### Alpha testing
 

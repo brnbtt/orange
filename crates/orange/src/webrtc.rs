@@ -452,7 +452,8 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
         || {
             gst::ElementFactory::make("wasapi2sink")
                 .property("async", false)
-                .property("low-latency", true)
+                .property("buffer-time", 100_000i64)
+                .property("latency-time", 20_000i64)
                 .build()
         },
     );
@@ -465,7 +466,8 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
         Err(_) => build_receive_element(diagnostic_role, "audio-sink", "wasapisink", || {
             gst::ElementFactory::make("wasapisink")
                 .property("async", false)
-                .property("low-latency", true)
+                .property("buffer-time", 100_000i64)
+                .property("latency-time", 20_000i64)
                 .build()
                 .context("audio sink is unavailable")
         }),
@@ -742,6 +744,14 @@ mod tests {
     }
 
     #[test]
+    fn h265_file_output_uses_cross_vendor_media_foundation() {
+        assert_eq!(
+            file_output_factories(Codec::H265),
+            ("mfh265enc", "h265parse")
+        );
+    }
+
+    #[test]
     fn opus_decoder_conceals_loss_without_fec_lookahead() {
         gst::init().unwrap();
         let decoder = build_audio_decoder("test").unwrap();
@@ -814,5 +824,7 @@ mod tests {
         assert!(!video.element.property::<bool>("async"));
         assert!(!video.element.property::<bool>("sync"));
         assert!(!audio.element.property::<bool>("async"));
+        assert_eq!(audio.element.property::<i64>("buffer-time"), 100_000);
+        assert_eq!(audio.element.property::<i64>("latency-time"), 20_000);
     }
 }

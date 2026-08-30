@@ -138,7 +138,7 @@ struct QualityArgs {
     /// Disable audio capture.
     #[arg(long)]
     no_audio: bool,
-    #[arg(long, default_value = "h264")]
+    #[arg(long, default_value = "h265")]
     codec: String,
     /// Kilobits per second.
     #[arg(long, default_value_t = 25_000)]

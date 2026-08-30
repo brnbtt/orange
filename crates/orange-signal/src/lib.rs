@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+const SIGNAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Messages exchanged between peers and the relay.
 ///
 /// Anything carrying a `peer` field is routed: a host may be talking to several
@@ -365,6 +367,9 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
     let (shutdown_done_tx, shutdown_done_rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
+        let mut heartbeat = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
         loop {
             tokio::select! {
                 signal = out_rx.recv() => {
@@ -379,6 +384,15 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
                         .send(tokio_tungstenite::tungstenite::Message::Close(None))
                         .await;
                     break;
+                }
+                _ = heartbeat.tick() => {
+                    if sink
+                        .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
         }
