@@ -117,26 +117,60 @@ pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool)
 fn prepare_media_jitterbuffer(jitterbuffer: &gst::Element) {
     jitterbuffer.set_property("latency", 100u32);
     jitterbuffer.set_property("do-lost", true);
-    // Bundled audio and video can share one RTP session index, so classify from
-    // negotiated RTP caps instead. Defaulting to no silent drops is safe until
-    // the caps event identifies video.
+    // Bundled audio and video can share one RTP session index. Default to no
+    // silent drops until the first RTP packet identifies its payload type.
     jitterbuffer.set_property("drop-on-latency", false);
     let jitterbuffer_weak = jitterbuffer.downgrade();
     if let Some(sink) = jitterbuffer.static_pad("sink") {
-        sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
-            let Some(gst::PadProbeData::Event(event)) = &info.data else {
-                return gst::PadProbeReturn::Ok;
-            };
-            let gst::EventView::Caps(caps) = event.view() else {
-                return gst::PadProbeReturn::Ok;
-            };
-            if let Some(jitterbuffer) = jitterbuffer_weak.upgrade() {
-                if !configure_jitterbuffer_for_caps(&jitterbuffer, caps.caps()) {
-                    return gst::PadProbeReturn::Ok;
+        sink.add_probe(
+            gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::BUFFER,
+            move |_, info| {
+                let classified = match &info.data {
+                    Some(gst::PadProbeData::Buffer(buffer)) => buffer
+                        .map_readable()
+                        .ok()
+                        .and_then(|map| rtp_payload_type(map.as_slice()))
+                        .and_then(|payload| {
+                            jitterbuffer_weak.upgrade().map(|jitterbuffer| {
+                                configure_jitterbuffer_for_payload(&jitterbuffer, payload)
+                            })
+                        })
+                        .unwrap_or(false),
+                    Some(gst::PadProbeData::Event(event)) => {
+                        let gst::EventView::Caps(caps) = event.view() else {
+                            return gst::PadProbeReturn::Ok;
+                        };
+                        jitterbuffer_weak.upgrade().is_some_and(|jitterbuffer| {
+                            configure_jitterbuffer_for_caps(&jitterbuffer, caps.caps())
+                        })
+                    }
+                    _ => false,
+                };
+                if classified {
+                    gst::PadProbeReturn::Remove
+                } else {
+                    gst::PadProbeReturn::Ok
                 }
-            }
-            gst::PadProbeReturn::Remove
-        });
+            },
+        );
+    }
+}
+
+fn rtp_payload_type(packet: &[u8]) -> Option<u8> {
+    (packet.len() >= 2 && packet[0] >> 6 == 2).then(|| packet[1] & 0x7f)
+}
+
+fn configure_jitterbuffer_for_payload(jitterbuffer: &gst::Element, payload: u8) -> bool {
+    match payload {
+        111 => {
+            jitterbuffer.set_property("drop-on-latency", false);
+            true
+        }
+        96 | 97 => {
+            jitterbuffer.set_property("drop-on-latency", true);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -144,16 +178,24 @@ fn configure_jitterbuffer_for_caps(jitterbuffer: &gst::Element, caps: &gst::Caps
     let Some(structure) = caps.structure(0) else {
         return false;
     };
-    let payload = structure.get::<i32>("payload").ok().or_else(|| {
-        structure
-            .get::<u32>("payload")
-            .ok()
-            .map(|value| value as i32)
-    });
+    let payload = structure
+        .get::<i32>("payload")
+        .ok()
+        .or_else(|| {
+            structure
+                .get::<u32>("payload")
+                .ok()
+                .map(|value| value as i32)
+        })
+        .and_then(|value| u8::try_from(value).ok());
     let encoding = structure.get::<String>("encoding-name").ok();
-    let is_audio = payload == Some(111) || encoding.as_deref() == Some("OPUS");
-    let is_video = matches!(payload, Some(96 | 97))
-        || matches!(encoding.as_deref(), Some("AV1" | "H264" | "H265"));
+    if let Some(payload) = payload {
+        if configure_jitterbuffer_for_payload(jitterbuffer, payload) {
+            return true;
+        }
+    }
+    let is_audio = encoding.as_deref() == Some("OPUS");
+    let is_video = matches!(encoding.as_deref(), Some("AV1" | "H264" | "H265"));
     if !is_audio && !is_video {
         return false;
     }
@@ -606,6 +648,9 @@ mod tests {
         assert_eq!(audio.property::<u32>("latency"), 100);
         assert!(audio.property::<bool>("do-lost"));
         assert!(!audio.property::<bool>("drop-on-latency"));
+        assert_eq!(super::rtp_payload_type(&[0x80, 0xe0]), Some(96));
+        assert_eq!(super::rtp_payload_type(&[0x80, 0xef]), Some(111));
+        assert_eq!(super::rtp_payload_type(&[0x00, 0x60]), None);
     }
 }
 
