@@ -240,11 +240,14 @@ impl Orange {
     }
 
     fn poll_updates(&mut self, cx: &mut Context<Self>) {
-        let event = self.update_rx.as_ref().and_then(|receiver| match receiver.try_recv() {
-            Ok(event) => Some(Ok(event)),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(())),
-            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-        });
+        let event = self
+            .update_rx
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(event) => Some(Ok(event)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(())),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            });
         match event {
             Some(Ok(update::UpdateEvent::Checked(Ok(Some(info))))) => {
                 self.update_status = update::UpdateStatus::Available(info);
@@ -273,21 +276,19 @@ impl Orange {
             Some(Ok(update::UpdateEvent::Downloaded { info, result })) => {
                 self.update_rx = None;
                 match result {
-                    Ok(installer) => {
-                        match update::launch_updater(&info, &installer) {
-                            Ok(()) => {
-                                self.stop_host();
-                                self.stop_all_watches();
-                                cx.quit();
-                            }
-                            Err(_) => {
-                                self.update_status = update::UpdateStatus::Failed {
-                                    info: Some(info),
-                                    message: "Could not start the updater".into(),
-                                };
-                            }
+                    Ok(installer) => match update::launch_updater(&info, &installer) {
+                        Ok(()) => {
+                            self.stop_host();
+                            self.stop_all_watches();
+                            cx.quit();
                         }
-                    }
+                        Err(_) => {
+                            self.update_status = update::UpdateStatus::Failed {
+                                info: Some(info),
+                                message: "Could not start the updater".into(),
+                            };
+                        }
+                    },
                     Err(_) => {
                         self.update_status = update::UpdateStatus::Failed {
                             info: Some(info),
@@ -1040,11 +1041,10 @@ impl Orange {
                         .child(label(detail, MUTED).text_xs()),
                 )
                 .children(action.map(|text| {
-                    update_action("apply-update", text)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.request_update();
-                            cx.notify();
-                        }))
+                    update_action("apply-update", text).on_click(cx.listener(|this, _, _, cx| {
+                        this.request_update();
+                        cx.notify();
+                    }))
                 }))
                 .into_any_element(),
         )
