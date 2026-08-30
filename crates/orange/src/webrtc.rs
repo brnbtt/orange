@@ -470,6 +470,15 @@ fn file_output_factories(codec: Codec) -> (&'static str, &'static str) {
     (codec.encoder(), codec.parser())
 }
 
+fn build_audio_decoder(diagnostic_role: &str) -> Result<ReceiveElement> {
+    build_receive_element(diagnostic_role, "audio-decoder", "opusdec", || {
+        Ok(gst::ElementFactory::make("opusdec")
+            .property("plc", true)
+            .property("use-inband-fec", true)
+            .build()?)
+    })
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
@@ -628,9 +637,7 @@ pub fn build_audio_branch(
         build_receive_element(diagnostic_role, "audio-depayloader", "rtpopusdepay", || {
             Ok(gst::ElementFactory::make("rtpopusdepay").build()?)
         })?;
-    let dec = build_receive_element(diagnostic_role, "audio-decoder", "opusdec", || {
-        Ok(gst::ElementFactory::make("opusdec").build()?)
-    })?;
+    let dec = build_audio_decoder(diagnostic_role)?;
     let convert =
         build_receive_element(diagnostic_role, "audio-converter", "audioconvert", || {
             Ok(gst::ElementFactory::make("audioconvert").build()?)
@@ -725,8 +732,17 @@ mod tests {
     fn h264_file_output_does_not_require_av1_encoding() {
         assert_eq!(
             file_output_factories(Codec::H264),
-            ("nvd3d11h264enc", "h264parse")
+            ("mfh264enc", "h264parse")
         );
+    }
+
+    #[test]
+    fn opus_decoder_conceals_loss_and_uses_inband_fec() {
+        gst::init().unwrap();
+        let decoder = build_audio_decoder("test").unwrap();
+
+        assert!(decoder.element.property::<bool>("plc"));
+        assert!(decoder.element.property::<bool>("use-inband-fec"));
     }
 
     #[test]

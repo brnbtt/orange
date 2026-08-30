@@ -1412,7 +1412,7 @@ impl Orange {
                                     target.title.clone()
                                 };
                                 let meta = if is_screen {
-                                    "Full display · includes notifications".to_string()
+                                    "Full display · includes all system audio".to_string()
                                 } else {
                                     format!(
                                         "{} · {}×{}",
@@ -1479,9 +1479,12 @@ impl Orange {
                                                 (None, true) => label("capturing…", FAINT)
                                                     .text_xs()
                                                     .into_any_element(),
-                                                (None, false) => label("no preview", FAINT)
-                                                    .text_xs()
-                                                    .into_any_element(),
+                                                (None, false) => label(
+                                                    "preview unavailable · click to share",
+                                                    FAINT,
+                                                )
+                                                .text_xs()
+                                                .into_any_element(),
                                             }),
                                     )
                                     .child(

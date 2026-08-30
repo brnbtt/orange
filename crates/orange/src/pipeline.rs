@@ -28,7 +28,7 @@ impl Codec {
         match self {
             Codec::Av1 => "nvd3d11av1enc",
             Codec::H265 => "nvd3d11h265enc",
-            Codec::H264 => "nvd3d11h264enc",
+            Codec::H264 => "mfh264enc",
         }
     }
 
@@ -140,7 +140,7 @@ pub fn build_audio_chain(pid: u32) -> String {
          ! queue max-size-buffers=10 leaky=downstream \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
-         ! opusenc bitrate=128000 frame-size=10 \
+         ! opusenc bitrate=128000 frame-size=10 inband-fec=true packet-loss-percentage=10 \
          ! rtpopuspay"
     )
 }
@@ -181,7 +181,7 @@ pub fn check_elements(codec: Codec) -> Result<()> {
 
     if !missing.is_empty() {
         bail!(
-            "missing GStreamer elements: {}. Is the NVIDIA plugin (nvcodec) available?",
+            "missing GStreamer elements: {}. Is the graphics driver and matching hardware encoder available?",
             missing
                 .iter()
                 .map(|s| s.to_string())
@@ -218,6 +218,16 @@ pub fn build_capture_chain(settings: &CaptureSettings) -> String {
             settings.hwnd
         )
     };
+    let encoder_options = match settings.codec {
+        Codec::H264 => format!(
+            "bitrate={} gop-size={gop_size} low-latency=true rc-mode=cbr quality-vs-speed=80",
+            settings.bitrate
+        ),
+        Codec::Av1 | Codec::H265 => format!(
+            "bitrate={} gop-size={gop_size} preset=p5 tune=low-latency rc-mode=cbr spatial-aq=true",
+            settings.bitrate
+        ),
+    };
 
     format!(
         "{source} \
@@ -225,13 +235,10 @@ pub fn build_capture_chain(settings: &CaptureSettings) -> String {
          ! queue max-size-buffers=3 leaky=downstream \
          ! d3d11convert \
          {scale_caps}\
-         ! {encoder} name=stream-encoder bitrate={bitrate} gop-size={gop_size} \
-           preset=p5 tune=low-latency rc-mode=cbr spatial-aq=true \
+         ! {encoder} name=stream-encoder {encoder_options} \
          ! {parser}",
         fps = settings.fps,
         encoder = settings.codec.encoder(),
-        bitrate = settings.bitrate,
-        gop_size = gop_size,
         parser = settings.codec.parser(),
     )
 }
@@ -290,7 +297,10 @@ mod tests {
 
     #[test]
     fn streaming_encoder_uses_consistent_low_latency_quality_settings() {
-        let chain = build_capture_chain(&CaptureSettings::default());
+        let chain = build_capture_chain(&CaptureSettings {
+            codec: Codec::Av1,
+            ..CaptureSettings::default()
+        });
 
         assert!(chain.contains("preset=p5"));
         assert!(chain.contains("tune=low-latency"));
@@ -299,13 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn default_streaming_codec_works_on_pre_av1_nvenc() {
+    fn default_streaming_codec_uses_cross_vendor_media_foundation() {
         let settings = CaptureSettings::default();
         let chain = build_capture_chain(&settings);
 
         assert_eq!(settings.codec, Codec::H264);
-        assert!(chain.contains("nvd3d11h264enc"));
+        assert!(chain.contains("mfh264enc"));
         assert!(chain.contains("h264parse"));
+        assert!(chain.contains("low-latency=true rc-mode=cbr quality-vs-speed=80"));
+        assert!(!chain.contains("preset=p5"));
     }
 
     #[test]
@@ -313,5 +325,6 @@ mod tests {
         let chain = build_audio_chain(42);
 
         assert!(chain.contains("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"));
+        assert!(chain.contains("inband-fec=true packet-loss-percentage=10"));
     }
 }
