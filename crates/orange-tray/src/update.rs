@@ -184,6 +184,7 @@ pub(crate) fn check_for_update(current_version: &str) -> Result<Option<UpdateInf
         .build()?;
     let manifest = client
         .get(BETA_MANIFEST_URL)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .send()
         .context("could not check for updates")?
         .error_for_status()
@@ -217,7 +218,7 @@ pub(crate) fn download_update(info: &UpdateInfo) -> Result<PathBuf> {
             .timeout(Duration::from_secs(10 * 60))
             .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        let response = client
+        let mut response = client
             .get(info.installer_url.clone())
             .send()
             .context("could not download update")?
@@ -233,12 +234,9 @@ pub(crate) fn download_update(info: &UpdateInfo) -> Result<PathBuf> {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        let copied = std::io::copy(&mut response.take(MAX_INSTALLER_BYTES + 1), &mut file)?;
+        copy_bounded(&mut response, &mut file, MAX_INSTALLER_BYTES)?;
         file.flush()?;
         file.sync_all()?;
-        if copied > MAX_INSTALLER_BYTES {
-            bail!("update is larger than 250 MiB");
-        }
         if !installer_matches(&temporary, &info.sha256)? {
             bail!("update checksum mismatch");
         }
@@ -250,6 +248,14 @@ pub(crate) fn download_update(info: &UpdateInfo) -> Result<PathBuf> {
     }
     result?;
     Ok(destination)
+}
+
+fn copy_bounded(reader: &mut impl Read, writer: &mut impl Write, limit: u64) -> Result<u64> {
+    let copied = std::io::copy(&mut reader.take(limit + 1), writer)?;
+    if copied > limit {
+        bail!("update is larger than 250 MiB");
+    }
+    Ok(copied)
 }
 
 pub(crate) fn start_check() -> Option<Receiver<UpdateEvent>> {
@@ -391,6 +397,17 @@ mod tests {
         let hash = sha256_file(&path).unwrap();
         assert!(installer_matches(&path, &hash).unwrap());
         assert!(!installer_matches(&path, &"0".repeat(64)).unwrap());
+    }
+
+    #[test]
+    fn bounded_copy_accepts_the_limit_and_rejects_one_more_byte() {
+        let mut exact = &b"1234"[..];
+        let mut exact_output = Vec::new();
+        assert_eq!(copy_bounded(&mut exact, &mut exact_output, 4).unwrap(), 4);
+        assert_eq!(exact_output, b"1234");
+
+        let mut oversized = &b"12345"[..];
+        assert!(copy_bounded(&mut oversized, &mut Vec::new(), 4).is_err());
     }
 
     #[test]
