@@ -12,6 +12,9 @@
 //! The price is that we do signalling ourselves. This module proves the media
 //! path with both peers in one process, exchanging SDP by direct call.
 
+mod transport;
+pub(crate) use transport::{audio_rtp_caps, video_rtp_caps as rtp_caps};
+
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use gstreamer as gst;
@@ -27,21 +30,6 @@ use crate::pipeline::{
     build_capture_chain, check_elements, configure_encoder, CaptureSettings, Codec,
 };
 
-/// RTP caps for our encoded video. AV1 has no static payload type, so we pick
-/// one from the dynamic range and both ends agree on it.
-pub fn rtp_caps(codec: Codec, frame_rate: u32) -> gst::Caps {
-    let builder = gst::Caps::builder("application/x-rtp")
-        .field("media", "video")
-        .field("encoding-name", codec.rtp_encoding())
-        .field("payload", 96i32)
-        .field("clock-rate", 90_000i32)
-        .field("a-framerate", frame_rate.to_string());
-    match codec {
-        Codec::H264 => builder.field("packetization-mode", "1").build(),
-        Codec::Av1 | Codec::H265 => builder.build(),
-    }
-}
-
 pub fn build_video_payloader(codec: Codec) -> Result<gst::Element> {
     let factory = codec.payloader();
     match codec {
@@ -55,17 +43,6 @@ pub fn build_video_payloader(codec: Codec) -> Result<gst::Element> {
             .build(),
     }
     .with_context(|| format!("{factory} missing"))
-}
-
-/// RTP caps for Opus audio, on a separate payload type from the video.
-pub fn audio_rtp_caps() -> gst::Caps {
-    gst::Caps::builder("application/x-rtp")
-        .field("media", "audio")
-        .field("encoding-name", "OPUS")
-        .field("payload", 111i32)
-        .field("clock-rate", 48_000i32)
-        .field("encoding-params", "2")
-        .build()
 }
 
 struct Peers {
@@ -769,8 +746,8 @@ mod tests {
             .get::<i32>("payload")
             .unwrap();
 
-        assert_eq!(payload, 111);
-        assert_ne!(payload, 97);
+        assert_eq!(payload, transport::AUDIO_PAYLOAD);
+        assert_ne!(payload, transport::VIDEO_RTX_PAYLOAD);
     }
 
     #[test]
