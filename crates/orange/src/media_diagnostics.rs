@@ -16,6 +16,12 @@ static DIAGNOSTIC_SINK: OnceLock<Option<SyncSender<DiagnosticCommand>>> = OnceLo
 static DIAGNOSTIC_CONTEXT: OnceLock<DiagnosticContext> = OnceLock::new();
 const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_DIAGNOSTIC_SINK: std::cell::RefCell<Option<Vec<serde_json::Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Default)]
 struct DiagnosticMetadata {
     build: Option<String>,
@@ -493,10 +499,45 @@ pub(crate) fn diagnostics_enabled() -> bool {
 }
 
 pub(crate) fn emit_diagnostic(event: &str, role: &str, payload: impl Serialize) {
+    #[cfg(test)]
+    if emit_to_test_sink(event, role, &payload) {
+        return;
+    }
     let Some(sink) = diagnostic_sink() else {
         return;
     };
     emit_diagnostic_to(sink, event, role, payload);
+}
+
+#[cfg(test)]
+fn emit_to_test_sink(event: &str, role: &str, payload: &impl Serialize) -> bool {
+    TEST_DIAGNOSTIC_SINK.with(|sink| {
+        let mut sink = sink.borrow_mut();
+        let Some(records) = sink.as_mut() else {
+            return false;
+        };
+        records.push(serde_json::json!({
+            "event": event,
+            "role": role,
+            "payload": payload,
+        }));
+        true
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn capture_diagnostics(action: impl FnOnce()) -> Vec<serde_json::Value> {
+    TEST_DIAGNOSTIC_SINK.with(|sink| {
+        let mut sink = sink.borrow_mut();
+        assert!(sink.is_none(), "diagnostic capture is already active");
+        *sink = Some(Vec::new());
+    });
+    action();
+    TEST_DIAGNOSTIC_SINK.with(|sink| {
+        sink.borrow_mut()
+            .take()
+            .expect("diagnostic capture was active")
+    })
 }
 
 fn emit_diagnostic_to(

@@ -326,21 +326,32 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
     Ok(gst_webrtc::WebRTCSessionDescription::new(sdp_type, msg))
 }
 
-fn emit_signal_diagnostic(signal: &Signal, emit: impl FnOnce(&str, &str, serde_json::Value)) {
-    let (role, diagnostic_session) = match signal {
-        Signal::Hosting {
-            diagnostic_session: Some(diagnostic_session),
-            ..
-        } => ("host", diagnostic_session),
-        Signal::StreamInfo {
-            diagnostic_session: Some(diagnostic_session),
-            ..
-        } => ("watch", diagnostic_session),
-        _ => return,
+fn handle_host_diagnostic_signal(signal: &Signal) {
+    let Signal::Hosting {
+        diagnostic_session: Some(diagnostic_session),
+        ..
+    } = signal
+    else {
+        return;
     };
-    emit(
+    emit_diagnostic(
         "diagnostic-session",
-        role,
+        "host",
+        serde_json::json!({ "id": diagnostic_session }),
+    );
+}
+
+fn handle_watch_diagnostic_signal(signal: &Signal) {
+    let Signal::StreamInfo {
+        diagnostic_session: Some(diagnostic_session),
+        ..
+    } = signal
+    else {
+        return;
+    };
+    emit_diagnostic(
+        "diagnostic-session",
+        "watch",
         serde_json::json!({ "id": diagnostic_session }),
     );
 }
@@ -351,46 +362,54 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn hosting_receipt_emits_exact_diagnostic_session_event() {
-        let mut captured = None;
-        let signal = Signal::Hosting {
+    fn host_receipt_accepts_only_hosting_diagnostic_session() {
+        let hosting = Signal::Hosting {
             code: "ROOM-CODE".to_string(),
-            diagnostic_session: Some("opaque-session".to_string()),
+            diagnostic_session: Some("host-session".to_string()),
+        };
+        let untrusted_stream_info = Signal::StreamInfo {
+            host_name: Some("Viewer Supplied".to_string()),
+            diagnostic_session: Some("viewer-controlled".to_string()),
         };
 
-        super::emit_signal_diagnostic(&signal, |event, role, payload| {
-            captured = Some((event.to_string(), role.to_string(), payload));
+        let captured = crate::media_diagnostics::capture_diagnostics(|| {
+            super::handle_host_diagnostic_signal(&hosting);
+            super::handle_host_diagnostic_signal(&untrusted_stream_info);
         });
 
         assert_eq!(
             captured,
-            Some((
-                "diagnostic-session".to_string(),
-                "host".to_string(),
-                serde_json::json!({ "id": "opaque-session" }),
-            ))
+            [serde_json::json!({
+                "event": "diagnostic-session",
+                "role": "host",
+                "payload": { "id": "host-session" },
+            })]
         );
     }
 
     #[test]
-    fn stream_info_receipt_emits_exact_diagnostic_session_event() {
-        let mut captured = None;
-        let signal = Signal::StreamInfo {
+    fn watch_receipt_accepts_only_stream_info_diagnostic_session() {
+        let stream_info = Signal::StreamInfo {
             host_name: Some("Host Name".to_string()),
-            diagnostic_session: Some("opaque-session".to_string()),
+            diagnostic_session: Some("watch-session".to_string()),
+        };
+        let unexpected_hosting = Signal::Hosting {
+            code: "ROOM-CODE".to_string(),
+            diagnostic_session: Some("unexpected-host-session".to_string()),
         };
 
-        super::emit_signal_diagnostic(&signal, |event, role, payload| {
-            captured = Some((event.to_string(), role.to_string(), payload));
+        let captured = crate::media_diagnostics::capture_diagnostics(|| {
+            super::handle_watch_diagnostic_signal(&stream_info);
+            super::handle_watch_diagnostic_signal(&unexpected_hosting);
         });
 
         assert_eq!(
             captured,
-            Some((
-                "diagnostic-session".to_string(),
-                "watch".to_string(),
-                serde_json::json!({ "id": "opaque-session" }),
-            ))
+            [serde_json::json!({
+                "event": "diagnostic-session",
+                "role": "watch",
+                "payload": { "id": "watch-session" },
+            })]
         );
     }
 
@@ -645,7 +664,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 signal = client.incoming.recv() => signal,
             };
             let Some(signal) = signal else { break };
-            emit_signal_diagnostic(&signal, emit_diagnostic);
+            handle_host_diagnostic_signal(&signal);
             match signal {
                 Signal::Hosting { code, .. } => {
                     println!("\n  Share this code:  {code}\n");
@@ -1281,7 +1300,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                 }
             };
             let Some(signal) = signal else { break };
-            emit_signal_diagnostic(&signal, emit_diagnostic);
+            handle_watch_diagnostic_signal(&signal);
             match signal {
                 Signal::Sdp { kind, sdp, .. } if kind == "offer" => {
                     let desc = parse_sdp(&kind, &sdp)?;
