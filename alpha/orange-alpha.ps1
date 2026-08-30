@@ -26,6 +26,47 @@ function Initialize-AlphaRoot {
     }
 }
 
+function Get-AlphaMutexName {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd("\").ToUpperInvariant()
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes("$user`n$normalizedRoot")
+        $hash = [BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace("-", "")
+    } finally {
+        $sha256.Dispose()
+    }
+    return "Local\OrangeAlpha-$hash"
+}
+
+function Invoke-WithAlphaMutex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [int]$TimeoutMilliseconds = 10000
+    )
+
+    if ($TimeoutMilliseconds -lt 0) { throw "Mutex timeout must not be negative" }
+    $mutex = New-Object System.Threading.Mutex($false, (Get-AlphaMutexName -Root $Root))
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne($TimeoutMilliseconds)
+        } catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            throw [TimeoutException]::new("Timed out waiting for the Orange Alpha state lock")
+        }
+        return & $Action
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
 function ConvertTo-AlphaManifest {
     param(
         [Parameter(Mandatory = $true)][string]$Json,
@@ -44,7 +85,7 @@ function ConvertTo-AlphaManifest {
 
     $expected = @("schema", "build", "asset_url", "sha256", "profile", "environment")
     $actual = @($manifest.PSObject.Properties | ForEach-Object { $_.Name })
-    if ($actual.Count -ne $expected.Count -or @($expected | Where-Object { $actual -notcontains $_ }).Count -ne 0) {
+    if ($actual.Count -ne $expected.Count -or @($expected | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
         throw "Invalid manifest schema: expected exactly schema, build, asset_url, sha256, profile, and environment"
     }
     if ($manifest.schema -isnot [int] -or $manifest.schema -ne 1) {
@@ -127,9 +168,14 @@ function Write-AlphaJsonAtomically {
     )
 
     $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    $backup = "$Path.bak"
     try {
         $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Path, $backup, $true)
+        } else {
+            [IO.File]::Move($temporary, $Path)
+        }
     } finally {
         Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
     }
@@ -139,14 +185,18 @@ function Get-ActiveAlphaManifest {
     param([Parameter(Mandatory = $true)][string]$Root)
 
     $path = Join-Path $Root "active.json"
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    try {
-        $active = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-        if ($active.build -isnot [string] -or $active.build -cnotmatch "^[0-9a-f]{40}$") { return $null }
-        return $active
-    } catch {
-        return $null
+    foreach ($candidate in @($path, "$path.bak")) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $active = Get-Content -LiteralPath $candidate -Raw | ConvertFrom-Json
+            if ($active.build -is [string] -and $active.build -cmatch "^[0-9a-f]{40}$") {
+                return $active
+            }
+        } catch {
+            # A replacement backup remains available if the current file is unreadable.
+        }
     }
+    return $null
 }
 
 function Test-AlphaVersionComplete {
@@ -155,7 +205,38 @@ function Test-AlphaVersionComplete {
         (Test-Path -LiteralPath (Join-Path $Path "orange-tray.exe") -PathType Leaf))
 }
 
-function Install-AlphaVersion {
+function Test-AlphaArchiveEntries {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $rootPath = [IO.Path]::GetFullPath($Destination).TrimEnd("\")
+    $rootPrefix = $rootPath + [IO.Path]::DirectorySeparatorChar
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            $name = $entry.FullName
+            if ([string]::IsNullOrWhiteSpace($name)) { throw "Archive contains an unsafe ZIP entry" }
+            if ($name.StartsWith("/") -or $name.StartsWith("\") -or $name -match "^[A-Za-z]:" -or [IO.Path]::IsPathRooted($name)) {
+                throw "Archive contains an unsafe ZIP entry '$name'"
+            }
+            try {
+                $entryPath = [IO.Path]::GetFullPath((Join-Path $rootPath $name.Replace("/", "\")))
+            } catch {
+                throw "Archive contains an unsafe ZIP entry '$name'"
+            }
+            if ($entryPath -ne $rootPath -and -not $entryPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Archive contains an unsafe ZIP entry '$name'"
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+function Install-AlphaVersionUnlocked {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)]$Manifest,
@@ -191,6 +272,7 @@ function Install-AlphaVersion {
                 throw "Asset checksum mismatch"
             }
 
+            Test-AlphaArchiveEntries -ArchivePath $download -Destination $extraction
             New-Item -ItemType Directory -Path $extraction | Out-Null
             Expand-Archive -LiteralPath $download -DestinationPath $extraction
             if (-not (Test-AlphaVersionComplete -Path $extraction)) {
@@ -230,6 +312,19 @@ function Install-AlphaVersion {
         }
     }
     return $destination
+}
+
+function Install-AlphaVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)]$Manifest,
+        [switch]$AllowLocalAssets,
+        [int]$LockTimeoutMilliseconds = 10000
+    )
+
+    return Invoke-WithAlphaMutex -Root $Root -TimeoutMilliseconds $LockTimeoutMilliseconds -Action {
+        Install-AlphaVersionUnlocked -Root $Root -Manifest $Manifest -AllowLocalAssets:$AllowLocalAssets
+    }
 }
 
 function New-CanonicalAlphaUuid {
@@ -333,23 +428,66 @@ function Restore-AlphaLaunchEnvironment {
     }
 }
 
-function Complete-AlphaRun {
+function Read-AlphaRunMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$RunDirectory
+    )
+
+    $diagnosticsRoot = [IO.Path]::GetFullPath((Join-Path $Root "diagnostics")).TrimEnd("\")
+    $directoryPath = [IO.Path]::GetFullPath($RunDirectory).TrimEnd("\")
+    $parent = [IO.Directory]::GetParent($directoryPath)
+    if ($null -eq $parent -or -not $parent.FullName.Equals($diagnosticsRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Invalid run metadata: run directory is outside diagnostics"
+    }
+    $directoryName = [IO.Path]::GetFileName($directoryPath)
+    if ($directoryName -cnotmatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") {
+        throw "Invalid run metadata: run directory name is not a canonical UUID"
+    }
+
+    $runJson = Join-Path $directoryPath "run.json"
+    if (-not (Test-Path -LiteralPath $runJson -PathType Leaf)) {
+        throw "Invalid run metadata: run.json is missing"
+    }
+    try {
+        $metadata = Get-Content -LiteralPath $runJson -Raw | ConvertFrom-Json
+    } catch {
+        throw "Invalid run metadata: run.json is unreadable"
+    }
+    $expected = @("schema", "build", "run", "device", "profile", "started_at")
+    $actual = @($metadata.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($actual.Count -ne $expected.Count -or @($expected | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
+        throw "Invalid run metadata: expected the complete schema"
+    }
+    if ($metadata.schema -isnot [int] -or $metadata.schema -ne 1) { throw "Invalid run metadata: schema" }
+    if ($metadata.build -isnot [string] -or $metadata.build -cnotmatch "^[0-9a-f]{40}$") { throw "Invalid run metadata: build" }
+    if ($metadata.run -isnot [string] -or $metadata.run -cnotmatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" -or $metadata.run -cne $directoryName) {
+        throw "Invalid run metadata: run must match its directory"
+    }
+    if ($metadata.device -isnot [string] -or $metadata.device -cnotmatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") {
+        throw "Invalid run metadata: device"
+    }
+    if ($metadata.profile -isnot [string] -or $metadata.profile -cnotmatch "^[a-z0-9-]{1,64}$" -or [Text.Encoding]::UTF8.GetByteCount($metadata.profile) -gt 64) {
+        throw "Invalid run metadata: profile"
+    }
+    $startedAt = [DateTimeOffset]::MinValue
+    if ($metadata.started_at -isnot [string] -or -not $metadata.started_at.EndsWith("Z") -or
+        -not [DateTimeOffset]::TryParseExact($metadata.started_at, "o", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$startedAt) -or
+        $startedAt.Offset -ne [TimeSpan]::Zero) {
+        throw "Invalid run metadata: started_at"
+    }
+    return $metadata
+}
+
+function Complete-AlphaRunUnlocked {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$RunDirectory
     )
 
     Initialize-AlphaRoot -Root $Root
+    $metadata = Read-AlphaRunMetadata -Root $Root -RunDirectory $RunDirectory
     $runJson = Join-Path $RunDirectory "run.json"
-    if (-not (Test-Path -LiteralPath $runJson -PathType Leaf)) {
-        throw "Cannot archive a run without run.json"
-    }
-    $metadata = Get-Content -LiteralPath $runJson -Raw | ConvertFrom-Json
-    foreach ($name in @("build", "run", "device", "profile")) {
-        if ($metadata.PSObject.Properties.Name -notcontains $name -or $metadata.$name -isnot [string]) {
-            throw "Invalid run metadata: missing $name"
-        }
-    }
 
     $pending = Join-Path $Root "pending"
     $zipPath = Join-Path $pending ($metadata.run + ".zip")
@@ -390,7 +528,19 @@ function Complete-AlphaRun {
     return [pscustomobject]@{ Zip = $zipPath; Metadata = $sidecarPath }
 }
 
-function Recover-AlphaRuns {
+function Complete-AlphaRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$RunDirectory,
+        [int]$LockTimeoutMilliseconds = 10000
+    )
+
+    return Invoke-WithAlphaMutex -Root $Root -TimeoutMilliseconds $LockTimeoutMilliseconds -Action {
+        Complete-AlphaRunUnlocked -Root $Root -RunDirectory $RunDirectory
+    }
+}
+
+function Recover-AlphaRunsUnlocked {
     param([Parameter(Mandatory = $true)][string]$Root)
 
     Initialize-AlphaRoot -Root $Root
@@ -404,11 +554,30 @@ function Recover-AlphaRuns {
         $sentComplete = (Test-Path -LiteralPath $sentZip -PathType Leaf) -and (Test-Path -LiteralPath $sentSidecar -PathType Leaf)
         if (-not $pendingComplete -and -not $sentComplete -and
             (Test-Path -LiteralPath (Join-Path $directory.FullName "run.json") -PathType Leaf)) {
-            Complete-AlphaRun -Root $Root -RunDirectory $directory.FullName | Out-Null
-            $recovered++
+            try {
+                Complete-AlphaRunUnlocked -Root $Root -RunDirectory $directory.FullName | Out-Null
+                $recovered++
+            } catch {
+                # Leave corrupt or temporarily unarchivable runs in place for later inspection/retry.
+            }
         }
     }
     return $recovered
+}
+
+function Recover-AlphaRuns {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [int]$LockTimeoutMilliseconds = 10000
+    )
+
+    try {
+        return Invoke-WithAlphaMutex -Root $Root -TimeoutMilliseconds $LockTimeoutMilliseconds -Action {
+            Recover-AlphaRunsUnlocked -Root $Root
+        }
+    } catch [TimeoutException] {
+        return 0
+    }
 }
 
 function Get-AlphaUploadUri {
@@ -426,7 +595,7 @@ function Get-AlphaUploadUri {
     return ("{0}://{1}/diagnostics" -f $scheme, $uri.Authority)
 }
 
-function Invoke-PendingUploads {
+function Invoke-PendingUploadsUnlocked {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [string]$SessionPath = (Join-Path (Join-Path $env:APPDATA "orange") "session.json"),
@@ -492,6 +661,26 @@ function Invoke-PendingUploads {
     return [pscustomobject]@{ Uploaded = $uploaded; Pending = $remaining }
 }
 
+function Invoke-PendingUploads {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string]$SessionPath = (Join-Path (Join-Path $env:APPDATA "orange") "session.json"),
+        [string]$UploadUri,
+        [string]$Server,
+        [int]$LockTimeoutMilliseconds = 10000
+    )
+
+    try {
+        return Invoke-WithAlphaMutex -Root $Root -TimeoutMilliseconds $LockTimeoutMilliseconds -Action {
+            Invoke-PendingUploadsUnlocked -Root $Root -SessionPath $SessionPath -UploadUri $UploadUri -Server $Server
+        }
+    } catch [TimeoutException] {
+        Initialize-AlphaRoot -Root $Root
+        $remaining = @(Get-ChildItem -LiteralPath (Join-Path $Root "pending") -File -Filter "*.zip").Count
+        return [pscustomobject]@{ Uploaded = 0; Pending = $remaining }
+    }
+}
+
 function Invoke-OrangeAlpha {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -506,7 +695,7 @@ function Invoke-OrangeAlpha {
     try {
         $manifest = Get-AlphaManifest -ManifestPath $ManifestPath -AllowLocalAssets:$AllowLocalAssets
         $version = Install-AlphaVersion -Root $Root -Manifest $manifest -AllowLocalAssets:$AllowLocalAssets
-        $active = Get-ActiveAlphaManifest -Root $Root
+        $active = $manifest
     } catch {
         $active = Get-ActiveAlphaManifest -Root $Root
         if ($null -eq $active) { throw }

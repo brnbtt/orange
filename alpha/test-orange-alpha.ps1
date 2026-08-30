@@ -62,6 +62,27 @@ function New-FixtureAsset {
     }
 }
 
+function New-AdversarialAsset {
+    param([string]$Root, [string]$Name, [string]$EntryName)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zipPath = Join-Path $Root ("adversarial-" + $Name + ".zip")
+    $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($entryNameToWrite in @("orange.exe", "orange-tray.exe", $EntryName)) {
+            $entry = $zip.CreateEntry($entryNameToWrite)
+            $writer = New-Object System.IO.StreamWriter($entry.Open())
+            try { $writer.Write("fixture") } finally { $writer.Dispose() }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    return [pscustomobject]@{
+        Path = $zipPath
+        Hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    }
+}
+
 function New-ManifestJson {
     param(
         [string]$Build = "0123456789abcdef0123456789abcdef01234567",
@@ -133,6 +154,21 @@ try {
         Assert-Throws { Read-AlphaManifest -Path (Write-ManifestFixture $root (New-ManifestJson @base -Environment 4) "env-scalar.json") -AllowLocalAssets } "environment"
     }
 
+    Invoke-Test "manifest field names are exact and case-sensitive" {
+        $root = New-TestRoot
+        $asset = New-FixtureAsset $root "field-names"
+        $json = New-ManifestJson -AssetUrl $asset.Path -Hash $asset.Hash
+        $missing = $json | ConvertFrom-Json
+        $missing.PSObject.Properties.Remove("profile")
+        Assert-Throws { Read-AlphaManifest -Path (Write-ManifestFixture $root ($missing | ConvertTo-Json -Depth 5) "missing.json") -AllowLocalAssets } "exactly"
+        $additional = $json.TrimEnd() -replace '}\s*$', ',"unexpected":true}'
+        Assert-Throws { Read-AlphaManifest -Path (Write-ManifestFixture $root $additional "additional.json") -AllowLocalAssets } "exactly"
+        $incorrectCase = $json -creplace '"schema"', '"Schema"'
+        Assert-Throws { Read-AlphaManifest -Path (Write-ManifestFixture $root $incorrectCase "case.json") -AllowLocalAssets } "exactly"
+        $surfacedDuplicate = $json -creplace '"schema"\s*:\s*1', '"schema":1,"Schema":1'
+        Assert-Throws { Read-AlphaManifest -Path (Write-ManifestFixture $root $surfacedDuplicate "duplicate.json") -AllowLocalAssets } "Invalid manifest JSON"
+    }
+
     Invoke-Test "first install activates a complete version" {
         $root = New-TestRoot
         $asset = New-FixtureAsset $root "first"
@@ -171,6 +207,40 @@ try {
         Assert-Equal 2 $versions.Count "retained version count"
         Assert-Equal $builds[1] $versions[0] "previous version"
         Assert-Equal $builds[2] $versions[1] "active version"
+    }
+
+    Invoke-Test "active replacement retains and can recover the prior state" {
+        $root = New-TestRoot
+        $firstBuild = "4444444444444444444444444444444444444444"
+        $secondBuild = "5555555555555555555555555555555555555555"
+        $firstAsset = New-FixtureAsset $root "atomic-first"
+        $first = Read-AlphaManifest -Path (Write-ManifestFixture $root (New-ManifestJson -Build $firstBuild -AssetUrl $firstAsset.Path -Hash $firstAsset.Hash) "atomic-first.json") -AllowLocalAssets
+        Install-AlphaVersion -Root $root -Manifest $first -AllowLocalAssets | Out-Null
+        $secondAsset = New-FixtureAsset $root "atomic-second"
+        $second = Read-AlphaManifest -Path (Write-ManifestFixture $root (New-ManifestJson -Build $secondBuild -AssetUrl $secondAsset.Path -Hash $secondAsset.Hash) "atomic-second.json") -AllowLocalAssets
+        Install-AlphaVersion -Root $root -Manifest $second -AllowLocalAssets | Out-Null
+        $backupPath = Join-Path $root "active.json.bak"
+        Assert-True (Test-Path -LiteralPath $backupPath -PathType Leaf) "active backup missing"
+        Assert-Equal $firstBuild ((Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json).build) "backup build"
+        Set-Content -LiteralPath (Join-Path $root "active.json") -Value "corrupt" -Encoding ASCII
+        Assert-Equal $firstBuild (Get-ActiveAlphaManifest -Root $root).build "backup recovery build"
+    }
+
+    Invoke-Test "unsafe ZIP entries are rejected before extraction" {
+        $entries = @(
+            @{ Name = "parent"; Entry = "../escaped.txt" },
+            @{ Name = "absolute"; Entry = "/orange-alpha-absolute.txt" },
+            @{ Name = "drive"; Entry = "C:/orange-alpha-drive.txt" }
+        )
+        foreach ($case in $entries) {
+            $root = New-TestRoot
+            $asset = New-AdversarialAsset -Root $root -Name $case.Name -EntryName $case.Entry
+            $build = if ($case.Name -eq "parent") { "6" * 40 } elseif ($case.Name -eq "absolute") { "7" * 40 } else { "8" * 40 }
+            $manifest = Read-AlphaManifest -Path (Write-ManifestFixture $root (New-ManifestJson -Build $build -AssetUrl $asset.Path -Hash $asset.Hash)) -AllowLocalAssets
+            Assert-Throws { Install-AlphaVersion -Root $root -Manifest $manifest -AllowLocalAssets } "unsafe ZIP entry"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $root "versions") "escaped.txt"))) "parent entry escaped extraction root"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $root "versions") $build))) "unsafe build was activated"
+        }
     }
 
     Invoke-Test "checksum rejection preserves the active build" {
@@ -242,6 +312,57 @@ try {
         Assert-Equal $device $sidecar.device "sidecar device"
     }
 
+    Invoke-Test "corrupt run metadata cannot traverse or overwrite active state" {
+        $root = New-TestRoot
+        $activePath = Join-Path $root "active.json"
+        Set-Content -LiteralPath $activePath -Value '{"sentinel":"unchanged"}' -Encoding ASCII
+        $run = New-AlphaRun -Root $root -Build ("c" * 40) -Device ([guid]::NewGuid().ToString("D").ToLowerInvariant()) -Profile "test-profile"
+        $metadata = Get-Content -LiteralPath (Join-Path $run.Directory "run.json") -Raw | ConvertFrom-Json
+        $metadata.run = "..\active"
+        $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run.Directory "run.json") -Encoding UTF8
+        Assert-Throws { Complete-AlphaRun -Root $root -RunDirectory $run.Directory } "run metadata"
+        Assert-Equal '{"sentinel":"unchanged"}' ((Get-Content -LiteralPath $activePath -Raw).Trim()) "active state was overwritten"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $root "active.zip"))) "traversal ZIP was created"
+
+        $outsideName = "orange-alpha-outside-" + [guid]::NewGuid().ToString("N")
+        $outsideJson = Join-Path ([IO.Path]::GetTempPath()) ($outsideName + ".json")
+        $outsideZip = Join-Path ([IO.Path]::GetTempPath()) ($outsideName + ".zip")
+        $run2 = New-AlphaRun -Root $root -Build ("c" * 40) -Device ([guid]::NewGuid().ToString("D").ToLowerInvariant()) -Profile "test-profile"
+        $metadata2 = Get-Content -LiteralPath (Join-Path $run2.Directory "run.json") -Raw | ConvertFrom-Json
+        $metadata2.run = "..\..\$outsideName"
+        $metadata2 | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run2.Directory "run.json") -Encoding UTF8
+        try {
+            Assert-Throws { Complete-AlphaRun -Root $root -RunDirectory $run2.Directory } "run metadata"
+            Assert-True (-not (Test-Path -LiteralPath $outsideJson)) "outside sidecar was created"
+            Assert-True (-not (Test-Path -LiteralPath $outsideZip)) "outside ZIP was created"
+        } finally {
+            Remove-Item -LiteralPath $outsideJson, $outsideZip -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Invoke-Test "run metadata schema and values are validated completely" {
+        $mutations = @(
+            @{ Name = "schema"; Apply = { param($m) $m.schema = 2 } },
+            @{ Name = "build"; Apply = { param($m) $m.build = "ABC" } },
+            @{ Name = "run"; Apply = { param($m) $m.run = [guid]::NewGuid().ToString("D").ToUpperInvariant() } },
+            @{ Name = "device"; Apply = { param($m) $m.device = "not-a-uuid" } },
+            @{ Name = "profile"; Apply = { param($m) $m.profile = "Bad Profile" } },
+            @{ Name = "started"; Apply = { param($m) $m.started_at = "not-utc" } },
+            @{ Name = "missing"; Apply = { param($m) $m.PSObject.Properties.Remove("profile") } },
+            @{ Name = "case"; Apply = { param($m) $value = $m.schema; $m.PSObject.Properties.Remove("schema"); $m | Add-Member -NotePropertyName Schema -NotePropertyValue $value } },
+            @{ Name = "extra"; Apply = { param($m) $m | Add-Member -NotePropertyName unexpected -NotePropertyValue $true } }
+        )
+        foreach ($mutation in $mutations) {
+            $root = New-TestRoot
+            $run = New-AlphaRun -Root $root -Build ("d" * 40) -Device ([guid]::NewGuid().ToString("D").ToLowerInvariant()) -Profile "test-profile"
+            $metadata = Get-Content -LiteralPath (Join-Path $run.Directory "run.json") -Raw | ConvertFrom-Json
+            & $mutation.Apply $metadata
+            $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run.Directory "run.json") -Encoding UTF8
+            Assert-Throws { Complete-AlphaRun -Root $root -RunDirectory $run.Directory } "run metadata"
+            Assert-Equal 0 @(Get-ChildItem -LiteralPath (Join-Path $root "pending") -File).Count ("pending files for " + $mutation.Name)
+        }
+    }
+
     Invoke-Test "startup recovers an unarchived prior run once" {
         $root = New-TestRoot
         $run = New-AlphaRun -Root $root -Build ("d" * 40) -Device ([guid]::NewGuid().ToString("D").ToLowerInvariant()) -Profile "test-profile"
@@ -252,6 +373,69 @@ try {
         Remove-Item -LiteralPath (Join-Path (Join-Path $root "pending") ($run.Run + ".json")) -Force
         Assert-Equal 1 (Recover-AlphaRuns -Root $root) "incomplete pending pair recovery count"
         Assert-True (Test-Path -LiteralPath (Join-Path (Join-Path $root "pending") ($run.Run + ".json"))) "recovered sidecar missing"
+    }
+
+    Invoke-Test "recovery isolates a corrupt run and continues with valid runs" {
+        $root = New-TestRoot
+        $corruptRun = [guid]::NewGuid().ToString("D").ToLowerInvariant()
+        $corruptDirectory = Join-Path (Join-Path $root "diagnostics") $corruptRun
+        New-Item -ItemType Directory -Path $corruptDirectory -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $corruptDirectory "run.json") -Value '{not-json' -Encoding ASCII
+        $valid = New-AlphaRun -Root $root -Build ("e" * 40) -Device ([guid]::NewGuid().ToString("D").ToLowerInvariant()) -Profile "test-profile"
+        Set-Content -LiteralPath (Join-Path $valid.Directory "valid.jsonl") -Value '{"event":"valid"}' -Encoding UTF8
+        Assert-Equal 1 (Recover-AlphaRuns -Root $root) "valid recovery count"
+        Assert-True (Test-Path -LiteralPath (Join-Path $corruptDirectory "run.json")) "corrupt run was removed"
+        Assert-True (Test-Path -LiteralPath (Join-Path (Join-Path $root "pending") ($valid.Run + ".zip"))) "valid run was not recovered"
+    }
+
+    Invoke-Test "named mutex serializes launcher mutations and releases after errors" {
+        $root = New-TestRoot
+        $asset = New-FixtureAsset $root "mutex-install"
+        $build = "9" * 40
+        $manifest = Read-AlphaManifest -Path (Write-ManifestFixture $root (New-ManifestJson -Build $build -AssetUrl $asset.Path -Hash $asset.Hash)) -AllowLocalAssets
+        $unarchived = New-AlphaRun -Root $root -Build ("a" * 40) -Device ([guid]::NewGuid().ToString("D").ToLowerInvariant()) -Profile "test-profile"
+        $ready = Join-Path $root "mutex-ready.txt"
+        $release = Join-Path $root "mutex-release.txt"
+        $job = Start-Job -ArgumentList $launcher, $root, $ready, $release -ScriptBlock {
+            param($Launcher, $StateRoot, $Ready, $Release)
+            . $Launcher
+            Invoke-WithAlphaMutex -Root $StateRoot -TimeoutMilliseconds 2000 -Action {
+                Set-Content -LiteralPath $Ready -Value (Get-AlphaMutexName -Root $StateRoot) -Encoding ASCII
+                $deadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $Release) -and [DateTime]::UtcNow -lt $deadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+            }
+        }
+        try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not (Test-Path -LiteralPath $ready) -and [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            Assert-True (Test-Path -LiteralPath $ready) "mutex holder did not acquire the lock"
+            Assert-Equal (Get-AlphaMutexName -Root $root) ((Get-Content -LiteralPath $ready -Raw).Trim()) "mutex names differ across processes"
+            Assert-Equal "Running" $job.State "mutex holder exited before contention test"
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws { Invoke-WithAlphaMutex -Root $root -TimeoutMilliseconds 200 -Action { throw "unexpected acquisition" } } "Timed out"
+            $watch.Stop()
+            Assert-True ($watch.ElapsedMilliseconds -lt 1500) "mutex acquisition was not bounded"
+            Assert-Throws { Install-AlphaVersion -Root $root -Manifest $manifest -AllowLocalAssets -LockTimeoutMilliseconds 200 } "Timed out"
+            Assert-Equal 0 (Recover-AlphaRuns -Root $root -LockTimeoutMilliseconds 200) "recovery mutated state while locked"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $root "versions") $build))) "install bypassed the mutex"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $root "pending") ($unarchived.Run + ".zip")))) "recovery bypassed the mutex"
+            Set-Content -LiteralPath $release -Value "release" -Encoding ASCII
+            Wait-Job -Job $job -Timeout 5 | Out-Null
+            Receive-Job -Job $job -ErrorAction Stop | Out-Null
+        } finally {
+            Set-Content -LiteralPath $release -Value "release" -Encoding ASCII -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+        Assert-Throws { Invoke-WithAlphaMutex -Root $root -TimeoutMilliseconds 1000 -Action { throw "fixture action failure" } } "fixture action failure"
+        $marker = Join-Path $root "mutex-reacquired.txt"
+        Invoke-WithAlphaMutex -Root $root -TimeoutMilliseconds 1000 -Action { Set-Content -LiteralPath $marker -Value "ok" -Encoding ASCII }
+        Assert-True (Test-Path -LiteralPath $marker) "mutex was not released in finally"
+        Install-AlphaVersion -Root $root -Manifest $manifest -AllowLocalAssets | Out-Null
+        Assert-Equal 1 (Recover-AlphaRuns -Root $root) "recovery did not proceed after lock release"
     }
 
     Invoke-Test "failed upload remains pending" {
@@ -335,6 +519,8 @@ try {
         Assert-True ($request -match "(?im)^Content-Type: application/zip\s*$") "wrong content type"
         Assert-True ($request -match ("(?im)^x-orange-build: " + $run.Build + "\s*$")) "wrong build header"
         Assert-True ($request -match ("(?im)^x-orange-run: " + $run.Run + "\s*$")) "wrong run header"
+        Assert-True ($request -match ("(?im)^x-orange-device: " + $run.Device + "\s*$")) "wrong device header"
+        Assert-True ($request -match ("(?im)^x-orange-profile: " + $run.Profile + "\s*$")) "wrong profile header"
         Assert-True ($request -notmatch "do-not-send") "unrelated session data was sent"
     }
 } finally {
