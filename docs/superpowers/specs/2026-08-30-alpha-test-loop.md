@@ -32,6 +32,8 @@ records the exact build and profile, and uploads diagnostics after Orange exits.
   8 MiB compressed.
 - Upload failures never block or fail streaming; pending archives retry on the
   next launcher run.
+- On startup, the launcher archives any prior run directory left behind by a
+  launcher, tray, media-process, or machine crash before retrying uploads.
 - The launcher keeps the previous successful build and changes the active build
   only after SHA-256 verification and complete extraction.
 - The alpha manifest schema is versioned and rejects unsupported schemas,
@@ -90,6 +92,7 @@ archives in `pending`.
 - A checksum mismatch leaves the prior build active.
 - Closing the tray creates one archive and attempts upload.
 - A failed upload remains pending and succeeds on a later run.
+- A run interrupted before archive creation is recovered on the next launch.
 - Missing or invalid authentication receives `401`; malformed metadata receives
   `400`; oversized bodies receive `413`; disabled storage receives `503`.
 - Host and viewer diagnostic logs contain the same diagnostic session ID.

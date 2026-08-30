@@ -92,7 +92,7 @@
 - [ ] Write a self-contained PowerShell test harness with local fixture manifests/assets covering first install, cache hit, update, checksum rejection, pending retry, and unsupported manifest input.
 - [ ] Run the harness and confirm it fails because launcher functions are absent.
 - [ ] Implement strict manifest validation, HTTPS-only production downloads, SHA-256 verification, temporary extraction plus atomic activation, and one-version rollback retention.
-- [ ] Implement run metadata, archive creation after tray exit, bearer upload from the existing session file, pending retry, and non-blocking failure reporting.
+- [ ] Implement run metadata, archive creation after tray exit, recovery of unarchived prior run directories, bearer upload from the existing session file, pending retry, and non-blocking failure reporting.
 - [ ] Run the PowerShell harness twice and confirm no network dependency.
 - [ ] Commit the task.
 
