@@ -134,7 +134,23 @@ fn generate_diagnostic_session() -> String {
     format!("{:032x}", rand::thread_rng().gen::<u128>())
 }
 
-type Tx = mpsc::UnboundedSender<Message>;
+const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Clone)]
+struct Tx {
+    messages: mpsc::Sender<Message>,
+    disconnect: tokio::sync::watch::Sender<bool>,
+}
+
+impl Tx {
+    fn try_send(&self, message: Message) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let result = self.messages.try_send(message);
+        if result.is_err() {
+            self.disconnect.send_replace(true);
+        }
+        result
+    }
+}
 
 #[derive(Default)]
 pub struct Room {
@@ -154,9 +170,14 @@ enum Role {
 /// Serve one connected peer for its lifetime.
 pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> Result<()> {
     let (mut sink, mut source) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (messages, mut rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+    let (disconnect, mut disconnect_rx) = tokio::sync::watch::channel(false);
+    let tx = Tx {
+        messages,
+        disconnect,
+    };
 
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sink.send(msg).await.is_err() {
                 break;
@@ -168,12 +189,24 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
     let mut identity: Option<Identity> = None;
 
     let session_result: Result<()> = async {
-        while let Some(msg) = source.next().await {
+        loop {
+            let msg = tokio::select! {
+                changed = disconnect_rx.changed() => {
+                    if changed.is_err() || *disconnect_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                msg = source.next() => {
+                    let Some(msg) = msg else { break };
+                    msg
+                }
+            };
             let Message::Text(text) = msg? else { continue };
             let signal: Signal = match serde_json::from_str(&text) {
                 Ok(s) => s,
                 Err(err) => {
-                    let _ = tx.send(Message::Text(
+                    let _ = tx.try_send(Message::Text(
                         Signal::Error {
                             message: format!("bad message: {err}"),
                         }
@@ -187,7 +220,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                 Signal::Authenticate { session } => {
                     match auth.identify(&session).await {
                         Some(found) => {
-                            let _ = tx.send(Message::Text(
+                            let _ = tx.try_send(Message::Text(
                                 Signal::Authenticated {
                                     name: found.name.clone(),
                                 }
@@ -202,6 +235,9 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                     }
                 }
                 Signal::Host => {
+                    if joined.is_some() {
+                        bail!("peer attempted to change signalling role");
+                    }
                     let code = generate_code();
                     let diagnostic_session = generate_diagnostic_session();
                     let name = identity.as_ref().map(|i| i.name.clone());
@@ -215,7 +251,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                         },
                     );
                     joined = Some((code.clone(), Role::Host));
-                    tx.send(Message::Text(
+                    tx.try_send(Message::Text(
                         Signal::Hosting {
                             code,
                             diagnostic_session: Some(diagnostic_session),
@@ -224,6 +260,9 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                     ))?;
                 }
                 Signal::Join { code } => {
+                    if joined.is_some() {
+                        bail!("peer attempted to change signalling role");
+                    }
                     let code = code.trim().to_ascii_uppercase();
                     let peer = generate_peer_id();
                     let mut rooms = rooms.lock().await;
@@ -234,7 +273,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                             let diagnostic_session = room.diagnostic_session.clone();
                             joined = Some((code.clone(), Role::Viewer(peer.clone())));
 
-                            let _ = tx.send(Message::Text(
+                            let _ = tx.try_send(Message::Text(
                                 Signal::StreamInfo {
                                     host_name,
                                     diagnostic_session: Some(diagnostic_session),
@@ -242,7 +281,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                                 .to_json(),
                             ));
                             if let Some(host) = &room.host {
-                                let _ = host.send(Message::Text(
+                                let _ = host.try_send(Message::Text(
                                     Signal::ViewerJoined {
                                         peer,
                                         name: identity.as_ref().map(|i| i.name.clone()),
@@ -252,7 +291,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                             }
                         }
                         _ => {
-                            tx.send(Message::Text(
+                            tx.try_send(Message::Text(
                                 Signal::Error {
                                     message: format!("no stream with code {code}"),
                                 }
@@ -275,12 +314,13 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                             if let Some(target) =
                                 other.peer_id().and_then(|id| room.viewers.get(id))
                             {
-                                let _ = target.send(Message::Text(other.to_json()));
+                                let _ = target.try_send(Message::Text(other.to_json()));
                             }
                         }
                         Role::Viewer(peer) => {
                             if let Some(host) = &room.host {
-                                let _ = host.send(Message::Text(other.with_peer(peer).to_json()));
+                                let _ =
+                                    host.try_send(Message::Text(other.with_peer(peer).to_json()));
                             }
                         }
                     }
@@ -296,7 +336,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
             let room = rooms.lock().await.remove(&code);
             if let Some(room) = room {
                 for viewer in room.viewers.into_values() {
-                    let _ = viewer.send(Message::Text(
+                    let _ = viewer.try_send(Message::Text(
                         Signal::Error {
                             message: "The stream ended".into(),
                         }
@@ -311,13 +351,19 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
             if let Some(room) = rooms.get_mut(&code) {
                 room.viewers.remove(&peer);
                 if let Some(host) = &room.host {
-                    let _ = host.send(Message::Text(Signal::ViewerLeft { peer }.to_json()));
+                    let _ = host.try_send(Message::Text(Signal::ViewerLeft { peer }.to_json()));
                 }
             }
         }
         None => {}
     }
+    stop_writer(writer).await;
     session_result
+}
+
+async fn stop_writer(writer: tokio::task::JoinHandle<()>) {
+    writer.abort();
+    let _ = writer.await;
 }
 
 // --- client -----------------------------------------------------------------
@@ -427,6 +473,89 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn relay_outbound_queue_is_bounded() {
+        let (messages, _rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let (disconnect, disconnect_rx) = tokio::sync::watch::channel(false);
+        let tx = Tx {
+            messages,
+            disconnect,
+        };
+        for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+            tx.try_send(Message::Text("signal".into())).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(Message::Text("overflow".into())),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert!(*disconnect_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_peer_drops_its_blocked_writer_task() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped_tx));
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        stop_writer(writer).await;
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("writer resources were not dropped")
+            .expect("writer drop signal was lost");
+    }
+
+    #[tokio::test]
+    async fn repeated_host_command_cleans_the_original_room() {
+        let rooms = Rooms::default();
+        let app = server::router(server::AppState {
+            rooms: rooms.clone(),
+            auth: auth::Auth::new(None),
+            diagnostics: server::DiagnosticsStorage::Disabled,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+        let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Host.to_json(),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive_signal(&mut host).await,
+            Signal::Hosting { .. }
+        ));
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Host.to_json(),
+        ))
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), host.next()).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !rooms.lock().await.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(rooms.lock().await.is_empty());
+        relay.abort();
+    }
 
     async fn receive_signal(
         socket: &mut tokio_tungstenite::WebSocketStream<

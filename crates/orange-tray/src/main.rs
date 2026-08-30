@@ -62,6 +62,7 @@ struct Notice {
 }
 
 struct Orange {
+    tray_available: bool,
     screen: Screen,
     session: Option<session::Session>,
     windows: Vec<WindowTarget>,
@@ -95,7 +96,7 @@ struct Orange {
 }
 
 impl Orange {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(cx: &mut Context<Self>, tray_available: bool) -> Self {
         update::cleanup_helpers();
         // The UI reflects state owned by child processes, so poll rather than
         // trying to push updates across process boundaries.
@@ -117,6 +118,7 @@ impl Orange {
             update::UpdateStatus::Disabled
         };
         Self {
+            tray_available,
             screen: if session.is_some() {
                 Screen::Home
             } else {
@@ -362,7 +364,6 @@ impl Orange {
                     0,
                     WindowTarget {
                         hwnd: 0,
-                        pid: 0,
                         title: "Entire screen".into(),
                         process: "Desktop".into(),
                         width: screen_width,
@@ -426,6 +427,9 @@ impl Orange {
     }
 
     fn start_login(&mut self) {
+        if self.logging_in.is_some() {
+            return;
+        }
         self.clear_error();
         match supervisor::start_login(&self.server) {
             Ok(attempt) => self.logging_in = Some(attempt),
@@ -562,7 +566,7 @@ fn request_avatar(url: Option<String>) -> Option<std::sync::mpsc::Receiver<captu
                 image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Lanczos3)
                     .into_raw();
             // GPUI's image renderer expects BGRA.
-            for pixel in raw.chunks_exact_mut(4) {
+            for pixel in raw.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
             Some((64, 64, raw))
@@ -827,7 +831,7 @@ fn logo(px_size: f32, epoch: u64) -> impl IntoElement {
                     }
                 }
                 // GPUI wants BGRA; the PNG decodes as RGBA.
-                for pixel in raw.chunks_exact_mut(4) {
+                for pixel in raw.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                 }
                 let buffer = image::RgbaImage::from_raw(128, 128, raw)?;
@@ -1120,9 +1124,17 @@ impl Orange {
                     // Close hides the window completely - no taskbar entry -
                     // while the app keeps running in the tray. Minimise is a
                     // normal minimise; the two should not do the same thing.
-                    .child(titlebar_button("close", "×", 0x8c2b28).on_click(|_, _, _| {
-                        tray::hide_main_window();
-                    })),
+                    .child(
+                        titlebar_button("close", "×", 0x8c2b28).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                if this.tray_available {
+                                    tray::hide_main_window();
+                                } else {
+                                    cx.quit();
+                                }
+                            },
+                        )),
+                    ),
             )
     }
 }
@@ -2092,6 +2104,7 @@ fn main() {
     // Installed before the UI so a failure here is visible as a missing icon
     // rather than a half-started app.
     let tray_events = tray::install().ok();
+    let tray_available = tray_events.is_some();
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(400.0), px(540.0)), cx);
@@ -2110,7 +2123,7 @@ fn main() {
                     is_resizable: false,
                     ..Default::default()
                 },
-                |_, cx| cx.new(Orange::new),
+                |_, cx| cx.new(|cx| Orange::new(cx, tray_available)),
             )
             .unwrap();
         cx.activate(true);
@@ -2119,9 +2132,13 @@ fn main() {
         // keep streaming when its window is dismissed. Quit lives in the tray
         // menu.
         let _ = window.update(cx, |_, window, cx| {
-            window.on_window_should_close(cx, |window, _cx| {
-                window.minimize_window();
-                false
+            window.on_window_should_close(cx, move |window, _cx| {
+                if tray_available {
+                    window.minimize_window();
+                    false
+                } else {
+                    true
+                }
             });
         });
 

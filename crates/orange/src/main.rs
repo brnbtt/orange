@@ -446,10 +446,7 @@ fn cmd_list(json: bool) -> Result<()> {
         println!("No capturable windows found.");
         return Ok(());
     }
-    println!(
-        "{:<12} {:>11}  {:<24} {}",
-        "HWND", "SIZE", "PROCESS", "TITLE"
-    );
+    println!("{:<12} {:>11}  {:<24} TITLE", "HWND", "SIZE", "PROCESS");
     for t in windows {
         let size = format!("{}x{}", t.width, t.height);
         let title: String = t.title.chars().take(48).collect();

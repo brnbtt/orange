@@ -101,7 +101,7 @@ unsafe fn create() -> Result<HWND> {
         // asking for the system tray metric avoids a blurry 32px downscale.
         hIcon: LoadImageW(
             Some(instance.into()),
-            PCWSTR(1 as *const u16),
+            PCWSTR(std::ptr::with_exposed_provenance(1)),
             IMAGE_ICON,
             GetSystemMetrics(SM_CXSMICON),
             GetSystemMetrics(SM_CYSMICON),

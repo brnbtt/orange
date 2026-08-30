@@ -25,7 +25,6 @@ const MAX_DIAGNOSTIC_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Clone, Deserialize)]
 pub struct WindowTarget {
     pub hwnd: i64,
-    pub pid: u32,
     pub title: String,
     pub process: String,
     pub width: i32,
@@ -163,9 +162,17 @@ pub fn list_windows() -> Result<Vec<WindowTarget>> {
     let output = orange_command()?
         .args(["list", "--json"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .context("could not run `orange list`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`orange list` exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     // The binary prints nothing else on stdout in JSON mode, but be forgiving.
     let json = text
@@ -184,18 +191,37 @@ pub fn list_windows() -> Result<Vec<WindowTarget>> {
 /// The child is returned so the caller can tell "still waiting for the user"
 /// apart from "it died", which otherwise looks identical from the UI.
 pub fn start_login(server: &str) -> Result<LoginAttempt> {
-    let child = orange_command()?
+    let mut child = orange_command()?
         .arg("login")
         .args(["--server", server])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("could not start `orange login`")?;
-    Ok(LoginAttempt { child })
+    let last_stderr = Arc::new(Mutex::new(String::new()));
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        let last_stderr = last_stderr.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    if let Ok(mut last) = last_stderr.lock() {
+                        *last = line;
+                    }
+                }
+            }
+        })
+    });
+    Ok(LoginAttempt {
+        child,
+        last_stderr,
+        stderr_reader,
+    })
 }
 
 pub struct LoginAttempt {
     child: Child,
+    last_stderr: Arc<Mutex<String>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LoginAttempt {
@@ -203,23 +229,42 @@ impl LoginAttempt {
     /// producing a session.
     pub fn failure(&mut self) -> Option<String> {
         match self.child.try_wait() {
-            Ok(Some(_)) => {
-                let mut reason = String::new();
-                if let Some(stderr) = self.child.stderr.take() {
-                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                        if !line.trim().is_empty() {
-                            reason = line;
-                        }
-                    }
-                }
+            Ok(Some(status)) => {
+                self.finish_stderr_reader();
+                let reason = self
+                    .last_stderr
+                    .lock()
+                    .map(|reason| reason.clone())
+                    .unwrap_or_default();
                 Some(if reason.is_empty() {
-                    "Login was cancelled or timed out".to_string()
+                    if status.success() {
+                        "Login was cancelled or timed out".to_string()
+                    } else {
+                        format!("Login process exited with {status}")
+                    }
                 } else {
                     reason
                 })
             }
-            _ => None,
+            Ok(None) => None,
+            Err(error) => Some(format!("Could not check login status: {error}")),
         }
+    }
+
+    fn finish_stderr_reader(&mut self) {
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl Drop for LoginAttempt {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.finish_stderr_reader();
     }
 }
 
@@ -317,11 +362,27 @@ impl Supervisor {
     }
 
     pub fn running(&mut self) -> bool {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            return true;
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                self.finish_readers();
+                if !status.success() {
+                    if let Ok(mut stream) = self.status.lock() {
+                        if stream.error.is_none() {
+                            stream.error = Some(format!("Orange exited with {status}"));
+                        }
+                    }
+                }
+                false
+            }
+            Err(error) => {
+                if let Ok(mut stream) = self.status.lock() {
+                    stream.error = Some(format!("Could not inspect Orange: {error}"));
+                }
+                self.stop();
+                false
+            }
         }
-        self.finish_readers();
-        false
     }
 
     pub fn stop(&mut self) {
@@ -443,7 +504,6 @@ mod tests {
     fn target(width: i32, height: i32) -> WindowTarget {
         WindowTarget {
             hwnd: 1,
-            pid: 1,
             title: String::new(),
             process: String::new(),
             width,

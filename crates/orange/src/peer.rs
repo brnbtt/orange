@@ -474,6 +474,7 @@ fn handle_watch_diagnostic_signal(signal: &Signal) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -1058,6 +1059,9 @@ fn link_tee_branch(
     Ok(branch)
 }
 
+// Keeping the media branch inputs explicit makes their ownership and teardown
+// order visible; grouping them would only move this lifecycle-sensitive API.
+#[allow(clippy::too_many_arguments)]
 fn add_viewer(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,

@@ -86,6 +86,10 @@ enum Pending {
     Waiting {
         since: Instant,
     },
+    /// A callback claimed this attempt and is exchanging its code.
+    Completing {
+        since: Instant,
+    },
     /// Login finished; the app has not collected it yet.
     Ready {
         session: String,
@@ -101,6 +105,7 @@ impl Pending {
     fn since(&self) -> Instant {
         match self {
             Pending::Waiting { since }
+            | Pending::Completing { since }
             | Pending::Ready { since, .. }
             | Pending::Failed { since, .. } => *since,
         }
@@ -163,12 +168,7 @@ impl Auth {
             .as_ref()
             .context("Discord login is not configured")?;
 
-        {
-            let auth = self.state.lock().await;
-            if !matches!(auth.pending.get(state), Some(Pending::Waiting { .. })) {
-                anyhow::bail!("unknown or expired login attempt");
-            }
-        }
+        self.state.lock().await.claim(state)?;
 
         let result = self.exchange(config, code).await;
 
@@ -196,6 +196,21 @@ impl Auth {
                 );
                 Err(err)
             }
+        }
+    }
+
+    /// Terminalize a browser cancellation so the desktop poller does not wait
+    /// until the pending-attempt timeout.
+    pub async fn fail(&self, state: &str, message: String) {
+        let mut auth = self.state.lock().await;
+        if matches!(auth.pending.get(state), Some(Pending::Waiting { .. })) {
+            auth.pending.insert(
+                state.to_string(),
+                Pending::Failed {
+                    message,
+                    since: Instant::now(),
+                },
+            );
         }
     }
 
@@ -264,7 +279,7 @@ impl Auth {
         auth.prune();
         match auth.pending.get(state) {
             None => PollResult::Unknown,
-            Some(Pending::Waiting { .. }) => PollResult::Waiting,
+            Some(Pending::Waiting { .. } | Pending::Completing { .. }) => PollResult::Waiting,
             Some(Pending::Failed { message, .. }) => {
                 let message = message.clone();
                 auth.pending.remove(state);
@@ -306,6 +321,19 @@ pub enum PollResult {
 }
 
 impl AuthState {
+    fn claim(&mut self, state: &str) -> Result<()> {
+        let Some(pending) = self.pending.get_mut(state) else {
+            anyhow::bail!("unknown or expired login attempt");
+        };
+        if !matches!(pending, Pending::Waiting { .. }) {
+            anyhow::bail!("unknown or expired login attempt");
+        }
+        *pending = Pending::Completing {
+            since: Instant::now(),
+        };
+        Ok(())
+    }
+
     fn prune(&mut self) {
         self.pending
             .retain(|_, p| p.since().elapsed() < PENDING_TTL);
@@ -323,4 +351,41 @@ fn random_token() -> String {
             CHARS[rng.gen_range(0..CHARS.len())] as char
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waiting_state() -> AuthState {
+        let mut auth = AuthState::default();
+        auth.pending.insert(
+            "state".into(),
+            Pending::Waiting {
+                since: Instant::now(),
+            },
+        );
+        auth
+    }
+
+    #[test]
+    fn callback_state_can_only_be_claimed_once() {
+        let mut auth = waiting_state();
+
+        assert!(auth.claim("state").is_ok());
+        assert!(auth.claim("state").is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_terminalizes_a_waiting_attempt() {
+        let auth = Auth::new(None);
+        *auth.state.lock().await = waiting_state();
+
+        auth.fail("state", "access_denied".into()).await;
+
+        assert!(matches!(
+            auth.poll("state").await,
+            PollResult::Failed(message) if message == "access_denied"
+        ));
+    }
 }

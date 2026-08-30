@@ -9,7 +9,9 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -110,17 +112,37 @@ fn wait_for_parent(pid: u32) -> Result<()> {
 }
 
 fn wait_for_parent_with_timeout(pid: u32, timeout_ms: u32) -> Result<()> {
+    let Some(handle) = open_parent(pid)? else {
+        return Ok(());
+    };
+    let result = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    let wait_error = (result == WAIT_FAILED).then(windows::core::Error::from_thread);
     unsafe {
-        if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            let result = WaitForSingleObject(handle, timeout_ms);
-            let _ = CloseHandle(handle);
-            if result != WAIT_OBJECT_0 {
-                bail!("Orange did not exit before the update timeout");
-            }
-        }
+        let _ = CloseHandle(handle);
+    }
+    if let Some(error) = wait_error {
+        return Err(error).context("could not wait for Orange to exit");
+    }
+    if result == WAIT_TIMEOUT {
+        bail!("Orange did not exit before the update timeout");
+    }
+    if result != WAIT_OBJECT_0 {
+        bail!("unexpected result while waiting for Orange to exit");
     }
     std::thread::sleep(Duration::from_millis(200));
     Ok(())
+}
+
+fn open_parent(pid: u32) -> Result<Option<HANDLE>> {
+    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(handle) => Ok(Some(handle)),
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).context("could not inspect the Orange process"),
+    }
 }
 
 fn run_installer(installer: &Path) -> Result<i32> {
@@ -138,15 +160,19 @@ fn run_installer(installer: &Path) -> Result<i32> {
     Ok(status.code().unwrap_or(-1))
 }
 
-fn parent_has_exited(pid: u32) -> bool {
+fn parent_has_exited(pid: u32) -> Result<bool> {
+    let Some(handle) = open_parent(pid)? else {
+        return Ok(true);
+    };
+    let result = unsafe { WaitForSingleObject(handle, 0) };
+    let wait_error = (result == WAIT_FAILED).then(windows::core::Error::from_thread);
     unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
-            return true;
-        };
-        let result = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
         let _ = CloseHandle(handle);
-        result
     }
+    if let Some(error) = wait_error {
+        return Err(error).context("could not inspect the Orange process state");
+    }
+    Ok(result == WAIT_OBJECT_0)
 }
 
 fn apply_update(args: UpdateArgs) -> Result<()> {
@@ -174,8 +200,16 @@ fn write_failure(error: &anyhow::Error) {
     let directory = PathBuf::from(local).join("orange");
     let _ = std::fs::create_dir_all(&directory);
     let mut message = format!("{error:#}");
-    message.truncate(2_000);
+    truncate_utf8(&mut message, 2_000);
     let _ = std::fs::write(directory.join("update-error.txt"), message);
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 fn main() {
@@ -184,7 +218,7 @@ fn main() {
             let retry = args.clone();
             if let Err(error) = apply_update(args) {
                 write_failure(&error);
-                if parent_has_exited(retry.parent) {
+                if parent_has_exited(retry.parent).unwrap_or(false) {
                     let tray = retry.install_dir.join("orange-tray.exe");
                     let _ = Command::new(tray).current_dir(retry.install_dir).spawn();
                 }
@@ -271,8 +305,17 @@ mod tests {
 
     #[test]
     fn current_process_is_not_treated_as_exited() {
-        assert!(!parent_has_exited(std::process::id()));
-        assert!(parent_has_exited(u32::MAX));
+        assert!(!parent_has_exited(std::process::id()).unwrap());
+        assert!(parent_has_exited(u32::MAX).unwrap());
+    }
+
+    #[test]
+    fn failure_messages_truncate_only_at_utf8_boundaries() {
+        let mut message = "a".repeat(1_999) + "é trailing";
+        truncate_utf8(&mut message, 2_000);
+
+        assert_eq!(message, "a".repeat(1_999));
+        assert!(message.len() <= 2_000);
     }
 
     #[test]

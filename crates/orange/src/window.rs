@@ -64,8 +64,10 @@ pub fn target_refresh_rate(hwnd: isize) -> Option<u32> {
             return None;
         }
 
-        let mut mode = DEVMODEW::default();
-        mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        let mut mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
         if !EnumDisplaySettingsW(
             PCWSTR(info.szDevice.as_ptr()),
             ENUM_CURRENT_SETTINGS,
@@ -353,6 +355,7 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{aspect_locked_size, fit_aspect};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -579,9 +582,7 @@ fn client_to_video(hwnd: HWND, cx: f32, cy: f32, video: (u32, u32)) -> Option<(f
 /// `WM_NCCALCSIZE` removes its visible non-client strips. We therefore identify
 /// the edges ourselves instead of relying on the frame that is no longer there.
 unsafe fn resize_hit_test(hwnd: HWND, x: i32, y: i32) -> Option<LRESULT> {
-    let Some(ctx) = context(hwnd) else {
-        return None;
-    };
+    let ctx = context(hwnd)?;
     if ctx.restore.get().is_some() {
         return None; // no resize edges in fullscreen
     }
@@ -669,7 +670,11 @@ unsafe fn create_window(
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance.into(),
         lpszClassName: class_name,
-        hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16)).unwrap_or_default(),
+        hIcon: LoadIconW(
+            Some(instance.into()),
+            PCWSTR(std::ptr::with_exposed_provenance(1)),
+        )
+        .unwrap_or_default(),
         hCursor: LoadCursorW(None, IDC_ARROW)?,
         hbrBackground: HBRUSH(CreateSolidBrush(BACKGROUND).0),
         ..Default::default()
@@ -1006,7 +1011,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // The pointer hides along with the controls, and comes back with
             // them. Windows asks about the cursor on movement; the timer
             // handles the case where the mouse has simply stopped.
-            WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT as u32 => {
+            WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
                 if controls_visible(hwnd) {
                     DefWindowProcW(hwnd, msg, wparam, lparam)
                 } else {

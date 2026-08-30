@@ -10,11 +10,11 @@ use axum::{
     async_trait,
     body::Bytes,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, FromRequestParts, Query, State,
     },
     http::{header, request::Parts, HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -364,20 +364,23 @@ struct CallbackParams {
 async fn auth_callback(
     State(app): State<AppState>,
     Query(params): Query<CallbackParams>,
-) -> impl IntoResponse {
+) -> Response {
     if let Some(error) = params.error {
-        return Html(page("Login cancelled", &error));
+        if let Some(state) = params.state.as_deref() {
+            app.auth.fail(state, error.clone()).await;
+        }
+        return auth_page("Login cancelled", &error);
     }
     let (Some(code), Some(state)) = (params.code, params.state) else {
-        return Html(page("Login failed", "Discord did not return a code."));
+        return auth_page("Login failed", "Discord did not return a code.");
     };
 
     match app.auth.complete(&state, &code).await {
-        Ok(identity) => Html(page(
+        Ok(identity) => auth_page(
             &format!("Signed in as {}", identity.name),
             "You can close this tab and go back to orange.",
-        )),
-        Err(err) => Html(page("Login failed", &err.to_string())),
+        ),
+        Err(err) => auth_page("Login failed", &err.to_string()),
     }
 }
 
@@ -421,7 +424,8 @@ async fn auth_poll(
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, app))
+    ws.max_message_size(64 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, app))
 }
 
 async fn handle_socket(socket: WebSocket, app: AppState) {
@@ -432,6 +436,8 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
 
 /// Minimal styled page for the browser leg of the login.
 fn page(title: &str, body: &str) -> String {
+    let title = escape_html(title);
+    let body = escape_html(body);
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>orange</title>
 <style>
@@ -443,9 +449,27 @@ fn page(title: &str, body: &str) -> String {
     )
 }
 
-/// Convenience for the peer loop, which speaks in `Message`.
-pub fn text(value: impl Serialize) -> Message {
-    Message::Text(serde_json::to_string(&value).unwrap_or_default())
+fn auth_page(title: &str, body: &str) -> Response {
+    (
+        [
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Html(page(title, body)),
+    )
+        .into_response()
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -463,6 +487,32 @@ mod tests {
     const BUILD: &str = "0123456789abcdef0123456789abcdef01234567";
     const RUN: &str = "12345678-1234-4abc-8def-1234567890ab";
     const DEVICE: &str = "87654321-4321-4abc-8def-ba0987654321";
+
+    #[tokio::test]
+    async fn oauth_callback_escapes_untrusted_html_and_sets_csp() {
+        let app = router(AppState {
+            rooms: Default::default(),
+            auth: crate::auth::Auth::new(None),
+            diagnostics: DiagnosticsStorage::Disabled,
+        });
+        let response = app
+            .oneshot(
+                Request::get("/auth/callback?error=%3Cscript%3Ealert%281%29%3C%2Fscript%3E")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(header::CONTENT_SECURITY_POLICY));
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
 
     fn headers() -> HeaderMap {
         let mut headers = HeaderMap::new();

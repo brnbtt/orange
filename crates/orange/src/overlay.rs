@@ -1028,7 +1028,7 @@ fn to_composition(panels: Vec<Panel>) -> Option<gst_video::VideoOverlayCompositi
         let render_w = (right - left).max(1) as u32;
         let render_h = (bottom - top).max(1) as u32;
         let mut data = panel.pixmap.take();
-        for pixel in data.chunks_exact_mut(4) {
+        for pixel in data.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
 
@@ -1206,7 +1206,12 @@ mod tests {
         ] {
             let mut pixmap = Pixmap::new(24, 24).unwrap();
             draw_svg_icon(&mut pixmap, 2.0, 2.0, 20.0, path, rgba(CREAM, 1.0));
-            assert!(pixmap.data().chunks_exact(4).any(|pixel| pixel[3] > 0));
+            assert!(pixmap
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] > 0));
         }
     }
 }

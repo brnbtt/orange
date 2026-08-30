@@ -1,12 +1,11 @@
 //! The capture and encode pipeline.
 //!
-//! This is the pipeline validated by measurement on an RTX 4080 SUPER: 4K60
-//! AV1 at ~29 Mbps cost roughly 9% of a single CPU core and no measurable
-//! in-game FPS.
+//! The default cross-vendor path uses Media Foundation H.265 encoding. The
+//! original NVIDIA AV1 path remains available for development and comparison.
 //!
 //! The property that makes it cheap is that frames never leave VRAM.
 //! `d3d11screencapturesrc` outputs `memory:D3D11Memory`, `d3d11convert` scales
-//! and converts on the GPU, and `nvd3d11*enc` consumes D3D11 textures directly.
+//! and converts on the GPU, and the hardware encoder consumes D3D11 textures.
 //! Inserting anything that forces a download to system memory (`videoconvert`,
 //! `videoscale`, most CPU filters) would destroy the performance profile.
 
@@ -22,8 +21,8 @@ pub enum Codec {
 }
 
 impl Codec {
-    /// D3D11-mode encoders keep the frame on the GPU. The CUDA-mode variants
-    /// (`nvav1enc`, `nvh264enc`) would work but involve extra copies.
+    /// The selected hardware encoders accept the D3D11 capture path without a
+    /// CPU conversion step.
     pub(crate) fn encoder(&self) -> &'static str {
         match self {
             Codec::Av1 => "nvd3d11av1enc",
@@ -147,7 +146,13 @@ pub fn build_audio_chain(pid: u32) -> String {
 
 /// Verify the audio elements exist before trying to build the chain.
 pub fn check_audio_elements() -> Result<()> {
-    let required = ["wasapi2src", "audioconvert", "opusenc", "rtpopuspay"];
+    let required = [
+        "wasapi2src",
+        "audioconvert",
+        "audioresample",
+        "opusenc",
+        "rtpopuspay",
+    ];
     let missing: Vec<_> = required
         .iter()
         .filter(|name| gst::ElementFactory::find(name).is_none())
@@ -354,5 +359,19 @@ mod tests {
         assert!(chain.contains("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"));
         assert!(!chain.contains("inband-fec=true"));
         assert!(chain.contains("buffer-time=100000 latency-time=20000"));
+    }
+
+    #[test]
+    fn audio_preflight_covers_every_chain_element() {
+        let chain = build_audio_chain(42);
+        for element in [
+            "wasapi2src",
+            "audioconvert",
+            "audioresample",
+            "opusenc",
+            "rtpopuspay",
+        ] {
+            assert!(chain.contains(element), "audio chain omitted {element}");
+        }
     }
 }

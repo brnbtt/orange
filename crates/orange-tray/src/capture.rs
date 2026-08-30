@@ -123,7 +123,7 @@ pub fn screen_thumbnail(max_w: u32, max_h: u32) -> Option<Thumbnail> {
             let len = (width * height * 4) as usize;
             let mut buffer = vec![0u8; len];
             std::ptr::copy_nonoverlapping(bits as *const u8, buffer.as_mut_ptr(), len);
-            for chunk in buffer.chunks_exact_mut(4) {
+            for chunk in buffer.as_chunks_mut::<4>().0 {
                 chunk[3] = 255;
             }
             Some(buffer)
@@ -161,7 +161,7 @@ unsafe fn capture_bgra(hwnd: HWND, width: u32, height: u32) -> Option<Vec<u8>> {
     let screen_dc = GetDC(None);
     let mem_dc = CreateCompatibleDC(Some(screen_dc));
 
-    let mut info = BITMAPINFO {
+    let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width as i32,
@@ -188,7 +188,7 @@ unsafe fn capture_bgra(hwnd: HWND, width: u32, height: u32) -> Option<Vec<u8>> {
         std::ptr::copy_nonoverlapping(bits as *const u8, buffer.as_mut_ptr(), len);
         // Many windows draw with a zero alpha channel, which would render the
         // thumbnail invisible. Opaque is the only sensible interpretation.
-        for chunk in buffer.chunks_exact_mut(4) {
+        for chunk in buffer.as_chunks_mut::<4>().0 {
             chunk[3] = 255;
         }
         Some(buffer)
