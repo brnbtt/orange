@@ -7,12 +7,13 @@ use crate::auth::{Auth, DiscordConfig, PollResult};
 use crate::{handle_peer, Rooms};
 use anyhow::{bail, Context, Result};
 use axum::{
+    async_trait,
     body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Query, State,
+        DefaultBodyLimit, FromRequestParts, Query, State,
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
@@ -288,36 +289,50 @@ fn diagnostics_storage_key(metadata: &DiagnosticsMetadata, discord_id: &str, dat
     )
 }
 
+struct AuthenticatedDiagnostics {
+    identity: crate::auth::Identity,
+    metadata: DiagnosticsMetadata,
+}
+
+#[async_trait]
+impl FromRequestParts<AppState> for AuthenticatedDiagnostics {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let session = header_value(&parts.headers, "authorization")
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.is_empty())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let identity = state
+            .auth
+            .identify(session)
+            .await
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        if header_value(&parts.headers, "content-type") != Ok("application/zip") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let metadata =
+            parse_diagnostics_metadata(&parts.headers).map_err(|()| StatusCode::BAD_REQUEST)?;
+        let _validated_profile = &metadata.profile;
+        Ok(Self { identity, metadata })
+    }
+}
+
 async fn upload_diagnostics(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    authenticated: AuthenticatedDiagnostics,
     body: Bytes,
 ) -> StatusCode {
-    let session = match header_value(&headers, "authorization")
-        .ok()
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.is_empty())
-    {
-        Some(session) => session,
-        None => return StatusCode::UNAUTHORIZED,
-    };
-    let Some(identity) = app.auth.identify(session).await else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    if header_value(&headers, "content-type") != Ok("application/zip") {
-        return StatusCode::BAD_REQUEST;
-    }
-    let metadata = match parse_diagnostics_metadata(&headers) {
-        Ok(metadata) => metadata,
-        Err(()) => return StatusCode::BAD_REQUEST,
-    };
-    let _validated_profile = &metadata.profile;
     if matches!(&app.diagnostics, DiagnosticsStorage::Disabled) {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
 
     let date = Utc::now().format("%Y-%m-%d").to_string();
-    let key = diagnostics_storage_key(&metadata, &identity.id, &date);
+    let key = diagnostics_storage_key(&authenticated.metadata, &authenticated.identity.id, &date);
     match app.diagnostics.store(&key, body).await {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::BAD_GATEWAY,
@@ -624,15 +639,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostics_rejects_bodies_larger_than_eight_mib() {
+    async fn diagnostics_authenticates_before_enforcing_the_body_limit() {
+        let temp = TempDir::new().unwrap();
+        let app = app(DiagnosticsStorage::Local(temp.path().to_path_buf())).await;
+        let oversized = || vec![0_u8; DIAGNOSTICS_LIMIT + 1];
+
+        let mut missing = headers();
+        missing.remove(header::AUTHORIZATION);
+        let response = app
+            .clone()
+            .oneshot(request(missing, oversized()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut invalid = headers();
+        invalid.insert(header::AUTHORIZATION, "Bearer expired".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(request(invalid, oversized()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app.oneshot(request(headers(), oversized())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(files_below(temp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_accepts_and_stores_exactly_eight_mib() {
         let temp = TempDir::new().unwrap();
         let response = app(DiagnosticsStorage::Local(temp.path().to_path_buf()))
             .await
-            .oneshot(request(headers(), vec![0_u8; 8 * 1024 * 1024 + 1]))
+            .oneshot(request(headers(), vec![0_u8; DIAGNOSTICS_LIMIT]))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(files_below(temp.path()).is_empty());
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let files = files_below(temp.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::metadata(&files[0]).unwrap().len(), 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn local_storage_rejects_parent_and_absolute_paths_before_writing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("configured-root");
+        let parent_target = temp.path().join("parent-escape.zip");
+        assert!(store_local(&root, "../parent-escape.zip", b"secret")
+            .await
+            .is_err());
+        assert!(!parent_target.exists());
+        assert!(!root.exists());
+
+        let absolute_target = temp.path().join("absolute-escape.zip");
+        assert!(
+            store_local(&root, absolute_target.to_str().unwrap(), b"secret")
+                .await
+                .is_err()
+        );
+        assert!(!absolute_target.exists());
+        assert!(!root.exists());
     }
 
     #[tokio::test]
