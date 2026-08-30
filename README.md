@@ -176,9 +176,9 @@ runtime is missing, setup downloads the pinned official x64 runtime from the
 GStreamer project and verifies its SHA-256 hash before installing it. Rust,
 Visual Studio, and the source tree are not needed on the receiving machine.
 
-The current build targets 64-bit Windows 10/11. Hosting requires an NVIDIA GPU
-with AV1 NVENC support; watching requires hardware AV1 decode exposed through
-the Windows D3D11 media stack.
+The current build targets 64-bit Windows 10/11. Beta streaming defaults to
+H.264 NVENC so NVIDIA RTX 20, 30, 40, and 50-series hosts work. AV1 remains an
+opt-in CLI mode for RTX 40/50 hosts and compatible hardware decoders.
 
 ### Alpha testing
 
