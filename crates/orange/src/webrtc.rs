@@ -13,7 +13,9 @@
 //! path with both peers in one process, exchanging SDP by direct call.
 
 mod transport;
-pub(crate) use transport::{audio_rtp_caps, video_rtp_caps as rtp_caps};
+pub(crate) use transport::{
+    audio_rtp_caps, configure_receive_transport, video_rtp_caps as rtp_caps,
+};
 
 use anyhow::{Context, Result};
 use gst::prelude::*;
@@ -179,7 +181,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         .name("receiver")
         .property_from_str("bundle-policy", "max-bundle")
         .build()?;
-    crate::peer::configure_receive_transport(&recv_bin, matches!(&output, Output::Window(_)))?;
+    configure_receive_transport(&recv_bin, matches!(&output, Output::Window(_)))?;
 
     pipeline.add_many([
         capture.upcast_ref(),

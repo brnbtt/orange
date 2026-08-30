@@ -28,8 +28,8 @@ use crate::pipeline::{
     configure_encoder, set_encoder_gop, CaptureSettings, Codec,
 };
 use crate::webrtc::{
-    audio_rtp_caps, build_audio_branch, build_receive_branch, build_video_payloader, encoding_name,
-    rtp_caps, Output,
+    audio_rtp_caps, build_audio_branch, build_receive_branch, build_video_payloader,
+    configure_receive_transport, encoding_name, rtp_caps, Output,
 };
 use orange_signal::{connect, Signal};
 
@@ -85,124 +85,6 @@ fn make_webrtcbin(name: &str) -> Result<gst::Element> {
         .property("stun-server", STUN)
         .build()
         .context("webrtcbin missing")
-}
-
-pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool) -> Result<()> {
-    if !live_output {
-        return Ok(());
-    }
-    const LATENCY_MS: u32 = 100;
-    bin.set_property("latency", LATENCY_MS);
-    let rtpbin = bin
-        .dynamic_cast_ref::<gst::Bin>()
-        .context("webrtcbin is not a GstBin")?
-        .by_name("rtpbin")
-        .context("webrtcbin has no internal rtpbin")?;
-    rtpbin.set_property("latency", LATENCY_MS);
-    rtpbin.set_property("drop-on-latency", false);
-    rtpbin.connect("new-jitterbuffer", false, move |values| {
-        let Ok(jitterbuffer) = values[1].get::<gst::Element>() else {
-            return None;
-        };
-        prepare_media_jitterbuffer(&jitterbuffer);
-        None
-    });
-    if std::env::var("ORANGE_RTP_BUFFER_MODE").as_deref() == Ok("none") {
-        rtpbin.set_property_from_str("buffer-mode", "none");
-        rtpbin.set_property_from_str("rtcp-sync", "never");
-    }
-    Ok(())
-}
-
-fn prepare_media_jitterbuffer(jitterbuffer: &gst::Element) {
-    jitterbuffer.set_property("latency", 100u32);
-    jitterbuffer.set_property("do-lost", true);
-    // Bundled audio and video can share one RTP session index. Default to no
-    // silent drops until the first RTP packet identifies its payload type.
-    jitterbuffer.set_property("drop-on-latency", false);
-    let jitterbuffer_weak = jitterbuffer.downgrade();
-    if let Some(sink) = jitterbuffer.static_pad("sink") {
-        sink.add_probe(
-            gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::BUFFER,
-            move |_, info| {
-                let classified = match &info.data {
-                    Some(gst::PadProbeData::Buffer(buffer)) => buffer
-                        .map_readable()
-                        .ok()
-                        .and_then(|map| rtp_payload_type(map.as_slice()))
-                        .and_then(|payload| {
-                            jitterbuffer_weak.upgrade().map(|jitterbuffer| {
-                                configure_jitterbuffer_for_payload(&jitterbuffer, payload)
-                            })
-                        })
-                        .unwrap_or(false),
-                    Some(gst::PadProbeData::Event(event)) => {
-                        let gst::EventView::Caps(caps) = event.view() else {
-                            return gst::PadProbeReturn::Ok;
-                        };
-                        jitterbuffer_weak.upgrade().is_some_and(|jitterbuffer| {
-                            configure_jitterbuffer_for_caps(&jitterbuffer, caps.caps())
-                        })
-                    }
-                    _ => false,
-                };
-                if classified {
-                    gst::PadProbeReturn::Remove
-                } else {
-                    gst::PadProbeReturn::Ok
-                }
-            },
-        );
-    }
-}
-
-fn rtp_payload_type(packet: &[u8]) -> Option<u8> {
-    (packet.len() >= 2 && packet[0] >> 6 == 2).then(|| packet[1] & 0x7f)
-}
-
-fn configure_jitterbuffer_for_payload(jitterbuffer: &gst::Element, payload: u8) -> bool {
-    match payload {
-        111 => {
-            jitterbuffer.set_property("drop-on-latency", false);
-            true
-        }
-        96 | 97 => {
-            jitterbuffer.set_property("drop-on-latency", true);
-            true
-        }
-        _ => false,
-    }
-}
-
-fn configure_jitterbuffer_for_caps(jitterbuffer: &gst::Element, caps: &gst::CapsRef) -> bool {
-    let Some(structure) = caps.structure(0) else {
-        return false;
-    };
-    let payload = structure
-        .get::<i32>("payload")
-        .ok()
-        .or_else(|| {
-            structure
-                .get::<u32>("payload")
-                .ok()
-                .map(|value| value as i32)
-        })
-        .and_then(|value| u8::try_from(value).ok());
-    let encoding = structure.get::<String>("encoding-name").ok();
-    if let Some(payload) = payload {
-        if configure_jitterbuffer_for_payload(jitterbuffer, payload) {
-            return true;
-        }
-    }
-    let is_audio = encoding.as_deref() == Some("OPUS");
-    let is_video = matches!(encoding.as_deref(), Some("AV1" | "H264" | "H265"));
-    if !is_audio && !is_video {
-        return false;
-    }
-    // Video stays at the live edge. Opus must turn late packets into GAP events
-    // so opusdec can conceal them instead of joining discontinuous waveforms.
-    jitterbuffer.set_property("drop-on-latency", is_video);
-    true
 }
 
 /// Surface pipeline errors.
@@ -606,52 +488,6 @@ mod tests {
         assert_eq!(super::gop_update(120, 480), Some(480));
         assert_eq!(super::gop_update(480, 475), None);
         assert_eq!(super::gop_update(480, 120), Some(120));
-    }
-
-    #[test]
-    fn receiver_transport_keeps_video_live_without_silently_dropping_audio() {
-        gst::init().unwrap();
-        let bin = super::make_webrtcbin("latency-test").unwrap();
-
-        super::configure_receive_transport(&bin, true).unwrap();
-
-        assert_eq!(bin.property::<u32>("latency"), 100);
-        let rtpbin = bin
-            .dynamic_cast_ref::<gst::Bin>()
-            .unwrap()
-            .by_name("rtpbin")
-            .unwrap();
-        assert_eq!(rtpbin.property::<u32>("latency"), 100);
-        assert!(!rtpbin.property::<bool>("drop-on-latency"));
-
-        let video = gst::ElementFactory::make("rtpjitterbuffer")
-            .build()
-            .unwrap();
-        super::prepare_media_jitterbuffer(&video);
-        assert!(super::configure_jitterbuffer_for_caps(
-            &video,
-            &gst::Caps::builder("application/x-rtp")
-                .field("payload", 96i32)
-                .build()
-        ));
-        assert!(video.property::<bool>("drop-on-latency"));
-
-        let audio = gst::ElementFactory::make("rtpjitterbuffer")
-            .build()
-            .unwrap();
-        super::prepare_media_jitterbuffer(&audio);
-        assert!(super::configure_jitterbuffer_for_caps(
-            &audio,
-            &gst::Caps::builder("application/x-rtp")
-                .field("payload", 111i32)
-                .build()
-        ));
-        assert_eq!(audio.property::<u32>("latency"), 100);
-        assert!(audio.property::<bool>("do-lost"));
-        assert!(!audio.property::<bool>("drop-on-latency"));
-        assert_eq!(super::rtp_payload_type(&[0x80, 0xe0]), Some(96));
-        assert_eq!(super::rtp_payload_type(&[0x80, 0xef]), Some(111));
-        assert_eq!(super::rtp_payload_type(&[0x00, 0x60]), None);
     }
 }
 
