@@ -12,6 +12,7 @@ mod capture;
 mod session;
 mod supervisor;
 mod tray;
+mod update;
 
 use gpui::{
     div, prelude::*, px, rgb, size, Animation, AnimationExt, App, Application, Bounds, Context,
@@ -88,6 +89,9 @@ struct Orange {
     copied_code: Option<String>,
     own_codes: Vec<String>,
     logo_epoch: u64,
+    update_status: update::UpdateStatus,
+    update_rx: Option<std::sync::mpsc::Receiver<update::UpdateEvent>>,
+    next_update_check: Instant,
 }
 
 impl Orange {
@@ -105,6 +109,12 @@ impl Orange {
         let session = session::load();
         let preferences = session::load_preferences();
         let avatar_rx = request_avatar(session.as_ref().and_then(|s| s.avatar_url.clone()));
+        let update_rx = update::start_check();
+        let update_status = if update_rx.is_some() {
+            update::UpdateStatus::Checking
+        } else {
+            update::UpdateStatus::Disabled
+        };
         Self {
             screen: if session.is_some() {
                 Screen::Home
@@ -131,11 +141,15 @@ impl Orange {
             copied_code: None,
             own_codes: preferences.own_codes,
             logo_epoch: 0,
+            update_status,
+            update_rx,
+            next_update_check: Instant::now() + Duration::from_secs(6 * 60 * 60),
         }
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         self.drain_thumbnails();
+        self.poll_updates(cx);
         if let Some(rx) = &self.avatar_rx {
             match rx.try_recv() {
                 Ok(pixels) => {
@@ -222,6 +236,98 @@ impl Orange {
             self.notice = None;
         }
         cx.notify();
+    }
+
+    fn poll_updates(&mut self, cx: &mut Context<Self>) {
+        let event = self.update_rx.as_ref().and_then(|receiver| match receiver.try_recv() {
+            Ok(event) => Some(Ok(event)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(())),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        });
+        match event {
+            Some(Ok(update::UpdateEvent::Checked(Ok(Some(info))))) => {
+                self.update_status = update::UpdateStatus::Available(info);
+                self.update_rx = None;
+            }
+            Some(Ok(update::UpdateEvent::Checked(Ok(None)))) => {
+                self.update_status = update::UpdateStatus::Current;
+                self.update_rx = None;
+            }
+            Some(Ok(update::UpdateEvent::Checked(Err(_)))) | Some(Err(())) => {
+                let info = match &self.update_status {
+                    update::UpdateStatus::Downloading(info) => Some(info.clone()),
+                    _ => None,
+                };
+                let message = if info.is_some() {
+                    "Update download failed"
+                } else {
+                    "Could not check for updates"
+                };
+                self.update_status = update::UpdateStatus::Failed {
+                    info,
+                    message: message.into(),
+                };
+                self.update_rx = None;
+            }
+            Some(Ok(update::UpdateEvent::Downloaded { info, result })) => {
+                self.update_rx = None;
+                match result {
+                    Ok(installer) => {
+                        match update::launch_updater(&info, &installer) {
+                            Ok(()) => {
+                                self.stop_host();
+                                self.stop_all_watches();
+                                cx.quit();
+                            }
+                            Err(_) => {
+                                self.update_status = update::UpdateStatus::Failed {
+                                    info: Some(info),
+                                    message: "Could not start the updater".into(),
+                                };
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        self.update_status = update::UpdateStatus::Failed {
+                            info: Some(info),
+                            message: "Update download failed".into(),
+                        };
+                    }
+                }
+            }
+            None => {}
+        }
+
+        if update::enabled()
+            && self.update_rx.is_none()
+            && Instant::now() >= self.next_update_check
+            && matches!(
+                self.update_status,
+                update::UpdateStatus::Current | update::UpdateStatus::Failed { info: None, .. }
+            )
+        {
+            self.update_status = update::UpdateStatus::Checking;
+            self.update_rx = update::start_check();
+            self.next_update_check = Instant::now() + Duration::from_secs(6 * 60 * 60);
+        }
+    }
+
+    fn request_update(&mut self) {
+        match &self.update_status {
+            update::UpdateStatus::Available(info)
+            | update::UpdateStatus::Failed {
+                info: Some(info), ..
+            } => {
+                let info = info.clone();
+                self.update_rx = Some(update::start_download(info.clone()));
+                self.update_status = update::UpdateStatus::Downloading(info);
+            }
+            update::UpdateStatus::Failed { info: None, .. } => {
+                self.update_status = update::UpdateStatus::Checking;
+                self.update_rx = update::start_check();
+            }
+            _ => {}
+        }
     }
 
     fn quality(&self) -> Quality {
@@ -606,6 +712,27 @@ fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui
         .child(text.into())
 }
 
+fn update_action(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_w(px(104.0))
+        .h(px(36.0))
+        .px_3()
+        .rounded_md()
+        .bg(rgb(ORANGE))
+        .text_color(rgb(INK))
+        .font_family("Bahnschrift")
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0xff6f38)))
+        .active(|style| style.bg(rgb(ORANGE_DIM)))
+        .child(text.into())
+}
+
 fn option_pill(
     id: SharedString,
     text: impl Into<SharedString>,
@@ -806,6 +933,7 @@ impl Render for Orange {
             Screen::Watching => self.render_watching(cx).into_any_element(),
             Screen::Settings => self.render_settings(cx).into_any_element(),
         };
+        let update_banner = self.render_update_banner(cx);
 
         div()
             .flex()
@@ -815,6 +943,7 @@ impl Render for Orange {
             .text_sm()
             .font_family("Segoe UI")
             .child(self.render_titlebar(cx))
+            .children(update_banner)
             .child(
                 div()
                     .relative()
@@ -860,6 +989,66 @@ impl Render for Orange {
 }
 
 impl Orange {
+    fn render_update_banner(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.update_status.is_visible() {
+            return None;
+        }
+        let action = self.update_status.action_label();
+        let (heading, detail, action) = match &self.update_status {
+            update::UpdateStatus::Available(info) => (
+                format!("UPDATE {} AVAILABLE", info.version),
+                if info.notes.is_empty() {
+                    "A new beta build is ready.".to_string()
+                } else {
+                    info.notes.clone()
+                },
+                action,
+            ),
+            update::UpdateStatus::Downloading(info) => (
+                format!("DOWNLOADING {}", info.version),
+                "Orange will restart when the verified installer is ready.".to_string(),
+                None,
+            ),
+            update::UpdateStatus::Failed { message, .. } => (
+                "UPDATE PAUSED".to_string(),
+                message.clone(),
+                self.update_status.action_label(),
+            ),
+            _ => return None,
+        };
+        Some(
+            div()
+                .mx_5()
+                .mt_3()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(0x24190f))
+                .border_1()
+                .border_color(rgb(ORANGE_DIM))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .min_w(px(0.0))
+                        .child(micro(heading, ORANGE))
+                        .child(label(detail, MUTED).text_xs()),
+                )
+                .children(action.map(|text| {
+                    update_action("apply-update", text)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_update();
+                            cx.notify();
+                        }))
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// Custom titlebar. GPUI hides the system one via `appears_transparent`,
     /// which its source documents as supported on Windows.
     ///
@@ -1855,6 +2044,14 @@ impl Orange {
                     ),
             )
             .child(div().flex_1())
+            .child(micro(
+                format!(
+                    "VERSION {}  ·  {}",
+                    update::current_version(),
+                    update::build_label()
+                ),
+                FAINT,
+            ))
             .child(
                 secondary("back-settings", "Done").on_click(cx.listener(|this, _, _, cx| {
                     this.screen = Screen::Home;
