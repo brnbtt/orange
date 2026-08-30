@@ -93,8 +93,43 @@ fn orange_command() -> Result<Command> {
         let existing = std::env::var("PATH").unwrap_or_default();
         command.env("PATH", format!("{};{}", bin.display(), existing));
     }
+    if std::env::var_os("ORANGE_MEDIA_DIAGNOSTICS").is_none() {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let directory = std::path::PathBuf::from(local)
+                .join("orange")
+                .join("diagnostics");
+            prune_diagnostics(&directory);
+            command.env("ORANGE_MEDIA_DIAGNOSTICS", directory);
+            command.env("ORANGE_TEST_PROFILE", "beta");
+            if let Some(build) = option_env!("ORANGE_BUILD_ID") {
+                command.env("ORANGE_BUILD_ID", build);
+            }
+        }
+    }
     command.creation_flags(CREATE_NO_WINDOW);
     Ok(command)
+}
+
+fn prune_diagnostics(directory: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let retention = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age > retention);
+        if old
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Whether the media stack is present, so the UI can say so plainly rather

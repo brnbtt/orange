@@ -294,12 +294,14 @@ fn snapshot_stage(counter: &StageCounter, now_ms: u64) -> StageSnapshot {
 
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct WebRtcReport {
-    inbound_video: Option<InboundVideoStats>,
-    outbound_video: Option<OutboundVideoStats>,
+    inbound_video: Option<InboundRtpStats>,
+    outbound_video: Option<OutboundRtpStats>,
+    inbound_audio: Option<InboundRtpStats>,
+    outbound_audio: Option<OutboundRtpStats>,
 }
 
 #[derive(Debug, Default, Serialize)]
-struct InboundVideoStats {
+struct InboundRtpStats {
     packets_received: u64,
     payload_bytes_received: u64,
     packets_lost: i64,
@@ -322,7 +324,7 @@ struct InboundVideoStats {
 }
 
 #[derive(Debug, Default, Serialize)]
-struct OutboundVideoStats {
+struct OutboundRtpStats {
     packets_sent: u64,
     payload_bytes_sent: u64,
     nack_received: u64,
@@ -336,55 +338,67 @@ pub(crate) fn parse_webrtc_stats(stats: &gst::StructureRef) -> WebRtcReport {
         let Ok(sample) = value.get::<gst::Structure>() else {
             continue;
         };
-        if sample.get::<String>("kind").as_deref() != Ok("video") {
+        let Ok(media) = sample.get::<String>("kind") else {
             continue;
-        }
+        };
         let Ok(kind) = sample.get::<gst_webrtc::WebRTCStatsType>("type") else {
             continue;
         };
         match kind {
             gst_webrtc::WebRTCStatsType::InboundRtp => {
-                let inbound = report
-                    .inbound_video
-                    .get_or_insert_with(InboundVideoStats::default);
-                inbound.packets_received += get_u64(&sample, "packets-received");
-                inbound.payload_bytes_received += get_u64(&sample, "bytes-received");
-                inbound.packets_lost += get_i64(&sample, "packets-lost");
-                inbound.packets_repaired += get_u64(&sample, "packets-repaired");
-                inbound.packets_discarded += get_u64(&sample, "packets-discarded");
-                inbound.packets_duplicated += get_u64(&sample, "packets-duplicated");
-                inbound.jitter_ms = get_f64(&sample, "jitter") * 1_000.0;
-                inbound.nack_sent += get_u64(&sample, "nack-count");
-                inbound.pli_sent += get_u64(&sample, "pli-count");
-                inbound.fir_sent += get_u64(&sample, "fir-count");
-                if let Ok(jitter) = sample.get::<gst::Structure>("gst-rtpjitterbuffer-stats") {
-                    inbound.jitterbuffer_packets_pushed += get_u64(&jitter, "num-pushed");
-                    inbound.jitterbuffer_packets_lost += get_u64(&jitter, "num-lost");
-                    inbound.jitterbuffer_packets_duplicated += get_u64(&jitter, "num-duplicates");
-                    inbound.jitterbuffer_avg_jitter_ms =
-                        get_u64(&jitter, "avg-jitter") as f64 / 1_000_000.0;
-                    inbound.rtx_requested += get_u64(&jitter, "rtx-count");
-                    inbound.rtx_succeeded += get_u64(&jitter, "rtx-success-count");
-                    inbound.jitterbuffer_rtx_per_packet = get_f64(&jitter, "rtx-per-packet");
-                    inbound.jitterbuffer_rtx_rtt_ms =
-                        get_u64(&jitter, "rtx-rtt") as f64 / 1_000_000.0;
-                    inbound.packets_late += get_u64(&jitter, "num-late");
+                let inbound = match media.as_str() {
+                    "video" => &mut report.inbound_video,
+                    "audio" => &mut report.inbound_audio,
+                    _ => continue,
                 }
+                .get_or_insert_with(InboundRtpStats::default);
+                accumulate_inbound(inbound, &sample);
             }
             gst_webrtc::WebRTCStatsType::OutboundRtp => {
-                let outbound = report
-                    .outbound_video
-                    .get_or_insert_with(OutboundVideoStats::default);
-                outbound.packets_sent += get_u64(&sample, "packets-sent");
-                outbound.payload_bytes_sent += get_u64(&sample, "bytes-sent");
-                outbound.nack_received += get_u64(&sample, "nack-count");
-                outbound.pli_received += get_u64(&sample, "pli-count");
-                outbound.fir_received += get_u64(&sample, "fir-count");
+                let outbound = match media.as_str() {
+                    "video" => &mut report.outbound_video,
+                    "audio" => &mut report.outbound_audio,
+                    _ => continue,
+                }
+                .get_or_insert_with(OutboundRtpStats::default);
+                accumulate_outbound(outbound, &sample);
             }
             _ => {}
         }
     }
     report
+}
+
+fn accumulate_inbound(inbound: &mut InboundRtpStats, sample: &gst::StructureRef) {
+    inbound.packets_received += get_u64(sample, "packets-received");
+    inbound.payload_bytes_received += get_u64(sample, "bytes-received");
+    inbound.packets_lost += get_i64(sample, "packets-lost");
+    inbound.packets_repaired += get_u64(sample, "packets-repaired");
+    inbound.packets_discarded += get_u64(sample, "packets-discarded");
+    inbound.packets_duplicated += get_u64(sample, "packets-duplicated");
+    inbound.jitter_ms = get_f64(sample, "jitter") * 1_000.0;
+    inbound.nack_sent += get_u64(sample, "nack-count");
+    inbound.pli_sent += get_u64(sample, "pli-count");
+    inbound.fir_sent += get_u64(sample, "fir-count");
+    if let Ok(jitter) = sample.get::<gst::Structure>("gst-rtpjitterbuffer-stats") {
+        inbound.jitterbuffer_packets_pushed += get_u64(&jitter, "num-pushed");
+        inbound.jitterbuffer_packets_lost += get_u64(&jitter, "num-lost");
+        inbound.jitterbuffer_packets_duplicated += get_u64(&jitter, "num-duplicates");
+        inbound.jitterbuffer_avg_jitter_ms = get_u64(&jitter, "avg-jitter") as f64 / 1_000_000.0;
+        inbound.rtx_requested += get_u64(&jitter, "rtx-count");
+        inbound.rtx_succeeded += get_u64(&jitter, "rtx-success-count");
+        inbound.jitterbuffer_rtx_per_packet = get_f64(&jitter, "rtx-per-packet");
+        inbound.jitterbuffer_rtx_rtt_ms = get_u64(&jitter, "rtx-rtt") as f64 / 1_000_000.0;
+        inbound.packets_late += get_u64(&jitter, "num-late");
+    }
+}
+
+fn accumulate_outbound(outbound: &mut OutboundRtpStats, sample: &gst::StructureRef) {
+    outbound.packets_sent += get_u64(sample, "packets-sent");
+    outbound.payload_bytes_sent += get_u64(sample, "bytes-sent");
+    outbound.nack_received += get_u64(sample, "nack-count");
+    outbound.pli_received += get_u64(sample, "pli-count");
+    outbound.fir_received += get_u64(sample, "fir-count");
 }
 
 fn get_u64(stats: &gst::StructureRef, field: &str) -> u64 {
@@ -920,9 +934,25 @@ mod tests {
             .field("pli-count", 2u32)
             .field("fir-count", 1u32)
             .build();
+        let audio_jitter = gst::Structure::builder("application/x-rtp-jitterbuffer-stats")
+            .field("num-pushed", 990u64)
+            .field("num-lost", 4u64)
+            .field("num-late", 6u64)
+            .field("avg-jitter", 4_000_000u64)
+            .build();
+        let inbound_audio = gst::Structure::builder("inbound-audio")
+            .field("type", gst_webrtc::WebRTCStatsType::InboundRtp)
+            .field("kind", "audio")
+            .field("packets-received", 1_000u64)
+            .field("bytes-received", 128_000u64)
+            .field("packets-lost", 4i64)
+            .field("jitter", 0.018f64)
+            .field("gst-rtpjitterbuffer-stats", audio_jitter)
+            .build();
         let stats = gst::Structure::builder("application/x-webrtc-stats")
             .field("inbound-sensitive-id", inbound)
             .field("outbound-sensitive-id", outbound)
+            .field("inbound-audio-sensitive-id", inbound_audio)
             .build();
 
         let report = parse_webrtc_stats(&stats);
@@ -941,6 +971,13 @@ mod tests {
         assert_eq!(inbound.jitterbuffer_rtx_rtt_ms, 12.0);
         assert_eq!(outbound.packets_sent, 850);
         assert_eq!(outbound.nack_received, 11);
+        let audio = report.inbound_audio.as_ref().unwrap();
+        assert_eq!(audio.packets_received, 1_000);
+        assert_eq!(audio.packets_lost, 4);
+        assert_eq!(audio.packets_late, 6);
+        assert_eq!(audio.jitter_ms, 18.0);
+        assert_eq!(audio.jitterbuffer_packets_pushed, 990);
+        assert_eq!(audio.jitterbuffer_packets_lost, 4);
 
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("inbound-sensitive-id"));

@@ -39,6 +39,7 @@ const STUN: &str = "stun://stun.l.google.com:19302";
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_AFTER: Duration = Duration::from_millis(100);
 const RECOVERY_KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
+const AUDIO_BRANCH_MAX_PACKETS: u32 = 10;
 static NEXT_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_KEYFRAME_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
@@ -98,12 +99,28 @@ pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool)
         .by_name("rtpbin")
         .context("webrtcbin has no internal rtpbin")?;
     rtpbin.set_property("latency", LATENCY_MS);
-    rtpbin.set_property("drop-on-latency", true);
+    rtpbin.set_property("drop-on-latency", false);
+    rtpbin.connect("new-jitterbuffer", false, move |values| {
+        let Ok(jitterbuffer) = values[1].get::<gst::Element>() else {
+            return None;
+        };
+        let session = values[2].get::<u32>().unwrap_or_default();
+        configure_media_jitterbuffer(&jitterbuffer, session);
+        None
+    });
     if std::env::var("ORANGE_RTP_BUFFER_MODE").as_deref() == Ok("none") {
         rtpbin.set_property_from_str("buffer-mode", "none");
         rtpbin.set_property_from_str("rtcp-sync", "never");
     }
     Ok(())
+}
+
+fn configure_media_jitterbuffer(jitterbuffer: &gst::Element, session: u32) {
+    jitterbuffer.set_property("latency", 100u32);
+    jitterbuffer.set_property("do-lost", true);
+    // Video stays at the live edge. Opus must turn late packets into GAP events
+    // so opusdec can conceal them instead of joining discontinuous waveforms.
+    jitterbuffer.set_property("drop-on-latency", session == 0);
 }
 
 /// Surface pipeline errors.
@@ -122,6 +139,7 @@ fn watch_bus(
     let bus = pipeline.bus().context("pipeline has no bus")?;
     let (errors, receiver) = mpsc::unbounded_channel();
     let bus_errors = errors.clone();
+    let pipeline_weak = pipeline.downgrade();
     bus.set_sync_handler(move |_, msg| {
         match msg.view() {
             gst::MessageView::Error(err) => {
@@ -154,6 +172,21 @@ fn watch_bus(
             gst::MessageView::Eos(_) => {
                 println!("[{label}] end of stream");
                 emit_diagnostic("pipeline-eos", label, serde_json::json!({}));
+            }
+            gst::MessageView::Latency(_) => {
+                if let Some(pipeline) = pipeline_weak.upgrade() {
+                    pipeline.call_async(move |pipeline| {
+                        if let Err(error) = pipeline.recalculate_latency() {
+                            eprintln!("[{label}] warning: could not recalculate latency: {error}");
+                        } else {
+                            emit_diagnostic(
+                                "pipeline-latency-recalculated",
+                                label,
+                                serde_json::json!({}),
+                            );
+                        }
+                    });
+                }
             }
             _ => {}
         }
@@ -493,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn receiver_transport_has_a_hard_live_latency_bound() {
+    fn receiver_transport_keeps_video_live_without_silently_dropping_audio() {
         gst::init().unwrap();
         let bin = super::make_webrtcbin("latency-test").unwrap();
 
@@ -506,7 +539,21 @@ mod tests {
             .by_name("rtpbin")
             .unwrap();
         assert_eq!(rtpbin.property::<u32>("latency"), 100);
-        assert!(rtpbin.property::<bool>("drop-on-latency"));
+        assert!(!rtpbin.property::<bool>("drop-on-latency"));
+
+        let video = gst::ElementFactory::make("rtpjitterbuffer")
+            .build()
+            .unwrap();
+        super::configure_media_jitterbuffer(&video, 0);
+        assert!(video.property::<bool>("drop-on-latency"));
+
+        let audio = gst::ElementFactory::make("rtpjitterbuffer")
+            .build()
+            .unwrap();
+        super::configure_media_jitterbuffer(&audio, 1);
+        assert_eq!(audio.property::<u32>("latency"), 100);
+        assert!(audio.property::<bool>("do-lost"));
+        assert!(!audio.property::<bool>("drop-on-latency"));
     }
 }
 
@@ -954,7 +1001,7 @@ fn add_viewer(
                 pipeline,
                 audio_tee,
                 &branch.bin,
-                50,
+                AUDIO_BRANCH_MAX_PACKETS,
                 false,
                 None,
                 Vec::new(),
