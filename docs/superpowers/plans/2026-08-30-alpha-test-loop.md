@@ -121,12 +121,12 @@
 - Create: `deploy/test-azure-script.ps1`
 
 **Interfaces:**
-- Produces: a private Blob container with lifecycle retention and a server-side write/create SAS stored as a Container Apps secret.
+- Produces: a private Blob container with lifecycle retention and a server-side write/create SAS stored as Container Apps secret `diag-container-url`.
 - Configures: `ORANGE_DIAGNOSTICS_CONTAINER_URL` from a secret reference without printing the SAS.
 
 - [ ] Add static script tests proving secure-transfer-only storage, disabled public blob access, private container creation, retention configuration, secret reference usage, and absence of SAS output.
 - [ ] Run the checks and confirm they fail against the current deployment script.
-- [ ] Extend deployment to idempotently provision storage, container, retention, SAS secret, and relay environment configuration.
+- [ ] Extend deployment to idempotently provision storage, container, retention, SAS secret `diag-container-url`, and relay environment configuration.
 - [ ] Run static checks and PowerShell parser validation without changing Azure resources.
 - [ ] Commit the task.
 
