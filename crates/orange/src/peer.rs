@@ -326,10 +326,73 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
     Ok(gst_webrtc::WebRTCSessionDescription::new(sdp_type, msg))
 }
 
+fn emit_signal_diagnostic(signal: &Signal, emit: impl FnOnce(&str, &str, serde_json::Value)) {
+    let (role, diagnostic_session) = match signal {
+        Signal::Hosting {
+            diagnostic_session: Some(diagnostic_session),
+            ..
+        } => ("host", diagnostic_session),
+        Signal::StreamInfo {
+            diagnostic_session: Some(diagnostic_session),
+            ..
+        } => ("watch", diagnostic_session),
+        _ => return,
+    };
+    emit(
+        "diagnostic-session",
+        role,
+        serde_json::json!({ "id": diagnostic_session }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn hosting_receipt_emits_exact_diagnostic_session_event() {
+        let mut captured = None;
+        let signal = Signal::Hosting {
+            code: "ROOM-CODE".to_string(),
+            diagnostic_session: Some("opaque-session".to_string()),
+        };
+
+        super::emit_signal_diagnostic(&signal, |event, role, payload| {
+            captured = Some((event.to_string(), role.to_string(), payload));
+        });
+
+        assert_eq!(
+            captured,
+            Some((
+                "diagnostic-session".to_string(),
+                "host".to_string(),
+                serde_json::json!({ "id": "opaque-session" }),
+            ))
+        );
+    }
+
+    #[test]
+    fn stream_info_receipt_emits_exact_diagnostic_session_event() {
+        let mut captured = None;
+        let signal = Signal::StreamInfo {
+            host_name: Some("Host Name".to_string()),
+            diagnostic_session: Some("opaque-session".to_string()),
+        };
+
+        super::emit_signal_diagnostic(&signal, |event, role, payload| {
+            captured = Some((event.to_string(), role.to_string(), payload));
+        });
+
+        assert_eq!(
+            captured,
+            Some((
+                "diagnostic-session".to_string(),
+                "watch".to_string(),
+                serde_json::json!({ "id": "opaque-session" }),
+            ))
+        );
+    }
 
     #[test]
     fn closed_playback_suppresses_teardown_bus_errors() {
@@ -582,18 +645,9 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 signal = client.incoming.recv() => signal,
             };
             let Some(signal) = signal else { break };
+            emit_signal_diagnostic(&signal, emit_diagnostic);
             match signal {
-                Signal::Hosting {
-                    code,
-                    diagnostic_session,
-                } => {
-                    if let Some(diagnostic_session) = diagnostic_session {
-                        emit_diagnostic(
-                            "diagnostic-session",
-                            "host",
-                            serde_json::json!({ "id": diagnostic_session }),
-                        );
-                    }
+                Signal::Hosting { code, .. } => {
                     println!("\n  Share this code:  {code}\n");
                     println!("  Viewers run:  orange watch --code {code}\n");
                 }
@@ -1227,6 +1281,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                 }
             };
             let Some(signal) = signal else { break };
+            emit_signal_diagnostic(&signal, emit_diagnostic);
             match signal {
                 Signal::Sdp { kind, sdp, .. } if kind == "offer" => {
                     let desc = parse_sdp(&kind, &sdp)?;
@@ -1253,17 +1308,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                 } => {
                     bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
                 }
-                Signal::StreamInfo {
-                    host_name,
-                    diagnostic_session,
-                } => {
-                    if let Some(diagnostic_session) = diagnostic_session {
-                        emit_diagnostic(
-                            "diagnostic-session",
-                            "watch",
-                            serde_json::json!({ "id": diagnostic_session }),
-                        );
-                    }
+                Signal::StreamInfo { host_name, .. } => {
                     if let Some(overlay) = &viewer_overlay {
                         if let Ok(mut state) = overlay.lock() {
                             state.host = host_name.clone();
