@@ -466,6 +466,10 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
     }
 }
 
+fn file_output_factories(codec: Codec) -> (&'static str, &'static str) {
+    (codec.encoder(), codec.parser())
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
@@ -560,19 +564,16 @@ pub fn build_receive_branch(
         Output::File(path) => {
             // Re-encode only because writing raw frames to disk is impractical.
             // This branch exists for verification, not for the real product.
-            let enc = build_receive_element(
-                diagnostic_role,
-                "video-file-encoder",
-                "nvd3d11av1enc",
-                || {
-                    Ok(gst::ElementFactory::make("nvd3d11av1enc")
+            let (encoder, parser) = file_output_factories(codec);
+            let enc =
+                build_receive_element(diagnostic_role, "video-file-encoder", encoder, || {
+                    Ok(gst::ElementFactory::make(encoder)
                         .property("bitrate", 25_000u32)
                         .build()?)
-                },
-            )?;
+                })?;
             let parse2 =
-                build_receive_element(diagnostic_role, "video-file-parser", "av1parse", || {
-                    Ok(gst::ElementFactory::make("av1parse").build()?)
+                build_receive_element(diagnostic_role, "video-file-parser", parser, || {
+                    Ok(gst::ElementFactory::make(parser).build()?)
                 })?;
             let mux =
                 build_receive_element(diagnostic_role, "video-file-muxer", "matroskamux", || {
@@ -718,6 +719,14 @@ mod tests {
         assert!(depay.element.property::<bool>("request-keyframe"));
         assert!(depay.element.property::<bool>("wait-for-keyframe"));
         assert_eq!(Codec::from_rtp_encoding("H264"), Some(Codec::H264));
+    }
+
+    #[test]
+    fn h264_file_output_does_not_require_av1_encoding() {
+        assert_eq!(
+            file_output_factories(Codec::H264),
+            ("nvd3d11h264enc", "h264parse")
+        );
     }
 
     #[test]
