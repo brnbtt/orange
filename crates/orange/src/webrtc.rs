@@ -23,18 +23,36 @@ use std::sync::{Arc, Mutex};
 use crate::media_diagnostics::{
     measure_operation, track_pad, MediaProgress, MediaStage, Operation,
 };
-use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
+use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings, Codec};
 
 /// RTP caps for our encoded video. AV1 has no static payload type, so we pick
 /// one from the dynamic range and both ends agree on it.
-pub fn rtp_caps(frame_rate: u32) -> gst::Caps {
-    gst::Caps::builder("application/x-rtp")
+pub fn rtp_caps(codec: Codec, frame_rate: u32) -> gst::Caps {
+    let builder = gst::Caps::builder("application/x-rtp")
         .field("media", "video")
-        .field("encoding-name", "AV1")
+        .field("encoding-name", codec.rtp_encoding())
         .field("payload", 96i32)
         .field("clock-rate", 90_000i32)
-        .field("a-framerate", frame_rate.to_string())
-        .build()
+        .field("a-framerate", frame_rate.to_string());
+    match codec {
+        Codec::H264 => builder.field("packetization-mode", "1").build(),
+        Codec::Av1 | Codec::H265 => builder.build(),
+    }
+}
+
+pub fn build_video_payloader(codec: Codec) -> Result<gst::Element> {
+    let factory = codec.payloader();
+    match codec {
+        Codec::Av1 => gst::ElementFactory::make(factory).build(),
+        Codec::H264 => gst::ElementFactory::make(factory)
+            .property("config-interval", -1i32)
+            .property_from_str("aggregate-mode", "zero-latency")
+            .build(),
+        Codec::H265 => gst::ElementFactory::make(factory)
+            .property("config-interval", -1i32)
+            .build(),
+    }
+    .with_context(|| format!("{factory} missing"))
 }
 
 /// RTP caps for Opus audio, on a separate payload type from the video.
@@ -163,11 +181,9 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
     // --- sending half -------------------------------------------------------
     let capture = gst::parse::bin_from_description(&build_capture_chain(settings), true)
         .context("failed to build capture chain")?;
-    let pay = gst::ElementFactory::make("rtpav1pay")
-        .build()
-        .context("rtpav1pay missing")?;
+    let pay = build_video_payloader(settings.codec)?;
     let caps_filter = gst::ElementFactory::make("capsfilter")
-        .property("caps", rtp_caps(settings.fps))
+        .property("caps", rtp_caps(settings.codec, settings.fps))
         .build()?;
     let send_bin = gst::ElementFactory::make("webrtcbin")
         .name("sender")
@@ -365,14 +381,39 @@ fn build_av1_decoder(
     })
 }
 
-fn build_av1_depayloader(diagnostic_role: &str) -> Result<ReceiveElement> {
-    build_receive_element(diagnostic_role, "video-depayloader", "rtpav1depay", || {
-        gst::ElementFactory::make("rtpav1depay")
+fn build_video_decoder(
+    codec: Codec,
+    selection: Option<&str>,
+    file_output: bool,
+    diagnostic_role: &str,
+) -> Result<ReceiveElement> {
+    if codec == Codec::Av1 {
+        return build_av1_decoder(selection, file_output, diagnostic_role);
+    }
+    let factory = codec.decoder();
+    build_receive_element(diagnostic_role, "video-decoder", factory, || {
+        gst::ElementFactory::make(factory)
+            .property("automatic-request-sync-points", true)
+            .property("discard-corrupted-frames", true)
+            .build()
+            .with_context(|| format!("{factory} is unavailable"))
+    })
+}
+
+fn build_video_depayloader(codec: Codec, diagnostic_role: &str) -> Result<ReceiveElement> {
+    let factory = codec.depayloader();
+    build_receive_element(diagnostic_role, "video-depayloader", factory, || {
+        gst::ElementFactory::make(factory)
             .property("request-keyframe", true)
             .property("wait-for-keyframe", true)
             .build()
-            .context("rtpav1depay is unavailable")
+            .with_context(|| format!("{factory} is unavailable"))
     })
+}
+
+#[cfg(test)]
+fn build_av1_depayloader(diagnostic_role: &str) -> Result<ReceiveElement> {
+    build_video_depayloader(Codec::Av1, diagnostic_role)
 }
 
 fn build_live_video_queue(diagnostic_role: &str) -> Result<ReceiveElement> {
@@ -437,14 +478,18 @@ pub fn build_receive_branch(
         Output::Window(playback) => Some(playback.clone()),
         Output::File(_) => None,
     };
-    let depay = build_av1_depayloader(diagnostic_role)?;
-    let parse = build_receive_element(diagnostic_role, "video-parser", "av1parse", || {
-        gst::ElementFactory::make("av1parse")
+    let encoding = encoding_name(pad).context("video RTP pad has no encoding name")?;
+    let codec = Codec::from_rtp_encoding(&encoding).context("unsupported video RTP encoding")?;
+    let depay = build_video_depayloader(codec, diagnostic_role)?;
+    let parser = codec.parser();
+    let parse = build_receive_element(diagnostic_role, "video-parser", parser, || {
+        gst::ElementFactory::make(parser)
             .build()
-            .context("av1parse is unavailable")
+            .with_context(|| format!("{parser} is unavailable"))
     })?;
     let decoder_selection = std::env::var("ORANGE_AV1_DECODER").ok();
-    let dec = build_av1_decoder(
+    let dec = build_video_decoder(
+        codec,
         decoder_selection.as_deref(),
         matches!(&output, Output::File(_)),
         diagnostic_role,
@@ -643,7 +688,7 @@ mod tests {
     #[test]
     fn rtp_caps_advertise_the_configured_frame_rate() {
         gst::init().unwrap();
-        let caps = rtp_caps(120);
+        let caps = rtp_caps(Codec::H264, 120);
 
         assert_eq!(
             caps.structure(0)
@@ -653,6 +698,26 @@ mod tests {
             "120"
         );
         assert_eq!(frame_rate_from_rtp_caps(&caps), Some(120));
+    }
+
+    #[test]
+    fn h264_transport_resends_headers_and_recovers_after_loss() {
+        gst::init().unwrap();
+        let caps = rtp_caps(Codec::H264, 60);
+        let pay = build_video_payloader(Codec::H264).unwrap();
+        let depay = build_video_depayloader(Codec::H264, "test").unwrap();
+
+        assert_eq!(
+            caps.structure(0)
+                .unwrap()
+                .get::<String>("encoding-name")
+                .unwrap(),
+            "H264"
+        );
+        assert_eq!(pay.property::<i32>("config-interval"), -1);
+        assert!(depay.element.property::<bool>("request-keyframe"));
+        assert!(depay.element.property::<bool>("wait-for-keyframe"));
+        assert_eq!(Codec::from_rtp_encoding("H264"), Some(Codec::H264));
     }
 
     #[test]

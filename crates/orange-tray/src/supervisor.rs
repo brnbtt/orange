@@ -359,7 +359,7 @@ pub const QUALITIES: &[Quality] = &[
         max_width: 1280,
         max_height: 720,
         bitrate: 4_000,
-        codec: "av1",
+        codec: "h264",
         mbps: 4,
     },
     Quality {
@@ -367,7 +367,7 @@ pub const QUALITIES: &[Quality] = &[
         max_width: 1920,
         max_height: 1080,
         bitrate: 8_000,
-        codec: "av1",
+        codec: "h264",
         mbps: 8,
     },
     Quality {
@@ -375,7 +375,7 @@ pub const QUALITIES: &[Quality] = &[
         max_width: 2560,
         max_height: 1440,
         bitrate: 18_000,
-        codec: "av1",
+        codec: "h264",
         mbps: 18,
     },
 ];

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/orange-signal", "crates/orange-relay", "crates/orange", "crates/orange-tray", "crates/orange-updater"]
 
 [workspace.package]
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 edition = "2021"
 license = "MIT"
 

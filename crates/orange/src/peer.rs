@@ -25,9 +25,11 @@ use crate::media_diagnostics::{
 };
 use crate::pipeline::{
     build_audio_chain, build_capture_chain, check_audio_elements, check_elements, CaptureSettings,
+    Codec,
 };
 use crate::webrtc::{
-    audio_rtp_caps, build_audio_branch, build_receive_branch, encoding_name, rtp_caps, Output,
+    audio_rtp_caps, build_audio_branch, build_receive_branch, build_video_payloader, encoding_name,
+    rtp_caps, Output,
 };
 use orange_signal::{connect, Signal};
 
@@ -692,6 +694,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         audio_tee.as_ref(),
                         &peer,
                         label.clone(),
+                        settings.codec,
                         settings.fps,
                         client.outgoing.clone(),
                         viewer_failures.clone(),
@@ -916,6 +919,7 @@ fn add_viewer(
     audio_tee: Option<&gst::Element>,
     peer: &str,
     label: String,
+    codec: Codec,
     frame_rate: u32,
     out: mpsc::UnboundedSender<Signal>,
     failures: mpsc::UnboundedSender<(String, String)>,
@@ -931,9 +935,9 @@ fn add_viewer(
     let progress = diagnostics_enabled().then(|| Arc::new(MediaProgress::new()));
 
     let result = (|| -> Result<()> {
-        let pay = gst::ElementFactory::make("rtpav1pay").build()?;
+        let pay = build_video_payloader(codec)?;
         let caps = gst::ElementFactory::make("capsfilter")
-            .property("caps", rtp_caps(frame_rate))
+            .property("caps", rtp_caps(codec, frame_rate))
             .build()?;
         branch.links.push(link_tee_branch(
             pipeline,

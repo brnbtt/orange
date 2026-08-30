@@ -148,7 +148,7 @@ cargo build
 ## Install
 
 The beta uses a one-click per-user installer. Open
-`orange-setup-0.2.0-beta.1.exe`; it installs prerequisites when needed,
+`orange-setup-0.2.0-beta.2.exe`; it installs prerequisites when needed,
 installs Orange under `%LOCALAPPDATA%\Programs\orange`, creates a Start menu
 shortcut, and opens the app. There are no destination, shortcut, or completion
 pages to step through.

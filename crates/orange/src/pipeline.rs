@@ -11,8 +11,8 @@
 //! `videoscale`, most CPU filters) would destroy the performance profile.
 
 use anyhow::{bail, Context, Result};
-use gstreamer as gst;
 use gst::prelude::*;
+use gstreamer as gst;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -24,7 +24,7 @@ pub enum Codec {
 impl Codec {
     /// D3D11-mode encoders keep the frame on the GPU. The CUDA-mode variants
     /// (`nvav1enc`, `nvh264enc`) would work but involve extra copies.
-    fn encoder(&self) -> &'static str {
+    pub(crate) fn encoder(&self) -> &'static str {
         match self {
             Codec::Av1 => "nvd3d11av1enc",
             Codec::H265 => "nvd3d11h265enc",
@@ -32,7 +32,7 @@ impl Codec {
         }
     }
 
-    fn parser(&self) -> &'static str {
+    pub(crate) fn parser(&self) -> &'static str {
         match self {
             Codec::Av1 => "av1parse",
             Codec::H265 => "h265parse",
@@ -46,6 +46,47 @@ impl Codec {
             "h265" | "hevc" => Ok(Codec::H265),
             "h264" => Ok(Codec::H264),
             other => bail!("unknown codec '{other}' (expected av1, h265 or h264)"),
+        }
+    }
+
+    pub(crate) fn rtp_encoding(self) -> &'static str {
+        match self {
+            Codec::Av1 => "AV1",
+            Codec::H265 => "H265",
+            Codec::H264 => "H264",
+        }
+    }
+
+    pub(crate) fn payloader(self) -> &'static str {
+        match self {
+            Codec::Av1 => "rtpav1pay",
+            Codec::H265 => "rtph265pay",
+            Codec::H264 => "rtph264pay",
+        }
+    }
+
+    pub(crate) fn depayloader(self) -> &'static str {
+        match self {
+            Codec::Av1 => "rtpav1depay",
+            Codec::H265 => "rtph265depay",
+            Codec::H264 => "rtph264depay",
+        }
+    }
+
+    pub(crate) fn decoder(self) -> &'static str {
+        match self {
+            Codec::Av1 => "d3d11av1dec",
+            Codec::H265 => "d3d11h265dec",
+            Codec::H264 => "d3d11h264dec",
+        }
+    }
+
+    pub(crate) fn from_rtp_encoding(encoding: &str) -> Option<Self> {
+        match encoding {
+            "AV1" => Some(Self::Av1),
+            "H265" => Some(Self::H265),
+            "H264" => Some(Self::H264),
+            _ => None,
         }
     }
 }
@@ -67,7 +108,7 @@ impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
             hwnd: 0,
-            codec: Codec::Av1,
+            codec: Codec::H264,
             bitrate: 30_000,
             fps: 60,
             scale: None,
@@ -98,6 +139,7 @@ pub fn build_audio_chain(pid: u32) -> String {
          loopback-silence-on-device-mute=true low-latency=true \
          ! queue max-size-buffers=10 leaky=downstream \
          ! audioconvert ! audioresample \
+         ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
          ! opusenc bitrate=128000 frame-size=10 \
          ! rtpopuspay"
     )
@@ -113,7 +155,11 @@ pub fn check_audio_elements() -> Result<()> {
     if !missing.is_empty() {
         bail!(
             "missing audio elements: {}",
-            missing.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+            missing
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())
@@ -250,5 +296,22 @@ mod tests {
         assert!(chain.contains("tune=low-latency"));
         assert!(chain.contains("rc-mode=cbr"));
         assert!(chain.contains("spatial-aq=true"));
+    }
+
+    #[test]
+    fn default_streaming_codec_works_on_pre_av1_nvenc() {
+        let settings = CaptureSettings::default();
+        let chain = build_capture_chain(&settings);
+
+        assert_eq!(settings.codec, Codec::H264);
+        assert!(chain.contains("nvd3d11h264enc"));
+        assert!(chain.contains("h264parse"));
+    }
+
+    #[test]
+    fn audio_payload_is_forced_to_the_advertised_stereo_format() {
+        let chain = build_audio_chain(42);
+
+        assert!(chain.contains("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"));
     }
 }
