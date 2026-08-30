@@ -18,8 +18,9 @@ records the exact build and profile, and uploads diagnostics after Orange exits.
   container configured by a server-side SAS URL.
 - Add a stable PowerShell alpha launcher with atomic, checksum-verified updates,
   local rollback, pending upload retry, and a persistent pseudonymous device ID.
-- Add a publisher script that builds one portable ZIP and updates the
-  `alpha-latest` prerelease manifest and assets.
+- Add a publisher script that builds one portable ZIP, updates the private
+  `alpha-latest` prerelease mirror, and uploads the public alpha channel to a
+  dedicated Azure Blob container.
 - Extend the Azure deployment script to provision diagnostics storage and pass
   its write-only container SAS to the relay.
 

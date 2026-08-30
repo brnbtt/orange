@@ -5,7 +5,8 @@ param(
     [switch]$LibraryOnly,
     [string]$Profile = "hardware-bounded-jitter",
     [string]$Av1Decoder = "hardware",
-    [string]$RtpBufferMode = ""
+    [string]$RtpBufferMode = "",
+    [string]$AlphaStorageAccount = "orangealpha0d8d5893e69a3"
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,7 +25,7 @@ function New-AlphaManifest {
     return [pscustomobject][ordered]@{
         schema = 1
         build = $Build
-        asset_url = "https://github.com/$script:Repository/releases/download/$script:ReleaseTag/$AssetName"
+        asset_url = "https://$AlphaStorageAccount.blob.core.windows.net/releases/$AssetName"
         sha256 = $Sha256.ToUpperInvariant()
         profile = $Profile
         environment = [pscustomobject]$Environment
@@ -41,7 +42,7 @@ function Test-AlphaPublishManifest {
     . $launcher
     $json = $Manifest | ConvertTo-Json -Depth 8
     $validated = ConvertTo-AlphaManifest -Json $json
-    if ($validated.asset_url -cnotmatch "^https://github\.com/brnbtt/orange/releases/download/alpha-latest/orange-alpha-[0-9a-f]{7}\.zip$") {
+    if ($validated.asset_url -cnotmatch "^https://[a-z0-9]{3,24}\.blob\.core\.windows\.net/releases/orange-alpha-[0-9a-f]{7}\.zip$") {
         throw "Invalid published asset URL"
     }
     return $validated
@@ -190,6 +191,23 @@ This portable build requires the GStreamer MSVC x64 runtime.
             Invoke-CheckedCommand -Command "gh" -Arguments @("release", "upload", $script:ReleaseTag, $archive, "--repo", $script:Repository, "--clobber")
             Invoke-CheckedCommand -Command "gh" -Arguments @("release", "upload", $script:ReleaseTag, $manifestPath, "--repo", $script:Repository, "--clobber")
             Invoke-CheckedCommand -Command "gh" -Arguments @("release", "upload", $script:ReleaseTag, $launcherArchive, "--repo", $script:Repository, "--clobber")
+
+            foreach ($upload in @(
+                @{ Path = $archive; Name = $assetName },
+                @{ Path = $launcherArchive; Name = "orange-alpha-launcher.zip" },
+                @{ Path = $manifestPath; Name = "orange-alpha.json" }
+            )) {
+                Invoke-CheckedCommand -Command "az" -Arguments @(
+                    "storage", "blob", "upload",
+                    "--account-name", $AlphaStorageAccount,
+                    "--container-name", "releases",
+                    "--file", $upload.Path,
+                    "--name", $upload.Name,
+                    "--auth-mode", "key",
+                    "--overwrite", "true",
+                    "--only-show-errors"
+                )
+            }
         }
 
         Write-Host "Alpha build: $build"

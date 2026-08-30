@@ -21,7 +21,8 @@ param(
     [string]$Environment   = "orange-env",
     [string]$StorageAccount,
     [string]$DiagnosticsContainer = "diagnostics",
-    [int]$DiagnosticsRetentionDays = 30
+    [int]$DiagnosticsRetentionDays = 30,
+    [string]$AlphaStorageAccount = "orangealpha0d8d5893e69a3"
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,6 +54,9 @@ if (-not $StorageAccount) {
 if ($StorageAccount -cnotmatch '^[a-z0-9]{3,24}$') {
     throw "StorageAccount must contain 3-24 lowercase letters or digits"
 }
+if ($AlphaStorageAccount -cnotmatch '^[a-z0-9]{3,24}$') {
+    throw "AlphaStorageAccount must contain 3-24 lowercase letters or digits"
+}
 
 Step "Ensuring the containerapp extension is present"
 az extension add --name containerapp --upgrade --only-show-errors 2>$null | Out-Null
@@ -83,6 +87,27 @@ az storage container create `
     --public-access off `
     --only-show-errors | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "diagnostics container provisioning failed" }
+
+Step "Public alpha build storage $AlphaStorageAccount"
+az storage account create `
+    --name $AlphaStorageAccount `
+    --resource-group $ResourceGroup `
+    --location $Location `
+    --sku Standard_LRS `
+    --kind StorageV2 `
+    --https-only true `
+    --min-tls-version TLS1_2 `
+    --allow-blob-public-access true `
+    --only-show-errors | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "alpha storage account provisioning failed" }
+
+az storage container create `
+    --name releases `
+    --account-name $AlphaStorageAccount `
+    --auth-mode key `
+    --public-access blob `
+    --only-show-errors | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "alpha release container provisioning failed" }
 
 $policyPath = Join-Path $env:TEMP ("orange-storage-policy-" + [guid]::NewGuid().ToString("N") + ".json")
 try {

@@ -165,9 +165,9 @@ the Windows D3D11 media stack.
 
 ### Alpha testing
 
-Alpha testers download `orange-alpha-launcher.zip` once from the
-[`alpha-latest`](https://github.com/brnbtt/orange/releases/tag/alpha-latest)
-prerelease, extract it, and run `orange-alpha.cmd`. The launcher checks the
+Alpha testers download
+[`orange-alpha-launcher.zip`](https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha-launcher.zip)
+once, extract it, and run `orange-alpha.cmd`. The launcher checks the
 channel manifest, verifies the build's SHA-256 hash, keeps the previous build
 for rollback, and starts the selected version. No installer is replaced.
 

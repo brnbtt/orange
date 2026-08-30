@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$script:AlphaManifestUrl = "https://github.com/brnbtt/orange/releases/download/alpha-latest/orange-alpha.json"
+$script:AlphaManifestUrl = "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha.json"
 $script:AlphaDefaultServer = "wss://orange-relay.redmushroom-80c79f12.brazilsouth.azurecontainerapps.io/ws"
 $script:AlphaReservedEnvironment = @(
     "ORANGE_BUILD_ID",

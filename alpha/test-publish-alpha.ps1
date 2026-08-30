@@ -25,6 +25,9 @@ try {
 
     Test-AlphaPublishManifest -Manifest $manifest | Out-Null
     Test-AlphaPublishArchive -Path $zip | Out-Null
+    if ($script:AlphaManifestUrl -cne "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha.json") {
+        throw "launcher does not use the public alpha manifest"
+    }
 
     $probe = Test-NativeCommandSucceeds -Command "cmd.exe" -Arguments @("/d", "/c", "exit 7")
     if ($probe) { throw "nonzero native probe was reported as successful" }
@@ -32,7 +35,7 @@ try {
     if ($manifest.schema -ne 1) { throw "wrong schema" }
     if ($manifest.build -cne $build) { throw "wrong build" }
     if ($manifest.sha256 -cne $hash.ToUpperInvariant()) { throw "wrong hash" }
-    if ($manifest.asset_url -cne "https://github.com/brnbtt/orange/releases/download/alpha-latest/orange-alpha-0123456.zip") { throw "wrong asset URL" }
+    if ($manifest.asset_url -cne "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha-0123456.zip") { throw "wrong asset URL" }
 
     $bad = $manifest | ConvertTo-Json -Depth 8 | ConvertFrom-Json
     $bad.sha256 = "bad"

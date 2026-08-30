@@ -4,7 +4,7 @@
 
 **Goal:** Build a one-launch alpha update and diagnostics pipeline for repeatable two-machine media debugging.
 
-**Architecture:** A stable PowerShell launcher downloads commit-addressed portable builds from a versioned manifest, injects pseudonymous run metadata, and uploads completed ZIP archives with retry. Orange emits precise operation spans and a relay-generated media-session ID; the authenticated relay validates each archive and stores it through a local or Azure Blob backend.
+**Architecture:** A stable PowerShell launcher downloads commit-addressed portable builds from a public-read Azure Blob channel, injects pseudonymous run metadata, and uploads completed ZIP archives with retry. Orange emits precise operation spans and a relay-generated media-session ID; the authenticated relay validates each archive and stores it through a separate private local or Azure Blob backend. GitHub prerelease assets remain an authenticated mirror because the source repository is private.
 
 **Tech Stack:** Rust 2021, GStreamer, Axum 0.7, Reqwest 0.12, PowerShell 5.1+, GitHub Releases, Azure Container Apps, Azure Blob Storage.
 
@@ -105,11 +105,11 @@
 **Interfaces:**
 - Produces: `dist/alpha/orange-alpha-<short-sha>.zip` and `dist/alpha/orange-alpha.json`.
 - Publishes only with explicit `-Publish`; otherwise builds and validates locally.
-- Publishes commit-addressed ZIP assets plus a stable `orange-alpha.json` to prerelease tag `alpha-latest`.
+- Publishes commit-addressed ZIP assets plus stable manifest/launcher assets to the Azure alpha channel and mirrors them to prerelease tag `alpha-latest`.
 
 - [ ] Add dry-run script checks for manifest schema, full commit ID, uppercase SHA-256, archive contents, and stable launcher URLs.
 - [ ] Run dry-run and confirm missing publisher behavior fails.
-- [ ] Implement test, locked release build, staging, hashing, manifest generation, and opt-in `gh release create/upload --clobber` behavior.
+- [ ] Implement test, locked release build, staging, hashing, manifest generation, Azure Blob upload, and opt-in `gh release create/upload --clobber` mirror behavior.
 - [ ] Document the one-time launcher installation, test flow, storage privacy, local paths, and publish command.
 - [ ] Run publisher without `-Publish` and run the PowerShell launcher tests.
 - [ ] Commit the task.
@@ -121,7 +121,7 @@
 - Create: `deploy/test-azure-script.ps1`
 
 **Interfaces:**
-- Produces: a private Blob container with lifecycle retention and a server-side write/create SAS stored as Container Apps secret `diag-container-url`.
+- Produces: a private diagnostics Blob container with lifecycle retention and a server-side write/create SAS stored as Container Apps secret `diag-container-url`, plus a separate public-read `releases` container for alpha binaries.
 - Configures: `ORANGE_DIAGNOSTICS_CONTAINER_URL` from a secret reference without printing the SAS.
 
 - [ ] Add static script tests proving secure-transfer-only storage, disabled public blob access, private container creation, retention configuration, secret reference usage, and absence of SAS output.
