@@ -79,6 +79,22 @@ function Invoke-CheckedCommand {
     }
 }
 
+function Test-NativeCommandSucceeds {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $Command @Arguments *> $null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 function Invoke-AlphaPublish {
     $root = Split-Path $PSScriptRoot -Parent
     Push-Location $root
@@ -158,8 +174,10 @@ This portable build requires the GStreamer MSVC x64 runtime.
             if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) {
                 throw "GitHub CLI is required for -Publish"
             }
-            & gh release view $script:ReleaseTag --repo $script:Repository *> $null
-            if ($LASTEXITCODE -ne 0) {
+            $releaseExists = Test-NativeCommandSucceeds -Command "gh" -Arguments @(
+                "release", "view", $script:ReleaseTag, "--repo", $script:Repository
+            )
+            if (-not $releaseExists) {
                 Invoke-CheckedCommand -Command "gh" -Arguments @(
                     "release", "create", $script:ReleaseTag,
                     "--repo", $script:Repository,

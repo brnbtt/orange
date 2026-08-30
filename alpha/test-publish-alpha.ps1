@@ -26,6 +26,9 @@ try {
     Test-AlphaPublishManifest -Manifest $manifest | Out-Null
     Test-AlphaPublishArchive -Path $zip | Out-Null
 
+    $probe = Test-NativeCommandSucceeds -Command "cmd.exe" -Arguments @("/d", "/c", "exit 7")
+    if ($probe) { throw "nonzero native probe was reported as successful" }
+
     if ($manifest.schema -ne 1) { throw "wrong schema" }
     if ($manifest.build -cne $build) { throw "wrong build" }
     if ($manifest.sha256 -cne $hash.ToUpperInvariant()) { throw "wrong hash" }
