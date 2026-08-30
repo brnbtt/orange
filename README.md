@@ -163,6 +163,36 @@ The current build targets 64-bit Windows 10/11. Hosting requires an NVIDIA GPU
 with AV1 NVENC support; watching requires hardware AV1 decode exposed through
 the Windows D3D11 media stack.
 
+### Alpha testing
+
+Alpha testers download `orange-alpha-launcher.zip` once from the
+[`alpha-latest`](https://github.com/brnbtt/orange/releases/tag/alpha-latest)
+prerelease, extract it, and run `orange-alpha.cmd`. The launcher checks the
+channel manifest, verifies the build's SHA-256 hash, keeps the previous build
+for rollback, and starts the selected version. No installer is replaced.
+
+Each launch writes diagnostics under `%LOCALAPPDATA%\Orange Alpha\diagnostics`
+and retries completed archives from `%LOCALAPPDATA%\Orange Alpha\pending`.
+After Orange closes, signed-in alpha testers automatically upload the archive
+to the relay. Upload failure does not block Orange and retries on the next run.
+
+Uploaded archives contain build/profile identifiers and Orange's structured
+media counters and timings. They do not contain video, audio, Discord tokens,
+authorization headers, room codes, SDP, ICE candidates, window titles, or
+process names. The server stores a one-way digest rather than the Discord ID.
+
+Maintainers build and validate the next alpha locally with:
+
+```powershell
+.\alpha\publish-alpha.ps1
+```
+
+After the commit is on `origin/main`, publication is explicit:
+
+```powershell
+.\alpha\publish-alpha.ps1 -Publish
+```
+
 ## Transport: why `webrtcbin`, not `webrtcsink`
 
 `webrtcsink` is the friendlier element — it handles negotiation and codec
