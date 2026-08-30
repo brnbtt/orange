@@ -8,11 +8,18 @@ description = "Signalling protocol, Discord identity, and relay for orange. Deli
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+uuid.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rand = "0.8"
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

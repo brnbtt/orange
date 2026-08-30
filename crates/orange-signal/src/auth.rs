@@ -83,10 +83,18 @@ fn urlencode(s: &str) -> String {
 
 enum Pending {
     /// Waiting for the user to finish in the browser.
-    Waiting { since: Instant },
+    Waiting {
+        since: Instant,
+    },
     /// Login finished; the app has not collected it yet.
-    Ready { session: String, since: Instant },
-    Failed { message: String, since: Instant },
+    Ready {
+        session: String,
+        since: Instant,
+    },
+    Failed {
+        message: String,
+        since: Instant,
+    },
 }
 
 impl Pending {
@@ -278,6 +286,15 @@ impl Auth {
     /// Who a session belongs to, if it is still valid.
     pub async fn identify(&self, session: &str) -> Option<Identity> {
         self.state.lock().await.sessions.get(session).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_test_session(&self, session: &str, identity: Identity) {
+        self.state
+            .lock()
+            .await
+            .sessions
+            .insert(session.to_string(), identity);
     }
 }
 
