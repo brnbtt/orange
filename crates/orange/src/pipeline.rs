@@ -140,7 +140,7 @@ pub fn build_audio_chain(pid: u32) -> String {
          ! queue max-size-buffers=10 leaky=downstream \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
-         ! opusenc bitrate=128000 frame-size=10 inband-fec=true packet-loss-percentage=10 \
+         ! opusenc bitrate=128000 frame-size=10 \
          ! rtpopuspay"
     )
 }
@@ -203,7 +203,6 @@ pub fn check_elements(codec: Codec) -> Result<()> {
 /// knows the rate to run at; `d3d11convert` does not do framerate conversion,
 /// so requesting it further downstream would fail to negotiate.
 pub fn build_capture_chain(settings: &CaptureSettings) -> String {
-    let gop_size = settings.fps.saturating_mul(2).min(i32::MAX as u32);
     let scale_caps = match settings.scale {
         Some((w, h)) => format!("! video/x-raw(memory:D3D11Memory),width={w},height={h} "),
         None => String::new(),
@@ -218,29 +217,56 @@ pub fn build_capture_chain(settings: &CaptureSettings) -> String {
             settings.hwnd
         )
     };
-    let encoder_options = match settings.codec {
-        Codec::H264 => format!(
-            "bitrate={} gop-size={gop_size} low-latency=true rc-mode=cbr quality-vs-speed=80",
-            settings.bitrate
-        ),
-        Codec::Av1 | Codec::H265 => format!(
-            "bitrate={} gop-size={gop_size} preset=p5 tune=low-latency rc-mode=cbr spatial-aq=true",
-            settings.bitrate
-        ),
-    };
-
     format!(
         "{source} \
          ! video/x-raw(memory:D3D11Memory),framerate={fps}/1 \
          ! queue max-size-buffers=3 leaky=downstream \
          ! d3d11convert \
          {scale_caps}\
-         ! {encoder} name=stream-encoder {encoder_options} \
+         ! {encoder} name=stream-encoder bitrate={bitrate} \
          ! {parser}",
         fps = settings.fps,
         encoder = settings.codec.encoder(),
+        bitrate = settings.bitrate,
         parser = settings.codec.parser(),
     )
+}
+
+fn gop_size(fps: u32) -> i32 {
+    fps.saturating_mul(2).min(i32::MAX as u32) as i32
+}
+
+fn set_if_supported(element: &gst::Element, property: &str, value: impl Into<gst::glib::Value>) {
+    if element.find_property(property).is_some() {
+        element.set_property(property, value);
+    }
+}
+
+fn set_from_str_if_supported(element: &gst::Element, property: &str, value: &str) {
+    if element.find_property(property).is_some() {
+        element.set_property_from_str(property, value);
+    }
+}
+
+pub fn configure_encoder(element: &gst::Element, codec: Codec, fps: u32) {
+    set_encoder_gop(element, gop_size(fps) as u32);
+    match codec {
+        Codec::H264 => {
+            set_if_supported(element, "low-latency", true);
+            set_from_str_if_supported(element, "rc-mode", "cbr");
+            set_if_supported(element, "quality-vs-speed", 50u32);
+        }
+        Codec::Av1 | Codec::H265 => {
+            set_from_str_if_supported(element, "preset", "p5");
+            set_from_str_if_supported(element, "tune", "low-latency");
+            set_from_str_if_supported(element, "rc-mode", "cbr");
+            set_if_supported(element, "spatial-aq", true);
+        }
+    }
+}
+
+pub fn set_encoder_gop(element: &gst::Element, frames: u32) {
+    set_if_supported(element, "gop-size", frames.min(i32::MAX as u32) as i32);
 }
 
 /// Record to a file. Primarily a diagnostic: it exercises the exact capture and
@@ -256,6 +282,10 @@ pub fn build_record_pipeline(settings: &CaptureSettings, output: &str) -> Result
 
     let capture = gst::parse::bin_from_description(&build_capture_chain(settings), true)
         .context("failed to build capture chain")?;
+    let encoder = capture
+        .by_name("stream-encoder")
+        .context("capture chain has no named encoder")?;
+    configure_encoder(&encoder, settings.codec, settings.fps);
     let muxer = gst::ElementFactory::make("matroskamux")
         .build()
         .context("matroskamux missing")?;
@@ -282,7 +312,7 @@ mod tests {
             ..CaptureSettings::default()
         };
 
-        assert!(build_capture_chain(&settings).contains("gop-size=120"));
+        assert_eq!(gop_size(settings.fps), 120);
     }
 
     #[test]
@@ -292,20 +322,17 @@ mod tests {
             ..CaptureSettings::default()
         };
 
-        assert!(build_capture_chain(&settings).contains("gop-size=480"));
+        assert_eq!(gop_size(settings.fps), 480);
     }
 
     #[test]
     fn streaming_encoder_uses_consistent_low_latency_quality_settings() {
-        let chain = build_capture_chain(&CaptureSettings {
-            codec: Codec::Av1,
-            ..CaptureSettings::default()
-        });
+        gst::init().unwrap();
+        let encoder = gst::ElementFactory::make("nvd3d11av1enc").build().unwrap();
+        configure_encoder(&encoder, Codec::Av1, 60);
 
-        assert!(chain.contains("preset=p5"));
-        assert!(chain.contains("tune=low-latency"));
-        assert!(chain.contains("rc-mode=cbr"));
-        assert!(chain.contains("spatial-aq=true"));
+        assert_eq!(encoder.property::<i32>("gop-size"), 120);
+        assert!(encoder.property::<bool>("spatial-aq"));
     }
 
     #[test]
@@ -316,8 +343,8 @@ mod tests {
         assert_eq!(settings.codec, Codec::H264);
         assert!(chain.contains("mfh264enc"));
         assert!(chain.contains("h264parse"));
-        assert!(chain.contains("low-latency=true rc-mode=cbr quality-vs-speed=80"));
-        assert!(!chain.contains("preset=p5"));
+        assert!(!chain.contains("low-latency="));
+        assert!(!chain.contains("quality-vs-speed="));
     }
 
     #[test]
@@ -325,6 +352,6 @@ mod tests {
         let chain = build_audio_chain(42);
 
         assert!(chain.contains("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"));
-        assert!(chain.contains("inband-fec=true packet-loss-percentage=10"));
+        assert!(!chain.contains("inband-fec=true"));
     }
 }

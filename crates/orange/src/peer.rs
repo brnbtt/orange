@@ -24,8 +24,8 @@ use crate::media_diagnostics::{
     DiagnosticsHandle, MediaProgress, MediaStage,
 };
 use crate::pipeline::{
-    build_audio_chain, build_capture_chain, check_audio_elements, check_elements, CaptureSettings,
-    Codec,
+    build_audio_chain, build_capture_chain, check_audio_elements, check_elements,
+    configure_encoder, set_encoder_gop, CaptureSettings, Codec,
 };
 use crate::webrtc::{
     audio_rtp_caps, build_audio_branch, build_receive_branch, build_video_payloader, encoding_name,
@@ -534,8 +534,9 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     let encoder = capture
         .by_name("stream-encoder")
         .context("capture chain has no named encoder")?;
+    configure_encoder(&encoder, settings.codec, settings.fps);
     let initial_gop_size = initial_host_gop_size(settings.fps);
-    encoder.set_property("gop-size", initial_gop_size as i32);
+    set_encoder_gop(&encoder, initial_gop_size);
     let tee = gst::ElementFactory::make("tee")
         .property("allow-not-linked", true)
         .build()?;
@@ -633,7 +634,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         recovery_gop_size(frames, elapsed, settings.fps)
                     {
                         if let Some(gop_size) = gop_update(current_gop_size, measured_gop_size) {
-                            encoder.set_property("gop-size", gop_size as i32);
+                            set_encoder_gop(&encoder, gop_size);
                             current_gop_size = gop_size;
                         }
                         emit_diagnostic(
@@ -683,7 +684,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                         gop_sampled_at = Instant::now();
                         recovery_keyframe.reset();
                         if current_gop_size != initial_gop_size {
-                            encoder.set_property("gop-size", initial_gop_size as i32);
+                            set_encoder_gop(&encoder, initial_gop_size);
                             current_gop_size = initial_gop_size;
                         }
                     }

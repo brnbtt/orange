@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 use crate::media_diagnostics::{
     measure_operation, track_pad, MediaProgress, MediaStage, Operation,
 };
-use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings, Codec};
+use crate::pipeline::{
+    build_capture_chain, check_elements, configure_encoder, CaptureSettings, Codec,
+};
 
 /// RTP caps for our encoded video. AV1 has no static payload type, so we pick
 /// one from the dynamic range and both ends agree on it.
@@ -181,6 +183,10 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
     // --- sending half -------------------------------------------------------
     let capture = gst::parse::bin_from_description(&build_capture_chain(settings), true)
         .context("failed to build capture chain")?;
+    let encoder = capture
+        .by_name("stream-encoder")
+        .context("capture chain has no named encoder")?;
+    configure_encoder(&encoder, settings.codec, settings.fps);
     let pay = build_video_payloader(settings.codec)?;
     let caps_filter = gst::ElementFactory::make("capsfilter")
         .property("caps", rtp_caps(settings.codec, settings.fps))
@@ -474,7 +480,6 @@ fn build_audio_decoder(diagnostic_role: &str) -> Result<ReceiveElement> {
     build_receive_element(diagnostic_role, "audio-decoder", "opusdec", || {
         Ok(gst::ElementFactory::make("opusdec")
             .property("plc", true)
-            .property("use-inband-fec", true)
             .build()?)
     })
 }
@@ -737,12 +742,12 @@ mod tests {
     }
 
     #[test]
-    fn opus_decoder_conceals_loss_and_uses_inband_fec() {
+    fn opus_decoder_conceals_loss_without_fec_lookahead() {
         gst::init().unwrap();
         let decoder = build_audio_decoder("test").unwrap();
 
         assert!(decoder.element.property::<bool>("plc"));
-        assert!(decoder.element.property::<bool>("use-inband-fec"));
+        assert!(!decoder.element.property::<bool>("use-inband-fec"));
     }
 
     #[test]
