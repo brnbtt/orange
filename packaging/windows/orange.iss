@@ -49,6 +49,12 @@ Name: "{group}\orange"; Filename: "{app}\orange-tray.exe"
 Filename: "{app}\orange-tray.exe"; Description: "Open orange"; Flags: nowait skipifsilent
 
 [Code]
+const
+  BN_CLICKED = 0;
+  WM_COMMAND = $0111;
+  CN_BASE = $BC00;
+  CN_COMMAND = CN_BASE + WM_COMMAND;
+
 var
   DownloadPage: TDownloadWizardPage;
 
@@ -90,6 +96,17 @@ begin
     'orange needs the official GStreamer runtime for video and audio.',
     nil);
   DownloadPage.ShowBaseNameInsteadOfUrl := True;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+var
+  ClickNotification: Longint;
+begin
+  if (CurPageID = wpReady) and (not WizardSilent) then
+  begin
+    ClickNotification := BN_CLICKED shl 16;
+    PostMessage(WizardForm.NextButton.Handle, CN_COMMAND, ClickNotification, 0);
+  end;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

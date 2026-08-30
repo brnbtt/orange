@@ -13,6 +13,7 @@ $checks = [ordered]@{
     "no task page" = '(?m)^\[Tasks\]\s*$'
     "updater release build" = 'cargo build --locked --release -p orange -p orange-tray -p orange-updater'
     "beta build channel" = 'ORANGE_UPDATE_CHANNEL\s*=\s*"beta"'
+    "automatic install click" = 'CurPageID\s*=\s*wpReady[\s\S]*PostMessage\(WizardForm\.NextButton\.Handle,\s*CN_COMMAND'
 }
 
 $failures = New-Object System.Collections.Generic.List[string]
