@@ -162,6 +162,12 @@ struct InboundVideoStats {
     rtx_requested: u64,
     rtx_succeeded: u64,
     packets_late: u64,
+    jitterbuffer_packets_pushed: u64,
+    jitterbuffer_packets_lost: u64,
+    jitterbuffer_packets_duplicated: u64,
+    jitterbuffer_avg_jitter_ms: f64,
+    jitterbuffer_rtx_per_packet: f64,
+    jitterbuffer_rtx_rtt_ms: f64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -201,8 +207,16 @@ pub(crate) fn parse_webrtc_stats(stats: &gst::StructureRef) -> WebRtcReport {
                 inbound.pli_sent += get_u64(&sample, "pli-count");
                 inbound.fir_sent += get_u64(&sample, "fir-count");
                 if let Ok(jitter) = sample.get::<gst::Structure>("gst-rtpjitterbuffer-stats") {
+                    inbound.jitterbuffer_packets_pushed += get_u64(&jitter, "num-pushed");
+                    inbound.jitterbuffer_packets_lost += get_u64(&jitter, "num-lost");
+                    inbound.jitterbuffer_packets_duplicated += get_u64(&jitter, "num-duplicates");
+                    inbound.jitterbuffer_avg_jitter_ms =
+                        get_u64(&jitter, "avg-jitter") as f64 / 1_000_000.0;
                     inbound.rtx_requested += get_u64(&jitter, "rtx-count");
                     inbound.rtx_succeeded += get_u64(&jitter, "rtx-success-count");
+                    inbound.jitterbuffer_rtx_per_packet = get_f64(&jitter, "rtx-per-packet");
+                    inbound.jitterbuffer_rtx_rtt_ms =
+                        get_u64(&jitter, "rtx-rtt") as f64 / 1_000_000.0;
                     inbound.packets_late += get_u64(&jitter, "num-late");
                 }
             }
@@ -528,10 +542,15 @@ mod tests {
     fn webrtc_stats_extract_video_recovery_without_sensitive_values() {
         gst::init().unwrap();
         let jitter = gst::Structure::builder("application/x-rtp-jitterbuffer-stats")
+            .field("num-pushed", 790u64)
             .field("num-lost", 7u64)
             .field("num-late", 3u64)
+            .field("num-duplicates", 2u64)
+            .field("avg-jitter", 2_500_000u64)
             .field("rtx-count", 11u64)
             .field("rtx-success-count", 9u64)
+            .field("rtx-per-packet", 1.25f64)
+            .field("rtx-rtt", 12_000_000u64)
             .build();
         let inbound = gst::Structure::builder("inbound-video")
             .field("type", gst_webrtc::WebRTCStatsType::InboundRtp)
@@ -570,6 +589,12 @@ mod tests {
         assert_eq!(inbound.nack_sent, 11);
         assert_eq!(inbound.rtx_requested, 11);
         assert_eq!(inbound.rtx_succeeded, 9);
+        assert_eq!(inbound.jitterbuffer_packets_pushed, 790);
+        assert_eq!(inbound.jitterbuffer_packets_lost, 7);
+        assert_eq!(inbound.jitterbuffer_packets_duplicated, 2);
+        assert_eq!(inbound.jitterbuffer_avg_jitter_ms, 2.5);
+        assert_eq!(inbound.jitterbuffer_rtx_per_packet, 1.25);
+        assert_eq!(inbound.jitterbuffer_rtx_rtt_ms, 12.0);
         assert_eq!(outbound.packets_sent, 850);
         assert_eq!(outbound.nack_received, 11);
 

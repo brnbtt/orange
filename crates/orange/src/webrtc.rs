@@ -178,6 +178,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         .name("receiver")
         .property_from_str("bundle-policy", "max-bundle")
         .build()?;
+    crate::peer::configure_receive_transport(&recv_bin, matches!(&output, Output::Window(_)))?;
 
     pipeline.add_many([
         capture.upcast_ref(),
@@ -298,6 +299,16 @@ fn build_av1_depayloader() -> Result<gst::Element> {
         .context("rtpav1depay is unavailable")
 }
 
+fn build_live_video_queue() -> Result<gst::Element> {
+    gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 1u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .property_from_str("leaky", "downstream")
+        .build()
+        .context("video presentation queue is unavailable")
+}
+
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
@@ -353,6 +364,7 @@ pub fn build_receive_branch(
                 .build()
                 .context("overlaycomposition missing")?;
             crate::overlay::attach(&composition, &playback);
+            let queue = build_live_video_queue()?;
 
             let sink = gst::ElementFactory::make("d3d11videosink")
                 .property("sync", false)
@@ -365,7 +377,7 @@ pub fn build_receive_branch(
             // remains valid while the receiver session is running.
             unsafe { overlay_iface.set_window_handle(playback.hwnd() as usize) };
 
-            vec![composition, sink]
+            vec![queue, composition, sink]
         }
         Output::File(path) => {
             // Re-encode only because writing raw frames to disk is impractical.
@@ -507,5 +519,15 @@ mod tests {
 
         assert!(depay.property::<bool>("request-keyframe"));
         assert!(depay.property::<bool>("wait-for-keyframe"));
+    }
+
+    #[test]
+    fn presentation_queue_keeps_only_the_live_decoded_frame() {
+        gst::init().unwrap();
+        let queue = build_live_video_queue().unwrap();
+
+        assert_eq!(queue.property::<u32>("max-size-buffers"), 1);
+        assert_eq!(queue.property::<u32>("max-size-bytes"), 0);
+        assert_eq!(queue.property::<u64>("max-size-time"), 0);
     }
 }

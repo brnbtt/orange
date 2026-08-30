@@ -84,6 +84,26 @@ fn make_webrtcbin(name: &str) -> Result<gst::Element> {
         .context("webrtcbin missing")
 }
 
+pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool) -> Result<()> {
+    if !live_output {
+        return Ok(());
+    }
+    const LATENCY_MS: u32 = 100;
+    bin.set_property("latency", LATENCY_MS);
+    let rtpbin = bin
+        .dynamic_cast_ref::<gst::Bin>()
+        .context("webrtcbin is not a GstBin")?
+        .by_name("rtpbin")
+        .context("webrtcbin has no internal rtpbin")?;
+    rtpbin.set_property("latency", LATENCY_MS);
+    rtpbin.set_property("drop-on-latency", true);
+    if std::env::var("ORANGE_RTP_BUFFER_MODE").as_deref() == Ok("none") {
+        rtpbin.set_property_from_str("buffer-mode", "none");
+        rtpbin.set_property_from_str("rtcp-sync", "never");
+    }
+    Ok(())
+}
+
 /// Surface pipeline errors.
 ///
 /// Without this, a failure inside the receive branch (a decoder refusing caps,
@@ -386,6 +406,23 @@ mod tests {
         assert_eq!(super::gop_update(120, 480), Some(480));
         assert_eq!(super::gop_update(480, 475), None);
         assert_eq!(super::gop_update(480, 120), Some(120));
+    }
+
+    #[test]
+    fn receiver_transport_has_a_hard_live_latency_bound() {
+        gst::init().unwrap();
+        let bin = super::make_webrtcbin("latency-test").unwrap();
+
+        super::configure_receive_transport(&bin, true).unwrap();
+
+        assert_eq!(bin.property::<u32>("latency"), 100);
+        let rtpbin = bin
+            .dynamic_cast_ref::<gst::Bin>()
+            .unwrap()
+            .by_name("rtpbin")
+            .unwrap();
+        assert_eq!(rtpbin.property::<u32>("latency"), 100);
+        assert!(rtpbin.property::<bool>("drop-on-latency"));
     }
 }
 
@@ -1048,6 +1085,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
 
     let pipeline = gst::Pipeline::new();
     let bin = make_webrtcbin("viewer")?;
+    configure_receive_transport(&bin, matches!(&output, Output::Window(_)))?;
     pipeline.add(&bin)?;
     let viewer_playback = match &output {
         Output::Window(playback) => Some(playback.clone()),
@@ -1091,8 +1129,16 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
             return;
         };
         let kind = encoding_name(pad).unwrap_or_default();
-        let result = match kind.as_str() {
-            "OPUS" => build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
+        emit_diagnostic(
+            "pad-added",
+            "watch",
+            serde_json::json!({ "encoding": &kind }),
+        );
+        let (result, branch_ready) = match kind.as_str() {
+            "OPUS" => (
+                build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
+                true,
+            ),
             "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
                 Some(output) => {
                     if let Some(progress) = &media_progress_for_pad {
@@ -1101,13 +1147,21 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                     if let Some(overlay) = overlay_for_video.clone() {
                         watch_incoming_bitrate(pad, overlay);
                     }
-                    build_receive_branch(&pipeline, pad, output, media_progress_for_pad.clone())
+                    (
+                        build_receive_branch(
+                            &pipeline,
+                            pad,
+                            output,
+                            media_progress_for_pad.clone(),
+                        ),
+                        true,
+                    )
                 }
-                None => Ok(()),
+                None => (Ok(()), false),
             },
             other => {
                 eprintln!("[watch] ignoring unexpected stream '{other}'");
-                Ok(())
+                (Ok(()), false)
             }
         };
         if let Err(err) = result {
@@ -1116,6 +1170,12 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                 source: String::new(),
                 message: format!("could not build {kind} receive branch: {err}"),
             });
+        } else if branch_ready {
+            emit_diagnostic(
+                "receive-branch-ready",
+                "watch",
+                serde_json::json!({ "encoding": &kind }),
+            );
         }
     });
 
