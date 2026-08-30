@@ -312,8 +312,12 @@ fn prepare_updater(
         bail!("invalid updater handoff");
     }
     let source = install_dir.join("orange-updater.exe");
+    let runtime = install_dir.join("vcruntime140.dll");
     if !source.is_file() {
         bail!("orange-updater.exe is missing");
+    }
+    if !runtime.is_file() {
+        bail!("vcruntime140.dll is missing");
     }
     std::fs::create_dir_all(temporary_dir)?;
     let handoff = tempfile::Builder::new()
@@ -322,6 +326,8 @@ fn prepare_updater(
     let executable = handoff.path().join("orange-updater.exe");
     std::fs::copy(&source, &executable)
         .with_context(|| format!("could not prepare {}", executable.display()))?;
+    std::fs::copy(&runtime, handoff.path().join("vcruntime140.dll"))
+        .context("could not prepare the updater runtime")?;
     let _ = handoff.keep();
     let arguments = vec![
         OsString::from("--installer"),
@@ -443,6 +449,7 @@ mod tests {
         std::fs::create_dir_all(&temporary).unwrap();
         std::fs::write(install_dir.join("orange-tray.exe"), b"tray").unwrap();
         std::fs::write(install_dir.join("orange-updater.exe"), b"updater").unwrap();
+        std::fs::write(install_dir.join("vcruntime140.dll"), b"runtime").unwrap();
         let installer = directory.path().join("orange-setup-0.2.0-beta.2.exe");
         std::fs::write(&installer, b"installer").unwrap();
         let info = UpdateInfo {
@@ -459,6 +466,12 @@ mod tests {
         assert!(launch.executable.starts_with(&temporary));
         assert_ne!(launch.executable.parent().unwrap(), temporary);
         assert!(launch.executable.is_file());
+        assert!(launch
+            .executable
+            .parent()
+            .unwrap()
+            .join("vcruntime140.dll")
+            .is_file());
         assert_eq!(launch.arguments[0], "--installer");
         assert_eq!(launch.arguments[1], installer.as_os_str());
         assert!(launch.arguments.iter().any(|arg| arg == "42"));

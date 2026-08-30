@@ -8,6 +8,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $previousBuildId = $env:ORANGE_BUILD_ID
 $previousChannel = $env:ORANGE_UPDATE_CHANNEL
 $previousManifestUrl = $env:ORANGE_UPDATE_MANIFEST_URL
+$packageLock = $null
 $iscc = @(
     (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
     (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe")
@@ -19,6 +20,17 @@ if (-not $iscc) {
 
 Push-Location $root
 try {
+    $targetDirectory = Join-Path $root "target"
+    New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+    try {
+        $packageLock = [IO.File]::Open(
+            (Join-Path $targetDirectory "orange-package.lock"),
+            [IO.FileMode]::OpenOrCreate,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None)
+    } catch {
+        throw "Another Orange packaging process is already running."
+    }
     . .\dev.ps1
     if (-not $env:GSTREAMER_1_0_ROOT_MSVC_X86_64) {
         throw "The GStreamer development environment is unavailable."
@@ -76,6 +88,7 @@ try {
     Write-Host "Installer: $root\dist\orange-setup-$version.exe" -ForegroundColor Green
 }
 finally {
+    if ($packageLock) { $packageLock.Dispose() }
     $env:ORANGE_BUILD_ID = $previousBuildId
     $env:ORANGE_UPDATE_CHANNEL = $previousChannel
     $env:ORANGE_UPDATE_MANIFEST_URL = $previousManifestUrl

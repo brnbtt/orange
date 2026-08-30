@@ -113,13 +113,46 @@ function Ensure-AzureInstaller {
             "--name", $InstallerName, "--auth-mode", "key", "--overwrite", "false",
             "--metadata", "sha256=$Sha256", "build=$Build", "--only-show-errors"
         )
-        return
+    } else {
+        $size = (Get-Item -LiteralPath $Installer).Length
+        if ([int64]$existing.properties.contentLength -ne $size -or
+            $existing.metadata.sha256 -cne $Sha256 -or $existing.metadata.build -cne $Build) {
+            throw "Existing Azure beta installer does not match this immutable build"
+        }
     }
-    $size = (Get-Item -LiteralPath $Installer).Length
-    if ([int64]$existing.properties.contentLength -ne $size -or
-        $existing.metadata.sha256 -cne $Sha256 -or $existing.metadata.build -cne $Build) {
-        throw "Existing Azure beta installer does not match this immutable build"
+    $check = Join-Path $env:TEMP ("orange-azure-check-" + [guid]::NewGuid().ToString("N") + ".exe")
+    try {
+        Invoke-Checked -Command "az" -Arguments @(
+            "storage", "blob", "download", "--account-name", $script:BetaStorageAccount,
+            "--container-name", $script:BetaContainer, "--name", $InstallerName,
+            "--file", $check, "--auth-mode", "key", "--overwrite", "true", "--only-show-errors"
+        )
+        if ((Get-FileHash -LiteralPath $check -Algorithm SHA256).Hash -cne $Sha256) {
+            throw "Azure beta installer failed remote SHA-256 verification"
+        }
+    } finally {
+        Remove-Item -LiteralPath $check -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Resolve-GitHubTagCommit {
+    param([Parameter(Mandatory = $true)][string]$Tag)
+    $reference = Get-OptionalNativeJson -Command "gh" -Arguments @(
+        "api", "repos/$script:Repository/git/ref/tags/$Tag"
+    )
+    if ($null -eq $reference) { return $null }
+    $object = $reference.object
+    for ($depth = 0; $depth -lt 5 -and $object.type -eq "tag"; $depth++) {
+        $tagObject = Get-OptionalNativeJson -Command "gh" -Arguments @(
+            "api", "repos/$script:Repository/git/tags/$($object.sha)"
+        )
+        if ($null -eq $tagObject) { throw "Could not peel GitHub beta tag" }
+        $object = $tagObject.object
+    }
+    if ($object.type -ne "commit" -or $object.sha -cnotmatch '^[0-9a-f]{40}$') {
+        throw "GitHub beta tag does not resolve to a commit"
+    }
+    return [string]$object.sha
 }
 
 function Ensure-GitHubRelease {
@@ -134,6 +167,10 @@ function Ensure-GitHubRelease {
         "release", "view", $Tag, "--repo", $script:Repository,
         "--json", "targetCommitish,assets"
     )
+    $tagCommit = Resolve-GitHubTagCommit -Tag $Tag
+    if ($null -ne $tagCommit -and $tagCommit -cne $Build) {
+        throw "Existing GitHub beta tag targets a different build"
+    }
     if ($null -eq $release) {
         Invoke-Checked -Command "gh" -Arguments @(
             "release", "create", $Tag, "--repo", $script:Repository, "--target", $Build,
@@ -141,7 +178,8 @@ function Ensure-GitHubRelease {
         )
         $release = [pscustomobject]@{ targetCommitish = $Build; assets = @() }
     }
-    if ($release.targetCommitish -cne $Build) {
+    $tagCommit = Resolve-GitHubTagCommit -Tag $Tag
+    if ($tagCommit -cne $Build) {
         throw "Existing GitHub beta tag targets a different build"
     }
     foreach ($asset in $Assets) {
@@ -151,9 +189,7 @@ function Ensure-GitHubRelease {
             Invoke-Checked -Command "gh" -Arguments @(
                 "release", "upload", $Tag, $asset, "--repo", $script:Repository
             )
-            continue
-        }
-        if ($remote.Count -ne 1 -or [int64]$remote[0].size -ne (Get-Item -LiteralPath $asset).Length) {
+        } elseif ($remote.Count -ne 1 -or [int64]$remote[0].size -ne (Get-Item -LiteralPath $asset).Length) {
             throw "Existing GitHub asset $name does not match this build"
         }
         $check = Join-Path $env:TEMP ("orange-beta-check-" + [guid]::NewGuid().ToString("N"))
@@ -165,7 +201,7 @@ function Ensure-GitHubRelease {
             )
             if ((Get-FileHash -LiteralPath (Join-Path $check $name) -Algorithm SHA256).Hash -cne
                 (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash) {
-                throw "Existing GitHub asset $name has different bytes"
+                throw "GitHub asset $name failed remote SHA-256 verification"
             }
         } finally {
             Remove-Item -LiteralPath $check -Recurse -Force -ErrorAction SilentlyContinue
@@ -175,6 +211,7 @@ function Ensure-GitHubRelease {
 
 function Invoke-BetaPublish {
     $root = $PSScriptRoot
+    $publishStage = $null
     Push-Location $root
     try {
         if ($Publish) {
@@ -202,12 +239,24 @@ function Invoke-BetaPublish {
         $version = ($metadata.packages | Where-Object name -eq "orange-tray").version
         if ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') { throw "Workspace version is not a beta version" }
         $installerName = "orange-setup-$version.exe"
-        $installer = Join-Path $root "dist\$installerName"
-        if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw "Installer was not created" }
+        $outputInstaller = Join-Path $root "dist\$installerName"
+        if (-not (Test-Path -LiteralPath $outputInstaller -PathType Leaf)) { throw "Installer was not created" }
+        $installer = $outputInstaller
+        if ($Publish) {
+            $publishStage = Join-Path $root ("dist\.publish-" + [guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $publishStage | Out-Null
+            $installer = Join-Path $publishStage $installerName
+            Copy-Item -LiteralPath $outputInstaller -Destination $installer
+        }
 
         $manifest = New-BetaManifest -Version $version -Build $build -InstallerPath $installer -Notes $Notes
         Test-BetaManifest -Manifest $manifest -InstallerPath $installer | Out-Null
-        $manifestPath = Join-Path $root "dist\orange-beta.json"
+        $outputManifest = Join-Path $root "dist\orange-beta.json"
+        $manifestPath = if ($Publish) {
+            Join-Path $publishStage "orange-beta.json"
+        } else {
+            $outputManifest
+        }
         [IO.File]::WriteAllText(
             $manifestPath,
             ($manifest | ConvertTo-Json -Depth 4),
@@ -230,13 +279,17 @@ function Invoke-BetaPublish {
                 "--container-name", $script:BetaContainer, "--file", $manifestPath,
                 "--name", "orange-beta.json", "--auth-mode", "key", "--overwrite", "true", "--only-show-errors"
             )
+            Copy-Item -LiteralPath $manifestPath -Destination $outputManifest -Force
         }
 
         Write-Host "Beta: $version ($build)"
-        Write-Host "Installer: $installer"
+        Write-Host "Installer: $outputInstaller"
         Write-Host "SHA-256: $($manifest.sha256)"
-        Write-Host "Manifest: $manifestPath"
+        Write-Host "Manifest: $outputManifest"
     } finally {
+        if ($publishStage) {
+            Remove-Item -LiteralPath $publishStage -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Pop-Location
     }
 }
