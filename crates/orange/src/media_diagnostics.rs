@@ -13,7 +13,152 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static DIAGNOSTIC_SINK: OnceLock<Option<SyncSender<DiagnosticCommand>>> = OnceLock::new();
+static DIAGNOSTIC_CONTEXT: OnceLock<DiagnosticContext> = OnceLock::new();
 const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct DiagnosticMetadata {
+    build: Option<String>,
+    run: Option<String>,
+    device: Option<String>,
+    profile: Option<String>,
+}
+
+impl DiagnosticMetadata {
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        Self {
+            build: lookup("ORANGE_BUILD_ID"),
+            run: lookup("ORANGE_RUN_ID"),
+            device: lookup("ORANGE_DEVICE_ID"),
+            profile: lookup("ORANGE_TEST_PROFILE"),
+        }
+    }
+}
+
+struct DiagnosticContext {
+    started: Instant,
+    metadata: DiagnosticMetadata,
+}
+
+#[derive(Serialize)]
+struct DiagnosticRecord<'a, T> {
+    at_unix_ms: u128,
+    elapsed_ms: u64,
+    event: &'a str,
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
+    payload: T,
+}
+
+fn diagnostic_json(
+    metadata: &DiagnosticMetadata,
+    elapsed_ms: u64,
+    at_unix_ms: u128,
+    event: &str,
+    role: &str,
+    payload: impl Serialize,
+) -> String {
+    serde_json::to_string(&DiagnosticRecord {
+        at_unix_ms,
+        elapsed_ms,
+        event,
+        role,
+        build: metadata.build.as_deref(),
+        run: metadata.run.as_deref(),
+        device: metadata.device.as_deref(),
+        profile: metadata.profile.as_deref(),
+        payload,
+    })
+    .expect("diagnostic payload should serialize")
+}
+
+pub(crate) trait OperationOutcome {
+    fn succeeded(&self) -> bool;
+}
+
+impl<T, E> OperationOutcome for Result<T, E> {
+    fn succeeded(&self) -> bool {
+        self.is_ok()
+    }
+}
+
+impl OperationOutcome for () {
+    fn succeeded(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub(crate) struct Operation<'a> {
+    operation: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    element: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory: Option<&'a str>,
+}
+
+impl<'a> Operation<'a> {
+    pub(crate) const fn named(operation: &'a str) -> Self {
+        Self {
+            operation,
+            element: None,
+            factory: None,
+        }
+    }
+
+    pub(crate) const fn element(operation: &'a str, element: &'a str, factory: &'a str) -> Self {
+        Self {
+            operation,
+            element: Some(element),
+            factory: Some(factory),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OperationPayload<'a> {
+    #[serde(flatten)]
+    operation: Operation<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    success: Option<bool>,
+}
+
+fn measure_operation_with<R: OperationOutcome>(
+    operation: Operation<'_>,
+    action: impl FnOnce() -> R,
+    mut emit: impl FnMut(&str, OperationPayload<'_>),
+) -> R {
+    emit(
+        "operation-started",
+        OperationPayload {
+            operation,
+            duration_ms: None,
+            success: None,
+        },
+    );
+    let started = Instant::now();
+    let result = action();
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let success = result.succeeded();
+    emit(
+        "operation-finished",
+        OperationPayload {
+            operation,
+            duration_ms: Some(duration_ms),
+            success: Some(success),
+        },
+    );
+    result
+}
 
 enum DiagnosticCommand {
     Line(String),
@@ -323,6 +468,10 @@ fn diagnostic_sink() -> Option<&'static SyncSender<DiagnosticCommand>> {
                     return None;
                 }
             };
+            DIAGNOSTIC_CONTEXT.get_or_init(|| DiagnosticContext {
+                started: Instant::now(),
+                metadata: DiagnosticMetadata::from_lookup(|name| std::env::var(name).ok()),
+            });
             let remaining = MAX_DIAGNOSTIC_BYTES
                 .saturating_sub(file.metadata().map(|metadata| metadata.len()).unwrap_or(0));
             std::thread::spawn(move || {
@@ -347,18 +496,49 @@ pub(crate) fn emit_diagnostic(event: &str, role: &str, payload: impl Serialize) 
     let Some(sink) = diagnostic_sink() else {
         return;
     };
+    emit_diagnostic_to(sink, event, role, payload);
+}
+
+fn emit_diagnostic_to(
+    sink: &SyncSender<DiagnosticCommand>,
+    event: &str,
+    role: &str,
+    payload: impl Serialize,
+) {
+    let context = DIAGNOSTIC_CONTEXT
+        .get()
+        .expect("diagnostic context initialized with sink");
     let at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let line = serde_json::json!({
-        "at_unix_ms": at_unix_ms,
-        "event": event,
-        "role": role,
-        "payload": payload,
-    })
-    .to_string();
+    let elapsed_ms = context
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let line = diagnostic_json(
+        &context.metadata,
+        elapsed_ms,
+        at_unix_ms,
+        event,
+        role,
+        payload,
+    );
     let _ = sink.try_send(DiagnosticCommand::Line(line));
+}
+
+pub(crate) fn measure_operation<R: OperationOutcome>(
+    role: &str,
+    operation: Operation<'_>,
+    action: impl FnOnce() -> R,
+) -> R {
+    let Some(sink) = diagnostic_sink() else {
+        return action();
+    };
+    measure_operation_with(operation, action, |event, payload| {
+        emit_diagnostic_to(sink, event, role, payload);
+    })
 }
 
 pub(crate) fn flush_diagnostics() {
@@ -445,7 +625,130 @@ mod tests {
     use super::*;
     use gstreamer as gst;
     use gstreamer_webrtc as gst_webrtc;
+    use std::cell::RefCell;
     use std::path::Path;
+
+    #[test]
+    fn diagnostic_metadata_is_omitted_when_allowlisted_environment_is_absent() {
+        let metadata = DiagnosticMetadata::from_lookup(|_| None);
+
+        let json = diagnostic_json(
+            &metadata,
+            17,
+            1_725_000_000_000,
+            "test-event",
+            "watch",
+            serde_json::json!({ "value": 42 }),
+        );
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "at_unix_ms": 1_725_000_000_000u64,
+                "elapsed_ms": 17,
+                "event": "test-event",
+                "role": "watch",
+                "payload": { "value": 42 },
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostic_metadata_is_included_as_top_level_strings() {
+        let metadata = DiagnosticMetadata::from_lookup(|name| match name {
+            "ORANGE_BUILD_ID" => Some("0123456789abcdef".to_string()),
+            "ORANGE_RUN_ID" => Some("run-123".to_string()),
+            "ORANGE_DEVICE_ID" => Some("device-456".to_string()),
+            "ORANGE_TEST_PROFILE" => Some("hardware-bounded-jitter".to_string()),
+            _ => None,
+        });
+
+        let json = diagnostic_json(
+            &metadata,
+            29,
+            1_725_000_000_001,
+            "test-event",
+            "watch",
+            serde_json::json!({}),
+        );
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "at_unix_ms": 1_725_000_000_001u64,
+                "elapsed_ms": 29,
+                "event": "test-event",
+                "role": "watch",
+                "build": "0123456789abcdef",
+                "run": "run-123",
+                "device": "device-456",
+                "profile": "hardware-bounded-jitter",
+                "payload": {},
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostic_metadata_reads_only_the_explicit_allowlist() {
+        let requested = RefCell::new(Vec::new());
+
+        let _metadata = DiagnosticMetadata::from_lookup(|name| {
+            requested.borrow_mut().push(name.to_string());
+            None
+        });
+
+        assert_eq!(
+            requested.into_inner(),
+            [
+                "ORANGE_BUILD_ID",
+                "ORANGE_RUN_ID",
+                "ORANGE_DEVICE_ID",
+                "ORANGE_TEST_PROFILE",
+            ]
+        );
+    }
+
+    #[test]
+    fn measured_operation_preserves_success_value_and_reports_success() {
+        let mut events = Vec::new();
+
+        let result = measure_operation_with(
+            Operation::named("incoming-video-pad-link"),
+            || Ok::<_, &'static str>(String::from("unchanged")),
+            |event, payload| {
+                events.push((event.to_string(), serde_json::to_value(payload).unwrap()));
+            },
+        );
+
+        assert_eq!(result, Ok(String::from("unchanged")));
+        assert_eq!(events[0].0, "operation-started");
+        assert_eq!(
+            events[0].1,
+            serde_json::json!({ "operation": "incoming-video-pad-link" })
+        );
+        assert_eq!(events[1].0, "operation-finished");
+        assert_eq!(events[1].1["operation"], "incoming-video-pad-link");
+        assert_eq!(events[1].1["success"], true);
+        assert!(events[1].1["duration_ms"].is_u64());
+    }
+
+    #[test]
+    fn measured_operation_preserves_error_and_reports_failure() {
+        let mut events = Vec::new();
+
+        let result = measure_operation_with(
+            Operation::named("video-decoder-create-d3d11av1dec"),
+            || Err::<String, _>("decoder unavailable"),
+            |event, payload| {
+                events.push((event.to_string(), serde_json::to_value(payload).unwrap()));
+            },
+        );
+
+        assert_eq!(result, Err("decoder unavailable"));
+        assert_eq!(events[0].0, "operation-started");
+        assert_eq!(events[1].0, "operation-finished");
+        assert_eq!(events[1].1["success"], false);
+    }
 
     #[test]
     fn progress_snapshot_identifies_the_last_advancing_media_stage() {

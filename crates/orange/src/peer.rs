@@ -1136,7 +1136,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
         );
         let (result, branch_ready) = match kind.as_str() {
             "OPUS" => (
-                build_audio_branch(&pipeline, pad, overlay_for_audio.clone()),
+                build_audio_branch(&pipeline, pad, overlay_for_audio.clone(), "watch"),
                 true,
             ),
             "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
@@ -1153,6 +1153,7 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
                             pad,
                             output,
                             media_progress_for_pad.clone(),
+                            "watch",
                         ),
                         true,
                     )

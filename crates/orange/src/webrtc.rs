@@ -20,7 +20,9 @@ use gstreamer_video::prelude::VideoOverlayExtManual;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::{Arc, Mutex};
 
-use crate::media_diagnostics::{track_pad, MediaProgress, MediaStage};
+use crate::media_diagnostics::{
+    measure_operation, track_pad, MediaProgress, MediaStage, Operation,
+};
 use crate::pipeline::{build_capture_chain, check_elements, CaptureSettings};
 
 /// RTP caps for our encoded video. AV1 has no static payload type, so we pick
@@ -207,7 +209,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
             return; // only handle the first stream
         };
 
-        if let Err(err) = build_receive_branch(&pipeline, pad, output, None) {
+        if let Err(err) = build_receive_branch(&pipeline, pad, output, None, "loopback") {
             eprintln!("[webrtc] could not build receive branch: {err}");
         }
     });
@@ -230,10 +232,38 @@ pub fn encoding_name(pad: &gst::Pad) -> Option<String> {
 /// Add and link a dynamic receive branch as one transaction. GStreamer does
 /// not roll back partially added elements or pad links when a later operation
 /// fails, so the caller must do it explicitly before keeping the session alive.
+struct ReceiveElement {
+    element: gst::Element,
+    logical_name: &'static str,
+    factory: &'static str,
+}
+
+fn build_receive_element(
+    diagnostic_role: &str,
+    logical_name: &'static str,
+    factory: &'static str,
+    build: impl FnOnce() -> Result<gst::Element>,
+) -> Result<ReceiveElement> {
+    let element = measure_operation(
+        diagnostic_role,
+        Operation::element("element-create", logical_name, factory),
+        build,
+    )?;
+    Ok(ReceiveElement {
+        element,
+        logical_name,
+        factory,
+    })
+}
+
 fn attach_receive_elements(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
-    elements: &[gst::Element],
+    elements: &[ReceiveElement],
+    diagnostic_role: &str,
+    link_operation: &'static str,
+    pad_link_operation: &'static str,
+    remove_probe_operation: &'static str,
 ) -> Result<()> {
     let mut added = 0;
     let block_probe = pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_, _| {
@@ -241,34 +271,64 @@ fn attach_receive_elements(
     });
     let result = (|| -> Result<()> {
         for element in elements {
-            pipeline.add(element)?;
+            measure_operation(
+                diagnostic_role,
+                Operation::element("pipeline-add", element.logical_name, element.factory),
+                || pipeline.add(&element.element),
+            )?;
             added += 1;
         }
-        gst::Element::link_many(elements)?;
-        pad.link(&elements[0].static_pad("sink").unwrap())?;
+        measure_operation(diagnostic_role, Operation::named(link_operation), || {
+            gst::Element::link_many(elements.iter().map(|element| &element.element))
+        })?;
+        measure_operation(
+            diagnostic_role,
+            Operation::named(pad_link_operation),
+            || pad.link(&elements[0].element.static_pad("sink").unwrap()),
+        )?;
         for element in elements {
-            element.sync_state_with_parent()?;
+            measure_operation(
+                diagnostic_role,
+                Operation::element(
+                    "sync-state-with-parent",
+                    element.logical_name,
+                    element.factory,
+                ),
+                || element.element.sync_state_with_parent(),
+            )?;
         }
         Ok(())
     })();
     if let Err(error) = result {
         if let Some(sink_pad) = elements
             .first()
-            .and_then(|element| element.static_pad("sink"))
+            .and_then(|element| element.element.static_pad("sink"))
         {
             let _ = pad.unlink(&sink_pad);
         }
         for element in elements.iter().take(added).rev() {
-            let _ = element.set_state(gst::State::Null);
-            let _ = pipeline.remove(element);
+            let _ = element.element.set_state(gst::State::Null);
+            let _ = pipeline.remove(&element.element);
         }
         if let Some(block_probe) = block_probe {
-            pad.remove_probe(block_probe);
+            measure_operation(
+                diagnostic_role,
+                Operation::named(remove_probe_operation),
+                || {
+                    pad.remove_probe(block_probe);
+                },
+            );
         }
         return Err(error);
     }
     if let Some(block_probe) = block_probe {
-        pad.remove_probe(block_probe);
+        measure_operation(
+            diagnostic_role,
+            Operation::named(remove_probe_operation),
+            || {
+                pad.remove_probe(block_probe);
+            },
+        );
     }
     Ok(())
 }
@@ -290,54 +350,79 @@ fn av1_decoder_factory(selection: Option<&str>, file_output: bool) -> &'static s
     }
 }
 
-fn build_av1_decoder(selection: Option<&str>, file_output: bool) -> Result<gst::Element> {
+fn build_av1_decoder(
+    selection: Option<&str>,
+    file_output: bool,
+    diagnostic_role: &str,
+) -> Result<ReceiveElement> {
     let factory = av1_decoder_factory(selection, file_output);
-    gst::ElementFactory::make(factory)
-        .property("automatic-request-sync-points", true)
-        .property("discard-corrupted-frames", true)
-        .build()
-        .with_context(|| format!("{factory} is unavailable"))
+    build_receive_element(diagnostic_role, "video-decoder", factory, || {
+        gst::ElementFactory::make(factory)
+            .property("automatic-request-sync-points", true)
+            .property("discard-corrupted-frames", true)
+            .build()
+            .with_context(|| format!("{factory} is unavailable"))
+    })
 }
 
-fn build_av1_depayloader() -> Result<gst::Element> {
-    gst::ElementFactory::make("rtpav1depay")
-        .property("request-keyframe", true)
-        .property("wait-for-keyframe", true)
-        .build()
-        .context("rtpav1depay is unavailable")
+fn build_av1_depayloader(diagnostic_role: &str) -> Result<ReceiveElement> {
+    build_receive_element(diagnostic_role, "video-depayloader", "rtpav1depay", || {
+        gst::ElementFactory::make("rtpav1depay")
+            .property("request-keyframe", true)
+            .property("wait-for-keyframe", true)
+            .build()
+            .context("rtpav1depay is unavailable")
+    })
 }
 
-fn build_live_video_queue() -> Result<gst::Element> {
-    gst::ElementFactory::make("queue")
-        .property("max-size-buffers", 1u32)
-        .property("max-size-bytes", 0u32)
-        .property("max-size-time", 0u64)
-        .property_from_str("leaky", "downstream")
-        .build()
-        .context("video presentation queue is unavailable")
+fn build_live_video_queue(diagnostic_role: &str) -> Result<ReceiveElement> {
+    build_receive_element(diagnostic_role, "video-presentation-queue", "queue", || {
+        gst::ElementFactory::make("queue")
+            .property("max-size-buffers", 1u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 0u64)
+            .property_from_str("leaky", "downstream")
+            .build()
+            .context("video presentation queue is unavailable")
+    })
 }
 
-fn build_video_sink() -> Result<gst::Element> {
-    gst::ElementFactory::make("d3d11videosink")
-        .property("async", false)
-        .property("sync", false)
-        .property("force-aspect-ratio", true)
-        .build()
-        .context("d3d11videosink is unavailable")
+fn build_video_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
+    build_receive_element(diagnostic_role, "video-sink", "d3d11videosink", || {
+        gst::ElementFactory::make("d3d11videosink")
+            .property("async", false)
+            .property("sync", false)
+            .property("force-aspect-ratio", true)
+            .build()
+            .context("d3d11videosink is unavailable")
+    })
 }
 
-fn build_audio_sink() -> Result<gst::Element> {
-    gst::ElementFactory::make("wasapi2sink")
-        .property("async", false)
-        .property("low-latency", true)
-        .build()
-        .or_else(|_| {
+fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
+    let primary = measure_operation(
+        diagnostic_role,
+        Operation::element("element-create", "audio-sink", "wasapi2sink"),
+        || {
+            gst::ElementFactory::make("wasapi2sink")
+                .property("async", false)
+                .property("low-latency", true)
+                .build()
+        },
+    );
+    match primary {
+        Ok(element) => Ok(ReceiveElement {
+            element,
+            logical_name: "audio-sink",
+            factory: "wasapi2sink",
+        }),
+        Err(_) => build_receive_element(diagnostic_role, "audio-sink", "wasapisink", || {
             gst::ElementFactory::make("wasapisink")
                 .property("async", false)
                 .property("low-latency", true)
                 .build()
-        })
-        .context("audio sink is unavailable")
+                .context("audio sink is unavailable")
+        }),
+    }
 }
 
 /// Attach depayload -> parse -> hardware decode -> output to the receiver.
@@ -346,17 +431,23 @@ pub fn build_receive_branch(
     pad: &gst::Pad,
     output: Output,
     progress: Option<Arc<MediaProgress>>,
+    diagnostic_role: &str,
 ) -> Result<()> {
     let reveal_playback = match &output {
         Output::Window(playback) => Some(playback.clone()),
         Output::File(_) => None,
     };
-    let depay = build_av1_depayloader()?;
-    let parse = gst::ElementFactory::make("av1parse").build()?;
+    let depay = build_av1_depayloader(diagnostic_role)?;
+    let parse = build_receive_element(diagnostic_role, "video-parser", "av1parse", || {
+        gst::ElementFactory::make("av1parse")
+            .build()
+            .context("av1parse is unavailable")
+    })?;
     let decoder_selection = std::env::var("ORANGE_AV1_DECODER").ok();
     let dec = build_av1_decoder(
         decoder_selection.as_deref(),
         matches!(&output, Output::File(_)),
+        diagnostic_role,
     )?;
     let advertised_rate = pad
         .current_caps()
@@ -365,24 +456,30 @@ pub fn build_receive_branch(
     if let Some(progress) = progress {
         track_pad(
             &depay
+                .element
                 .static_pad("src")
                 .context("depayloader has no src pad")?,
             MediaStage::Depay,
             progress.clone(),
         );
         track_pad(
-            &parse.static_pad("src").context("parser has no src pad")?,
+            &parse
+                .element
+                .static_pad("src")
+                .context("parser has no src pad")?,
             MediaStage::Parsed,
             progress.clone(),
         );
         track_pad(
-            &dec.static_pad("src").context("decoder has no src pad")?,
+            &dec.element
+                .static_pad("src")
+                .context("decoder has no src pad")?,
             MediaStage::Decoded,
             progress,
         );
     }
 
-    let tail: Vec<gst::Element> = match output {
+    let tail: Vec<ReceiveElement> = match output {
         Output::Window(playback) => {
             if let Some(rate) = advertised_rate {
                 if let Ok(mut state) = playback.overlay().lock() {
@@ -391,14 +488,22 @@ pub fn build_receive_branch(
             }
             // Controls are composited into the frame here, on the GPU, rather
             // than drawn by a second window that would have to chase this one.
-            let composition = gst::ElementFactory::make("overlaycomposition")
-                .build()
-                .context("overlaycomposition missing")?;
-            crate::overlay::attach(&composition, &playback);
-            let queue = build_live_video_queue()?;
+            let composition = build_receive_element(
+                diagnostic_role,
+                "video-overlay",
+                "overlaycomposition",
+                || {
+                    gst::ElementFactory::make("overlaycomposition")
+                        .build()
+                        .context("overlaycomposition missing")
+                },
+            )?;
+            crate::overlay::attach(&composition.element, &playback);
+            let queue = build_live_video_queue(diagnostic_role)?;
 
-            let sink = build_video_sink()?;
+            let sink = build_video_sink(diagnostic_role)?;
             let overlay_iface = sink
+                .element
                 .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
                 .context("d3d11videosink does not implement GstVideoOverlay")?;
             // SAFETY: the handle belongs to this playback component and
@@ -410,22 +515,46 @@ pub fn build_receive_branch(
         Output::File(path) => {
             // Re-encode only because writing raw frames to disk is impractical.
             // This branch exists for verification, not for the real product.
-            let enc = gst::ElementFactory::make("nvd3d11av1enc")
-                .property("bitrate", 25_000u32)
-                .build()?;
-            let parse2 = gst::ElementFactory::make("av1parse").build()?;
-            let mux = gst::ElementFactory::make("matroskamux").build()?;
-            let sink = gst::ElementFactory::make("filesink")
-                .property("location", path)
-                .build()?;
+            let enc = build_receive_element(
+                diagnostic_role,
+                "video-file-encoder",
+                "nvd3d11av1enc",
+                || {
+                    Ok(gst::ElementFactory::make("nvd3d11av1enc")
+                        .property("bitrate", 25_000u32)
+                        .build()?)
+                },
+            )?;
+            let parse2 =
+                build_receive_element(diagnostic_role, "video-file-parser", "av1parse", || {
+                    Ok(gst::ElementFactory::make("av1parse").build()?)
+                })?;
+            let mux =
+                build_receive_element(diagnostic_role, "video-file-muxer", "matroskamux", || {
+                    Ok(gst::ElementFactory::make("matroskamux").build()?)
+                })?;
+            let sink =
+                build_receive_element(diagnostic_role, "video-file-sink", "filesink", || {
+                    Ok(gst::ElementFactory::make("filesink")
+                        .property("location", path)
+                        .build()?)
+                })?;
             vec![enc, parse2, mux, sink]
         }
     };
 
-    let mut all: Vec<gst::Element> = vec![depay, parse, dec];
+    let mut all = vec![depay, parse, dec];
     all.extend(tail);
 
-    attach_receive_elements(pipeline, pad, &all)?;
+    attach_receive_elements(
+        pipeline,
+        pad,
+        &all,
+        diagnostic_role,
+        "link-video-receive-elements",
+        "link-incoming-video-rtp-pad",
+        "remove-incoming-video-block-probe",
+    )?;
     if let Some(playback) = reveal_playback {
         playback.reveal();
     }
@@ -442,27 +571,50 @@ pub fn build_audio_branch(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
     overlay: Option<crate::overlay::SharedOverlay>,
+    diagnostic_role: &str,
 ) -> Result<()> {
     let initial_volume = overlay
         .as_ref()
         .and_then(|overlay| overlay.lock().ok())
         .map(|state| if state.muted { 0.0 } else { state.volume })
         .unwrap_or(0.3);
-    let depay = gst::ElementFactory::make("rtpopusdepay").build()?;
-    let dec = gst::ElementFactory::make("opusdec").build()?;
-    let convert = gst::ElementFactory::make("audioconvert").build()?;
-    let resample = gst::ElementFactory::make("audioresample").build()?;
-    let volume = gst::ElementFactory::make("volume")
-        .name("viewer-volume")
-        .property("volume", initial_volume)
-        .build()?;
-    let sink = build_audio_sink()?;
+    let depay =
+        build_receive_element(diagnostic_role, "audio-depayloader", "rtpopusdepay", || {
+            Ok(gst::ElementFactory::make("rtpopusdepay").build()?)
+        })?;
+    let dec = build_receive_element(diagnostic_role, "audio-decoder", "opusdec", || {
+        Ok(gst::ElementFactory::make("opusdec").build()?)
+    })?;
+    let convert =
+        build_receive_element(diagnostic_role, "audio-converter", "audioconvert", || {
+            Ok(gst::ElementFactory::make("audioconvert").build()?)
+        })?;
+    let resample =
+        build_receive_element(diagnostic_role, "audio-resampler", "audioresample", || {
+            Ok(gst::ElementFactory::make("audioresample").build()?)
+        })?;
+    let volume = build_receive_element(diagnostic_role, "audio-volume", "volume", || {
+        Ok(gst::ElementFactory::make("volume")
+            .name("viewer-volume")
+            .property("volume", initial_volume)
+            .build()?)
+    })?;
+    let sink = build_audio_sink(diagnostic_role)?;
 
-    let all = [depay, dec, convert, resample, volume.clone(), sink];
-    attach_receive_elements(pipeline, pad, &all)?;
+    let all = [depay, dec, convert, resample, volume, sink];
+    attach_receive_elements(
+        pipeline,
+        pad,
+        &all,
+        diagnostic_role,
+        "link-audio-receive-elements",
+        "link-incoming-audio-rtp-pad",
+        "remove-incoming-audio-block-probe",
+    )?;
 
     if let Some(overlay) = overlay {
         let overlay = Arc::downgrade(&overlay);
+        let volume = all[4].element.clone();
         std::thread::spawn(move || {
             let mut applied = initial_volume;
             loop {
@@ -531,39 +683,41 @@ mod tests {
     #[test]
     fn av1_decoder_rejects_corrupt_output_and_requests_recovery() {
         gst::init().unwrap();
-        let decoder = build_av1_decoder(Some("software"), false).unwrap();
+        let decoder = build_av1_decoder(Some("software"), false, "test").unwrap();
 
-        assert!(decoder.property::<bool>("automatic-request-sync-points"));
-        assert!(decoder.property::<bool>("discard-corrupted-frames"));
+        assert!(decoder
+            .element
+            .property::<bool>("automatic-request-sync-points"));
+        assert!(decoder.element.property::<bool>("discard-corrupted-frames"));
     }
 
     #[test]
     fn av1_depayloader_requests_and_waits_for_recovery_keyframes() {
         gst::init().unwrap();
-        let depay = build_av1_depayloader().unwrap();
+        let depay = build_av1_depayloader("test").unwrap();
 
-        assert!(depay.property::<bool>("request-keyframe"));
-        assert!(depay.property::<bool>("wait-for-keyframe"));
+        assert!(depay.element.property::<bool>("request-keyframe"));
+        assert!(depay.element.property::<bool>("wait-for-keyframe"));
     }
 
     #[test]
     fn presentation_queue_keeps_only_the_live_decoded_frame() {
         gst::init().unwrap();
-        let queue = build_live_video_queue().unwrap();
+        let queue = build_live_video_queue("test").unwrap();
 
-        assert_eq!(queue.property::<u32>("max-size-buffers"), 1);
-        assert_eq!(queue.property::<u32>("max-size-bytes"), 0);
-        assert_eq!(queue.property::<u64>("max-size-time"), 0);
+        assert_eq!(queue.element.property::<u32>("max-size-buffers"), 1);
+        assert_eq!(queue.element.property::<u32>("max-size-bytes"), 0);
+        assert_eq!(queue.element.property::<u64>("max-size-time"), 0);
     }
 
     #[test]
     fn live_sinks_do_not_wait_for_preroll() {
         gst::init().unwrap();
-        let video = build_video_sink().unwrap();
-        let audio = build_audio_sink().unwrap();
+        let video = build_video_sink("test").unwrap();
+        let audio = build_audio_sink("test").unwrap();
 
-        assert!(!video.property::<bool>("async"));
-        assert!(!video.property::<bool>("sync"));
-        assert!(!audio.property::<bool>("async"));
+        assert!(!video.element.property::<bool>("async"));
+        assert!(!video.element.property::<bool>("sync"));
+        assert!(!audio.element.property::<bool>("async"));
     }
 }
