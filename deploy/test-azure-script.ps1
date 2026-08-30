@@ -15,6 +15,7 @@ $checks = [ordered]@{
     "HTTPS-only SAS" = 'generate-sas[\s\S]*--https-only'
     "short secret name" = 'diag-container-url'
     "secret environment reference" = 'ORANGE_DIAGNOSTICS_CONTAINER_URL=secretref:diag-container-url'
+    "SAS bypasses cmd wrapper" = '-IBm\s+azure\.cli[\s\S]*diag-container-url=\$diagnosticsUrl'
     "public alpha account" = 'orangealpha0d8d5893e69a3'
     "public alpha container" = 'container create[\s\S]*--name\s+releases[\s\S]*--public-access\s+blob'
 }

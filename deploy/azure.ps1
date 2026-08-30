@@ -178,7 +178,14 @@ try {
 finally { Pop-Location }
 
 Step "Configuring private diagnostics upload"
-az containerapp secret set `
+$azCommand = Get-Command az.cmd -ErrorAction Stop
+$azPython = [IO.Path]::GetFullPath((Join-Path (Split-Path $azCommand.Path -Parent) "..\python.exe"))
+if (-not (Test-Path -LiteralPath $azPython -PathType Leaf)) {
+    throw "Azure CLI Python executable was not found"
+}
+# Invoke the CLI module directly. Passing a SAS through az.cmd lets cmd.exe
+# reinterpret its ampersands as command separators before Azure CLI sees it.
+& $azPython -IBm azure.cli containerapp secret set `
     --name $AppName `
     --resource-group $ResourceGroup `
     --secrets "diag-container-url=$diagnosticsUrl" `
