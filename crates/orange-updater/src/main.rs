@@ -106,9 +106,13 @@ fn installer_succeeded(code: i32) -> bool {
 }
 
 fn wait_for_parent(pid: u32) -> Result<()> {
+    wait_for_parent_with_timeout(pid, 2 * 60 * 1000)
+}
+
+fn wait_for_parent_with_timeout(pid: u32, timeout_ms: u32) -> Result<()> {
     unsafe {
         if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            let result = WaitForSingleObject(handle, 2 * 60 * 1000);
+            let result = WaitForSingleObject(handle, timeout_ms);
             let _ = CloseHandle(handle);
             if result != WAIT_OBJECT_0 {
                 bail!("Orange did not exit before the update timeout");
@@ -117,6 +121,21 @@ fn wait_for_parent(pid: u32) -> Result<()> {
     }
     std::thread::sleep(Duration::from_millis(200));
     Ok(())
+}
+
+fn run_installer(installer: &Path) -> Result<i32> {
+    let status = Command::new(installer)
+        .args([
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+            "/SP-",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .context("could not start the Orange installer")?;
+    Ok(status.code().unwrap_or(-1))
 }
 
 fn parent_has_exited(pid: u32) -> bool {
@@ -131,22 +150,10 @@ fn parent_has_exited(pid: u32) -> bool {
 }
 
 fn apply_update(args: UpdateArgs) -> Result<()> {
-    verify_installer(&args.installer, &args.sha256)?;
     wait_for_parent(args.parent)?;
     verify_installer(&args.installer, &args.sha256)?;
 
-    let status = Command::new(&args.installer)
-        .args([
-            "/VERYSILENT",
-            "/SUPPRESSMSGBOXES",
-            "/NORESTART",
-            "/CLOSEAPPLICATIONS",
-            "/SP-",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .context("could not start the Orange installer")?;
-    let code = status.code().unwrap_or(-1);
+    let code = run_installer(&args.installer)?;
     if !installer_succeeded(code) {
         bail!("Orange installer exited with code {code}");
     }
@@ -265,5 +272,33 @@ mod tests {
     #[test]
     fn current_process_is_not_treated_as_exited() {
         assert!(!parent_has_exited(std::process::id()));
+        assert!(parent_has_exited(u32::MAX));
+    }
+
+    #[test]
+    fn parent_wait_is_bounded() {
+        let started = std::time::Instant::now();
+        assert!(wait_for_parent_with_timeout(std::process::id(), 1).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn installer_process_receives_silent_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("args.txt");
+        let installer = directory.path().join("fixture.cmd");
+        std::fs::write(
+            &installer,
+            format!(
+                "@echo off\r\necho %* > \"{}\"\r\nexit /b 0\r\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(run_installer(&installer).unwrap(), 0);
+        let arguments = std::fs::read_to_string(marker).unwrap();
+        assert!(arguments.contains("/VERYSILENT"));
+        assert!(arguments.contains("/CLOSEAPPLICATIONS"));
     }
 }

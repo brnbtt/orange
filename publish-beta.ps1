@@ -46,7 +46,7 @@ function Test-BetaManifest {
     if ($Manifest.version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') { throw "Invalid beta version" }
     if ($Manifest.build -cnotmatch '^[0-9a-f]{40}$') { throw "Invalid beta build" }
     if ($Manifest.sha256 -cnotmatch '^[0-9A-F]{64}$') { throw "Invalid installer hash" }
-    if ($Manifest.notes -isnot [string] -or $Manifest.notes.Length -gt 500 -or
+    if ($Manifest.notes -isnot [string] -or [Text.Encoding]::UTF8.GetByteCount($Manifest.notes) -gt 500 -or
         @($Manifest.notes.ToCharArray() | Where-Object { [char]::IsControl($_) }).Count -ne 0) {
         throw "Invalid release notes"
     }
@@ -81,10 +81,105 @@ function Test-NativeSuccess {
     }
 }
 
+function Get-OptionalNativeJson {
+    param([Parameter(Mandatory = $true)][string]$Command, [Parameter(Mandatory = $true)][string[]]$Arguments)
+    $old = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $Command @Arguments 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return ($output | Out-String | ConvertFrom-Json)
+    } finally {
+        $ErrorActionPreference = $old
+    }
+}
+
+function Ensure-AzureInstaller {
+    param(
+        [Parameter(Mandatory = $true)][string]$Installer,
+        [Parameter(Mandatory = $true)][string]$InstallerName,
+        [Parameter(Mandatory = $true)][string]$Build,
+        [Parameter(Mandatory = $true)][string]$Sha256
+    )
+    $existing = Get-OptionalNativeJson -Command "az" -Arguments @(
+        "storage", "blob", "show", "--account-name", $script:BetaStorageAccount,
+        "--container-name", $script:BetaContainer, "--name", $InstallerName,
+        "--auth-mode", "key", "--output", "json", "--only-show-errors"
+    )
+    if ($null -eq $existing) {
+        Invoke-Checked -Command "az" -Arguments @(
+            "storage", "blob", "upload", "--account-name", $script:BetaStorageAccount,
+            "--container-name", $script:BetaContainer, "--file", $Installer,
+            "--name", $InstallerName, "--auth-mode", "key", "--overwrite", "false",
+            "--metadata", "sha256=$Sha256", "build=$Build", "--only-show-errors"
+        )
+        return
+    }
+    $size = (Get-Item -LiteralPath $Installer).Length
+    if ([int64]$existing.properties.contentLength -ne $size -or
+        $existing.metadata.sha256 -cne $Sha256 -or $existing.metadata.build -cne $Build) {
+        throw "Existing Azure beta installer does not match this immutable build"
+    }
+}
+
+function Ensure-GitHubRelease {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [Parameter(Mandatory = $true)][string]$Build,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Notes,
+        [Parameter(Mandatory = $true)][string[]]$Assets
+    )
+    $release = Get-OptionalNativeJson -Command "gh" -Arguments @(
+        "release", "view", $Tag, "--repo", $script:Repository,
+        "--json", "targetCommitish,assets"
+    )
+    if ($null -eq $release) {
+        Invoke-Checked -Command "gh" -Arguments @(
+            "release", "create", $Tag, "--repo", $script:Repository, "--target", $Build,
+            "--title", $Title, "--notes", $Notes, "--prerelease", "--latest=false"
+        )
+        $release = [pscustomobject]@{ targetCommitish = $Build; assets = @() }
+    }
+    if ($release.targetCommitish -cne $Build) {
+        throw "Existing GitHub beta tag targets a different build"
+    }
+    foreach ($asset in $Assets) {
+        $name = Split-Path -Leaf $asset
+        $remote = @($release.assets | Where-Object { $_.name -ceq $name })
+        if ($remote.Count -eq 0) {
+            Invoke-Checked -Command "gh" -Arguments @(
+                "release", "upload", $Tag, $asset, "--repo", $script:Repository
+            )
+            continue
+        }
+        if ($remote.Count -ne 1 -or [int64]$remote[0].size -ne (Get-Item -LiteralPath $asset).Length) {
+            throw "Existing GitHub asset $name does not match this build"
+        }
+        $check = Join-Path $env:TEMP ("orange-beta-check-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $check | Out-Null
+        try {
+            Invoke-Checked -Command "gh" -Arguments @(
+                "release", "download", $Tag, "--repo", $script:Repository,
+                "--pattern", $name, "--dir", $check
+            )
+            if ((Get-FileHash -LiteralPath (Join-Path $check $name) -Algorithm SHA256).Hash -cne
+                (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash) {
+                throw "Existing GitHub asset $name has different bytes"
+            }
+        } finally {
+            Remove-Item -LiteralPath $check -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Invoke-BetaPublish {
     $root = $PSScriptRoot
     Push-Location $root
     try {
+        if ($Publish) {
+            Invoke-Checked -Command "git" -Arguments @("fetch", "origin", "main")
+        }
         $build = (& git rev-parse HEAD).Trim()
         if ($LASTEXITCODE -ne 0 -or $build -cnotmatch '^[0-9a-f]{40}$') { throw "Could not determine build commit" }
         if ($Publish) {
@@ -101,7 +196,7 @@ function Invoke-BetaPublish {
 
         & (Join-Path $root "packaging\windows\test-installer.ps1")
         & (Join-Path $root "packaging\windows\test-beta-publish.ps1")
-        & (Join-Path $root "package.ps1") -SkipTests:$SkipTests
+        & (Join-Path $root "package.ps1") -SkipTests:$SkipTests -BuildId $build
         if ($LASTEXITCODE -ne 0) { throw "Installer packaging failed" }
         $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
         $version = ($metadata.packages | Where-Object name -eq "orange-tray").version
@@ -119,21 +214,17 @@ function Invoke-BetaPublish {
             (New-Object Text.UTF8Encoding($false)))
 
         if ($Publish) {
-            Invoke-Checked -Command "az" -Arguments @(
-                "storage", "blob", "upload", "--account-name", $script:BetaStorageAccount,
-                "--container-name", $script:BetaContainer, "--file", $installer,
-                "--name", $installerName, "--auth-mode", "key", "--overwrite", "false", "--only-show-errors"
-            )
-
-            $tag = "v$version"
-            if (Test-NativeSuccess -Command "gh" -Arguments @("release", "view", $tag, "--repo", $script:Repository)) {
-                throw "Release $tag already exists; beta versions are immutable"
+            $afterBuild = (& git rev-parse HEAD).Trim()
+            & git diff --quiet --ignore-submodules --
+            $dirtyAfterBuild = $LASTEXITCODE -ne 0
+            & git diff --cached --quiet --ignore-submodules --
+            $dirtyIndexAfterBuild = $LASTEXITCODE -ne 0
+            if ($afterBuild -cne $build -or $dirtyAfterBuild -or $dirtyIndexAfterBuild) {
+                throw "Source changed while building the beta installer"
             }
-            Invoke-Checked -Command "gh" -Arguments @(
-                "release", "create", $tag, $installer, $manifestPath,
-                "--repo", $script:Repository, "--target", $build,
-                "--title", "Orange $version", "--notes", $Notes, "--prerelease", "--latest=false"
-            )
+            Ensure-AzureInstaller -Installer $installer -InstallerName $installerName -Build $build -Sha256 $manifest.sha256
+            $tag = "v$version"
+            Ensure-GitHubRelease -Tag $tag -Build $build -Title "Orange $version" -Notes $Notes -Assets @($installer, $manifestPath)
             Invoke-Checked -Command "az" -Arguments @(
                 "storage", "blob", "upload", "--account-name", $script:BetaStorageAccount,
                 "--container-name", $script:BetaContainer, "--file", $manifestPath,

@@ -12,8 +12,8 @@ newer verified installer after one user click before reopening Orange.
   are no welcome, destination, Start Menu, task-selection, ready, or completion
   pages.
 - Installation remains per-user and does not require elevation for Orange.
-- The current Microsoft VC++ redistributable is run silently and idempotently;
-  GStreamer is installed silently only when missing.
+- The signed Microsoft VC++ runtime DLL is deployed app-local, avoiding
+  elevation; GStreamer is installed silently per-user only when missing.
 - Orange opens automatically after a successful interactive installation.
 - Silent update installation does not launch Orange itself; the detached
   updater reopens it after checking the installer exit status.

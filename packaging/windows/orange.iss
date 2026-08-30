@@ -11,6 +11,7 @@
 AppId={{3F4D13A1-E6A0-49BA-97D6-67DAF8938677}
 AppName=orange
 AppVersion={#AppVersion}
+AppVerName=orange
 AppPublisher=orange
 AppPublisherURL=https://github.com/brnbtt/orange
 DefaultDirName={localappdata}\Programs\orange
@@ -40,7 +41,7 @@ RestartApplications=no
 Source: "..\..\target\release\orange.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\orange-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\orange-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\target\package\vc_redist.x64.exe"; Flags: dontcopy
+Source: "..\..\target\package\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\orange"; Filename: "{app}\orange-tray.exe"
@@ -101,27 +102,6 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  { The current redistributable is idempotent and verifies the minimum runtime
-    more reliably than the shared VS 14 registry key, which old 2015 runtimes
-    also satisfy. }
-  ExtractTemporaryFile('vc_redist.x64.exe');
-  if not Exec(
-    ExpandConstant('{tmp}\vc_redist.x64.exe'),
-    '/install /quiet /norestart',
-    '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
-  begin
-    Result := 'Could not start the Microsoft Visual C++ runtime installer.';
-    exit;
-  end;
-
-  if not ((ResultCode = 0) or (ResultCode = 1638) or (ResultCode = 3010)) then
-  begin
-    Result := Format('The Microsoft Visual C++ runtime installer failed with code %d.', [ResultCode]);
-    exit;
-  end;
-  if ResultCode = 3010 then
-    NeedsRestart := True;
-
   if GStreamerReady then
     exit;
 

@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string]$BuildId
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +31,15 @@ try {
         }
     }
 
-    $env:ORANGE_BUILD_ID = (git rev-parse HEAD).Trim()
+    $headBuild = (git rev-parse HEAD).Trim()
+    if ($BuildId) {
+        if ($BuildId -cnotmatch '^[0-9a-f]{40}$' -or $BuildId -cne $headBuild) {
+            throw "BuildId must match the current committed HEAD."
+        }
+    } else {
+        $BuildId = $headBuild
+    }
+    $env:ORANGE_BUILD_ID = $BuildId
     $env:ORANGE_UPDATE_CHANNEL = "beta"
     Remove-Item Env:ORANGE_UPDATE_MANIFEST_URL -ErrorAction SilentlyContinue
     cargo build --locked --release -p orange -p orange-tray -p orange-updater
@@ -38,21 +47,23 @@ try {
         throw "Release build failed."
     }
 
-    $redistDirectory = Join-Path $root "target\package"
-    $redistTarget = Join-Path $redistDirectory "vc_redist.x64.exe"
-    New-Item -ItemType Directory -Path $redistDirectory -Force | Out-Null
-    $redistPattern = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\vc_redist.x64.exe"
-    $redistSource = Get-ChildItem $redistPattern -ErrorAction SilentlyContinue |
+    $runtimeDirectory = Join-Path $root "target\package"
+    $runtimeTarget = Join-Path $runtimeDirectory "vcruntime140.dll"
+    New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
+    $runtimePatterns = @(
+        (Join-Path $env:ProgramFiles "Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT\vcruntime140.dll")
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT\vcruntime140.dll")
+    )
+    $runtimeSource = Get-ChildItem $runtimePatterns -ErrorAction SilentlyContinue |
         Sort-Object { $_.VersionInfo.FileVersionRaw } -Descending |
         Select-Object -First 1
-    if ($redistSource) {
-        Copy-Item $redistSource.FullName $redistTarget -Force
-    } else {
-        Invoke-WebRequest "https://aka.ms/vc14/vc_redist.x64.exe" -OutFile $redistTarget
+    if (-not $runtimeSource) {
+        throw "vcruntime140.dll was not found in the Visual Studio redistributable directories."
     }
-    $signature = Get-AuthenticodeSignature $redistTarget
+    Copy-Item $runtimeSource.FullName $runtimeTarget -Force
+    $signature = Get-AuthenticodeSignature $runtimeTarget
     if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notlike "*Microsoft Corporation*") {
-        throw "The Microsoft Visual C++ runtime signature is invalid."
+        throw "The Microsoft Visual C++ runtime DLL signature is invalid."
     }
 
     $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json

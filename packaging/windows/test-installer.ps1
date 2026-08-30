@@ -9,6 +9,7 @@ $checks = [ordered]@{
     "finished page disabled" = 'DisableFinishedPage=yes'
     "force close support" = 'CloseApplications=force'
     "updater installed" = 'Source: "\.\.\\\.\.\\target\\release\\orange-updater\.exe"'
+    "app-local VC runtime" = 'Source: "\.\.\\\.\.\\target\\package\\vcruntime140\.dll"; DestDir: "\{app\}"'
     "interactive launch" = 'Filename: "\{app\}\\orange-tray\.exe";[^\r\n]*nowait[^\r\n]*skipifsilent'
     "no task page" = '(?m)^\[Tasks\]\s*$'
     "updater release build" = 'cargo build --locked --release -p orange -p orange-tray -p orange-updater'
@@ -29,6 +30,9 @@ foreach ($check in $checks.GetEnumerator()) {
 }
 if ($iss -match 'Tasks:\s*(desktopicon|startup)') {
     $failures.Add("optional shortcut task remains")
+}
+if ($iss -match 'vc_redist|Microsoft Visual C\+\+ runtime installer') {
+    $failures.Add("machine-wide VC runtime installer remains")
 }
 if ($failures.Count) {
     throw "Installer checks failed: $($failures -join ', ')"

@@ -37,6 +37,14 @@ try {
     } catch {
         if ($_.Exception.Message -eq "control character was accepted") { throw }
     }
+    $unicodeNotes = $manifest | ConvertTo-Json | ConvertFrom-Json
+    $unicodeNotes.notes = ([string][char]0x00E9) * 500
+    try {
+        Test-BetaManifest -Manifest $unicodeNotes -InstallerPath $installer | Out-Null
+        throw "UTF-8 oversized notes were accepted"
+    } catch {
+        if ($_.Exception.Message -eq "UTF-8 oversized notes were accepted") { throw }
+    }
 
     $oversized = Join-Path $root "orange-setup-0.2.0-beta.1-oversized.exe"
     $stream = [IO.File]::Create($oversized)
@@ -51,10 +59,13 @@ try {
     }
 
     $source = Get-Content -LiteralPath $publisher -Raw
-    $installerUpload = $source.IndexOf('"--name", $installerName')
+    $installerUpload = $source.IndexOf('Ensure-AzureInstaller -Installer $installer')
     $manifestUpload = $source.IndexOf('"--name", "orange-beta.json"')
     if ($installerUpload -lt 0 -or $manifestUpload -le $installerUpload) {
         throw "publisher does not upload the installer before the manifest"
+    }
+    foreach ($required in @('-Command "git" -Arguments @("fetch", "origin", "main")', '-BuildId $build', 'Ensure-GitHubRelease', 'Source changed while building')) {
+        if ($source.IndexOf($required) -lt 0) { throw "publisher is missing safety gate: $required" }
     }
     Write-Host "RESULT: beta publisher checks passed"
 } finally {
