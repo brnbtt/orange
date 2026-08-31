@@ -426,18 +426,66 @@ pub struct SignalClient {
     pub incoming: mpsc::UnboundedReceiver<Signal>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_done: Option<tokio::sync::oneshot::Receiver<()>>,
+    writer: Option<tokio::task::JoinHandle<()>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(test)]
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        if let Some(signal) = self.0.take() {
+            let _ = signal.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CLIENT_TASK_DROP_SIGNALS:
+        std::cell::RefCell<Option<(DropSignal, DropSignal)>>;
 }
 
 impl SignalClient {
-    /// Send a WebSocket close frame before the media process exits. Waiting
-    /// only for the writer keeps shutdown prompt while ensuring the relay can
-    /// remove viewer state immediately instead of waiting for a TCP timeout.
+    /// Send a WebSocket close frame before the media process exits, then reap
+    /// both socket tasks after a bounded grace period.
     pub async fn close(mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
         if let Some(done) = self.shutdown_done.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(500), done).await;
+        }
+        let writer = self.writer.take();
+        let reader = self.reader.take();
+        if let Some(task) = &writer {
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+        if let Some(task) = &reader {
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+        if let Some(task) = writer {
+            let _ = task.await;
+        }
+        if let Some(task) = reader {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for SignalClient {
+    fn drop(&mut self) {
+        if let Some(task) = &self.writer {
+            task.abort();
+        }
+        if let Some(task) = &self.reader {
+            task.abort();
         }
     }
 }
@@ -463,8 +511,22 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Signal>();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let (shutdown_done_tx, shutdown_done_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, mut writer_stop_rx) = tokio::sync::watch::channel(false);
+    let mut reader_stop_rx = stop_tx.subscribe();
+    let writer_stop_tx = stop_tx.clone();
 
-    tokio::spawn(async move {
+    #[cfg(test)]
+    let (writer_drop_signal, reader_drop_signal) = CLIENT_TASK_DROP_SIGNALS
+        .try_with(|signals| signals.borrow_mut().take())
+        .ok()
+        .flatten()
+        .map_or((None, None), |(writer, reader)| {
+            (Some(writer), Some(reader))
+        });
+
+    let writer = tokio::spawn(async move {
+        #[cfg(test)]
+        let _drop_signal = writer_drop_signal;
         let mut heartbeat = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await;
@@ -483,6 +545,7 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
                         .await;
                     break;
                 }
+                _ = writer_stop_rx.changed() => break,
                 _ = heartbeat.tick() => {
                     if sink
                         .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new()))
@@ -494,11 +557,19 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
                 }
             }
         }
+        writer_stop_tx.send_replace(true);
         let _ = shutdown_done_tx.send(());
     });
 
-    tokio::spawn(async move {
-        while let Some(Ok(msg)) = source.next().await {
+    let reader = tokio::spawn(async move {
+        #[cfg(test)]
+        let _drop_signal = reader_drop_signal;
+        loop {
+            let msg = tokio::select! {
+                _ = reader_stop_rx.changed() => break,
+                msg = source.next() => msg,
+            };
+            let Some(Ok(msg)) = msg else { break };
             if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
                 match serde_json::from_str::<Signal>(&text) {
                     Ok(signal) => {
@@ -510,6 +581,7 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
                 }
             }
         }
+        stop_tx.send_replace(true);
     });
 
     Ok(SignalClient {
@@ -517,7 +589,124 @@ pub async fn connect(url: &str) -> Result<SignalClient> {
         incoming: in_rx,
         shutdown: Some(shutdown_tx),
         shutdown_done: Some(shutdown_done_rx),
+        writer: Some(writer),
+        reader: Some(reader),
     })
+}
+
+#[cfg(test)]
+async fn start_unresponsive_close_relay() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{extract::ws::WebSocketUpgrade, response::IntoResponse, routing::get, Router};
+
+    async fn websocket(ws: WebSocketUpgrade) -> impl IntoResponse {
+        ws.on_upgrade(|mut socket| async move {
+            while let Some(Ok(message)) = socket.recv().await {
+                if matches!(message, Message::Close(_)) {
+                    std::future::pending::<()>().await;
+                }
+            }
+        })
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind test relay");
+    let address = listener.local_addr().expect("test relay has no address");
+    let relay = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/ws", get(websocket)))
+            .await
+            .expect("test relay failed");
+    });
+    (format!("ws://{address}/ws"), relay)
+}
+
+#[cfg(test)]
+async fn start_remote_close_relay() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{extract::ws::WebSocketUpgrade, response::IntoResponse, routing::get, Router};
+
+    async fn websocket(ws: WebSocketUpgrade) -> impl IntoResponse {
+        ws.on_upgrade(|socket| async move {
+            socket.close().await.expect("failed to close test socket");
+        })
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind test relay");
+    let address = listener.local_addr().expect("test relay has no address");
+    let relay = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/ws", get(websocket)))
+            .await
+            .expect("test relay failed");
+    });
+    (format!("ws://{address}/ws"), relay)
+}
+
+#[cfg(test)]
+async fn connect_with_task_drop_signals(
+    url: &str,
+) -> (
+    SignalClient,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (writer_tx, writer_rx) = tokio::sync::oneshot::channel();
+    let (reader_tx, reader_rx) = tokio::sync::oneshot::channel();
+    let signals = (DropSignal(Some(writer_tx)), DropSignal(Some(reader_tx)));
+    let client = CLIENT_TASK_DROP_SIGNALS
+        .scope(std::cell::RefCell::new(Some(signals)), connect(url))
+        .await
+        .expect("failed to connect to test relay");
+    (client, writer_rx, reader_rx)
+}
+
+#[cfg(test)]
+async fn expect_socket_tasks_dropped(
+    writer: tokio::sync::oneshot::Receiver<()>,
+    reader: tokio::sync::oneshot::Receiver<()>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        writer.await.expect("writer drop signal was lost");
+        reader.await.expect("reader drop signal was lost");
+    })
+    .await
+    .expect("socket task resources were not dropped");
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn signal_client_close_reaps_both_socket_tasks() {
+    let (url, relay) = start_unresponsive_close_relay().await;
+    let (client, writer_dropped, reader_dropped) = connect_with_task_drop_signals(&url).await;
+
+    client.close().await;
+
+    expect_socket_tasks_dropped(writer_dropped, reader_dropped).await;
+    relay.abort();
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn dropping_signal_client_aborts_both_socket_tasks() {
+    let (url, relay) = start_unresponsive_close_relay().await;
+    let (client, writer_dropped, reader_dropped) = connect_with_task_drop_signals(&url).await;
+
+    drop(client);
+
+    expect_socket_tasks_dropped(writer_dropped, reader_dropped).await;
+    relay.abort();
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn remote_close_releases_both_socket_tasks() {
+    let (url, relay) = start_remote_close_relay().await;
+    let (client, writer_dropped, reader_dropped) = connect_with_task_drop_signals(&url).await;
+
+    expect_socket_tasks_dropped(writer_dropped, reader_dropped).await;
+
+    drop(client);
+    relay.abort();
 }
 
 #[cfg(test)]
@@ -525,16 +714,6 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
-
-    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            if let Some(signal) = self.0.take() {
-                let _ = signal.send(());
-            }
-        }
-    }
 
     #[test]
     fn relay_outbound_queue_is_bounded() {
