@@ -531,6 +531,44 @@ mod tests {
         assert_eq!(super::gop_update(480, 120), Some(120));
     }
 
+    #[test]
+    fn failed_keyframe_send_rolls_back_without_holding_the_lock() {
+        let requests = Mutex::new(None);
+        let now = Instant::now();
+
+        super::request_keyframe_at(&requests, now, || {
+            assert!(requests.try_lock().is_ok());
+            false
+        });
+
+        assert_eq!(*requests.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn keyframe_reservation_throttles_and_failed_rollback_preserves_newer_request() {
+        let requests = Mutex::new(None);
+        let now = Instant::now();
+        let newer = now + Duration::from_millis(250);
+        let mut sends = 0;
+
+        super::request_keyframe_at(&requests, now, || {
+            sends += 1;
+            true
+        });
+        super::request_keyframe_at(&requests, now + Duration::from_millis(199), || {
+            sends += 1;
+            true
+        });
+        super::request_keyframe_at(&requests, now + Duration::from_millis(200), || {
+            sends += 1;
+            *requests.lock().unwrap() = Some(newer);
+            false
+        });
+
+        assert_eq!(sends, 2);
+        assert_eq!(*requests.lock().unwrap(), Some(newer));
+    }
+
     #[tokio::test]
     async fn viewer_teardown_worker_removes_enqueued_branch() {
         gst::init().unwrap();
@@ -1163,21 +1201,40 @@ fn remove_tee_branch(pipeline: &gst::Pipeline, bin: &gst::Element, branch: TeeBr
     }
 }
 
-fn force_key_unit(tee: &gst::Element) {
-    let mut last_request = LAST_KEYFRAME_REQUEST
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    if last_request.is_some_and(|last| now.duration_since(last) < Duration::from_millis(200)) {
-        return;
+fn request_keyframe_at(
+    requests: &Mutex<Option<Instant>>,
+    now: Instant,
+    send: impl FnOnce() -> bool,
+) {
+    {
+        let mut last_request = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last_request.is_some_and(|last| now.duration_since(last) < Duration::from_millis(200)) {
+            return;
+        }
+        *last_request = Some(now);
     }
+
+    if !send() {
+        let mut last_request = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last_request == Some(now) {
+            *last_request = None;
+        }
+    }
+}
+
+fn force_key_unit(tee: &gst::Element) {
     let event = gst_video::UpstreamForceKeyUnitEvent::builder()
         .all_headers(true)
         .build();
-    if tee.send_event(event) {
-        *last_request = Some(now);
-    }
+    request_keyframe_at(
+        LAST_KEYFRAME_REQUEST.get_or_init(|| Mutex::new(None)),
+        Instant::now(),
+        || tee.send_event(event),
+    );
 }
 
 fn request_startup_keyframes(
