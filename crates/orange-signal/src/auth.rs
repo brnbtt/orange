@@ -308,17 +308,6 @@ impl Auth {
             .get(session)
             .map(|stored| stored.identity.clone())
     }
-
-    #[cfg(test)]
-    pub(crate) async fn insert_test_session(&self, session: &str, identity: Identity) {
-        self.state.lock().await.sessions.insert(
-            session.to_string(),
-            StoredSession {
-                identity,
-                created_at: Instant::now(),
-            },
-        );
-    }
 }
 
 pub enum PollResult {

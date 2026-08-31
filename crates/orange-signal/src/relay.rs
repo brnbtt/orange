@@ -1,9 +1,9 @@
+#[cfg(test)]
+use crate::server;
 use crate::{
     auth::{self, Identity},
     protocol::Signal,
 };
-#[cfg(test)]
-use crate::{diagnostics, server};
 use anyhow::{bail, Result};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -457,7 +457,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -495,7 +494,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -555,7 +553,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -676,7 +673,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -725,7 +721,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -775,7 +770,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms,
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -811,7 +805,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms,
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -862,7 +855,6 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

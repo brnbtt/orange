@@ -4,17 +4,16 @@
 //! ingress. `axum` handles the routing and the WebSocket upgrade.
 
 use crate::auth::{Auth, DiscordConfig, PollResult};
-use crate::diagnostics::{upload_diagnostics, DiagnosticsStorage, DIAGNOSTICS_LIMIT};
 use crate::relay::{handle_peer, Rooms};
 use anyhow::{Context, Result};
 use axum::{
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Query, State,
+        Query, State,
     },
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -32,7 +31,6 @@ static CONNECTIONS: LazyLock<Arc<Semaphore>> =
 pub struct AppState {
     pub rooms: Rooms,
     pub auth: Auth,
-    pub(crate) diagnostics: DiagnosticsStorage,
 }
 
 pub async fn serve(addr: &str) -> Result<()> {
@@ -43,12 +41,9 @@ pub async fn serve(addr: &str) -> Result<()> {
         println!("Discord login: not configured (set DISCORD_CLIENT_ID/SECRET/REDIRECT_URI)");
     }
 
-    let diagnostics = DiagnosticsStorage::from_env()?;
-    println!("Diagnostics storage: {}", diagnostics.description());
     let state = AppState {
         rooms: Arc::new(Mutex::new(HashMap::new())),
         auth,
-        diagnostics,
     };
 
     let app = router(state);
@@ -68,10 +63,6 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/auth/start", get(auth_start))
         .route("/auth/callback", get(auth_callback))
         .route("/auth/poll", get(auth_poll))
-        .route(
-            "/diagnostics",
-            post(upload_diagnostics).layer(DefaultBodyLimit::max(DIAGNOSTICS_LIMIT)),
-        )
         .route("/ws", get(ws_upgrade))
         .with_state(state)
 }
@@ -245,7 +236,6 @@ mod tests {
         let app = router(AppState {
             rooms: Default::default(),
             auth: crate::auth::Auth::new(None),
-            diagnostics: DiagnosticsStorage::Disabled,
         });
         let response = app
             .oneshot(
@@ -276,7 +266,6 @@ mod tests {
                 AppState {
                     rooms: Rooms::default(),
                     auth: Auth::new(None),
-                    diagnostics: DiagnosticsStorage::Disabled,
                 },
                 connections.clone(),
             ));

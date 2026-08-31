@@ -11,7 +11,6 @@
 
 mod auth;
 mod client;
-mod diagnostics;
 mod protocol;
 mod relay;
 mod server;
