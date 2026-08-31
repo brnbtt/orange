@@ -92,9 +92,13 @@ Media Foundation, then NVIDIA, and falls back to a compatible zero-copy H.264
 encoder when neither H.265 encoder can accept D3D11 textures:
 
 ```text
-d3d11screencapturesrc -> d3d11convert -> mfh265enc -> h265parse
-  -> rtph265pay -> webrtcbin ===== peer to peer ===== webrtcbin
-  -> rtph265depay -> h265parse -> d3d11h265dec
+d3d11screencapturesrc -> d3d11convert -> one selected branch:
+  -> mfh265enc (preferred) ------> h265parse -> rtph265pay
+  -> nvd3d11h265enc (fallback) --> h265parse -> rtph265pay
+  -> mfh264enc (fallback) --------> h264parse -> rtph264pay
+  -> nvd3d11h264enc (fallback) ---> h264parse -> rtph264pay
+  -> webrtcbin ===== peer to peer ===== webrtcbin
+  -> matching RTP depayloader -> parser -> D3D11 decoder
   -> overlaycomposition -> d3d11videosink
 ```
 

@@ -51,7 +51,7 @@ impl Codec {
             "av1" => Ok(Codec::Av1),
             "h265" | "hevc" => Ok(Codec::H265),
             "h264" => Ok(Codec::H264),
-            other => bail!("unknown codec '{other}' (expected av1, h265 or h264)"),
+            other => bail!("unknown codec '{other}' (expected auto, av1, h265 or h264)"),
         }
     }
 
@@ -420,11 +420,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local Windows GStreamer hardware stack"]
-    fn local_auto_probe_selects_media_foundation_h265() {
-        gst::init().unwrap();
+    fn unknown_codec_error_lists_every_cli_choice() {
+        let message = Codec::parse("vp9").unwrap_err().to_string();
 
-        assert_eq!(select_encoder(None).unwrap(), (Codec::H265, "mfh265enc"));
+        assert!(message.contains("expected auto, av1, h265 or h264"));
+    }
+
+    #[test]
+    #[ignore = "requires the local Windows GStreamer hardware stack"]
+    fn local_auto_probe_selects_first_compatible_candidate() {
+        gst::init().unwrap();
+        let expected = AUTO_ENCODERS
+            .iter()
+            .copied()
+            .find(|(_, factory)| supports_d3d11_input(factory))
+            .expect("no local zero-copy encoder is compatible");
+
+        assert_eq!(select_encoder(None).unwrap(), expected);
     }
 
     #[test]

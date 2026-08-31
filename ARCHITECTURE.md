@@ -117,8 +117,11 @@ through capture, GPU conversion, and hardware encoding:
 d3d11screencapturesrc
   -> video/x-raw(memory:D3D11Memory),framerate=...
   -> leaky queue -> d3d11convert -> optional D3D11 scale caps
-  -> mfh265enc -> h265parse -> tee
-  -> per-viewer leaky queue -> rtph265pay -> RTP caps -> webrtcbin
+  -> selected zero-copy encoder:
+       mfh265enc (preferred) | nvd3d11h265enc (fallback)
+       mfh264enc (fallback)  | nvd3d11h264enc (fallback)
+  -> matching h265parse/h264parse -> tee
+  -> per-viewer leaky queue -> matching RTP payloader/caps -> webrtcbin
 ```
 
 - The shared tee is after the parser: capture and hardware encode happen once.
