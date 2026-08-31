@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 
 /// How long an unclaimed login attempt stays valid.
 const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+const SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
@@ -112,12 +113,17 @@ impl Pending {
     }
 }
 
+struct StoredSession {
+    identity: Identity,
+    created_at: Instant,
+}
+
 #[derive(Default)]
 struct AuthState {
     /// state nonce -> progress
     pending: HashMap<String, Pending>,
     /// session token -> who it belongs to
-    sessions: HashMap<String, Identity>,
+    sessions: HashMap<String, StoredSession>,
 }
 
 #[derive(Clone)]
@@ -176,12 +182,19 @@ impl Auth {
         match result {
             Ok(identity) => {
                 let session = random_token();
-                auth.sessions.insert(session.clone(), identity.clone());
+                let now = Instant::now();
+                auth.sessions.insert(
+                    session.clone(),
+                    StoredSession {
+                        identity: identity.clone(),
+                        created_at: now,
+                    },
+                );
                 auth.pending.insert(
                     state.to_string(),
                     Pending::Ready {
                         session,
-                        since: Instant::now(),
+                        since: now,
                     },
                 );
                 Ok(identity)
@@ -287,7 +300,10 @@ impl Auth {
             }
             Some(Pending::Ready { session, .. }) => {
                 let session = session.clone();
-                let identity = auth.sessions.get(&session).cloned();
+                let identity = auth
+                    .sessions
+                    .get(&session)
+                    .map(|stored| stored.identity.clone());
                 // One-shot: collecting the result consumes it.
                 auth.pending.remove(state);
                 match identity {
@@ -300,16 +316,22 @@ impl Auth {
 
     /// Who a session belongs to, if it is still valid.
     pub async fn identify(&self, session: &str) -> Option<Identity> {
-        self.state.lock().await.sessions.get(session).cloned()
+        let mut auth = self.state.lock().await;
+        auth.prune();
+        auth.sessions
+            .get(session)
+            .map(|stored| stored.identity.clone())
     }
 
     #[cfg(test)]
     pub(crate) async fn insert_test_session(&self, session: &str, identity: Identity) {
-        self.state
-            .lock()
-            .await
-            .sessions
-            .insert(session.to_string(), identity);
+        self.state.lock().await.sessions.insert(
+            session.to_string(),
+            StoredSession {
+                identity,
+                created_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -337,6 +359,8 @@ impl AuthState {
     fn prune(&mut self) {
         self.pending
             .retain(|_, p| p.since().elapsed() < PENDING_TTL);
+        self.sessions
+            .retain(|_, session| session.created_at.elapsed() < SESSION_TTL);
     }
 }
 
@@ -387,5 +411,41 @@ mod tests {
             auth.poll("state").await,
             PollResult::Failed(message) if message == "access_denied"
         ));
+    }
+
+    #[tokio::test]
+    async fn identify_prunes_expired_sessions_and_retains_current_sessions() {
+        let auth = Auth::new(None);
+        let identity = |id: &str| Identity {
+            id: id.into(),
+            name: id.into(),
+            avatar_url: None,
+        };
+        {
+            let mut state = auth.state.lock().await;
+            state.sessions.insert(
+                "current".into(),
+                StoredSession {
+                    identity: identity("current-id"),
+                    created_at: Instant::now(),
+                },
+            );
+            state.sessions.insert(
+                "expired".into(),
+                StoredSession {
+                    identity: identity("expired-id"),
+                    created_at: Instant::now() - SESSION_TTL,
+                },
+            );
+        }
+
+        assert!(auth.identify("expired").await.is_none());
+        assert_eq!(
+            auth.identify("current").await.map(|identity| identity.id),
+            Some("current-id".into())
+        );
+        let state = auth.state.lock().await;
+        assert!(!state.sessions.contains_key("expired"));
+        assert!(state.sessions.contains_key("current"));
     }
 }
