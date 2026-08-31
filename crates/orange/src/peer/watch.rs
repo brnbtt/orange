@@ -94,7 +94,13 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
             let handle = owner.handle();
             (Some(owner), ReceiveOutput::Window(handle))
         }
-        Output::File(path) => (None, ReceiveOutput::File(path)),
+        Output::File(path) => (
+            None,
+            ReceiveOutput::File {
+                path,
+                encoder: None,
+            },
+        ),
     };
     let viewer_playback = playback_owner.as_ref().map(|owner| owner.handle());
     let mut client = connect(url).await?;

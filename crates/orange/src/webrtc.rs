@@ -191,7 +191,10 @@ pub enum Output {
 
 pub(crate) enum ReceiveOutput {
     Window(crate::window::PlaybackWindowHandle),
-    File(String),
+    File {
+        path: String,
+        encoder: Option<&'static str>,
+    },
 }
 
 /// Capture a window, send it over WebRTC, receive it back, and output it.
@@ -207,7 +210,13 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
             let handle = owner.handle();
             (Some(owner), ReceiveOutput::Window(handle))
         }
-        Output::File(path) => (None, ReceiveOutput::File(path)),
+        Output::File(path) => (
+            None,
+            ReceiveOutput::File {
+                path,
+                encoder: Some(settings.encoder),
+            },
+        ),
     };
     let playback = playback_owner.as_ref().map(|owner| owner.handle());
     check_elements(settings)?;

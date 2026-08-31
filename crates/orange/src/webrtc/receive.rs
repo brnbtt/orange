@@ -240,8 +240,11 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
     }
 }
 
-fn file_output_factories(codec: Codec) -> (&'static str, &'static str) {
-    (codec.encoder(), codec.parser())
+fn file_output_factories(
+    codec: Codec,
+    encoder: Option<&'static str>,
+) -> (&'static str, &'static str) {
+    (encoder.unwrap_or_else(|| codec.encoder()), codec.parser())
 }
 
 fn build_audio_decoder(diagnostic_role: &str) -> Result<ReceiveElement> {
@@ -262,7 +265,7 @@ pub fn build_receive_branch(
 ) -> Result<()> {
     let reveal_playback = match &output {
         ReceiveOutput::Window(playback) => Some(playback.clone()),
-        ReceiveOutput::File(_) => None,
+        ReceiveOutput::File { .. } => None,
     };
     let encoding = encoding_name(pad).context("video RTP pad has no encoding name")?;
     let codec = Codec::from_rtp_encoding(&encoding).context("unsupported video RTP encoding")?;
@@ -277,7 +280,7 @@ pub fn build_receive_branch(
     let dec = build_video_decoder(
         codec,
         decoder_selection.as_deref(),
-        matches!(&output, ReceiveOutput::File(_)),
+        matches!(&output, ReceiveOutput::File { .. }),
         diagnostic_role,
     )?;
     let advertised_rate = pad
@@ -345,10 +348,10 @@ pub fn build_receive_branch(
 
             vec![queue, composition, sink]
         }
-        ReceiveOutput::File(path) => {
+        ReceiveOutput::File { path, encoder } => {
             // Re-encode only because writing raw frames to disk is impractical.
             // This branch exists for verification, not for the real product.
-            let (encoder, parser) = file_output_factories(codec);
+            let (encoder, parser) = file_output_factories(codec, encoder);
             let enc =
                 build_receive_element(diagnostic_role, "video-file-encoder", encoder, || {
                     Ok(gst::ElementFactory::make(encoder)
@@ -501,7 +504,7 @@ mod tests {
     #[test]
     fn h264_file_output_does_not_require_av1_encoding() {
         assert_eq!(
-            file_output_factories(Codec::H264),
+            file_output_factories(Codec::H264, None),
             ("mfh264enc", "h264parse")
         );
     }
@@ -509,8 +512,16 @@ mod tests {
     #[test]
     fn h265_file_output_uses_cross_vendor_media_foundation() {
         assert_eq!(
-            file_output_factories(Codec::H265),
+            file_output_factories(Codec::H265, None),
             ("mfh265enc", "h265parse")
+        );
+    }
+
+    #[test]
+    fn loopback_file_output_reuses_the_selected_capture_encoder() {
+        assert_eq!(
+            file_output_factories(Codec::H265, Some("nvd3d11h265enc")),
+            ("nvd3d11h265enc", "h265parse")
         );
     }
 
