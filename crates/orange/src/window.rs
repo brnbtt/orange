@@ -13,6 +13,7 @@
 //! it, so the window lives on its own thread and hands the HWND back.
 
 use anyhow::{bail, Result};
+use std::io::Write;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
@@ -222,12 +223,12 @@ fn spawn_window(
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
     std::thread::spawn(move || unsafe {
-        match create_window(&title, envelope, profile, overlay, alive) {
+        match create_window(&title, envelope, profile, overlay, alive.clone()) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
                     return;
                 }
-                run_message_loop();
+                run_message_loop(hwnd, &alive);
             }
             Err(err) => {
                 let _ = tx.send(Err(err));
@@ -379,7 +380,7 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aspect_locked_size, fit_aspect};
+    use super::{aspect_locked_size, fit_aspect, message_result, MessageResult};
     use windows::Win32::UI::WindowsAndMessaging::{
         WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP,
         WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
@@ -441,6 +442,14 @@ mod tests {
                 assert!((actual - expected).abs() <= 1.0 / height as f64);
             }
         }
+    }
+
+    #[test]
+    fn message_result_preserves_get_message_tri_state() {
+        assert_eq!(message_result(-1), MessageResult::Error);
+        assert_eq!(message_result(0), MessageResult::Quit);
+        assert_eq!(message_result(1), MessageResult::Dispatch);
+        assert_eq!(message_result(42), MessageResult::Dispatch);
     }
 }
 
@@ -845,11 +854,38 @@ unsafe fn controls_visible(hwnd: HWND) -> bool {
     overlay.lock().ok().map(|o| o.visible()).unwrap_or(true)
 }
 
-unsafe fn run_message_loop() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageResult {
+    Error,
+    Quit,
+    Dispatch,
+}
+
+fn message_result(result: i32) -> MessageResult {
+    match result {
+        -1 => MessageResult::Error,
+        0 => MessageResult::Quit,
+        _ => MessageResult::Dispatch,
+    }
+}
+
+unsafe fn run_message_loop(hwnd: HWND, alive: &AtomicBool) {
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-        let _ = TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    loop {
+        match message_result(GetMessageW(&mut msg, None, 0, 0).0) {
+            MessageResult::Error => {
+                let _ = writeln!(std::io::stderr().lock(), "[window] GetMessageW failed (-1)");
+                if alive.swap(false, Ordering::AcqRel) {
+                    let _ = DestroyWindow(hwnd);
+                }
+                break;
+            }
+            MessageResult::Quit => break,
+            MessageResult::Dispatch => {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
     }
 }
 

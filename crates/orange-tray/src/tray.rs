@@ -9,6 +9,7 @@
 //! directly, so the GPUI side stays in charge of its own state.
 
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
@@ -45,12 +46,25 @@ pub fn install() -> Result<Receiver<TrayEvent>> {
     let (ready_tx, ready_rx) = channel::<Result<()>>();
     std::thread::spawn(move || unsafe {
         match create() {
-            Ok(_) => {
+            Ok(hwnd) => {
                 let _ = ready_tx.send(Ok(()));
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                loop {
+                    match message_result(GetMessageW(&mut msg, None, 0, 0).0) {
+                        MessageResult::Error => {
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "[tray] GetMessageW failed (-1)"
+                            );
+                            let _ = DestroyWindow(hwnd);
+                            break;
+                        }
+                        MessageResult::Quit => break,
+                        MessageResult::Dispatch => {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -61,6 +75,21 @@ pub fn install() -> Result<Receiver<TrayEvent>> {
 
     ready_rx.recv().context("tray thread died")??;
     Ok(rx)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageResult {
+    Error,
+    Quit,
+    Dispatch,
+}
+
+fn message_result(result: i32) -> MessageResult {
+    match result {
+        -1 => MessageResult::Error,
+        0 => MessageResult::Quit,
+        _ => MessageResult::Dispatch,
+    }
 }
 
 unsafe fn create() -> Result<HWND> {
@@ -246,4 +275,17 @@ unsafe fn show_menu(hwnd: HWND) {
         None,
     );
     let _ = DestroyMenu(menu);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{message_result, MessageResult};
+
+    #[test]
+    fn message_result_preserves_get_message_tri_state() {
+        assert_eq!(message_result(-1), MessageResult::Error);
+        assert_eq!(message_result(0), MessageResult::Quit);
+        assert_eq!(message_result(1), MessageResult::Dispatch);
+        assert_eq!(message_result(42), MessageResult::Dispatch);
+    }
 }
