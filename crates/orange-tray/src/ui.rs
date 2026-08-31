@@ -17,6 +17,27 @@ pub(super) const GREEN: u32 = 0x4ec97a;
 pub(super) const PICKER_PREVIEW_HEIGHT: f32 = 142.0;
 pub(super) const PICKER_DETAILS_HEIGHT: f32 = 52.0;
 pub(super) const PICKER_CARD_HEIGHT: f32 = PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT;
+/// Height of the custom titlebar. The toast layer hangs directly below it, so
+/// the two have to agree.
+pub(super) const TITLEBAR_HEIGHT: f32 = 44.0;
+
+/// Small square affordance on a toast: collapse, expand, or dismiss.
+pub(super) fn toast_toggle(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .w(px(20.0))
+        .h(px(20.0))
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
+        .child(glyph)
+}
 
 pub(super) fn label(text: impl Into<SharedString>, color: u32) -> gpui::Div {
     div().text_color(rgb(color)).child(text.into())

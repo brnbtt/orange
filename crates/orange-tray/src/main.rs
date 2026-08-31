@@ -92,7 +92,10 @@ struct Orange {
     server: String,
     /// Last screen the window was sized for, so resize happens once per
     /// transition rather than every frame.
-    sized_for: Option<(Screen, bool)>,
+    sized_for: Option<Screen>,
+    /// Whether the update toast is collapsed to its heading. The toast cannot
+    /// be dismissed, only folded away: an available update stays actionable.
+    update_collapsed: bool,
     /// Drives the transient "Copied" confirmation on the share code.
     copied_at: Option<Instant>,
     copied_code: Option<String>,
@@ -163,6 +166,7 @@ impl Orange {
             }),
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
             sized_for: None,
+            update_collapsed: false,
             copied_at: None,
             copied_code: None,
             own_codes: preferences.own_codes,

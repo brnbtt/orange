@@ -54,14 +54,11 @@ impl Screen {
 
 impl Render for Orange {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let update_visible = self.updates.status().is_visible();
-        let mut wanted = self.screen.size();
-        if update_visible {
-            wanted.height += px(84.0);
-        }
-        if self.sized_for != Some((self.screen, update_visible)) {
-            self.sized_for = Some((self.screen, update_visible));
-            window.resize(wanted);
+        // Toasts float above the content rather than sitting in the flow, so
+        // showing one never reflows the screen underneath or resizes the window.
+        if self.sized_for != Some(self.screen) {
+            self.sized_for = Some(self.screen);
+            window.resize(self.screen.size());
         }
 
         let key = self.screen.animation_key();
@@ -74,9 +71,10 @@ impl Render for Orange {
             Screen::Watching => self.render_watching(cx).into_any_element(),
             Screen::Settings => self.render_settings(cx).into_any_element(),
         };
-        let update_banner = self.render_update_banner(cx);
+        let toasts = self.render_toasts(cx);
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -84,7 +82,6 @@ impl Render for Orange {
             .text_sm()
             .font_family("Segoe UI")
             .child(self.render_titlebar(cx))
-            .children(update_banner)
             .child(
                 div()
                     .relative()
@@ -104,33 +101,83 @@ impl Render for Orange {
                             .flex_1()
                             .min_h(px(0.0))
                             .child(fade_in(key, body)),
-                    )
-                    .children(self.notice.as_ref().map(|notice| {
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .w_full()
-                            .p_3()
-                            .rounded_md()
-                            .bg(rgb(0x241514))
-                            .border_1()
-                            .border_color(rgb(0x3d211f))
-                            .text_xs()
-                            .text_color(rgb(DANGER))
-                            .child(notice.text.clone())
-                            .with_animation(
-                                SharedString::from("error"),
-                                Animation::new(Duration::from_millis(160)),
-                                |element, delta| element.opacity(delta),
-                            )
-                    })),
+                    ),
             )
+            // Last child, so it paints over the body.
+            .children(toasts)
     }
 }
 
 impl Orange {
-    fn render_update_banner(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The floating toast layer.
+    ///
+    /// Absolutely positioned below the titlebar so a toast never reflows the
+    /// screen underneath it. The update toast collapses but cannot be
+    /// dismissed, because an available update stays actionable; the error toast
+    /// closes, because a read error has no follow-up.
+    fn render_toasts(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let update = self.render_update_toast(cx);
+        let error = self.render_error_toast(cx);
+        if update.is_none() && error.is_none() {
+            // Nothing to show: render no layer at all, rather than an empty one
+            // whose padding would sit over the top of the body.
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .top(px(TITLEBAR_HEIGHT))
+                .left_0()
+                .w_full()
+                .px_5()
+                .pt_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(update)
+                .children(error),
+        )
+    }
+
+    fn render_error_toast(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let notice = self.notice.as_ref()?;
+        Some(
+            div()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap_3()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(0x241514))
+                .border_1()
+                .border_color(rgb(0x3d211f))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_xs()
+                        .text_color(rgb(DANGER))
+                        .child(notice.text.clone()),
+                )
+                .child(
+                    toast_toggle("dismiss-error", "\u{2715}").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.clear_error();
+                            cx.notify();
+                        },
+                    )),
+                )
+                .with_animation(
+                    SharedString::from("error"),
+                    Animation::new(Duration::from_millis(160)),
+                    |element, delta| element.opacity(delta),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_update_toast(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.updates.status().is_visible() {
             return None;
         }
@@ -157,10 +204,9 @@ impl Orange {
             ),
             _ => return None,
         };
+        let collapsed = self.update_collapsed;
         Some(
             div()
-                .mx_5()
-                .mt_3()
                 .flex()
                 .items_center()
                 .justify_between()
@@ -175,16 +221,29 @@ impl Orange {
                         .flex()
                         .flex_col()
                         .gap_0p5()
+                        .flex_1()
                         .min_w(px(0.0))
                         .child(micro(heading, ORANGE))
-                        .child(label(detail, MUTED).text_xs()),
+                        .when(!collapsed, |element| {
+                            element.child(label(detail, MUTED).text_xs())
+                        }),
                 )
-                .children(action.map(|text| {
+                .children(action.filter(|_| !collapsed).map(|text| {
                     update_action("apply-update", text).on_click(cx.listener(|this, _, _, cx| {
                         this.updates.request_update();
                         cx.notify();
                     }))
                 }))
+                .child(
+                    toast_toggle(
+                        "toggle-update",
+                        if collapsed { "\u{25be}" } else { "\u{25b4}" },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update_collapsed = !this.update_collapsed;
+                        cx.notify();
+                    })),
+                )
                 .into_any_element(),
         )
     }
@@ -202,7 +261,7 @@ impl Orange {
         div()
             .flex()
             .items_center()
-            .h(px(44.0))
+            .h(px(TITLEBAR_HEIGHT))
             .pl_4()
             .pr_1()
             .border_b_1()
