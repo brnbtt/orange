@@ -16,8 +16,9 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, OnceLock,
+    mpsc, Arc, Mutex, MutexGuard, OnceLock,
 };
+use std::thread::JoinHandle;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, COLORREF, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
@@ -104,6 +105,7 @@ static VIEWER_CLASS_RESULT: OnceLock<ClassResult> = OnceLock::new();
 const CURSOR_TIMER: usize = 1;
 const REVEAL_MESSAGE: u32 = WM_APP + 1;
 const ASPECT_MESSAGE: u32 = WM_APP + 2;
+const SHUTDOWN_MESSAGE: u32 = WM_APP + 3;
 const REVEAL_MS: u32 = 180;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -141,14 +143,53 @@ impl PlaybackProfile {
     }
 }
 
-/// One native playback component used for both friend streams and the local
-/// live monitor. The profile changes policy, never the media or interaction
-/// implementation.
-#[derive(Clone)]
+/// Unique owner of one native playback window and its creator thread.
 pub struct PlaybackWindow {
-    hwnd: isize,
+    handle: PlaybackWindowHandle,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// Passive access for media callbacks; dropping it never shuts down the window.
+#[derive(Clone)]
+pub struct PlaybackWindowHandle {
+    native: Arc<NativeWindowState>,
     overlay: crate::overlay::SharedOverlay,
-    alive: Arc<AtomicBool>,
+}
+
+struct NativeWindowState {
+    hwnd: Mutex<Option<isize>>,
+    alive: AtomicBool,
+}
+
+impl NativeWindowState {
+    fn new() -> Self {
+        Self {
+            hwnd: Mutex::new(None),
+            alive: AtomicBool::new(true),
+        }
+    }
+
+    fn lock_hwnd(&self) -> MutexGuard<'_, Option<isize>> {
+        self.hwnd
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn with_hwnd<R>(&self, action: impl FnOnce(isize) -> R) -> Option<R> {
+        let slot = self.lock_hwnd();
+        slot.map(action)
+    }
+
+    fn install(&self, hwnd: isize) {
+        *self.lock_hwnd() = Some(hwnd);
+    }
+
+    fn invalidate(&self, hwnd: isize) {
+        let mut slot = self.lock_hwnd();
+        if *slot == Some(hwnd) {
+            *slot = None;
+        }
+    }
 }
 
 impl PlaybackWindow {
@@ -175,17 +216,46 @@ impl PlaybackWindow {
         let overlay = std::sync::Arc::new(std::sync::Mutex::new(
             crate::overlay::OverlayState::new(profile),
         ));
-        let alive = Arc::new(AtomicBool::new(true));
-        let hwnd = spawn_window(title, envelope, profile, overlay.clone(), alive.clone())?;
+        let native = Arc::new(NativeWindowState::new());
+        let worker = spawn_window(title, envelope, profile, overlay.clone(), native.clone())?;
         Ok(Self {
-            hwnd,
-            overlay,
-            alive,
+            handle: PlaybackWindowHandle { native, overlay },
+            worker: Some(worker),
         })
     }
 
-    pub fn hwnd(&self) -> isize {
-        self.hwnd
+    pub fn handle(&self) -> PlaybackWindowHandle {
+        self.handle.clone()
+    }
+}
+
+impl Drop for PlaybackWindow {
+    fn drop(&mut self) {
+        self.handle.native.alive.store(false, Ordering::Release);
+        // SAFETY: the HWND slot stays locked through the post, and WM_DESTROY
+        // invalidates that slot before Windows can reuse the value.
+        if let Some(Err(error)) = self.handle.native.with_hwnd(|hwnd| unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                SHUTDOWN_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }) {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[window] failed to post shutdown message: {error}"
+            );
+        }
+        if let Some(worker) = self.worker.take() {
+            join_window_worker(worker, "shutdown");
+        }
+    }
+}
+
+impl PlaybackWindowHandle {
+    pub fn hwnd(&self) -> Option<isize> {
+        self.native.with_hwnd(|hwnd| hwnd)
     }
 
     pub fn overlay(&self) -> &crate::overlay::SharedOverlay {
@@ -193,13 +263,15 @@ impl PlaybackWindow {
     }
 
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
+        self.native.alive.load(Ordering::Acquire)
     }
 
     pub fn is_responsive(&self) -> bool {
-        unsafe {
+        // SAFETY: the HWND slot stays locked through this synchronous send;
+        // WM_NULL does not re-enter the native slot lock.
+        self.with_hwnd(|hwnd| unsafe {
             SendMessageTimeoutW(
-                HWND(self.hwnd as *mut _),
+                HWND(hwnd as *mut _),
                 WM_NULL,
                 WPARAM(0),
                 LPARAM(0),
@@ -208,15 +280,38 @@ impl PlaybackWindow {
                 None,
             )
             .0 != 0
-        }
+        })
+        .unwrap_or(false)
     }
 
     pub fn reveal(&self) {
-        reveal(self.hwnd);
+        // SAFETY: the HWND slot stays locked until the asynchronous post has
+        // copied the handle into the owning thread's queue.
+        let _ = self.with_hwnd(|hwnd| unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                REVEAL_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        });
     }
 
     pub fn set_source_size(&self, width: u32, height: u32) {
-        set_video_aspect(self.hwnd, width, height);
+        // SAFETY: the HWND slot stays locked until the asynchronous post has
+        // copied the handle into the owning thread's queue.
+        let _ = self.with_hwnd(|hwnd| unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                ASPECT_MESSAGE,
+                WPARAM(width as usize),
+                LPARAM(height as isize),
+            )
+        });
+    }
+
+    fn with_hwnd<R>(&self, action: impl FnOnce(isize) -> R) -> Option<R> {
+        self.native.with_hwnd(action)
     }
 }
 
@@ -225,38 +320,71 @@ fn spawn_window(
     envelope: (i32, i32),
     profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
-    alive: Arc<AtomicBool>,
-) -> Result<isize> {
-    let (tx, rx) = mpsc::channel::<Result<isize>>();
+    native: Arc<NativeWindowState>,
+) -> Result<JoinHandle<()>> {
+    let (tx, rx) = mpsc::sync_channel::<Result<isize>>(1);
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
-    std::thread::spawn(move || unsafe {
-        match create_window(&title, envelope, profile, overlay, alive.clone()) {
-            Ok(hwnd) => {
-                if tx.send(Ok(hwnd.0 as isize)).is_err() {
-                    alive.store(false, Ordering::Release);
-                    let _ = DestroyWindow(hwnd);
-                    return;
+    let worker = std::thread::Builder::new()
+        .name("orange-playback-window".to_string())
+        .spawn(move || unsafe {
+            match create_window(&title, envelope, profile, overlay, native.clone()) {
+                Ok(hwnd) => {
+                    native.install(hwnd.0 as isize);
+                    if tx.send(Ok(hwnd.0 as isize)).is_err() {
+                        finish_window_thread(hwnd, &native);
+                        return;
+                    }
+                    run_message_loop(hwnd, &native);
                 }
-                run_message_loop(hwnd, &alive);
+                Err(err) => {
+                    native.alive.store(false, Ordering::Release);
+                    let _ = tx.send(Err(err));
+                }
             }
-            Err(err) => {
-                let _ = tx.send(Err(err));
-            }
-        }
-    });
+        })?;
 
-    match rx.recv() {
-        Ok(Ok(hwnd)) => Ok(hwnd),
-        Ok(Err(err)) => Err(err),
-        Err(_) => bail!("window thread died before it was ready"),
+    let (_, worker) = finish_window_startup(rx, worker)?;
+    Ok(worker)
+}
+
+fn finish_window_startup(
+    ready: mpsc::Receiver<Result<isize>>,
+    worker: JoinHandle<()>,
+) -> Result<(isize, JoinHandle<()>)> {
+    match ready.recv() {
+        Ok(Ok(hwnd)) => Ok((hwnd, worker)),
+        Ok(Err(error)) => {
+            join_window_worker(worker, "startup failure");
+            Err(error)
+        }
+        Err(_) => {
+            join_window_worker(worker, "startup disconnect");
+            bail!("window thread died before it was ready")
+        }
+    }
+}
+
+fn join_window_worker(worker: JoinHandle<()>, phase: &str) {
+    if worker.thread().id() == std::thread::current().id() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[window] refused to join playback worker from itself during {phase}"
+        );
+        return;
+    }
+    if worker.join().is_err() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[window] playback worker panicked during {phase}"
+        );
     }
 }
 
 /// Per-window state reachable from the window procedure.
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
-    alive: Arc<AtomicBool>,
+    native: Arc<NativeWindowState>,
     revealed: std::cell::Cell<bool>,
     profile: PlaybackProfile,
     envelope: std::cell::Cell<(i32, i32)>,
@@ -265,29 +393,6 @@ struct WindowContext {
     /// Style and bounds to put back when leaving fullscreen. `Some` means we
     /// are currently fullscreen.
     restore: std::cell::Cell<Option<(WINDOW_STYLE, RECT)>>,
-}
-
-/// Reveal a prepared video window on its owning thread.
-pub fn reveal(hwnd: isize) {
-    unsafe {
-        let _ = PostMessageW(
-            Some(HWND(hwnd as *mut _)),
-            REVEAL_MESSAGE,
-            WPARAM(0),
-            LPARAM(0),
-        );
-    }
-}
-
-pub fn set_video_aspect(hwnd: isize, width: u32, height: u32) {
-    unsafe {
-        let _ = PostMessageW(
-            Some(HWND(hwnd as *mut _)),
-            ASPECT_MESSAGE,
-            WPARAM(width as usize),
-            LPARAM(height as isize),
-        );
-    }
 }
 
 fn fit_aspect(
@@ -390,11 +495,34 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aspect_locked_size, fit_aspect, message_result, MessageResult};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP,
-        WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
+    use super::{
+        aspect_locked_size, finish_window_startup, fit_aspect, message_result, MessageResult,
+        PlaybackProfile, PlaybackWindow,
     };
+    use anyhow::anyhow;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindowVisible, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT,
+        WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WM_CLOSE,
+    };
+
+    fn hidden_window(title: &str) -> PlaybackWindow {
+        PlaybackWindow::spawn(title, PlaybackProfile::FriendViewer { cascade: 0 }).unwrap()
+    }
+
+    fn drop_owner_with_deadline(owner: PlaybackWindow) {
+        let (done, completed) = mpsc::sync_channel(1);
+        let dropper = std::thread::spawn(move || {
+            drop(owner);
+            let _ = done.send(());
+        });
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("playback owner drop did not join its worker");
+        dropper.join().unwrap();
+    }
 
     #[test]
     fn source_aspects_fit_inside_profile_envelopes() {
@@ -461,6 +589,104 @@ mod tests {
         assert_eq!(message_result(0), MessageResult::Quit);
         assert_eq!(message_result(1), MessageResult::Dispatch);
         assert_eq!(message_result(42), MessageResult::Dispatch);
+    }
+
+    #[test]
+    fn owner_drop_joins_worker_and_invalidates_stale_handle() {
+        let owner = hidden_window("orange owner drop test");
+        let handle = owner.handle();
+        assert!(handle.hwnd().is_some());
+
+        drop_owner_with_deadline(owner);
+
+        assert_eq!(handle.hwnd(), None);
+        assert!(!handle.is_alive());
+        assert!(!handle.is_responsive());
+        handle.reveal();
+        handle.set_source_size(1920, 1080);
+    }
+
+    #[test]
+    fn dropping_passive_handles_does_not_stop_the_window() {
+        let owner = hidden_window("orange passive handle test");
+        let handle = owner.handle();
+        let hwnd = handle.hwnd();
+
+        drop(handle.clone());
+
+        assert_eq!(owner.handle().hwnd(), hwnd);
+        assert!(owner.handle().is_alive());
+        drop_owner_with_deadline(owner);
+    }
+
+    #[test]
+    fn close_hides_and_marks_dead_but_reserves_hwnd_until_owner_drop() {
+        let owner = hidden_window("orange close reservation test");
+        let handle = owner.handle();
+        let hwnd = handle.hwnd().expect("window did not publish its HWND");
+
+        let delivered = handle
+            .with_hwnd(|current| unsafe {
+                SendMessageTimeoutW(
+                    HWND(current as *mut _),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                    SMTO_ABORTIFHUNG,
+                    1_000,
+                    None,
+                )
+                .0 != 0
+            })
+            .unwrap_or(false);
+
+        assert!(delivered);
+        assert!(!handle.is_alive());
+        assert_eq!(handle.hwnd(), Some(hwnd));
+        assert!(!unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() });
+
+        drop_owner_with_deadline(owner);
+        assert_eq!(handle.hwnd(), None);
+    }
+
+    #[test]
+    fn poisoned_native_slot_is_recovered() {
+        let owner = hidden_window("orange poisoned HWND slot test");
+        let handle = owner.handle();
+        let hwnd = handle.hwnd();
+        let native = handle.native.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _slot = native.hwnd.lock().unwrap();
+            panic!("poison native HWND slot");
+        });
+        assert!(poisoner.join().is_err());
+
+        assert_eq!(handle.hwnd(), hwnd);
+        drop_owner_with_deadline(owner);
+        assert_eq!(handle.hwnd(), None);
+    }
+
+    #[test]
+    fn startup_error_joins_window_worker_before_returning() {
+        let (startup, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            startup.send(Err(anyhow!("creation failed"))).unwrap();
+            released.recv().unwrap();
+        });
+        let (result, returned) = mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let failed = finish_window_startup(ready, worker).is_err();
+            result.send(failed).unwrap();
+        });
+
+        assert_eq!(
+            returned.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        release.send(()).unwrap();
+        assert!(returned.recv_timeout(Duration::from_secs(5)).unwrap());
+        waiter.join().unwrap();
     }
 }
 
@@ -772,7 +998,7 @@ unsafe fn create_window(
     envelope: (i32, i32),
     profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
-    alive: Arc<AtomicBool>,
+    native: Arc<NativeWindowState>,
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
     let class_name = w!("orange_viewer");
@@ -830,7 +1056,7 @@ unsafe fn create_window(
     // Ownership transfers to GWLP_USERDATA and is reclaimed in WM_DESTROY.
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
-        alive,
+        native,
         revealed: std::cell::Cell::new(false),
         profile,
         envelope: std::cell::Cell::new(envelope),
@@ -908,15 +1134,12 @@ fn message_result(result: i32) -> MessageResult {
     }
 }
 
-unsafe fn run_message_loop(hwnd: HWND, alive: &AtomicBool) {
+unsafe fn run_message_loop(hwnd: HWND, native: &NativeWindowState) {
     let mut msg = MSG::default();
     loop {
         match message_result(GetMessageW(&mut msg, None, 0, 0).0) {
             MessageResult::Error => {
                 let error = GetLastError().0;
-                if alive.swap(false, Ordering::AcqRel) {
-                    let _ = DestroyWindow(hwnd);
-                }
                 let _ = writeln!(
                     std::io::stderr().lock(),
                     "[window] GetMessageW failed (Win32 error {error})"
@@ -928,6 +1151,20 @@ unsafe fn run_message_loop(hwnd: HWND, alive: &AtomicBool) {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+        }
+    }
+    finish_window_thread(hwnd, native);
+}
+
+unsafe fn finish_window_thread(hwnd: HWND, native: &NativeWindowState) {
+    native.alive.store(false, Ordering::Release);
+    native.invalidate(hwnd.0 as isize);
+    if IsWindow(Some(hwnd)).as_bool() {
+        if let Err(error) = DestroyWindow(hwnd) {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[window] failed to destroy playback window: {error}"
+            );
         }
     }
 }
@@ -1175,11 +1412,24 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 LRESULT(0)
             }
             WM_CLOSE => {
-                let _ = with_context(hwnd, |ctx| ctx.alive.store(false, Ordering::Release));
-                DefWindowProcW(hwnd, msg, wparam, lparam)
+                let _ = with_context(hwnd, |ctx| ctx.native.alive.store(false, Ordering::Release));
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                LRESULT(0)
+            }
+            SHUTDOWN_MESSAGE => {
+                if let Err(error) = DestroyWindow(hwnd) {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "[window] failed to destroy playback window on shutdown: {error}"
+                    );
+                }
+                LRESULT(0)
             }
             WM_DESTROY => {
-                let _ = with_context(hwnd, |ctx| ctx.alive.store(false, Ordering::Release));
+                if let Some(native) = with_context(hwnd, |ctx| ctx.native.clone()) {
+                    native.alive.store(false, Ordering::Release);
+                    native.invalidate(hwnd.0 as isize);
+                }
                 let _ = KillTimer(Some(hwnd), CURSOR_TIMER);
                 SetLastError(ERROR_SUCCESS);
                 let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut WindowContext;

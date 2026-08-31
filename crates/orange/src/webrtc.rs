@@ -149,12 +149,25 @@ pub enum Output {
     File(String),
 }
 
+pub(crate) enum ReceiveOutput {
+    Window(crate::window::PlaybackWindowHandle),
+    File(String),
+}
+
 /// Capture a window, send it over WebRTC, receive it back, and output it.
 ///
 /// Both peers live in this process. If this works, the encode -> payload ->
 /// transport -> depayload -> decode path is sound and only signalling stands
 /// between us and streaming to another machine.
 pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) -> Result<()> {
+    let (playback_owner, output) = match output {
+        Output::Window(owner) => {
+            let handle = owner.handle();
+            (Some(owner), ReceiveOutput::Window(handle))
+        }
+        Output::File(path) => (None, ReceiveOutput::File(path)),
+    };
+    let playback = playback_owner.as_ref().map(|owner| owner.handle());
     check_elements(settings.codec)?;
 
     let pipeline = gst::Pipeline::new();
@@ -181,7 +194,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         .name("receiver")
         .property_from_str("bundle-policy", "max-bundle")
         .build()?;
-    configure_receive_transport(&recv_bin, matches!(&output, Output::Window(_)))?;
+    configure_receive_transport(&recv_bin, matches!(&output, ReceiveOutput::Window(_)))?;
 
     pipeline.add_many([
         capture.upcast_ref(),
@@ -220,7 +233,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         receiver: recv_bin,
     })));
 
-    crate::run_pipeline(&pipeline, seconds)
+    crate::run_pipeline_while(&pipeline, seconds, playback.as_ref())
 }
 
 /// Which codec a newly-arrived pad carries, so the right branch is built.
@@ -469,13 +482,13 @@ fn build_audio_decoder(diagnostic_role: &str) -> Result<ReceiveElement> {
 pub fn build_receive_branch(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
-    output: Output,
+    output: ReceiveOutput,
     progress: Option<Arc<MediaProgress>>,
     diagnostic_role: &str,
 ) -> Result<()> {
     let reveal_playback = match &output {
-        Output::Window(playback) => Some(playback.clone()),
-        Output::File(_) => None,
+        ReceiveOutput::Window(playback) => Some(playback.clone()),
+        ReceiveOutput::File(_) => None,
     };
     let encoding = encoding_name(pad).context("video RTP pad has no encoding name")?;
     let codec = Codec::from_rtp_encoding(&encoding).context("unsupported video RTP encoding")?;
@@ -490,7 +503,7 @@ pub fn build_receive_branch(
     let dec = build_video_decoder(
         codec,
         decoder_selection.as_deref(),
-        matches!(&output, Output::File(_)),
+        matches!(&output, ReceiveOutput::File(_)),
         diagnostic_role,
     )?;
     let advertised_rate = pad
@@ -524,7 +537,7 @@ pub fn build_receive_branch(
     }
 
     let tail: Vec<ReceiveElement> = match output {
-        Output::Window(playback) => {
+        ReceiveOutput::Window(playback) => {
             if let Some(rate) = advertised_rate {
                 if let Ok(mut state) = playback.overlay().lock() {
                     state.fps = Some(rate as f64);
@@ -550,13 +563,14 @@ pub fn build_receive_branch(
                 .element
                 .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
                 .context("d3d11videosink does not implement GstVideoOverlay")?;
+            let hwnd = playback.hwnd().context("playback window is unavailable")?;
             // SAFETY: the handle belongs to this playback component and
-            // remains valid while the receiver session is running.
-            unsafe { overlay_iface.set_window_handle(playback.hwnd() as usize) };
+            // its unique owner outlives the receiver pipeline.
+            unsafe { overlay_iface.set_window_handle(hwnd as usize) };
 
             vec![queue, composition, sink]
         }
-        Output::File(path) => {
+        ReceiveOutput::File(path) => {
             // Re-encode only because writing raw frames to disk is impractical.
             // This branch exists for verification, not for the real product.
             let (encoder, parser) = file_output_factories(codec);

@@ -157,7 +157,7 @@ pub(crate) fn start_webrtc_diagnostics(
     bin: &gst::Element,
     label: String,
     progress: Option<Arc<MediaProgress>>,
-    playback: Option<crate::window::PlaybackWindow>,
+    playback: Option<crate::window::PlaybackWindowHandle>,
 ) -> Option<DiagnosticsHandle> {
     diagnostic_sink()?;
     let bin = bin.downgrade();
@@ -178,7 +178,7 @@ pub(crate) fn start_webrtc_diagnostics(
                 let snapshot = progress.snapshot();
                 let ui_responsive = playback
                     .as_ref()
-                    .map(crate::window::PlaybackWindow::is_responsive);
+                    .map(crate::window::PlaybackWindowHandle::is_responsive);
                 emit_diagnostic(
                     "media-progress",
                     &label,

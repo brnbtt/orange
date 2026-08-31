@@ -30,7 +30,7 @@ use crate::pipeline::{
 };
 use crate::webrtc::{
     audio_rtp_caps, build_audio_branch, build_receive_branch, build_video_payloader,
-    configure_receive_transport, encoding_name, rtp_caps, Output,
+    configure_receive_transport, encoding_name, rtp_caps, Output, ReceiveOutput,
 };
 use orange_signal::{connect, Signal};
 
@@ -96,7 +96,7 @@ fn make_webrtcbin(name: &str) -> Result<gst::Element> {
 fn watch_bus(
     pipeline: &gst::Pipeline,
     label: &'static str,
-    playback: Option<crate::window::PlaybackWindow>,
+    playback: Option<crate::window::PlaybackWindowHandle>,
 ) -> Result<(
     mpsc::UnboundedSender<PipelineError>,
     mpsc::UnboundedReceiver<PipelineError>,
@@ -1323,6 +1323,14 @@ fn create_offer(
 
 /// Viewer: join a stream by code.
 pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
+    let (playback_owner, output) = match output {
+        Output::Window(owner) => {
+            let handle = owner.handle();
+            (Some(owner), ReceiveOutput::Window(handle))
+        }
+        Output::File(path) => (None, ReceiveOutput::File(path)),
+    };
+    let viewer_playback = playback_owner.as_ref().map(|owner| owner.handle());
     let mut client = connect(url).await?;
     if let Some(session) = crate::auth::load_session()? {
         client.outgoing.send(Signal::Authenticate {
@@ -1336,12 +1344,8 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
 
     let pipeline = gst::Pipeline::new();
     let bin = make_webrtcbin("viewer")?;
-    configure_receive_transport(&bin, matches!(&output, Output::Window(_)))?;
+    configure_receive_transport(&bin, matches!(&output, ReceiveOutput::Window(_)))?;
     pipeline.add(&bin)?;
-    let viewer_playback = match &output {
-        Output::Window(playback) => Some(playback.clone()),
-        Output::File(_) => None,
-    };
     let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch", viewer_playback.clone())?;
 
     let connection_errors = session_errors.clone();

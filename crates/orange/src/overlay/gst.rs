@@ -26,7 +26,7 @@ fn draw_composition(
 /// while iterating on the layout is what a viewer actually gets.
 pub fn attach(
     composition: &gst::Element,
-    playback: &crate::window::PlaybackWindow,
+    playback: &crate::window::PlaybackWindowHandle,
 ) -> anyhow::Result<()> {
     let fallback = transparent_composition().context("failed to build overlay fallback")?;
 

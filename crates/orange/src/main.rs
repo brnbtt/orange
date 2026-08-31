@@ -303,8 +303,9 @@ fn run(cli: Cli) -> Result<()> {
                 anyhow::bail!("fps must be greater than zero");
             }
 
-            let playback =
+            let playback_owner =
                 window::PlaybackWindow::spawn_preview("orange - preview", ww as i32, wh as i32)?;
+            let playback = playback_owner.handle();
             {
                 let mut state = playback.overlay().lock().unwrap();
                 state.pinned = pin;
@@ -338,7 +339,7 @@ fn build_preview_pipeline(
     fps: u32,
     pattern: &str,
     image: Option<&str>,
-    playback: &window::PlaybackWindow,
+    playback: &window::PlaybackWindowHandle,
 ) -> Result<gst::Pipeline> {
     let (w, h) = size;
 
@@ -375,8 +376,9 @@ fn build_preview_pipeline(
     let overlay_iface = sink
         .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
         .context("d3d11videosink does not implement GstVideoOverlay")?;
+    let hwnd = playback.hwnd().context("playback window is unavailable")?;
     // SAFETY: `hwnd` is our own window, alive for as long as this runs.
-    unsafe { overlay_iface.set_window_handle(playback.hwnd() as usize) };
+    unsafe { overlay_iface.set_window_handle(hwnd as usize) };
 
     pipeline.add_many([source.upcast_ref(), &composition, &sink])?;
     gst::Element::link_many([source.upcast_ref(), &composition, &sink])?;
@@ -384,8 +386,14 @@ fn build_preview_pipeline(
 }
 
 /// Run until the viewer window goes away, rather than for a fixed duration.
-fn run_until_closed(pipeline: &gst::Pipeline, playback: &window::PlaybackWindow) -> Result<()> {
-    pipeline.set_state(gst::State::Playing)?;
+fn run_until_closed(
+    pipeline: &gst::Pipeline,
+    playback: &window::PlaybackWindowHandle,
+) -> Result<()> {
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(error.into());
+    }
     playback.reveal();
 
     let bus = pipeline.bus().expect("pipeline without bus");
@@ -468,14 +476,32 @@ fn cmd_list(json: bool) -> Result<()> {
 /// Capture produces no frames for an idle window, so a blocking wait would
 /// hang with no explanation.
 pub fn run_pipeline(pipeline: &gst::Pipeline, seconds: u64) -> Result<()> {
-    pipeline.set_state(gst::State::Playing)?;
+    run_pipeline_while(pipeline, seconds, None)
+}
+
+fn timed_pipeline_should_continue(before_deadline: bool, playback_alive: Option<bool>) -> bool {
+    before_deadline && playback_alive != Some(false)
+}
+
+pub(crate) fn run_pipeline_while(
+    pipeline: &gst::Pipeline,
+    seconds: u64,
+    playback: Option<&window::PlaybackWindowHandle>,
+) -> Result<()> {
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(error.into());
+    }
 
     let bus = pipeline.bus().expect("pipeline without bus");
     let started = Instant::now();
     let deadline = Duration::from_secs(seconds);
     let mut error = None;
 
-    while started.elapsed() < deadline {
+    while timed_pipeline_should_continue(
+        started.elapsed() < deadline,
+        playback.map(window::PlaybackWindowHandle::is_alive),
+    ) {
         let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) else {
             continue;
         };
@@ -517,4 +543,18 @@ fn report_file(path: &str) -> Result<()> {
     }
     println!("Wrote {path} ({:.1} MB)", size as f64 / 1_048_576.0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timed_pipeline_should_continue;
+
+    #[test]
+    fn timed_pipeline_runs_only_before_deadline_and_while_playback_is_open() {
+        assert!(timed_pipeline_should_continue(true, None));
+        assert!(timed_pipeline_should_continue(true, Some(true)));
+        assert!(!timed_pipeline_should_continue(true, Some(false)));
+        assert!(!timed_pipeline_should_continue(false, None));
+        assert!(!timed_pipeline_should_continue(false, Some(true)));
+    }
 }
