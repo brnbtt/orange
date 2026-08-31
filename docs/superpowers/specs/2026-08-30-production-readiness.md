@@ -9,6 +9,7 @@ Make the beta codebase safe to evolve without changing the validated product beh
 - H.265 remains the production video path: `mfh265enc` to `rtph265pay` / `rtph265depay` to `d3d11h265dec`.
 - Opus remains payload type 111; primary video remains 96 and video RTX remains 97.
 - Live receive latency remains 100 ms with `do-lost=true`, audio `drop-on-latency=false`, and video `drop-on-latency=true`.
+- `ORANGE_RTP_BUFFER_MODE=none` remains supported and sets `buffer-mode=none` and `rtcp-sync=never`.
 - The host captures and encodes once while maintaining independent RTP/WebRTC branches per viewer.
 - Process-scoped game audio and whole-system screen audio retain their current semantics.
 - Installer, update, diagnostics, and relay wire formats remain compatible with beta.5.
@@ -27,7 +28,7 @@ Make the beta codebase safe to evolve without changing the validated product beh
 
 - Every workstream lands as independently reviewed, behavior-preserving commits.
 - `cargo fmt --all -- --check`, strict workspace Clippy, all workspace tests, release builds, packaging tests, and installer tests pass in CI.
-- Media characterization includes H.265 host/watch, loopback, file output, late join, multiple viewers, clean audio, loss recovery, and teardown.
+- Media characterization includes H.265 host/watch, loopback, file output, late join, multiple viewers, clean audio, loss recovery, teardown, and the `ORANGE_RTP_BUFFER_MODE=none` override with `buffer-mode=none` and `rtcp-sync=never`.
 - Relay tests cover bounded slow consumers, repeated role attempts, authentication expiry, connection floods, and sustained room churn.
 - Unsafe blocks have explicit invariants and are contained behind owned safe interfaces.
 - No production child process, thread, async task, native handle, requested pad, or temporary update artifact has an unowned lifecycle.
