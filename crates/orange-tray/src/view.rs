@@ -1139,6 +1139,29 @@ impl Orange {
                     ),
             )
             .child(div().flex_1())
+            .child(
+                card()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(label("Diagnostics", TEXT))
+                            .child(
+                                label("Session logs. Attach these when reporting a problem.", FAINT)
+                                    .text_xs(),
+                            ),
+                    )
+                    .child(quiet("open-diagnostics", "Open folder").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.open_diagnostics();
+                            cx.notify();
+                        },
+                    ))),
+            )
             .child(micro(
                 format!(
                     "VERSION {}  ·  {}",

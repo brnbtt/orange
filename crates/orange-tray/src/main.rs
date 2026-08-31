@@ -304,6 +304,18 @@ impl Orange {
         self.notice = None;
     }
 
+    /// Open the folder holding this install's session diagnostics. Testers
+    /// attach the contents to bug reports; nothing is uploaded automatically.
+    fn open_diagnostics(&mut self) {
+        let Some(directory) = supervisor::diagnostics_directory() else {
+            self.show_error("Could not locate the diagnostics folder.");
+            return;
+        };
+        if let Err(error) = supervisor::open_directory(&directory) {
+            self.show_error(format!("Could not open diagnostics: {error}"));
+        }
+    }
+
     fn save_preferences(&mut self) {
         let preferences = session::Preferences {
             quality: self.quality,

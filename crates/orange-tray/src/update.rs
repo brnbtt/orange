@@ -29,7 +29,6 @@ const UPDATE_JOIN_TIMEOUT: Duration = Duration::from_secs(40);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdateInfo {
     pub(crate) version: Version,
-    pub(crate) build: String,
     pub(crate) installer_url: Url,
     pub(crate) sha256: String,
     pub(crate) notes: String,
@@ -322,7 +321,6 @@ fn parse_update_manifest(json: &str, current_version: &str) -> Result<Option<Upd
 
     Ok(Some(UpdateInfo {
         version,
-        build: manifest.build,
         installer_url: url,
         sha256: manifest.sha256.to_ascii_uppercase(),
         notes: manifest.notes,
@@ -648,7 +646,6 @@ mod tests {
     fn update_info() -> UpdateInfo {
         UpdateInfo {
             version: Version::parse("9.0.0").unwrap(),
-            build: "1".repeat(40),
             installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-9.0.0.exe").unwrap(),
             sha256: "A".repeat(64),
             notes: "Faster joining".into(),
@@ -1120,7 +1117,6 @@ mod tests {
         std::fs::write(&installer, b"installer").unwrap();
         let info = UpdateInfo {
             version: Version::parse("0.2.0-beta.2").unwrap(),
-            build: "1".repeat(40),
             installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe").unwrap(),
             sha256: "A".repeat(64),
             notes: String::new(),
@@ -1151,7 +1147,6 @@ mod tests {
     fn banner_state_exposes_one_clear_action() {
         let info = UpdateInfo {
             version: Version::parse("0.2.0-beta.2").unwrap(),
-            build: "1".repeat(40),
             installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe").unwrap(),
             sha256: "A".repeat(64),
             notes: "Faster joining".into(),

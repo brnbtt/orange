@@ -7,7 +7,6 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $previousBuildId = $env:ORANGE_BUILD_ID
 $previousChannel = $env:ORANGE_UPDATE_CHANNEL
-$previousManifestUrl = $env:ORANGE_UPDATE_MANIFEST_URL
 $packageLock = $null
 $iscc = @(
     (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
@@ -47,7 +46,6 @@ try {
 
     $env:ORANGE_BUILD_ID = $BuildId
     $env:ORANGE_UPDATE_CHANNEL = "beta"
-    Remove-Item Env:ORANGE_UPDATE_MANIFEST_URL -ErrorAction SilentlyContinue
     cargo build --locked --release -p orange -p orange-tray -p orange-updater
     if ($LASTEXITCODE -ne 0) {
         throw "Release build failed."
@@ -86,6 +84,5 @@ finally {
     if ($packageLock) { $packageLock.Dispose() }
     $env:ORANGE_BUILD_ID = $previousBuildId
     $env:ORANGE_UPDATE_CHANNEL = $previousChannel
-    $env:ORANGE_UPDATE_MANIFEST_URL = $previousManifestUrl
     Pop-Location
 }

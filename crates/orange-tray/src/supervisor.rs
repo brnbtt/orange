@@ -95,10 +95,7 @@ fn orange_command() -> Result<Command> {
         command.env("PATH", format!("{};{}", bin.display(), existing));
     }
     if std::env::var_os("ORANGE_MEDIA_DIAGNOSTICS").is_none() {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            let directory = std::path::PathBuf::from(local)
-                .join("orange")
-                .join("diagnostics");
+        if let Some(directory) = diagnostics_directory() {
             prune_diagnostics(&directory);
             command.env("ORANGE_MEDIA_DIAGNOSTICS", directory);
             command.env("ORANGE_TEST_PROFILE", "beta");
@@ -109,6 +106,29 @@ fn orange_command() -> Result<Command> {
     }
     command.creation_flags(CREATE_NO_WINDOW);
     Ok(command)
+}
+
+/// Where child processes write their JSONL media diagnostics.
+pub fn diagnostics_directory() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|local| {
+        std::path::PathBuf::from(local)
+            .join("orange")
+            .join("diagnostics")
+    })
+}
+
+/// Reveal a folder so a tester can attach its contents to a bug report.
+///
+/// Uses `explorer` rather than `ShellExecuteW` to keep this free of `unsafe`.
+/// Explorer's exit code is unreliable, so the spawn is not waited on.
+pub fn open_directory(path: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("could not open {}", path.display()))?;
+    Ok(())
 }
 
 fn prune_diagnostics(directory: &std::path::Path) {
@@ -274,7 +294,6 @@ pub struct StreamStatus {
     pub code: Option<String>,
     pub viewers: Vec<String>,
     pub error: Option<String>,
-    pub signed_in_as: Option<String>,
     viewer_labels: Vec<(String, String)>,
 }
 
@@ -412,8 +431,6 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
 
     if let Some(rest) = line.split("Share this code:").nth(1) {
         status.code = Some(rest.trim().to_string());
-    } else if let Some(rest) = line.strip_prefix("[host] signed in as ") {
-        status.signed_in_as = Some(rest.trim().to_string());
     } else if let Some(record) = line.strip_prefix("[host-status] ") {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
             return;
