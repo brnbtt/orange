@@ -392,11 +392,13 @@ fn run_until_closed(pipeline: &gst::Pipeline, hwnd: isize) -> Result<()> {
         };
         match msg.view() {
             gst::MessageView::Error(err) => {
-                error = Some(anyhow::anyhow!(
-                    "{} ({})",
-                    err.error(),
-                    err.debug().unwrap_or_default()
-                ));
+                if window::is_alive(hwnd) {
+                    error = Some(anyhow::anyhow!(
+                        "{} ({})",
+                        err.error(),
+                        err.debug().unwrap_or_default()
+                    ));
+                }
                 break;
             }
             gst::MessageView::Eos(_) => break,
