@@ -890,6 +890,26 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
 
+    struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+
+    impl ReleaseOnDrop {
+        fn new(sender: mpsc::Sender<()>) -> Self {
+            Self(Some(sender))
+        }
+
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     fn login_session() -> session::Session {
         session::Session {
             name: "Orange User".into(),
@@ -932,8 +952,6 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let cancel_observed = Arc::new(AtomicBool::new(false));
-        let worker_cancel_observed = Arc::clone(&cancel_observed);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let mut job = None;
@@ -942,11 +960,10 @@ mod tests {
             entered_tx.send(()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
             while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
-            worker_cancel_observed.store(cancel.load(Ordering::Acquire), Ordering::Release);
-            cancelled_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let _ = cancelled_tx.send(cancel.load(Ordering::Acquire));
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
             worker_exited.store(true, Ordering::Release);
             Some((1, 1, vec![0; 4]))
         });
@@ -955,17 +972,27 @@ mod tests {
             .expect("old capture did not start");
 
         std::thread::scope(|scope| {
-            let releaser = scope.spawn(move || {
-                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
-                std::thread::sleep(Duration::from_millis(25));
-                let _ = release_tx.send(());
+            let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let job = &mut job;
+            let caller = scope.spawn(move || {
+                replace_thumbnail_job(job, vec![3], |_, _| None);
+                let _ = caller_done_tx.send(());
             });
+            let mut release = ReleaseOnDrop::new(release_tx);
 
-            replace_thumbnail_job(&mut job, vec![3], |_, _| None);
-
-            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(cancelled_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker did not report cancellation"));
+            assert!(matches!(
+                caller_done_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            release.release();
+            caller_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replacement did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
-            releaser.join().unwrap();
+            caller.join().unwrap();
         });
         stop_thumbnail_job(&mut job);
     }
@@ -975,8 +1002,6 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let cancel_observed = Arc::new(AtomicBool::new(false));
-        let worker_cancel_observed = Arc::clone(&cancel_observed);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let mut job = None;
@@ -988,11 +1013,10 @@ mod tests {
                 entered_tx.send(()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(1);
                 while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::yield_now();
                 }
-                worker_cancel_observed.store(cancel.load(Ordering::Acquire), Ordering::Release);
-                cancelled_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let _ = cancelled_tx.send(cancel.load(Ordering::Acquire));
+                let _ = release_rx.recv_timeout(Duration::from_secs(1));
                 worker_exited.store(true, Ordering::Release);
                 Some(Vec::new())
             },
@@ -1002,21 +1026,27 @@ mod tests {
             .expect("old fetch did not start");
 
         std::thread::scope(|scope| {
-            let releaser = scope.spawn(move || {
-                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
-                std::thread::sleep(Duration::from_millis(25));
-                let _ = release_tx.send(());
+            let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let job = &mut job;
+            let caller = scope.spawn(move || {
+                replace_avatar_job(job, Some("https://example.com/new.png".into()), |_, _| None);
+                let _ = caller_done_tx.send(());
             });
+            let mut release = ReleaseOnDrop::new(release_tx);
 
-            replace_avatar_job(
-                &mut job,
-                Some("https://example.com/new.png".into()),
-                |_, _| None,
-            );
-
-            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(cancelled_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker did not report cancellation"));
+            assert!(matches!(
+                caller_done_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            release.release();
+            caller_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replacement did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
-            releaser.join().unwrap();
+            caller.join().unwrap();
         });
         stop_avatar_job(&mut job);
     }

@@ -625,6 +625,26 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+
+    impl ReleaseOnDrop {
+        fn new(sender: mpsc::Sender<()>) -> Self {
+            Self(Some(sender))
+        }
+
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     fn update_info() -> UpdateInfo {
         UpdateInfo {
             version: Version::parse("9.0.0").unwrap(),
@@ -749,13 +769,16 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let (sent_tx, sent_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let (poll_returned_tx, poll_returned_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let worker = std::thread::spawn(move || {
             sender.send(UpdateEvent::Checked(Ok(None))).unwrap();
             sent_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
             worker_exited.store(true, Ordering::SeqCst);
+            let _ = exited_tx.send(());
         });
         sent_rx
             .recv_timeout(Duration::from_secs(1))
@@ -771,18 +794,32 @@ mod tests {
         );
         std::thread::scope(|scope| {
             let releaser = scope.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                let poll_returned = poll_returned_rx.recv_timeout(Duration::from_secs(1));
                 let _ = release_tx.send(());
+                poll_returned.expect("poll_event did not return before the release timeout");
             });
 
-            let started = Instant::now();
-            assert!(controller.poll_event().is_none());
-            assert!(started.elapsed() < Duration::from_millis(25));
+            let result = controller.poll_event();
+            let _ = poll_returned_tx.send(());
+            assert!(result.is_none());
             assert!(controller.job.is_some());
 
             releaser.join().unwrap();
         });
+        exited_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("update worker did not exit after release");
         assert!(exited.load(Ordering::SeqCst));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while controller
+            .job
+            .as_ref()
+            .is_some_and(|job| !job.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(controller.job.as_ref().is_some_and(UpdateJob::is_finished));
         assert!(controller.poll_event().is_none());
         assert!(controller.job.is_none());
     }
@@ -793,19 +830,16 @@ mod tests {
         let worker_cancel = Arc::clone(&cancel);
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let cancel_observed = Arc::new(AtomicBool::new(false));
-        let worker_cancel_observed = Arc::clone(&cancel_observed);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let (_sender, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(1);
             while !worker_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
-            worker_cancel_observed.store(worker_cancel.load(Ordering::Acquire), Ordering::Release);
-            cancelled_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let _ = cancelled_tx.send(worker_cancel.load(Ordering::Acquire));
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
             worker_exited.store(true, Ordering::Release);
         });
         let controller = controller(
@@ -818,17 +852,26 @@ mod tests {
         );
 
         std::thread::scope(|scope| {
-            let releaser = scope.spawn(move || {
-                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
-                std::thread::sleep(Duration::from_millis(25));
-                let _ = release_tx.send(());
+            let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let caller = scope.spawn(move || {
+                drop(controller);
+                let _ = caller_done_tx.send(());
             });
+            let mut release = ReleaseOnDrop::new(release_tx);
 
-            drop(controller);
-
-            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(cancelled_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker did not report cancellation"));
+            assert!(matches!(
+                caller_done_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            release.release();
+            caller_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("controller drop did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
-            releaser.join().unwrap();
+            caller.join().unwrap();
         });
     }
 
@@ -838,19 +881,16 @@ mod tests {
         let worker_cancel = Arc::clone(&cancel);
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let cancel_observed = Arc::new(AtomicBool::new(false));
-        let worker_cancel_observed = Arc::clone(&cancel_observed);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let (_sender, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(1);
             while !worker_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
-            worker_cancel_observed.store(worker_cancel.load(Ordering::Acquire), Ordering::Release);
-            cancelled_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let _ = cancelled_tx.send(worker_cancel.load(Ordering::Acquire));
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
             worker_exited.store(true, Ordering::Release);
         });
         let mut controller = controller(
@@ -865,17 +905,27 @@ mod tests {
         );
 
         std::thread::scope(|scope| {
-            let releaser = scope.spawn(move || {
-                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
-                std::thread::sleep(Duration::from_millis(25));
-                let _ = release_tx.send(());
+            let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let controller = &mut controller;
+            let caller = scope.spawn(move || {
+                controller.stop_job();
+                let _ = caller_done_tx.send(());
             });
+            let mut release = ReleaseOnDrop::new(release_tx);
 
-            controller.stop_job();
-
-            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(cancelled_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker did not report cancellation"));
+            assert!(matches!(
+                caller_done_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            release.release();
+            caller_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("controller replacement did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
-            releaser.join().unwrap();
+            caller.join().unwrap();
         });
         assert!(controller.job.is_none());
     }
