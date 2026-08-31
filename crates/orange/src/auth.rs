@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Gives up if the browser leg is never completed.
@@ -26,27 +26,55 @@ fn session_path() -> Result<PathBuf> {
     Ok(PathBuf::from(dir).join("orange").join("session.json"))
 }
 
-pub fn load_session() -> Option<Session> {
-    let path = session_path().ok()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+pub fn load_session() -> Result<Option<Session>> {
+    load_session_from(&session_path()?)
+}
+
+fn load_session_from(path: &Path) -> Result<Option<Session>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read session {}", path.display()));
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("parse session {}", path.display()))
 }
 
 pub fn save_session(session: &Session) -> Result<()> {
-    let path = session_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(session)?)?;
+    save_session_to(&session_path()?, session)
+}
+
+fn save_session_to(path: &Path, session: &Session) -> Result<()> {
+    let parent = path.parent().context("session path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create session directory {}", parent.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary session file in {}", parent.display()))?;
+    serde_json::to_writer_pretty(&mut temporary, session)
+        .context("write temporary session file")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("sync temporary session file")?;
+    temporary
+        .persist(path)
+        .with_context(|| format!("replace session {}", path.display()))?;
     Ok(())
 }
 
 pub fn clear_session() -> Result<()> {
-    let path = session_path()?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    clear_session_at(&session_path()?)
+}
+
+fn clear_session_at(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove session {}", path.display())),
     }
-    Ok(())
 }
 
 /// Turn a WebSocket relay URL into its HTTP origin, so one `--server` value
@@ -104,7 +132,10 @@ pub async fn login(server: &str) -> Result<Session> {
 
     println!("Opening your browser to sign in with Discord...");
     if let Err(err) = open_in_browser(&start.url) {
-        println!("Could not open a browser ({err}). Visit this URL:\n{}", start.url);
+        println!(
+            "Could not open a browser ({err}). Visit this URL:\n{}",
+            start.url
+        );
     }
 
     let began = Instant::now();
@@ -172,7 +203,79 @@ fn open_in_browser(url: &str) -> Result<()> {
     };
     // ShellExecute returns a value <= 32 on failure.
     if result.0 as isize <= 32 {
-        bail!("the shell refused to open a browser (code {})", result.0 as isize);
+        bail!(
+            "the shell refused to open a browser (code {})",
+            result.0 as isize
+        );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> Session {
+        Session {
+            token: "secret".into(),
+            id: "123".into(),
+            name: "Orange User".into(),
+            avatar_url: Some("https://example.com/avatar.png".into()),
+        }
+    }
+
+    #[test]
+    fn missing_session_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let loaded = load_session_from(&dir.path().join("session.json")).unwrap();
+
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn malformed_session_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, "not json").unwrap();
+
+        let error = load_session_from(&path).unwrap_err();
+
+        assert!(error.to_string().contains("parse session"));
+    }
+
+    #[test]
+    fn atomic_save_replaces_existing_json_without_leaving_a_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, "old contents").unwrap();
+
+        save_session_to(&path, &session()).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["token"], "secret");
+        assert_eq!(json["id"], "123");
+        assert_eq!(json["name"], "Orange User");
+        assert_eq!(json["avatar_url"], "https://example.com/avatar.png");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn clearing_a_missing_session_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+
+        clear_session_at(&dir.path().join("session.json")).unwrap();
+    }
+
+    #[test]
+    fn clearing_an_existing_session_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, "session").unwrap();
+
+        clear_session_at(&path).unwrap();
+
+        assert!(!path.exists());
+    }
 }

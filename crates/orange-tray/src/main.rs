@@ -106,10 +106,21 @@ impl Orange {
         })
         .detach();
 
-        let session = session::load();
+        let (session, session_error) = match session::load() {
+            Ok(session) => (session, None),
+            Err(error) => (None, Some(error)),
+        };
         let (preferences, preference_error) = match session::load_preferences() {
             Ok(preferences) => (preferences, None),
             Err(error) => (session::Preferences::default(), Some(error)),
+        };
+        let startup_error = match (session_error, preference_error) {
+            (Some(session_error), Some(preference_error)) => Some(format!(
+                "Could not load session: {session_error}; could not load preferences: {preference_error}"
+            )),
+            (Some(error), None) => Some(format!("Could not load session: {error}")),
+            (None, Some(error)) => Some(format!("Could not load preferences: {error}")),
+            (None, None) => None,
         };
         let avatar_rx = request_avatar(session.as_ref().and_then(|s| s.avatar_url.clone()));
         let updates = update::UpdateController::new();
@@ -133,8 +144,8 @@ impl Orange {
             host: None,
             watches: Vec::new(),
             logging_in: None,
-            notice: preference_error.map(|error| Notice {
-                text: format!("Could not load preferences: {error}"),
+            notice: startup_error.map(|text| Notice {
+                text,
                 expires_at: Instant::now() + Duration::from_secs(4),
             }),
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
@@ -164,15 +175,31 @@ impl Orange {
         // Login happens in a child process; notice when it lands, and when it
         // dies without producing a session.
         if self.logging_in.is_some() {
-            if let Some(session) = session::load() {
-                self.avatar = None;
-                self.avatar_rx = request_avatar(session.avatar_url.clone());
-                self.session = Some(session);
-                self.logging_in = None;
-                self.screen = Screen::Home;
-            } else if let Some(reason) = self.logging_in.as_mut().and_then(|a| a.failure()) {
-                self.show_error(reason);
-                self.logging_in = None;
+            match session::load() {
+                Ok(Some(session)) => {
+                    self.avatar = None;
+                    self.avatar_rx = request_avatar(session.avatar_url.clone());
+                    self.session = Some(session);
+                    self.logging_in = None;
+                    self.screen = Screen::Home;
+                }
+                Ok(None) => {
+                    if let Some(reason) = self.logging_in.as_mut().and_then(|a| a.failure()) {
+                        self.show_error(reason);
+                        self.logging_in = None;
+                    }
+                }
+                Err(error) => {
+                    if self
+                        .logging_in
+                        .as_mut()
+                        .and_then(|attempt| attempt.failure())
+                        .is_some()
+                    {
+                        self.show_error(format!("Could not read session: {error}"));
+                        self.logging_in = None;
+                    }
+                }
             }
         }
 

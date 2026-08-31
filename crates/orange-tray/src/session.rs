@@ -48,9 +48,21 @@ fn preferences_path() -> Result<PathBuf> {
     Ok(PathBuf::from(dir).join("orange").join("preferences.json"))
 }
 
-pub fn load() -> Option<Session> {
-    let text = std::fs::read_to_string(path()?).ok()?;
-    serde_json::from_str(&text).ok()
+pub fn load() -> Result<Option<Session>> {
+    load_from(&path().context("APPDATA is not set")?)
+}
+
+fn load_from(path: &Path) -> Result<Option<Session>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read session {}", path.display()));
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("parse session {}", path.display()))
 }
 
 pub fn clear() -> Result<()> {
@@ -112,6 +124,51 @@ fn save_preferences_to(path: &Path, preferences: &Preferences) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_session_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let loaded = load_from(&dir.path().join("session.json")).unwrap();
+
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn malformed_session_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, "not json").unwrap();
+
+        let error = load_from(&path).unwrap_err();
+
+        assert!(error.to_string().contains("parse session"));
+    }
+
+    #[test]
+    fn session_with_cli_token_fields_loads_tray_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "token": "secret",
+                "id": "123",
+                "name": "Orange User",
+                "avatar_url": "https://example.com/avatar.png"
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = load_from(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.id, "123");
+        assert_eq!(loaded.name, "Orange User");
+        assert_eq!(
+            loaded.avatar_url.as_deref(),
+            Some("https://example.com/avatar.png")
+        );
+    }
 
     #[test]
     fn missing_preferences_use_defaults() {

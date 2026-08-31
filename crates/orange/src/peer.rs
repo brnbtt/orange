@@ -541,7 +541,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     let mut client = connect(url).await?;
 
     // Identity is optional: without it viewers show up as opaque ids.
-    if let Some(session) = crate::auth::load_session() {
+    if let Some(session) = crate::auth::load_session()? {
         client.outgoing.send(Signal::Authenticate {
             session: session.token,
         })?;
@@ -1185,7 +1185,7 @@ fn create_offer(
 /// Viewer: join a stream by code.
 pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let mut client = connect(url).await?;
-    if let Some(session) = crate::auth::load_session() {
+    if let Some(session) = crate::auth::load_session()? {
         client.outgoing.send(Signal::Authenticate {
             session: session.token,
         })?;
