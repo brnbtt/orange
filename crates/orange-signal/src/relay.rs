@@ -1,4 +1,7 @@
-use crate::{auth, Identity, Signal};
+use crate::{
+    auth::{self, Identity},
+    Signal,
+};
 #[cfg(test)]
 use crate::{diagnostics, server};
 use anyhow::{bail, Result};
@@ -109,14 +112,14 @@ impl Tx {
 }
 
 #[derive(Default)]
-pub struct Room {
+pub(crate) struct Room {
     host: Option<Tx>,
     host_name: Option<String>,
     diagnostic_session: String,
     viewers: HashMap<String, Tx>,
 }
 
-pub type Rooms = Arc<Mutex<HashMap<String, Room>>>;
+pub(crate) type Rooms = Arc<Mutex<HashMap<String, Room>>>;
 
 fn insert_room_with_code(
     rooms: &mut HashMap<String, Room>,
@@ -138,7 +141,7 @@ enum Role {
 }
 
 /// Serve one connected peer for its lifetime.
-pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> Result<()> {
+pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> Result<()> {
     let (mut sink, mut source) = socket.split();
     let (messages, mut rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
     let (disconnect, mut disconnect_rx) = tokio::sync::watch::channel(false);

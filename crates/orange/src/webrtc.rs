@@ -27,7 +27,6 @@ pub(crate) use workers::{
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use gstreamer as gst;
-use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::{Arc, Mutex};
 
@@ -180,10 +179,6 @@ fn connect_signalling(sender: &gst::Element, receiver: &gst::Element) {
         sender.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
         None
     });
-
-    // Silence the unused warning on the SDP import while keeping it available
-    // for the real signalling module that replaces this.
-    let _ = gst_sdp::SDPMessage::new();
 }
 
 /// Where the received video should end up.

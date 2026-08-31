@@ -280,8 +280,8 @@ mod tests {
     use super::*;
     use crate::{
         auth::{Auth, Identity},
+        relay::Rooms,
         server::{router, AppState},
-        Rooms,
     };
     use axum::{
         body::{to_bytes, Body},

@@ -9,15 +9,13 @@
 //! of the room code still grants access; logging in only attaches a name to
 //! whoever turns up.
 
-pub mod auth;
+mod auth;
 mod client;
 mod diagnostics;
 mod protocol;
 mod relay;
 mod server;
 
-pub use auth::Identity;
 pub use client::{connect, SignalClient};
 pub use protocol::Signal;
-pub use relay::{handle_peer, Room, Rooms};
 pub use server::serve;

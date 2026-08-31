@@ -5,7 +5,7 @@
 
 use crate::auth::{Auth, DiscordConfig, PollResult};
 use crate::diagnostics::{upload_diagnostics, DiagnosticsStorage, DIAGNOSTICS_LIMIT};
-use crate::{handle_peer, Rooms};
+use crate::relay::{handle_peer, Rooms};
 use anyhow::{Context, Result};
 use axum::{
     extract::{
