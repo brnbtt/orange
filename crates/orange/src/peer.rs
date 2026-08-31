@@ -480,11 +480,9 @@ mod tests {
         });
 
         bin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
-        let sdp = receive
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .expect("offer was not generated");
+        let sdp = receive.recv_timeout(Duration::from_secs(5));
         pipeline.set_state(gst::State::Null).unwrap();
+        let sdp = sdp.unwrap().expect("offer was not generated");
 
         assert!(sdp.contains("a=rtpmap:96 AV1/90000"));
         assert!(sdp.contains("a=rtpmap:97 rtx/90000"));
