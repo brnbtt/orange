@@ -1172,6 +1172,36 @@ impl Orange {
                             .flex()
                             .flex_col()
                             .gap_0p5()
+                            .min_w(px(0.0))
+                            .child(label("Updates", TEXT))
+                            .child(label(self.updates.settings_detail(), FAINT).text_xs()),
+                    )
+                    .child({
+                        // Always rendered so the row does not reflow while a
+                        // check runs; dimmed and inert when one cannot start.
+                        let button = quiet("check-updates", "Check now");
+                        if self.updates.can_check_now() {
+                            button
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.updates.check_now();
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        } else {
+                            button.opacity(0.35).cursor_default().into_any_element()
+                        }
+                    }),
+            )
+            .child(
+                card()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
                             .child(label("Diagnostics", TEXT))
                             .child(
                                 label("Session logs. Attach these when reporting a problem.", FAINT)

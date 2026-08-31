@@ -75,19 +75,44 @@ fn periodic_check_due(
     deadline_reached: bool,
     status: &UpdateStatus,
 ) -> bool {
-    updates_enabled
-        && receiver_idle
-        && deadline_reached
-        && matches!(
-            status,
-            UpdateStatus::Current | UpdateStatus::Available(_) | UpdateStatus::Failed { .. }
-        )
+    updates_enabled && receiver_idle && deadline_reached && check_startable(status)
+}
+
+/// A manual check is the periodic one without the deadline: the user asking is
+/// the trigger. Both share `check_startable` so the two can never disagree
+/// about which states a check may begin from.
+fn manual_check_due(updates_enabled: bool, receiver_idle: bool, status: &UpdateStatus) -> bool {
+    updates_enabled && receiver_idle && check_startable(status)
+}
+
+/// States a check may start from. Excludes `Checking` and `Downloading`, which
+/// already own a job, and `Disabled`, which has no manifest to check.
+fn check_startable(status: &UpdateStatus) -> bool {
+    matches!(
+        status,
+        UpdateStatus::Current | UpdateStatus::Available(_) | UpdateStatus::Failed { .. }
+    )
+}
+
+/// How long ago the last completed check was, phrased for the settings screen.
+///
+/// Pure so the wording is testable without waiting on a clock. Returns `None`
+/// before the first check completes.
+fn checked_ago(elapsed: Option<Duration>) -> Option<String> {
+    let seconds = elapsed?.as_secs();
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    Some(match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3599 => plural(seconds / 60, "minute"),
+        _ => plural(seconds / 3600, "hour"),
+    })
 }
 
 pub(crate) struct UpdateController {
     status: UpdateStatus,
     job: Option<UpdateJob>,
     next_update_check: Instant,
+    last_checked: Option<Instant>,
 }
 
 struct UpdateJob {
@@ -140,6 +165,7 @@ impl UpdateController {
             status,
             job,
             next_update_check: Instant::now() + UPDATE_CHECK_INTERVAL,
+            last_checked: None,
         }
     }
 
@@ -166,9 +192,11 @@ impl UpdateController {
         }
         match event {
             Some(Ok(UpdateEvent::Checked(Ok(Some(info))))) => {
+                self.last_checked = Some(Instant::now());
                 self.status = UpdateStatus::Available(info);
             }
             Some(Ok(UpdateEvent::Checked(Ok(None)))) => {
+                self.last_checked = Some(Instant::now());
                 self.status = UpdateStatus::Current;
             }
             Some(Ok(UpdateEvent::Checked(Err(_)))) | Some(Err(())) => {
@@ -207,10 +235,48 @@ impl UpdateController {
             Instant::now() >= self.next_update_check,
             &self.status,
         ) {
-            self.status = UpdateStatus::Checking;
-            self.stop_job();
-            self.job = start_check();
-            self.next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
+            self.begin_check();
+        }
+    }
+
+    /// Whether the settings screen should offer a manual check.
+    pub(crate) fn can_check_now(&self) -> bool {
+        manual_check_due(enabled(), self.job.is_none(), &self.status)
+    }
+
+    /// Check immediately, ignoring the periodic deadline.
+    ///
+    /// Guarded rather than assumed: the button is hidden when a check cannot
+    /// start, but the controller stays correct if that is ever called anyway.
+    pub(crate) fn check_now(&mut self) {
+        if self.can_check_now() {
+            self.begin_check();
+        }
+    }
+
+    fn begin_check(&mut self) {
+        self.status = UpdateStatus::Checking;
+        self.stop_job();
+        self.job = start_check();
+        self.next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
+    }
+
+    /// One line describing update state for the settings screen.
+    ///
+    /// `Available` deliberately states the version without offering an action:
+    /// the banner already owns "Update now", and duplicating it would give two
+    /// controls that must agree.
+    pub(crate) fn settings_detail(&self) -> String {
+        match &self.status {
+            UpdateStatus::Disabled => "Automatic updates apply to installed builds only.".into(),
+            UpdateStatus::Checking => "Checking\u{2026}".into(),
+            UpdateStatus::Downloading(info) => format!("Downloading {}\u{2026}", info.version),
+            UpdateStatus::Available(info) => format!("Version {} is available.", info.version),
+            UpdateStatus::Failed { message } => message.clone(),
+            UpdateStatus::Current => match checked_ago(self.last_checked.map(|at| at.elapsed())) {
+                Some(ago) => format!("Up to date \u{b7} checked {ago}"),
+                None => "Up to date.".into(),
+            },
         }
     }
 
@@ -657,6 +723,7 @@ mod tests {
             status,
             job,
             next_update_check: Instant::now() + UPDATE_CHECK_INTERVAL,
+            last_checked: None,
         }
     }
 
@@ -954,6 +1021,100 @@ mod tests {
         ] {
             assert_eq!(periodic_check_due(enabled, idle, due, status), expected);
         }
+    }
+
+    #[test]
+    fn manual_check_is_the_periodic_check_without_the_deadline() {
+        let current = UpdateStatus::Current;
+        let available = UpdateStatus::Available(update_info());
+        let failed = UpdateStatus::Failed {
+            message: "offline".into(),
+        };
+        let downloading = UpdateStatus::Downloading(update_info());
+        for (enabled, idle, status, expected) in [
+            (true, true, &current, true),
+            (true, true, &available, true),
+            (true, true, &failed, true),
+            (false, true, &current, false),
+            (true, false, &current, false),
+            (true, true, &UpdateStatus::Disabled, false),
+            (true, true, &UpdateStatus::Checking, false),
+            (true, true, &downloading, false),
+        ] {
+            assert_eq!(manual_check_due(enabled, idle, status), expected);
+            // A manual check must never start from a state the periodic one
+            // would refuse; only the deadline may differ.
+            assert_eq!(
+                manual_check_due(enabled, idle, status),
+                periodic_check_due(enabled, idle, true, status)
+            );
+        }
+    }
+
+    #[test]
+    fn checked_ago_phrases_each_magnitude_and_singularises() {
+        assert_eq!(checked_ago(None), None);
+        for (seconds, expected) in [
+            (0u64, "just now"),
+            (59, "just now"),
+            (60, "1 minute ago"),
+            (119, "1 minute ago"),
+            (120, "2 minutes ago"),
+            (3599, "59 minutes ago"),
+            (3600, "1 hour ago"),
+            (7199, "1 hour ago"),
+            (7200, "2 hours ago"),
+        ] {
+            assert_eq!(
+                checked_ago(Some(Duration::from_secs(seconds))).as_deref(),
+                Some(expected),
+                "{seconds}s"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_detail_describes_every_status() {
+        let cases = [
+            (UpdateStatus::Disabled, "installed builds only"),
+            (UpdateStatus::Checking, "Checking"),
+            (UpdateStatus::Current, "Up to date"),
+            (UpdateStatus::Available(update_info()), "is available"),
+            (UpdateStatus::Downloading(update_info()), "Downloading"),
+            (
+                UpdateStatus::Failed {
+                    message: "Could not check for updates".into(),
+                },
+                "Could not check for updates",
+            ),
+        ];
+        for (status, expected) in cases {
+            let detail = controller(status, None).settings_detail();
+            assert!(detail.contains(expected), "{detail:?} lacks {expected:?}");
+            assert!(!detail.is_empty());
+        }
+    }
+
+    #[test]
+    fn settings_detail_reports_when_the_last_check_happened() {
+        let mut controller = controller(UpdateStatus::Current, None);
+        // Before any check completes there is nothing truthful to report.
+        assert_eq!(controller.settings_detail(), "Up to date.");
+
+        controller.last_checked = Instant::now().checked_sub(Duration::from_secs(120));
+        assert_eq!(
+            controller.settings_detail(),
+            "Up to date \u{b7} checked 2 minutes ago"
+        );
+    }
+
+    #[test]
+    fn manual_check_is_refused_while_one_is_already_running() {
+        let mut controller = controller(UpdateStatus::Checking, None);
+        assert!(!controller.can_check_now());
+        controller.check_now();
+        // Still Checking: check_now must not restart or clobber a live job.
+        assert!(matches!(controller.status(), UpdateStatus::Checking));
     }
 
     #[test]
