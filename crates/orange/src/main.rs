@@ -396,10 +396,13 @@ fn run_until_closed(
     pipeline: &gst::Pipeline,
     playback: &window::PlaybackWindowHandle,
 ) -> Result<()> {
-    if let Err(error) = pipeline.set_state(gst::State::Playing) {
-        let _ = pipeline.set_state(gst::State::Null);
-        return Err(error.into());
-    }
+    let mut set_state = |state| {
+        pipeline
+            .set_state(state)
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    };
+    start_pipeline_with(&mut set_state)?;
     playback.reveal();
 
     let bus = pipeline.bus().expect("pipeline without bus");
@@ -425,11 +428,11 @@ fn run_until_closed(
         }
     }
 
-    pipeline.set_state(gst::State::Null)?;
-    match error {
+    let run_result = match error {
         Some(err) => Err(err),
         None => Ok(()),
-    }
+    };
+    stop_pipeline_with(run_result, &mut set_state)
 }
 
 /// Signalling is async; GStreamer is not. One runtime, created only when a
@@ -505,21 +508,46 @@ fn combine_pipeline_results(primary: Result<()>, cleanup: Result<()>) -> Result<
     }
 }
 
+fn start_pipeline_with(set_state: &mut impl FnMut(gst::State) -> Result<()>) -> Result<()> {
+    match set_state(gst::State::Playing) {
+        Ok(()) => Ok(()),
+        Err(error) => stop_pipeline_with(Err(error), set_state),
+    }
+}
+
+fn stop_pipeline_with(
+    primary: Result<()>,
+    set_state: &mut impl FnMut(gst::State) -> Result<()>,
+) -> Result<()> {
+    combine_pipeline_results(primary, set_state(gst::State::Null))
+}
+
 pub(crate) fn run_pipeline_while_with_shutdown(
     pipeline: &gst::Pipeline,
     seconds: u64,
     playback: Option<&window::PlaybackWindowHandle>,
     shutdown: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    if let Err(error) = pipeline.set_state(gst::State::Playing) {
-        let shutdown_result = shutdown();
-        let stop_result = pipeline
-            .set_state(gst::State::Null)
+    run_pipeline_while_with_shutdown_and_state(pipeline, seconds, playback, shutdown, |state| {
+        pipeline
+            .set_state(state)
             .map(|_| ())
-            .map_err(anyhow::Error::from);
-        return combine_pipeline_results(
-            Err(error.into()),
-            combine_pipeline_results(shutdown_result, stop_result),
+            .map_err(anyhow::Error::from)
+    })
+}
+
+fn run_pipeline_while_with_shutdown_and_state(
+    pipeline: &gst::Pipeline,
+    seconds: u64,
+    playback: Option<&window::PlaybackWindowHandle>,
+    shutdown: impl FnOnce() -> Result<()>,
+    mut set_state: impl FnMut(gst::State) -> Result<()>,
+) -> Result<()> {
+    if let Err(error) = set_state(gst::State::Playing) {
+        let shutdown_result = shutdown();
+        return stop_pipeline_with(
+            combine_pipeline_results(Err(error), shutdown_result),
+            &mut set_state,
         );
     }
 
@@ -556,17 +584,13 @@ pub(crate) fn run_pipeline_while_with_shutdown(
         &[gst::MessageType::Eos, gst::MessageType::Error],
     );
     let shutdown_result = shutdown();
-    let stop_result = pipeline
-        .set_state(gst::State::Null)
-        .map(|_| ())
-        .map_err(anyhow::Error::from);
     let run_result = match error {
         Some(err) => Err(err),
         None => Ok(()),
     };
-    combine_pipeline_results(
-        run_result,
-        combine_pipeline_results(shutdown_result, stop_result),
+    stop_pipeline_with(
+        combine_pipeline_results(run_result, shutdown_result),
+        &mut set_state,
     )
 }
 
@@ -585,9 +609,12 @@ fn report_file(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        gst, run_pipeline_while, run_pipeline_while_with_shutdown, timed_pipeline_should_continue,
+        gst, run_pipeline_while, run_pipeline_while_with_shutdown,
+        run_pipeline_while_with_shutdown_and_state, start_pipeline_with, stop_pipeline_with,
+        timed_pipeline_should_continue,
     };
     use gst::prelude::*;
+    use std::sync::{Arc, Mutex};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_CLOSE,
@@ -600,6 +627,77 @@ mod tests {
         assert!(!timed_pipeline_should_continue(true, Some(false)));
         assert!(!timed_pipeline_should_continue(false, None));
         assert!(!timed_pipeline_should_continue(false, Some(true)));
+    }
+
+    #[test]
+    fn window_pipeline_playing_failure_attempts_null_and_combines_errors() {
+        let mut states = Vec::new();
+
+        let result = start_pipeline_with(&mut |state| {
+            states.push(state);
+            match state {
+                gst::State::Playing => Err(anyhow::anyhow!("playing failed")),
+                gst::State::Null => Err(anyhow::anyhow!("null failed")),
+                _ => unreachable!(),
+            }
+        });
+
+        assert_eq!(states, [gst::State::Playing, gst::State::Null]);
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("playing failed"));
+        assert!(message.contains("null failed"));
+    }
+
+    #[test]
+    fn window_pipeline_later_error_combines_with_null_failure() {
+        let mut states = Vec::new();
+
+        let result = stop_pipeline_with(Err(anyhow::anyhow!("playback failed")), &mut |state| {
+            states.push(state);
+            Err(anyhow::anyhow!("null failed"))
+        });
+
+        assert_eq!(states, [gst::State::Null]);
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("playback failed"));
+        assert!(message.contains("null failed"));
+    }
+
+    #[test]
+    fn timed_pipeline_playing_failure_shuts_down_workers_before_null() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let shutdown_order = order.clone();
+        let state_order = order.clone();
+
+        let result = run_pipeline_while_with_shutdown_and_state(
+            &pipeline,
+            0,
+            None,
+            move || {
+                shutdown_order.lock().unwrap().push("shutdown");
+                Err(anyhow::anyhow!("worker cleanup failed"))
+            },
+            move |state| {
+                state_order.lock().unwrap().push(match state {
+                    gst::State::Playing => "playing",
+                    gst::State::Null => "null",
+                    _ => unreachable!(),
+                });
+                Err(anyhow::anyhow!(match state {
+                    gst::State::Playing => "playing failed",
+                    gst::State::Null => "null failed",
+                    _ => unreachable!(),
+                }))
+            },
+        );
+
+        assert_eq!(*order.lock().unwrap(), ["playing", "shutdown", "null"]);
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("playing failed"));
+        assert!(message.contains("worker cleanup failed"));
+        assert!(message.contains("null failed"));
     }
 
     #[test]
