@@ -15,8 +15,8 @@ use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -43,6 +43,116 @@ const RECOVERY_KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
 const AUDIO_BRANCH_MAX_PACKETS: u32 = 10;
 static NEXT_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_KEYFRAME_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+enum StartupKeyframeCommand {
+    Request,
+    Stop,
+}
+
+#[derive(Clone)]
+struct StartupKeyframeTrigger {
+    sender: std_mpsc::Sender<StartupKeyframeCommand>,
+    requested: Arc<AtomicBool>,
+}
+
+impl StartupKeyframeTrigger {
+    fn request(&self) {
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.send(StartupKeyframeCommand::Request);
+        }
+    }
+}
+
+struct StartupKeyframeWorker {
+    sender: Option<std_mpsc::Sender<StartupKeyframeCommand>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StartupKeyframeWorker {
+    fn spawn(
+        tee: gst::glib::WeakRef<gst::Element>,
+        bin: gst::glib::WeakRef<gst::Element>,
+    ) -> Result<(Self, StartupKeyframeTrigger)> {
+        let mut first = true;
+        Self::spawn_with(move || {
+            let Some(tee) = tee.upgrade() else {
+                return false;
+            };
+            if !first {
+                let Some(bin) = bin.upgrade() else {
+                    return false;
+                };
+                if bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state")
+                    != gst_webrtc::WebRTCPeerConnectionState::Connected
+                {
+                    return false;
+                }
+            }
+            first = false;
+            force_key_unit(&tee);
+            true
+        })
+    }
+
+    fn spawn_with(
+        mut request: impl FnMut() -> bool + Send + 'static,
+    ) -> Result<(Self, StartupKeyframeTrigger)> {
+        let (sender, receiver) = std_mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("startup-keyframes".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        StartupKeyframeCommand::Request => {
+                            if !request() {
+                                continue;
+                            }
+                            for delay in [250, 500, 750] {
+                                match receiver.recv_timeout(Duration::from_millis(delay)) {
+                                    Ok(StartupKeyframeCommand::Stop)
+                                    | Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                                    Ok(StartupKeyframeCommand::Request) => continue,
+                                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                                        if !request() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        StartupKeyframeCommand::Stop => return,
+                    }
+                }
+            })
+            .context("failed to spawn startup keyframe worker")?;
+        let trigger = StartupKeyframeTrigger {
+            sender: sender.clone(),
+            requested: Arc::new(AtomicBool::new(false)),
+        };
+        Ok((
+            Self {
+                sender: Some(sender),
+                worker: Some(worker),
+            },
+            trigger,
+        ))
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(StartupKeyframeCommand::Stop);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for StartupKeyframeWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
 
 struct PipelineError {
     source: String,
@@ -360,7 +470,63 @@ fn handle_watch_diagnostic_signal(signal: &Signal) {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    #[test]
+    fn startup_keyframe_worker_trigger_is_one_shot() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_worker = requests.clone();
+        let (mut worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
+            requests_for_worker.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .unwrap();
+
+        trigger.request();
+        trigger.request();
+        std::thread::sleep(Duration::from_millis(25));
+        worker.shutdown();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn startup_keyframe_worker_stop_interrupts_wait() {
+        let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
+        let (mut worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
+            let _ = started.send(());
+            true
+        })
+        .unwrap();
+        trigger.request();
+        wait_for_start.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let stopped_at = Instant::now();
+        worker.shutdown();
+
+        assert!(stopped_at.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn startup_keyframe_worker_sends_nothing_after_stop() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_worker = requests.clone();
+        let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
+        let (mut worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
+            requests_for_worker.fetch_add(1, Ordering::SeqCst);
+            let _ = started.try_send(());
+            true
+        })
+        .unwrap();
+        trigger.request();
+        wait_for_start.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        worker.shutdown();
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn host_receipt_accepts_only_hosting_diagnostic_session() {
@@ -585,12 +751,35 @@ mod tests {
                 bin,
                 links: Vec::new(),
                 label: "test viewer".to_string(),
-                _diagnostics: None,
+                startup_keyframes: StartupKeyframeWorker::spawn_with(|| false).unwrap().0,
+                diagnostics: None,
             })
             .await;
-        drop(teardown);
+        teardown.finish().await.unwrap();
 
         assert!(pipeline.by_name("viewer-teardown-test").is_none());
+    }
+
+    #[test]
+    fn viewer_teardown_starts_only_after_startup_worker_joins() {
+        struct MarkStopped(Arc<AtomicBool>);
+        impl Drop for MarkStopped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let worker_stopped = Arc::new(AtomicBool::new(false));
+        let marker = MarkStopped(worker_stopped.clone());
+        let (mut startup_keyframes, _) = StartupKeyframeWorker::spawn_with(move || {
+            let _ = &marker;
+            false
+        })
+        .unwrap();
+
+        shutdown_startup_then(&mut startup_keyframes, || {
+            assert!(worker_stopped.load(Ordering::SeqCst));
+        });
     }
 }
 
@@ -863,10 +1052,11 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     for (_, branch) in viewers.drain() {
         viewer_teardown.enqueue(branch).await;
     }
-    drop(viewer_teardown);
+    let teardown_result = viewer_teardown.finish().await;
     let stop_result = pipeline.set_state(gst::State::Null);
     client.close().await;
     session_result?;
+    teardown_result?;
     stop_result?;
     Ok(())
 }
@@ -921,7 +1111,8 @@ struct ViewerBranch {
     bin: gst::Element,
     links: Vec<TeeBranch>,
     label: String,
-    _diagnostics: Option<DiagnosticsHandle>,
+    startup_keyframes: StartupKeyframeWorker,
+    diagnostics: Option<DiagnosticsHandle>,
 }
 
 struct ViewerTeardown {
@@ -964,6 +1155,21 @@ impl ViewerTeardown {
         if let Err(error) = sender.send(branch).await {
             remove_viewer(&self.pipeline, error.0);
         }
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        self.sender.take();
+        let worker = self.worker.take();
+        tokio::task::spawn_blocking(move || {
+            if let Some(worker) = worker {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("viewer teardown worker panicked"))?;
+            }
+            Ok(())
+        })
+        .await
+        .context("viewer teardown join task failed")?
     }
 }
 
@@ -1066,12 +1272,15 @@ fn add_viewer(
     failures: mpsc::UnboundedSender<(String, String)>,
 ) -> Result<ViewerBranch> {
     let bin = make_webrtcbin(&format!("viewer-{peer}"))?;
+    let (startup_keyframes, startup_trigger) =
+        StartupKeyframeWorker::spawn(tee.downgrade(), bin.downgrade())?;
     pipeline.add(&bin)?;
     let mut branch = ViewerBranch {
         bin,
         links: Vec::new(),
         label,
-        _diagnostics: None,
+        startup_keyframes,
+        diagnostics: None,
     };
     let progress = diagnostics_enabled().then(|| Arc::new(MediaProgress::new()));
 
@@ -1124,14 +1333,8 @@ fn add_viewer(
     let on_connection_failure: ConnectionFailure = Arc::new(move |error| {
         let _ = connection_failures.send((failed_peer.clone(), error));
     });
-    let tee_for_connected = tee.downgrade();
-    let bin_for_connected = branch.bin.downgrade();
-    let started_keyframes = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let on_connected: ConnectionReady = Arc::new(move || {
-        if started_keyframes.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        request_startup_keyframes(tee_for_connected.clone(), bin_for_connected.clone());
+        startup_trigger.request();
     });
     watch_connection(
         &branch.bin,
@@ -1140,14 +1343,22 @@ fn add_viewer(
         Some(on_connected),
         Some(on_connection_failure),
     );
-    branch._diagnostics = start_webrtc_diagnostics(&branch.bin, diagnostic_label, progress, None);
+    branch.diagnostics = start_webrtc_diagnostics(&branch.bin, diagnostic_label, progress, None);
     forward_ice(&branch.bin, out.clone(), peer.to_string());
 
     create_offer(&branch.bin, out, failures, peer.to_string());
     Ok(branch)
 }
 
-fn remove_viewer(pipeline: &gst::Pipeline, branch: ViewerBranch) {
+fn shutdown_startup_then(worker: &mut StartupKeyframeWorker, teardown: impl FnOnce()) {
+    worker.shutdown();
+    teardown();
+}
+
+fn remove_viewer(pipeline: &gst::Pipeline, mut branch: ViewerBranch) {
+    shutdown_startup_then(&mut branch.startup_keyframes, || {
+        branch.diagnostics.take();
+    });
     for link in &branch.links {
         block_and_unlink_tee_branch(link);
     }
@@ -1234,28 +1445,6 @@ fn force_key_unit(tee: &gst::Element) {
         Instant::now(),
         || tee.send_event(event),
     );
-}
-
-fn request_startup_keyframes(
-    tee: gst::glib::WeakRef<gst::Element>,
-    bin: gst::glib::WeakRef<gst::Element>,
-) {
-    if let Some(tee) = tee.upgrade() {
-        force_key_unit(&tee);
-    }
-    std::thread::spawn(move || {
-        for delay in [250, 500, 750] {
-            std::thread::sleep(Duration::from_millis(delay));
-            let Some(tee) = tee.upgrade() else { break };
-            let Some(bin) = bin.upgrade() else { break };
-            if bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state")
-                != gst_webrtc::WebRTCPeerConnectionState::Connected
-            {
-                break;
-            }
-            force_key_unit(&tee);
-        }
-    });
 }
 
 fn print_viewer_status(event: &str, peer: &str, label: &str) {
