@@ -440,7 +440,7 @@ git commit -m "Guarantee pipeline state cleanup"
 - `peer.rs` remains the facade and owns shared bus, connection-state, ICE, and SDP helpers.
 - `peer::host` owns host capture/signaling orchestration; `peer::host_branch` owns tee/request-pad construction, offer creation, and deterministic viewer removal; `peer::watch` owns receive-session orchestration.
 - `media_diagnostics.rs` remains the facade; `writer.rs` owns JSONL persistence, `operation.rs` owns timed operation events, `progress.rs` owns stage counters/probes, and `webrtc_monitor.rs` owns WebRTC stats polling.
-- `overlay.rs` owns interaction state, `raster.rs` owns layout/raster/composition generation, and `gst.rs` owns GStreamer attachment and panic containment.
+- `overlay.rs` owns interaction state, `raster.rs` owns layout/raster/composition generation, and `gst.rs` owns GStreamer attachment and panic containment. State stays in the parent so child modules can read private render fields without widening them.
 - tray `main.rs` owns `Orange` state/effects/bootstrap; `view.rs` owns the existing Render implementation, global chrome, listener wiring, and all six screen methods in one child module.
 - `orange-signal::protocol` owns `Signal`; `client` owns `SignalClient` and connection tasks; `relay` owns room/peer state; `diagnostics` owns upload storage, metadata validation, and its route handler. Existing public re-exports remain stable.
 
