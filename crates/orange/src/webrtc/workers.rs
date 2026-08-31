@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use super::encoding_name;
-
 fn panic_detail(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
         .downcast_ref::<&str>()
@@ -235,17 +233,6 @@ pub(crate) enum AcceptedReceivePad {
     Video(ReceivePadClaim),
 }
 
-pub(crate) fn accept_receive_pad(
-    registry: &ReceiveWorkerRegistry,
-    pad: &gst::Pad,
-) -> Option<AcceptedReceivePad> {
-    match encoding_name(pad).as_deref() {
-        Some("OPUS") => registry.claim_audio().map(AcceptedReceivePad::Audio),
-        Some("AV1" | "H264" | "H265") => registry.claim_video().map(AcceptedReceivePad::Video),
-        _ => None,
-    }
-}
-
 impl ReceiveWorkerRegistry {
     pub(crate) fn new() -> Self {
         Self {
@@ -288,15 +275,15 @@ impl ReceiveWorkerRegistry {
         })
     }
 
-    pub(crate) fn claim_audio(&self) -> Option<ReceivePadClaim> {
+    pub(super) fn claim_audio(&self) -> Option<ReceivePadClaim> {
         self.claim(ReceiveKind::Audio)
     }
 
-    pub(crate) fn claim_video(&self) -> Option<ReceivePadClaim> {
+    pub(super) fn claim_video(&self) -> Option<ReceivePadClaim> {
         self.claim(ReceiveKind::Video)
     }
 
-    pub(crate) fn close_and_take(&self) -> ReceiveWorkers {
+    fn close_and_take(&self) -> ReceiveWorkers {
         let (lock, callbacks_finished) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         state.accepting = false;
@@ -361,13 +348,13 @@ impl Drop for ReceivePadClaim {
     }
 }
 
-pub(crate) struct ReceiveWorkers {
+struct ReceiveWorkers {
     audio: Option<AudioControlWorker>,
     bitrate: Option<IncomingBitrateWorker>,
 }
 
 impl ReceiveWorkers {
-    pub(crate) fn shutdown(mut self) -> Result<()> {
+    fn shutdown(mut self) -> Result<()> {
         let bitrate = self
             .bitrate
             .as_mut()
@@ -382,6 +369,7 @@ impl ReceiveWorkers {
 
 #[cfg(test)]
 mod tests {
+    use super::super::accept_receive_pad;
     use super::*;
     use crate::test_support::run_in_bounded_subprocess;
     use std::sync::atomic::Ordering;

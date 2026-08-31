@@ -21,8 +21,7 @@ pub(crate) use transport::{
     audio_rtp_caps, configure_receive_transport, video_rtp_caps as rtp_caps,
 };
 pub(crate) use workers::{
-    accept_receive_pad, watch_incoming_bitrate, AcceptedReceivePad, AudioControlWorker,
-    ReceiveWorkerRegistry,
+    watch_incoming_bitrate, AcceptedReceivePad, AudioControlWorker, ReceiveWorkerRegistry,
 };
 
 use anyhow::{Context, Result};
@@ -35,6 +34,17 @@ use std::sync::{Arc, Mutex};
 use crate::pipeline::{
     build_capture_chain, check_elements, configure_encoder, CaptureSettings, Codec,
 };
+
+pub(crate) fn accept_receive_pad(
+    registry: &ReceiveWorkerRegistry,
+    pad: &gst::Pad,
+) -> Option<AcceptedReceivePad> {
+    match receive::encoding_name(pad).as_deref() {
+        Some("OPUS") => registry.claim_audio().map(AcceptedReceivePad::Audio),
+        Some("AV1" | "H264" | "H265") => registry.claim_video().map(AcceptedReceivePad::Video),
+        _ => None,
+    }
+}
 
 pub fn build_video_payloader(codec: Codec) -> Result<gst::Element> {
     let factory = codec.payloader();
