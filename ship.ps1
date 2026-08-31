@@ -86,8 +86,12 @@ try {
     # --- mutate ---------------------------------------------------------------
     Step "Bumping the workspace version"
     $manifestPath = Join-Path $root "Cargo.toml"
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw
-    $bumped = $manifest -creplace "(?m)^version = ""$([regex]::Escape($current))""$", "version = ""$shipVersion"""
+    $manifest = [IO.File]::ReadAllText($manifestPath)
+    # A `$` anchor will not do: .NET matches it before `\n`, and Cargo.toml has
+    # CRLF endings, so the `\r` sits between the quote and the anchor. The
+    # lookahead matches the line end without consuming the `\r`, preserving it.
+    $pattern = "(?m)^version = ""$([regex]::Escape($current))""(?=\r?$)"
+    $bumped = $manifest -creplace $pattern, "version = ""$shipVersion"""
     if ($bumped -ceq $manifest) { throw "Could not find version = ""$current"" in Cargo.toml" }
     [IO.File]::WriteAllText($manifestPath, $bumped, (New-Object Text.UTF8Encoding($false)))
 
