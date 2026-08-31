@@ -174,42 +174,17 @@ impl Auth {
             .as_ref()
             .context("Discord login is not configured")?;
 
-        self.state.lock().await.claim(state)?;
+        {
+            let mut auth = self.state.lock().await;
+            auth.prune();
+            auth.claim(state)?;
+        }
 
         let result = self.exchange(config, code).await;
 
         let mut auth = self.state.lock().await;
-        match result {
-            Ok(identity) => {
-                let session = random_token();
-                let now = Instant::now();
-                auth.sessions.insert(
-                    session.clone(),
-                    StoredSession {
-                        identity: identity.clone(),
-                        created_at: now,
-                    },
-                );
-                auth.pending.insert(
-                    state.to_string(),
-                    Pending::Ready {
-                        session,
-                        since: now,
-                    },
-                );
-                Ok(identity)
-            }
-            Err(err) => {
-                auth.pending.insert(
-                    state.to_string(),
-                    Pending::Failed {
-                        message: err.to_string(),
-                        since: Instant::now(),
-                    },
-                );
-                Err(err)
-            }
-        }
+        auth.prune();
+        auth.finish_completion(state, result)
     }
 
     /// Terminalize a browser cancellation so the desktop poller does not wait
@@ -356,6 +331,44 @@ impl AuthState {
         Ok(())
     }
 
+    fn finish_completion(&mut self, state: &str, result: Result<Identity>) -> Result<Identity> {
+        if !matches!(self.pending.get(state), Some(Pending::Completing { .. })) {
+            anyhow::bail!("login attempt expired");
+        }
+
+        match result {
+            Ok(identity) => {
+                let session = random_token();
+                let now = Instant::now();
+                self.sessions.insert(
+                    session.clone(),
+                    StoredSession {
+                        identity: identity.clone(),
+                        created_at: now,
+                    },
+                );
+                self.pending.insert(
+                    state.to_string(),
+                    Pending::Ready {
+                        session,
+                        since: now,
+                    },
+                );
+                Ok(identity)
+            }
+            Err(err) => {
+                self.pending.insert(
+                    state.to_string(),
+                    Pending::Failed {
+                        message: err.to_string(),
+                        since: Instant::now(),
+                    },
+                );
+                Err(err)
+            }
+        }
+    }
+
     fn prune(&mut self) {
         self.pending
             .retain(|_, p| p.since().elapsed() < PENDING_TTL);
@@ -381,6 +394,14 @@ fn random_token() -> String {
 mod tests {
     use super::*;
 
+    fn identity(id: &str) -> Identity {
+        Identity {
+            id: id.into(),
+            name: id.into(),
+            avatar_url: None,
+        }
+    }
+
     fn waiting_state() -> AuthState {
         let mut auth = AuthState::default();
         auth.pending.insert(
@@ -400,6 +421,42 @@ mod tests {
         assert!(auth.claim("state").is_err());
     }
 
+    #[test]
+    fn expired_waiting_state_is_pruned_before_claim() {
+        let mut auth = AuthState::default();
+        auth.pending.insert(
+            "state".into(),
+            Pending::Waiting {
+                since: Instant::now() - PENDING_TTL,
+            },
+        );
+
+        auth.prune();
+
+        assert!(auth.claim("state").is_err());
+        assert!(!auth.pending.contains_key("state"));
+    }
+
+    #[test]
+    fn pruned_completion_cannot_create_session_or_ready_state() {
+        let mut auth = AuthState::default();
+        auth.pending.insert(
+            "state".into(),
+            Pending::Completing {
+                since: Instant::now() - PENDING_TTL,
+            },
+        );
+        auth.prune();
+
+        let error = auth
+            .finish_completion("state", Ok(identity("user")))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "login attempt expired");
+        assert!(!auth.pending.contains_key("state"));
+        assert!(auth.sessions.is_empty());
+    }
+
     #[tokio::test]
     async fn cancellation_terminalizes_a_waiting_attempt() {
         let auth = Auth::new(None);
@@ -416,11 +473,6 @@ mod tests {
     #[tokio::test]
     async fn identify_prunes_expired_sessions_and_retains_current_sessions() {
         let auth = Auth::new(None);
-        let identity = |id: &str| Identity {
-            id: id.into(),
-            name: id.into(),
-            avatar_url: None,
-        };
         {
             let mut state = auth.state.lock().await;
             state.sessions.insert(
