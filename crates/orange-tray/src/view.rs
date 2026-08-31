@@ -213,11 +213,16 @@ impl Orange {
                     .child(
                         titlebar_button("settings", "⚙︎", SURFACE_HOVER).on_click(cx.listener(
                             |this, _, _, cx| {
-                                this.screen = if this.screen == Screen::Settings {
+                                let destination = if this.screen == Screen::Settings {
                                     Screen::Home
                                 } else {
                                     Screen::Settings
                                 };
+                                if this.screen == Screen::PickWindow {
+                                    this.leave_picker(destination);
+                                } else {
+                                    this.screen = destination;
+                                }
                                 cx.notify();
                             },
                         )),
@@ -233,6 +238,9 @@ impl Orange {
                     .child(
                         titlebar_button("close", "×", 0x8c2b28).on_click(cx.listener(
                             |this, _, _, cx| {
+                                if this.screen == Screen::PickWindow {
+                                    this.leave_picker(Screen::Home);
+                                }
                                 if this.tray_available {
                                     tray::hide_main_window();
                                 } else {
@@ -434,7 +442,7 @@ impl Orange {
         // Distinguishes "still capturing" from "this window refuses to draw",
         // which previously both showed as "no preview" and made every card
         // flash a failure message before its thumbnail arrived.
-        let capturing = self.thumb_rx.is_some();
+        let capturing = self.thumbnail_job.is_some();
 
         div()
             .flex()
@@ -702,7 +710,7 @@ impl Orange {
                     )
                     .child(
                         quiet("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
-                            this.screen = Screen::Home;
+                            this.leave_picker(Screen::Home);
                             cx.notify();
                         })),
                     ),

@@ -21,12 +21,19 @@ use gpui::{
     WindowOptions,
 };
 use std::cell::RefCell;
+use std::io::Read;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
 const DEFAULT_SERVER: &str =
     "wss://orange-relay.redmushroom-80c79f12.brazilsouth.azurecontainerapps.io/ws";
+const AVATAR_MAX_BYTES: usize = 4 * 1024 * 1024;
+const THUMBNAIL_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const AVATAR_JOIN_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
@@ -46,6 +53,150 @@ struct WatchSession {
 struct Notice {
     text: String,
     expires_at: Instant,
+}
+
+struct ThumbnailJob {
+    cancel: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<(i64, capture::Thumbnail)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ThumbnailJob {
+    fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn join(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            join_background_worker(worker, THUMBNAIL_JOIN_TIMEOUT, "thumbnail capture");
+        }
+    }
+}
+
+impl Drop for ThumbnailJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.join();
+    }
+}
+
+struct AvatarJob {
+    cancel: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<Option<capture::Thumbnail>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AvatarJob {
+    fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn join(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            join_background_worker(worker, AVATAR_JOIN_TIMEOUT, "avatar fetch");
+        }
+    }
+}
+
+impl Drop for AvatarJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.join();
+    }
+}
+
+fn join_background_worker(worker: JoinHandle<()>, timeout: Duration, name: &str) {
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            tray::fail_fast(
+                &format!("{name} worker did not terminate before its deadline"),
+                &anyhow::anyhow!("timeout after {timeout:?}"),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if worker.join().is_err() {
+        eprintln!("[tray] {name} worker panicked");
+    }
+}
+
+fn replace_thumbnail_job(
+    job: &mut Option<ThumbnailJob>,
+    handles: Vec<i64>,
+    capture: impl Fn(i64) -> Option<capture::Thumbnail> + Send + 'static,
+) {
+    stop_thumbnail_job(job);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for hwnd in handles {
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let thumbnail = capture(hwnd);
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            if let Some(thumbnail) = thumbnail {
+                if worker_cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                if sender.send((hwnd, thumbnail)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    *job = Some(ThumbnailJob {
+        cancel,
+        receiver,
+        worker: Some(worker),
+    });
+}
+
+fn stop_thumbnail_job(job: &mut Option<ThumbnailJob>) {
+    drop(job.take());
+}
+
+fn replace_avatar_job(
+    job: &mut Option<AvatarJob>,
+    url: Option<String>,
+    fetch: impl FnOnce(&str) -> Option<Vec<u8>> + Send + 'static,
+) {
+    stop_avatar_job(job);
+    let Some(url) = url else {
+        return;
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        if worker_cancel.load(Ordering::Acquire) {
+            return;
+        }
+        let bytes = fetch(&url);
+        if worker_cancel.load(Ordering::Acquire) {
+            return;
+        }
+        let pixels = bytes.and_then(decode_avatar);
+        if worker_cancel.load(Ordering::Acquire) {
+            return;
+        }
+        if !worker_cancel.load(Ordering::Acquire) {
+            let _ = sender.send(pixels);
+        }
+    });
+    *job = Some(AvatarJob {
+        cancel,
+        receiver,
+        worker: Some(worker),
+    });
+}
+
+fn stop_avatar_job(job: &mut Option<AvatarJob>) {
+    drop(job.take());
 }
 
 fn poll_login(
@@ -71,10 +222,10 @@ struct Orange {
     /// Thumbnails keyed by window handle, filled in asynchronously.
     thumbnails: std::collections::HashMap<i64, std::sync::Arc<gpui::RenderImage>>,
     /// Results arriving from the capture thread.
-    thumb_rx: Option<std::sync::mpsc::Receiver<(i64, capture::Thumbnail)>>,
+    thumbnail_job: Option<ThumbnailJob>,
     /// Discord avatar decoded off the UI thread.
     avatar: Option<std::sync::Arc<gpui::RenderImage>>,
-    avatar_rx: Option<std::sync::mpsc::Receiver<capture::Thumbnail>>,
+    avatar_job: Option<AvatarJob>,
     quality: usize,
     fps: Option<u32>,
     active_target: Option<WindowTarget>,
@@ -124,7 +275,12 @@ impl Orange {
             (None, Some(error)) => Some(format!("Could not load preferences: {error}")),
             (None, None) => None,
         };
-        let avatar_rx = request_avatar(session.as_ref().and_then(|s| s.avatar_url.clone()));
+        let mut avatar_job = None;
+        replace_avatar_job(
+            &mut avatar_job,
+            session.as_ref().and_then(|s| s.avatar_url.clone()),
+            fetch_avatar,
+        );
         let updates = update::UpdateController::new();
         Self {
             tray_available,
@@ -136,9 +292,9 @@ impl Orange {
             session,
             windows: Vec::new(),
             thumbnails: std::collections::HashMap::new(),
-            thumb_rx: None,
+            thumbnail_job: None,
             avatar: None,
-            avatar_rx,
+            avatar_job,
             quality: preferences.quality.min(QUALITIES.len() - 1),
             fps: preferences.fps,
             active_target: None,
@@ -163,14 +319,19 @@ impl Orange {
     fn tick(&mut self, cx: &mut Context<Self>) {
         self.drain_thumbnails();
         self.poll_updates(cx);
-        if let Some(rx) = &self.avatar_rx {
-            match rx.try_recv() {
-                Ok(pixels) => {
-                    self.avatar = capture::to_image(pixels);
-                    self.avatar_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.avatar_rx = None,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        let avatar_result = self.avatar_job.as_ref().and_then(|job| {
+            job.is_finished().then(|| match job.receiver.try_recv() {
+                Ok(pixels) => Some(Some(pixels)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(mpsc::TryRecvError::Empty) => None,
+            })?
+        });
+        if let Some(result) = avatar_result {
+            if let Some(mut job) = self.avatar_job.take() {
+                job.join();
+            }
+            if let Some(Some(pixels)) = result {
+                self.avatar = capture::to_image(pixels);
             }
         }
 
@@ -180,7 +341,11 @@ impl Orange {
             match poll_login(session::load, || attempt.failure()) {
                 Some(Ok(session)) => {
                     self.avatar = None;
-                    self.avatar_rx = request_avatar(session.avatar_url.clone());
+                    replace_avatar_job(
+                        &mut self.avatar_job,
+                        session.avatar_url.clone(),
+                        fetch_avatar,
+                    );
                     self.session = Some(session);
                     self.logging_in = None;
                     self.screen = Screen::Home;
@@ -302,13 +467,14 @@ impl Orange {
         }
         self.session = None;
         self.avatar = None;
-        self.avatar_rx = None;
+        stop_avatar_job(&mut self.avatar_job);
         if let Some(destination) = destination {
             self.screen = destination;
         }
     }
 
     fn refresh_windows(&mut self) {
+        stop_thumbnail_job(&mut self.thumbnail_job);
         match supervisor::list_windows() {
             Ok(mut windows) => {
                 // Never offer our own windows as a capture target.
@@ -333,25 +499,15 @@ impl Orange {
                 // costs tens of milliseconds per window, so doing this inline
                 // froze the app for as long as it took to walk the list.
                 let handles: Vec<i64> = windows.iter().map(|w| w.hwnd).collect();
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    for hwnd in handles {
-                        let thumb = if hwnd == 0 {
-                            capture::screen_thumbnail(320, 180)
-                        } else {
-                            capture::thumbnail(hwnd as isize, 320, 180)
-                        };
-                        if let Some(thumb) = thumb {
-                            // A closed picker drops the receiver; stop early.
-                            if tx.send((hwnd, thumb)).is_err() {
-                                return;
-                            }
-                        }
+                replace_thumbnail_job(&mut self.thumbnail_job, handles, |hwnd| {
+                    if hwnd == 0 {
+                        capture::screen_thumbnail(320, 180)
+                    } else {
+                        capture::thumbnail(hwnd as isize, 320, 180)
                     }
                 });
 
                 self.thumbnails.clear();
-                self.thumb_rx = Some(rx);
                 self.windows = windows;
                 self.clear_error();
             }
@@ -362,23 +518,29 @@ impl Orange {
     /// Move any captured thumbnails into the map. Runs on the UI thread, which
     /// is where GPUI's image types have to be built.
     fn drain_thumbnails(&mut self) -> bool {
-        let Some(rx) = &self.thumb_rx else {
+        let Some(job) = &self.thumbnail_job else {
             return false;
         };
         let mut changed = false;
+        let mut terminal = false;
         loop {
-            match rx.try_recv() {
+            match job.receiver.try_recv() {
                 Ok((hwnd, thumb)) => {
                     if let Some(image) = capture::to_image(thumb) {
                         self.thumbnails.insert(hwnd, image);
                         changed = true;
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.thumb_rx = None;
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    terminal = job.is_finished();
                     break;
                 }
+            }
+        }
+        if terminal {
+            if let Some(mut job) = self.thumbnail_job.take() {
+                job.join();
             }
         }
         changed
@@ -396,6 +558,7 @@ impl Orange {
     }
 
     fn start_stream(&mut self, target: WindowTarget) {
+        stop_thumbnail_job(&mut self.thumbnail_job);
         if !supervisor::gstreamer_available() {
             self.show_error(
                 "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
@@ -485,6 +648,11 @@ impl Orange {
         }
     }
 
+    fn leave_picker(&mut self, destination: Screen) {
+        stop_thumbnail_job(&mut self.thumbnail_job);
+        self.screen = destination;
+    }
+
     fn code(&self) -> Option<String> {
         self.host
             .as_ref()
@@ -501,39 +669,65 @@ impl Orange {
     }
 }
 
+impl Drop for Orange {
+    fn drop(&mut self) {
+        stop_thumbnail_job(&mut self.thumbnail_job);
+        stop_avatar_job(&mut self.avatar_job);
+    }
+}
+
 // --- shared pieces ----------------------------------------------------------
 
-fn request_avatar(url: Option<String>) -> Option<std::sync::mpsc::Receiver<capture::Thumbnail>> {
-    let url = url?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let pixels = (|| {
-            let bytes = reqwest::blocking::Client::builder()
-                .user_agent("orange/0.1")
-                .build()
-                .ok()?
-                .get(url)
-                .send()
-                .ok()?
-                .error_for_status()
-                .ok()?
-                .bytes()
-                .ok()?;
-            let image = image::load_from_memory(&bytes).ok()?.into_rgba8();
-            let mut raw =
-                image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Lanczos3)
-                    .into_raw();
-            // GPUI's image renderer expects BGRA.
-            for pixel in raw.as_chunks_mut::<4>().0 {
-                pixel.swap(0, 2);
-            }
-            Some((64, 64, raw))
-        })();
-        if let Some(pixels) = pixels {
-            let _ = tx.send(pixels);
-        }
-    });
-    Some(rx)
+fn fetch_avatar(url: &str) -> Option<Vec<u8>> {
+    let mut response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?
+        .get(url)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > AVATAR_MAX_BYTES as u64)
+    {
+        return None;
+    }
+    read_avatar_response(&mut response)
+}
+
+fn read_avatar_response(reader: &mut impl std::io::Read) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(AVATAR_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= AVATAR_MAX_BYTES).then_some(bytes)
+}
+
+fn decode_avatar(bytes: Vec<u8>) -> Option<capture::Thumbnail> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?
+        .into_rgba8();
+    let mut raw =
+        image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Lanczos3).into_raw();
+    // GPUI's image renderer expects BGRA.
+    for pixel in raw.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Some((64, 64, raw))
 }
 
 type TrayOwner = Rc<RefCell<Option<tray::Tray>>>;
@@ -693,6 +887,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
 
     fn login_session() -> session::Session {
         session::Session {
@@ -729,5 +925,76 @@ mod tests {
         .expect("initial load should win");
         assert_eq!(session.name, "Orange User");
         assert_eq!(failure_checks, 0);
+    }
+
+    #[test]
+    fn thumbnail_background_job_replacement_cancels_and_joins_the_old_worker() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let old_capture_returned = Arc::new(AtomicBool::new(false));
+        let returned = Arc::clone(&old_capture_returned);
+        let mut job = None;
+
+        replace_thumbnail_job(&mut job, vec![1, 2], move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            returned.store(true, Ordering::SeqCst);
+            Some((1, 1, vec![0; 4]))
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old capture did not start");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            release_tx.send(()).unwrap();
+        });
+
+        replace_thumbnail_job(&mut job, vec![3], |_| None);
+
+        releaser.join().unwrap();
+        assert!(old_capture_returned.load(Ordering::SeqCst));
+        stop_thumbnail_job(&mut job);
+    }
+
+    #[test]
+    fn avatar_background_job_replacement_cancels_and_joins_the_old_worker() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let old_fetch_returned = Arc::new(AtomicBool::new(false));
+        let returned = Arc::clone(&old_fetch_returned);
+        let mut job = None;
+
+        replace_avatar_job(
+            &mut job,
+            Some("https://example.com/old.png".into()),
+            move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                returned.store(true, Ordering::SeqCst);
+                Some(Vec::new())
+            },
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old fetch did not start");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            release_tx.send(()).unwrap();
+        });
+
+        replace_avatar_job(&mut job, Some("https://example.com/new.png".into()), |_| {
+            None
+        });
+
+        releaser.join().unwrap();
+        assert!(old_fetch_returned.load(Ordering::SeqCst));
+        stop_avatar_job(&mut job);
+    }
+
+    #[test]
+    fn avatar_response_is_rejected_before_exceeding_its_memory_cap() {
+        let mut oversized = std::io::Cursor::new(vec![0; AVATAR_MAX_BYTES + 1]);
+
+        assert!(read_avatar_response(&mut oversized).is_none());
     }
 }
