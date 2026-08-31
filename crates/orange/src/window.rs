@@ -321,12 +321,10 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
     if width == 0 || height == 0 {
         return;
     }
-    let Some((previous, fullscreen, bounds, profile)) = with_context(hwnd, |ctx| {
+    let Some((previous, fullscreen)) = with_context(hwnd, |ctx| {
         (
             ctx.source.replace((width, height)),
             ctx.restore.get().is_some(),
-            ctx.envelope.get(),
-            ctx.profile,
         )
     }) else {
         return;
@@ -338,6 +336,10 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
     if GetWindowRect(hwnd, &mut rect).is_err() {
         return;
     }
+    let Some((bounds, profile)) = with_context(hwnd, |ctx| (ctx.envelope.get(), ctx.profile))
+    else {
+        return;
+    };
     let old_w = rect.right - rect.left;
     let old_h = rect.bottom - rect.top;
     let first_size = previous == (0, 0);
@@ -515,9 +517,6 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
 
     if let Some((style, bounds)) = restore {
         SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
-        if with_context(hwnd, |_| ()).is_none() {
-            return;
-        }
         let _ = SetWindowPos(
             hwnd,
             None,
@@ -529,14 +528,8 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         );
     } else {
         let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
-        if with_context(hwnd, |_| ()).is_none() {
-            return;
-        }
         let mut bounds = RECT::default();
         let _ = GetWindowRect(hwnd, &mut bounds);
-        if with_context(hwnd, |_| ()).is_none() {
-            return;
-        }
 
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
@@ -551,9 +544,6 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
             return;
         }
         SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !WS_THICKFRAME).0 as isize);
-        if with_context(hwnd, |_| ()).is_none() {
-            return;
-        }
         let screen = info.rcMonitor;
         let _ = SetWindowPos(
             hwnd,
@@ -802,10 +792,8 @@ unsafe fn create_window(
         }
     } else {
         eprintln!("[window] replaced unexpected existing window context");
-        // SAFETY: A non-null value in our private GWLP_USERDATA slot is an
-        // installed Box<WindowContext>. The successful replacement removed it
-        // from the HWND, and creation has no active context borrow.
-        drop(Box::from_raw(previous as *mut WindowContext));
+        // The previous value is opaque and no longer installed. It may leak,
+        // but interpreting or freeing an unknown pointer would be unsound.
     }
 
     sync_dpi(hwnd);
@@ -870,9 +858,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     } else {
                         AW_BLEND
                     };
-                    if AnimateWindow(hwnd, REVEAL_MS, flags).is_err()
-                        && with_context(hwnd, |_| ()).is_some()
-                    {
+                    if AnimateWindow(hwnd, REVEAL_MS, flags).is_err() {
                         let _ =
                             ShowWindow(hwnd, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
                     }
@@ -932,6 +918,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         let video = overlay.video;
                         let (vx, vy) =
                             client_to_video(hwnd, point.x as f32, point.y as f32, video)?;
+                        with_context(hwnd, |_| ())?;
                         Some(overlay.on_mouse_move(vx, vy))
                     })
                     .unwrap_or(false);
@@ -957,10 +944,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     if let Ok(mut overlay) = overlay.lock() {
                         let video = overlay.video;
                         if let Some((vx, vy)) = client_to_video(hwnd, x, y, video) {
-                            overlay.on_click(vx, vy);
-                            close = overlay.close_requested;
-                            fullscreen = std::mem::take(&mut overlay.fullscreen_requested);
-                            volume_dragging = overlay.volume_dragging();
+                            if with_context(hwnd, |_| ()).is_some() {
+                                overlay.on_click(vx, vy);
+                                close = overlay.close_requested;
+                                fullscreen = std::mem::take(&mut overlay.fullscreen_requested);
+                                volume_dragging = overlay.volume_dragging();
+                            }
                         }
                     }
                 }
@@ -982,7 +971,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         if overlay.volume_dragging() {
                             let video = overlay.video;
                             if let Some((vx, _)) = client_to_video(hwnd, x, y, video) {
-                                overlay.drag_volume(vx);
+                                if with_context(hwnd, |_| ()).is_some() {
+                                    overlay.drag_volume(vx);
+                                }
                             }
                         }
                     }
