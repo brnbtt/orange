@@ -15,7 +15,9 @@
 use anyhow::{bail, Result};
 use std::sync::mpsc;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, COLORREF, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_DONOTROUND, DWMWCP_ROUND,
@@ -319,46 +321,52 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
     if width == 0 || height == 0 {
         return;
     }
-    let _ = with_context(hwnd, |ctx| {
-        let previous = ctx.source.replace((width, height));
-        if ctx.restore.get().is_some() {
-            return;
-        }
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() {
-            return;
-        }
-        let old_w = rect.right - rect.left;
-        let old_h = rect.bottom - rect.top;
-        let first_size = previous == (0, 0);
-        let bounds = ctx.envelope.get();
-        let (new_w, new_h) = fit_aspect(bounds.0, bounds.1, width, height);
-        let (x, y) = if first_size {
-            playback_position(ctx.profile, new_w, new_h)
-        } else if ctx.profile == PlaybackProfile::LiveMonitor {
-            (rect.right - new_w, rect.bottom - new_h)
-        } else {
-            (
-                rect.left + (old_w - new_w) / 2,
-                rect.top + (old_h - new_h) / 2,
-            )
-        };
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            x,
-            y,
-            new_w,
-            new_h,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-    });
+    let Some((previous, fullscreen, bounds, profile)) = with_context(hwnd, |ctx| {
+        (
+            ctx.source.replace((width, height)),
+            ctx.restore.get().is_some(),
+            ctx.envelope.get(),
+            ctx.profile,
+        )
+    }) else {
+        return;
+    };
+    if fullscreen {
+        return;
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return;
+    }
+    let old_w = rect.right - rect.left;
+    let old_h = rect.bottom - rect.top;
+    let first_size = previous == (0, 0);
+    let (new_w, new_h) = fit_aspect(bounds.0, bounds.1, width, height);
+    let (x, y) = if first_size {
+        playback_position(profile, new_w, new_h)
+    } else if profile == PlaybackProfile::LiveMonitor {
+        (rect.right - new_w, rect.bottom - new_h)
+    } else {
+        (
+            rect.left + (old_w - new_w) / 2,
+            rect.top + (old_h - new_h) / 2,
+        )
+    };
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        x,
+        y,
+        new_w,
+        new_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
 }
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aspect_locked_size, fit_aspect, with_context_ptr};
+    use super::{aspect_locked_size, fit_aspect};
     use windows::Win32::UI::WindowsAndMessaging::{
         WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP,
         WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
@@ -421,57 +429,33 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn null_context_pointer_skips_action() {
-        let result: Option<()> = unsafe { with_context_ptr(std::ptr::null::<u32>(), |_| panic!()) };
-
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn valid_context_pointer_executes_action_and_extracts_value() {
-        let value = 41;
-        let mut calls = 0;
-
-        let result = unsafe {
-            with_context_ptr(&value, |value| {
-                calls += 1;
-                *value + 1
-            })
-        };
-
-        assert_eq!(calls, 1);
-        assert_eq!(result, Some(42));
-    }
 }
 
 unsafe fn constrain_sizing(hwnd: HWND, edge: usize, rect: &mut RECT) -> bool {
-    with_context(hwnd, |ctx| {
-        let Some((width, height)) = Some(ctx.source.get()).filter(|(w, h)| *w > 0 && *h > 0) else {
-            return false;
-        };
-        let current_w = rect.right - rect.left;
-        let current_h = rect.bottom - rect.top;
-        let Some((locked_w, locked_h)) =
-            aspect_locked_size(edge as u32, current_w, current_h, (width, height))
-        else {
-            return false;
-        };
+    let Some((width, height)) = with_context(hwnd, |ctx| ctx.source.get())
+        .filter(|(width, height)| *width > 0 && *height > 0)
+    else {
+        return false;
+    };
+    let current_w = rect.right - rect.left;
+    let current_h = rect.bottom - rect.top;
+    let Some((locked_w, locked_h)) =
+        aspect_locked_size(edge as u32, current_w, current_h, (width, height))
+    else {
+        return false;
+    };
 
-        match edge as u32 {
-            WMSZ_TOP | WMSZ_BOTTOM => rect.right = rect.left + locked_w,
-            WMSZ_TOPLEFT | WMSZ_TOPRIGHT => {
-                rect.top = rect.bottom - locked_h;
-            }
-            WMSZ_LEFT | WMSZ_RIGHT | WMSZ_BOTTOMLEFT | WMSZ_BOTTOMRIGHT => {
-                rect.bottom = rect.top + locked_h;
-            }
-            _ => return false,
+    match edge as u32 {
+        WMSZ_TOP | WMSZ_BOTTOM => rect.right = rect.left + locked_w,
+        WMSZ_TOPLEFT | WMSZ_TOPRIGHT => {
+            rect.top = rect.bottom - locked_h;
         }
-        true
-    })
-    .unwrap_or(false)
+        WMSZ_LEFT | WMSZ_RIGHT | WMSZ_BOTTOMLEFT | WMSZ_BOTTOMRIGHT => {
+            rect.bottom = rect.top + locked_h;
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Tell the overlay what display scaling it is being shown at.
@@ -480,11 +464,12 @@ unsafe fn sync_dpi(hwnd: HWND) {
     if dpi == 0 {
         return;
     }
-    let _ = with_context(hwnd, |ctx| {
-        if let Ok(mut overlay) = ctx.overlay.lock() {
-            overlay.dpi = dpi as f32 / 96.0;
-        }
-    });
+    let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) else {
+        return;
+    };
+    if let Ok(mut overlay) = overlay.lock() {
+        overlay.dpi = dpi as f32 / 96.0;
+    };
 }
 
 unsafe fn sync_client_size(hwnd: HWND) {
@@ -492,14 +477,15 @@ unsafe fn sync_client_size(hwnd: HWND) {
     if GetClientRect(hwnd, &mut rect).is_err() {
         return;
     }
-    let _ = with_context(hwnd, |ctx| {
-        if let Ok(mut overlay) = ctx.overlay.lock() {
-            overlay.client = (
-                (rect.right - rect.left).max(0) as u32,
-                (rect.bottom - rect.top).max(0) as u32,
-            );
-        }
-    });
+    let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) else {
+        return;
+    };
+    if let Ok(mut overlay) = overlay.lock() {
+        overlay.client = (
+            (rect.right - rect.left).max(0) as u32,
+            (rect.bottom - rect.top).max(0) as u32,
+        );
+    };
 }
 
 unsafe fn set_corner_style(hwnd: HWND, fullscreen: bool) {
@@ -522,58 +508,80 @@ unsafe fn set_corner_style(hwnd: HWND, fullscreen: bool) {
 /// and taking the monitor's bounds - and of using *this* window's monitor
 /// rather than the primary one, which is the part people notice.
 unsafe fn toggle_fullscreen(hwnd: HWND) {
-    let _ = with_context(hwnd, |ctx| {
-        let was_fullscreen = ctx.restore.get().is_some();
+    let Some(restore) = with_context(hwnd, |ctx| ctx.restore.take()) else {
+        return;
+    };
+    let was_fullscreen = restore.is_some();
 
-        if let Some((style, bounds)) = ctx.restore.take() {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                bounds.left,
-                bounds.top,
-                bounds.right - bounds.left,
-                bounds.bottom - bounds.top,
-                SWP_NOZORDER | SWP_FRAMECHANGED,
-            );
-        } else {
-            let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
-            let mut bounds = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut bounds);
-
-            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-                return;
-            }
-
-            ctx.restore.set(Some((style, bounds)));
-            SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !WS_THICKFRAME).0 as isize);
-            let screen = info.rcMonitor;
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOP),
-                screen.left,
-                screen.top,
-                screen.right - screen.left,
-                screen.bottom - screen.top,
-                SWP_FRAMECHANGED,
-            );
+    if let Some((style, bounds)) = restore {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
+        if with_context(hwnd, |_| ()).is_none() {
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+            SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    } else {
+        let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
+        if with_context(hwnd, |_| ()).is_none() {
+            return;
+        }
+        let mut bounds = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut bounds);
+        if with_context(hwnd, |_| ()).is_none() {
+            return;
         }
 
-        if let Ok(mut overlay) = ctx.overlay.lock() {
-            overlay.fullscreen = ctx.restore.get().is_some();
-            overlay.wake();
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
         }
-        set_corner_style(hwnd, ctx.restore.get().is_some());
-        if was_fullscreen {
-            let (width, height) = ctx.source.get();
-            resize_to_video_aspect(hwnd, width, height);
+
+        if with_context(hwnd, |ctx| ctx.restore.set(Some((style, bounds)))).is_none() {
+            return;
         }
-    });
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !WS_THICKFRAME).0 as isize);
+        if with_context(hwnd, |_| ()).is_none() {
+            return;
+        }
+        let screen = info.rcMonitor;
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            screen.left,
+            screen.top,
+            screen.right - screen.left,
+            screen.bottom - screen.top,
+            SWP_FRAMECHANGED,
+        );
+    }
+
+    let Some((overlay, fullscreen)) = with_context(hwnd, |ctx| {
+        (ctx.overlay.clone(), ctx.restore.get().is_some())
+    }) else {
+        return;
+    };
+    if let Ok(mut overlay) = overlay.lock() {
+        overlay.fullscreen = fullscreen;
+        overlay.wake();
+    }
+    set_corner_style(hwnd, fullscreen);
+    if was_fullscreen {
+        let Some((width, height)) = with_context(hwnd, |ctx| ctx.source.get()) else {
+            return;
+        };
+        resize_to_video_aspect(hwnd, width, height);
+    }
 }
 
 /// Map a point in client coordinates to the video's coordinate space.
@@ -607,72 +615,58 @@ fn client_to_video(hwnd: HWND, cx: f32, cy: f32, video: (u32, u32)) -> Option<(f
 /// `WM_NCCALCSIZE` removes its visible non-client strips. We therefore identify
 /// the edges ourselves instead of relying on the frame that is no longer there.
 unsafe fn resize_hit_test(hwnd: HWND, x: i32, y: i32) -> Option<LRESULT> {
-    with_context(hwnd, |ctx| {
-        if ctx.restore.get().is_some() {
-            return None; // no resize edges in fullscreen
-        }
+    if with_context(hwnd, |ctx| ctx.restore.get().is_some())? {
+        return None; // no resize edges in fullscreen
+    }
 
-        let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect).ok()?;
-        if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom {
-            return None;
-        }
-        let dpi = GetDpiForWindow(hwnd).max(96);
-        let edge_x = GetSystemMetricsForDpi(SM_CXFRAME, dpi)
-            + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-        let edge_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi)
-            + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-        let left = x < rect.left + edge_x;
-        let right = x >= rect.right - edge_x;
-        let top = y < rect.top + edge_y;
-        let bottom = y >= rect.bottom - edge_y;
+    let mut rect = RECT::default();
+    GetWindowRect(hwnd, &mut rect).ok()?;
+    if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom {
+        return None;
+    }
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    let edge_x =
+        GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    let edge_y =
+        GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    let left = x < rect.left + edge_x;
+    let right = x >= rect.right - edge_x;
+    let top = y < rect.top + edge_y;
+    let bottom = y >= rect.bottom - edge_y;
 
-        let hit = match (left, right, top, bottom) {
-            (true, _, true, _) => HTTOPLEFT,
-            (_, true, true, _) => HTTOPRIGHT,
-            (true, _, _, true) => HTBOTTOMLEFT,
-            (_, true, _, true) => HTBOTTOMRIGHT,
-            (true, _, _, _) => HTLEFT,
-            (_, true, _, _) => HTRIGHT,
-            (_, _, true, _) => HTTOP,
-            (_, _, _, true) => HTBOTTOM,
-            _ => return None,
-        };
-        Some(LRESULT(hit as isize))
-    })
-    .flatten()
-}
-
-/// Runs `action` with the context pointer's referent without exposing its lifetime.
-///
-/// # Safety
-///
-/// `ptr` must be null or point to a valid `T` for the synchronous duration of
-/// `action`.
-unsafe fn with_context_ptr<T, R>(
-    ptr: *const T,
-    action: impl for<'a> FnOnce(&'a T) -> R,
-) -> Option<R> {
-    // SAFETY: The caller guarantees that a non-null pointer remains valid for
-    // the synchronous action, and the HRTB prevents `R` from borrowing it.
-    ptr.as_ref().map(action)
+    let hit = match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, _, _, _) => HTLEFT,
+        (_, true, _, _) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (_, _, _, true) => HTBOTTOM,
+        _ => return None,
+    };
+    Some(LRESULT(hit as isize))
 }
 
 /// Runs `action` synchronously with this window's installed context.
 ///
 /// # Safety
 ///
-/// `hwnd` must be accessed on its owning window thread. `GWLP_USERDATA` is
-/// either null or the `Box<WindowContext>` installed for this HWND; access is
-/// synchronous, and `WM_DESTROY` removes the pointer before freeing the box.
+/// `hwnd` must be accessed synchronously on its owning window thread, and
+/// `action` must not destroy the window or call APIs that can dispatch window
+/// messages. `GWLP_USERDATA` must be null or the pointer installed by
+/// `Box::into_raw` for this HWND. A non-null pointer must remain properly
+/// aligned, initialized, and dereferenceable for one `WindowContext` throughout
+/// `action`, with no overlapping mutable access except through `UnsafeCell`
+/// interior mutability. `WM_DESTROY` removes the pointer before freeing it.
 unsafe fn with_context<R>(
     hwnd: HWND,
     action: impl for<'a> FnOnce(&'a WindowContext) -> R,
 ) -> Option<R> {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowContext;
-    // SAFETY: The window-thread and GWLP_USERDATA invariants documented above
-    // ensure the pointer remains valid for the synchronous closure call.
-    with_context_ptr(ptr, action)
+    // SAFETY: The caller upholds the documented validity, aliasing, thread, and
+    // no-reentrant-destruction requirements for the synchronous action.
+    unsafe { ptr.as_ref() }.map(action)
 }
 
 unsafe fn primary_work_area() -> Result<RECT> {
@@ -785,7 +779,7 @@ unsafe fn create_window(
         std::mem::size_of_val(&border) as u32,
     );
 
-    // Leaked deliberately and reclaimed in WM_DESTROY.
+    // Ownership transfers to GWLP_USERDATA and is reclaimed in WM_DESTROY.
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
         revealed: std::cell::Cell::new(false),
@@ -795,7 +789,24 @@ unsafe fn create_window(
         size_move_start: std::cell::Cell::new((0, 0)),
         restore: std::cell::Cell::new(None),
     }));
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
+    SetLastError(ERROR_SUCCESS);
+    let previous = SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
+    if previous == 0 {
+        let error = GetLastError();
+        if error != ERROR_SUCCESS {
+            // SAFETY: Installation failed, so the fresh allocation was never
+            // transferred to the HWND and remains exclusively owned here.
+            drop(Box::from_raw(ctx));
+            let _ = DestroyWindow(hwnd);
+            bail!("failed to install window context (Win32 error {})", error.0);
+        }
+    } else {
+        eprintln!("[window] replaced unexpected existing window context");
+        // SAFETY: A non-null value in our private GWLP_USERDATA slot is an
+        // installed Box<WindowContext>. The successful replacement removed it
+        // from the HWND, and creation has no active context borrow.
+        drop(Box::from_raw(previous as *mut WindowContext));
+    }
 
     sync_dpi(hwnd);
     sync_client_size(hwnd);
@@ -827,9 +838,10 @@ unsafe fn cursor_inside(hwnd: HWND) -> bool {
 
 /// Whether the controls are currently on screen. The cursor follows them.
 unsafe fn controls_visible(hwnd: HWND) -> bool {
-    with_context(hwnd, |ctx| ctx.overlay.lock().ok().map(|o| o.visible()))
-        .flatten()
-        .unwrap_or(true)
+    let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) else {
+        return true;
+    };
+    overlay.lock().ok().map(|o| o.visible()).unwrap_or(true)
 }
 
 unsafe fn run_message_loop() {
@@ -848,22 +860,23 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 LRESULT(0)
             }
             REVEAL_MESSAGE => {
-                let _ = with_context(hwnd, |ctx| {
-                    if !ctx.revealed.replace(true) {
-                        let activate = ctx.profile.activates_on_reveal();
-                        let flags = if activate {
-                            AW_BLEND | AW_ACTIVATE
-                        } else {
-                            AW_BLEND
-                        };
-                        if AnimateWindow(hwnd, REVEAL_MS, flags).is_err() {
-                            let _ = ShowWindow(
-                                hwnd,
-                                if activate { SW_SHOW } else { SW_SHOWNOACTIVATE },
-                            );
-                        }
+                let activate = with_context(hwnd, |ctx| {
+                    (!ctx.revealed.replace(true)).then(|| ctx.profile.activates_on_reveal())
+                })
+                .flatten();
+                if let Some(activate) = activate {
+                    let flags = if activate {
+                        AW_BLEND | AW_ACTIVATE
+                    } else {
+                        AW_BLEND
+                    };
+                    if AnimateWindow(hwnd, REVEAL_MS, flags).is_err()
+                        && with_context(hwnd, |_| ()).is_some()
+                    {
+                        let _ =
+                            ShowWindow(hwnd, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
                     }
-                });
+                }
                 LRESULT(0)
             }
             // Let video occupy the complete window while retaining
@@ -913,17 +926,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 };
                 let _ = ScreenToClient(hwnd, &mut point);
 
-                let over_control = with_context(hwnd, |ctx| {
-                    let mut overlay = ctx.overlay.lock().ok()?;
-                    let video = overlay.video;
-                    let (vx, vy) = client_to_video(hwnd, point.x as f32, point.y as f32, video)?;
-                    Some(overlay.on_mouse_move(vx, vy))
-                })
-                .flatten()
-                .unwrap_or(false);
+                let over_control = with_context(hwnd, |ctx| ctx.overlay.clone())
+                    .and_then(|overlay| {
+                        let mut overlay = overlay.lock().ok()?;
+                        let video = overlay.video;
+                        let (vx, vy) =
+                            client_to_video(hwnd, point.x as f32, point.y as f32, video)?;
+                        Some(overlay.on_mouse_move(vx, vy))
+                    })
+                    .unwrap_or(false);
 
-                let hot = with_context(hwnd, |ctx| ctx.overlay.lock().ok().map(|o| o.hovered()))
-                    .flatten()
+                let hot = with_context(hwnd, |ctx| ctx.overlay.clone())
+                    .and_then(|overlay| overlay.lock().ok().map(|o| o.hovered()))
                     .unwrap_or(false);
 
                 let _ = over_control;
@@ -939,8 +953,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let mut close = false;
                 let mut fullscreen = false;
                 let mut volume_dragging = false;
-                let _ = with_context(hwnd, |ctx| {
-                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
+                    if let Ok(mut overlay) = overlay.lock() {
                         let video = overlay.video;
                         if let Some((vx, vy)) = client_to_video(hwnd, x, y, video) {
                             overlay.on_click(vx, vy);
@@ -949,7 +963,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             volume_dragging = overlay.volume_dragging();
                         }
                     }
-                });
+                }
                 // Outside the lock: toggling fullscreen takes it again.
                 if close {
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -963,8 +977,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_MOUSEMOVE => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
-                let _ = with_context(hwnd, |ctx| {
-                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
+                    if let Ok(mut overlay) = overlay.lock() {
                         if overlay.volume_dragging() {
                             let video = overlay.video;
                             if let Some((vx, _)) = client_to_video(hwnd, x, y, video) {
@@ -972,26 +986,24 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             }
                         }
                     }
-                });
+                }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                let released = with_context(hwnd, |ctx| {
-                    ctx.overlay.lock().ok().map(|mut o| o.end_volume_drag())
-                })
-                .flatten()
-                .unwrap_or(false);
+                let released = with_context(hwnd, |ctx| ctx.overlay.clone())
+                    .and_then(|overlay| overlay.lock().ok().map(|mut o| o.end_volume_drag()))
+                    .unwrap_or(false);
                 if released {
                     let _ = ReleaseCapture();
                 }
                 LRESULT(0)
             }
             WM_CAPTURECHANGED | WM_CANCELMODE => {
-                let _ = with_context(hwnd, |ctx| {
-                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
+                    if let Ok(mut overlay) = overlay.lock() {
                         overlay.end_volume_drag();
                     }
-                });
+                }
                 LRESULT(0)
             }
             // Keep the overlay's idea of the window in step, so the controls
@@ -999,11 +1011,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_SIZE => {
                 let width = (lparam.0 & 0xFFFF) as u16 as u32;
                 let height = ((lparam.0 >> 16) & 0xFFFF) as u16 as u32;
-                let _ = with_context(hwnd, |ctx| {
-                    if let Ok(mut overlay) = ctx.overlay.lock() {
+                if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
+                    if let Ok(mut overlay) = overlay.lock() {
                         overlay.client = (width, height);
                     }
-                });
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN if wparam.0 == VK_F11.0 as usize => {
@@ -1081,8 +1093,19 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             WM_DESTROY => {
                 let _ = KillTimer(Some(hwnd), CURSOR_TIMER);
+                SetLastError(ERROR_SUCCESS);
                 let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut WindowContext;
-                if !ptr.is_null() {
+                if ptr.is_null() {
+                    let error = GetLastError();
+                    if error != ERROR_SUCCESS {
+                        eprintln!(
+                            "[window] failed to clear window context (Win32 error {})",
+                            error.0
+                        );
+                    }
+                } else {
+                    // SAFETY: A non-null return means the clear succeeded and
+                    // transferred the installed Box back from GWLP_USERDATA.
                     drop(Box::from_raw(ptr));
                 }
                 PostQuitMessage(0);
