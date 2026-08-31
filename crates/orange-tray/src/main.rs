@@ -107,7 +107,10 @@ impl Orange {
         .detach();
 
         let session = session::load();
-        let preferences = session::load_preferences();
+        let (preferences, preference_error) = match session::load_preferences() {
+            Ok(preferences) => (preferences, None),
+            Err(error) => (session::Preferences::default(), Some(error)),
+        };
         let avatar_rx = request_avatar(session.as_ref().and_then(|s| s.avatar_url.clone()));
         let updates = update::UpdateController::new();
         Self {
@@ -130,7 +133,10 @@ impl Orange {
             host: None,
             watches: Vec::new(),
             logging_in: None,
-            notice: None,
+            notice: preference_error.map(|error| Notice {
+                text: format!("Could not load preferences: {error}"),
+                expires_at: Instant::now() + Duration::from_secs(4),
+            }),
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
             sized_for: None,
             copied_at: None,
@@ -261,12 +267,28 @@ impl Orange {
         self.notice = None;
     }
 
-    fn save_preferences(&self) {
-        session::save_preferences(session::Preferences {
+    fn save_preferences(&mut self) {
+        let preferences = session::Preferences {
             quality: self.quality,
             fps: self.fps,
             own_codes: self.own_codes.clone(),
-        });
+        };
+        if let Err(error) = session::save_preferences(&preferences) {
+            self.show_error(format!("Could not save preferences: {error}"));
+        }
+    }
+
+    fn sign_out(&mut self, destination: Option<Screen>) {
+        if let Err(error) = session::clear() {
+            self.show_error(format!("Could not sign out: {error}"));
+            return;
+        }
+        self.session = None;
+        self.avatar = None;
+        self.avatar_rx = None;
+        if let Some(destination) = destination {
+            self.screen = destination;
+        }
     }
 
     fn refresh_windows(&mut self) {
@@ -1258,11 +1280,7 @@ impl Orange {
                     )
                     .child(
                         quiet("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
-                            session::clear();
-                            this.session = None;
-                            this.avatar = None;
-                            this.avatar_rx = None;
-                            this.screen = Screen::SignedOut;
+                            this.sign_out(Some(Screen::SignedOut));
                             cx.notify();
                         })),
                     ),
@@ -1895,10 +1913,7 @@ impl Orange {
                     .child(match signed_in {
                         Some(_) => quiet("so", "Sign out")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                session::clear();
-                                this.session = None;
-                                this.avatar = None;
-                                this.avatar_rx = None;
+                                this.sign_out(None);
                                 cx.notify();
                             }))
                             .into_any_element(),
