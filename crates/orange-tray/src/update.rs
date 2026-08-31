@@ -769,17 +769,19 @@ mod tests {
                 worker: Some(worker),
             }),
         );
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            release_tx.send(()).unwrap();
+        std::thread::scope(|scope| {
+            let releaser = scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = release_tx.send(());
+            });
+
+            let started = Instant::now();
+            assert!(controller.poll_event().is_none());
+            assert!(started.elapsed() < Duration::from_millis(25));
+            assert!(controller.job.is_some());
+
+            releaser.join().unwrap();
         });
-
-        let started = Instant::now();
-        assert!(controller.poll_event().is_none());
-        assert!(started.elapsed() < Duration::from_millis(25));
-        assert!(controller.job.is_some());
-
-        releaser.join().unwrap();
         assert!(exited.load(Ordering::SeqCst));
         assert!(controller.poll_event().is_none());
         assert!(controller.job.is_none());
@@ -789,13 +791,21 @@ mod tests {
     fn controller_drop_cancels_and_joins_its_background_job() {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let worker_cancel_observed = Arc::clone(&cancel_observed);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let (_sender, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            while !worker_cancel.load(Ordering::Acquire) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !worker_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            worker_cancel_observed.store(worker_cancel.load(Ordering::Acquire), Ordering::Release);
+            cancelled_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             worker_exited.store(true, Ordering::Release);
         });
         let controller = controller(
@@ -807,9 +817,67 @@ mod tests {
             }),
         );
 
-        drop(controller);
+        std::thread::scope(|scope| {
+            let releaser = scope.spawn(move || {
+                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(25));
+                let _ = release_tx.send(());
+            });
 
-        assert!(exited.load(Ordering::Acquire));
+            drop(controller);
+
+            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(exited.load(Ordering::Acquire));
+            releaser.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn controller_job_replacement_cancels_and_joins_the_old_worker() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let worker_cancel_observed = Arc::clone(&cancel_observed);
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
+        let (_sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !worker_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_cancel_observed.store(worker_cancel.load(Ordering::Acquire), Ordering::Release);
+            cancelled_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            worker_exited.store(true, Ordering::Release);
+        });
+        let mut controller = controller(
+            UpdateStatus::Failed {
+                message: "offline".into(),
+            },
+            Some(UpdateJob {
+                receiver,
+                cancel,
+                worker: Some(worker),
+            }),
+        );
+
+        std::thread::scope(|scope| {
+            let releaser = scope.spawn(move || {
+                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(25));
+                let _ = release_tx.send(());
+            });
+
+            controller.stop_job();
+
+            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(exited.load(Ordering::Acquire));
+            releaser.join().unwrap();
+        });
+        assert!(controller.job.is_none());
     }
 
     #[test]
@@ -958,6 +1026,28 @@ mod tests {
         assert_eq!(reader.reads, 2);
         assert!(!temporary.exists());
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn successful_download_copy_syncs_checksums_and_renames_the_temporary_file() {
+        let bytes = b"known installer bytes";
+        let expected_sha256 = format!("{:X}", Sha256::digest(bytes));
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("download.tmp");
+        let destination = directory.path().join("orange-setup.exe");
+        let cancel = AtomicBool::new(false);
+
+        finish_download(
+            &mut &bytes[..],
+            &temporary,
+            &destination,
+            &expected_sha256,
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+        assert!(!temporary.exists());
     }
 
     #[test]

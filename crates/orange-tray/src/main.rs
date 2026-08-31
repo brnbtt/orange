@@ -124,7 +124,7 @@ fn join_background_worker(worker: JoinHandle<()>, timeout: Duration, name: &str)
 fn replace_thumbnail_job(
     job: &mut Option<ThumbnailJob>,
     handles: Vec<i64>,
-    capture: impl Fn(i64) -> Option<capture::Thumbnail> + Send + 'static,
+    capture: impl Fn(i64, &AtomicBool) -> Option<capture::Thumbnail> + Send + 'static,
 ) {
     stop_thumbnail_job(job);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -135,7 +135,7 @@ fn replace_thumbnail_job(
             if worker_cancel.load(Ordering::Acquire) {
                 return;
             }
-            let thumbnail = capture(hwnd);
+            let thumbnail = capture(hwnd, &worker_cancel);
             if worker_cancel.load(Ordering::Acquire) {
                 return;
             }
@@ -163,7 +163,7 @@ fn stop_thumbnail_job(job: &mut Option<ThumbnailJob>) {
 fn replace_avatar_job(
     job: &mut Option<AvatarJob>,
     url: Option<String>,
-    fetch: impl FnOnce(&str) -> Option<Vec<u8>> + Send + 'static,
+    fetch: impl FnOnce(&str, &AtomicBool) -> Option<Vec<u8>> + Send + 'static,
 ) {
     stop_avatar_job(job);
     let Some(url) = url else {
@@ -176,7 +176,7 @@ fn replace_avatar_job(
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
-        let bytes = fetch(&url);
+        let bytes = fetch(&url, &worker_cancel);
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
@@ -279,7 +279,7 @@ impl Orange {
         replace_avatar_job(
             &mut avatar_job,
             session.as_ref().and_then(|s| s.avatar_url.clone()),
-            fetch_avatar,
+            |url, _| fetch_avatar(url),
         );
         let updates = update::UpdateController::new();
         Self {
@@ -344,7 +344,7 @@ impl Orange {
                     replace_avatar_job(
                         &mut self.avatar_job,
                         session.avatar_url.clone(),
-                        fetch_avatar,
+                        |url, _| fetch_avatar(url),
                     );
                     self.session = Some(session);
                     self.logging_in = None;
@@ -499,7 +499,7 @@ impl Orange {
                 // costs tens of milliseconds per window, so doing this inline
                 // froze the app for as long as it took to walk the list.
                 let handles: Vec<i64> = windows.iter().map(|w| w.hwnd).collect();
-                replace_thumbnail_job(&mut self.thumbnail_job, handles, |hwnd| {
+                replace_thumbnail_job(&mut self.thumbnail_job, handles, |hwnd, _| {
                     if hwnd == 0 {
                         capture::screen_thumbnail(320, 180)
                     } else {
@@ -930,64 +930,94 @@ mod tests {
     #[test]
     fn thumbnail_background_job_replacement_cancels_and_joins_the_old_worker() {
         let (entered_tx, entered_rx) = mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let old_capture_returned = Arc::new(AtomicBool::new(false));
-        let returned = Arc::clone(&old_capture_returned);
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let worker_cancel_observed = Arc::clone(&cancel_observed);
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
         let mut job = None;
 
-        replace_thumbnail_job(&mut job, vec![1, 2], move |_| {
+        replace_thumbnail_job(&mut job, vec![1, 2], move |_, cancel| {
             entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            returned.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_cancel_observed.store(cancel.load(Ordering::Acquire), Ordering::Release);
+            cancelled_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            worker_exited.store(true, Ordering::Release);
             Some((1, 1, vec![0; 4]))
         });
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("old capture did not start");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(25));
-            release_tx.send(()).unwrap();
+
+        std::thread::scope(|scope| {
+            let releaser = scope.spawn(move || {
+                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(25));
+                let _ = release_tx.send(());
+            });
+
+            replace_thumbnail_job(&mut job, vec![3], |_, _| None);
+
+            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(exited.load(Ordering::Acquire));
+            releaser.join().unwrap();
         });
-
-        replace_thumbnail_job(&mut job, vec![3], |_| None);
-
-        releaser.join().unwrap();
-        assert!(old_capture_returned.load(Ordering::SeqCst));
         stop_thumbnail_job(&mut job);
     }
 
     #[test]
     fn avatar_background_job_replacement_cancels_and_joins_the_old_worker() {
         let (entered_tx, entered_rx) = mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let old_fetch_returned = Arc::new(AtomicBool::new(false));
-        let returned = Arc::clone(&old_fetch_returned);
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let worker_cancel_observed = Arc::clone(&cancel_observed);
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
         let mut job = None;
 
         replace_avatar_job(
             &mut job,
             Some("https://example.com/old.png".into()),
-            move |_| {
+            move |_, cancel| {
                 entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                returned.store(true, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                worker_cancel_observed.store(cancel.load(Ordering::Acquire), Ordering::Release);
+                cancelled_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                worker_exited.store(true, Ordering::Release);
                 Some(Vec::new())
             },
         );
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("old fetch did not start");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(25));
-            release_tx.send(()).unwrap();
-        });
 
-        replace_avatar_job(&mut job, Some("https://example.com/new.png".into()), |_| {
-            None
-        });
+        std::thread::scope(|scope| {
+            let releaser = scope.spawn(move || {
+                let _ = cancelled_rx.recv_timeout(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(25));
+                let _ = release_tx.send(());
+            });
 
-        releaser.join().unwrap();
-        assert!(old_fetch_returned.load(Ordering::SeqCst));
+            replace_avatar_job(
+                &mut job,
+                Some("https://example.com/new.png".into()),
+                |_, _| None,
+            );
+
+            assert!(cancel_observed.load(Ordering::Acquire));
+            assert!(exited.load(Ordering::Acquire));
+            releaser.join().unwrap();
+        });
         stop_avatar_job(&mut job);
     }
 
