@@ -70,7 +70,7 @@ fn diagnostic_json(
     event: &str,
     role: &str,
     payload: impl Serialize,
-) -> String {
+) -> Result<String, serde_json::Error> {
     serde_json::to_string(&DiagnosticRecord {
         at_unix_ms,
         elapsed_ms,
@@ -82,7 +82,6 @@ fn diagnostic_json(
         profile: metadata.profile.as_deref(),
         payload,
     })
-    .expect("diagnostic payload should serialize")
 }
 
 pub(crate) trait OperationOutcome {
@@ -530,6 +529,9 @@ fn emit_to_test_sink(event: &str, role: &str, payload: &impl Serialize) -> bool 
         let Some(records) = sink.as_mut() else {
             return false;
         };
+        let Ok(payload) = serde_json::to_value(payload) else {
+            return true;
+        };
         records.push(serde_json::json!({
             "event": event,
             "role": role,
@@ -560,9 +562,10 @@ fn emit_diagnostic_to(
     role: &str,
     payload: impl Serialize,
 ) {
-    let context = DIAGNOSTIC_CONTEXT
-        .get()
-        .expect("diagnostic context initialized with sink");
+    let Some(context) = DIAGNOSTIC_CONTEXT.get() else {
+        eprintln!("[media-diagnostics] diagnostic context unavailable");
+        return;
+    };
     let at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -572,14 +575,22 @@ fn emit_diagnostic_to(
         .elapsed()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
-    let line = diagnostic_json(
+    let line = match diagnostic_json(
         &context.metadata,
         elapsed_ms,
         at_unix_ms,
         event,
         role,
         payload,
-    );
+    ) {
+        Ok(line) => line,
+        Err(error) => {
+            eprintln!(
+                "[media-diagnostics] could not serialize event {event:?} for role {role:?}: {error}"
+            );
+            return;
+        }
+    };
     let _ = sink.try_send(DiagnosticCommand::Line(line));
 }
 
@@ -680,8 +691,50 @@ mod tests {
     use super::*;
     use gstreamer as gst;
     use gstreamer_webrtc as gst_webrtc;
+    use serde::Serializer;
     use std::cell::RefCell;
     use std::path::Path;
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "deliberate serialization failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn diagnostic_json_returns_serialization_error() {
+        let result: Result<String, serde_json::Error> = diagnostic_json(
+            &DiagnosticMetadata::default(),
+            17,
+            1_725_000_000_000,
+            "test-event",
+            "watch",
+            FailingSerialize,
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "deliberate serialization failure"
+        );
+    }
+
+    #[test]
+    fn test_sink_handles_serialization_error_without_capturing_a_record() {
+        let result = std::panic::catch_unwind(|| {
+            capture_diagnostics(|| {
+                assert!(emit_to_test_sink("test-event", "watch", &FailingSerialize));
+            })
+        });
+
+        assert_eq!(result.unwrap(), Vec::<serde_json::Value>::new());
+    }
 
     #[test]
     fn diagnostic_metadata_is_omitted_when_allowlisted_environment_is_absent() {
@@ -694,7 +747,8 @@ mod tests {
             "test-event",
             "watch",
             serde_json::json!({ "value": 42 }),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&json).unwrap(),
@@ -725,7 +779,8 @@ mod tests {
             "test-event",
             "watch",
             serde_json::json!({}),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&json).unwrap(),
