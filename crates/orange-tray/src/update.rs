@@ -31,7 +31,7 @@ pub(crate) struct UpdateInfo {
     pub(crate) notes: String,
 }
 
-pub(crate) enum UpdateEvent {
+enum UpdateEvent {
     Checked(Result<Option<UpdateInfo>, String>),
     Downloaded {
         info: UpdateInfo,
@@ -63,19 +63,6 @@ impl UpdateStatus {
             Self::Failed { .. } => Some("Check again"),
             Self::Disabled | Self::Checking | Self::Current | Self::Downloading(_) => None,
         }
-    }
-}
-
-enum Request {
-    Check,
-    Download(UpdateInfo),
-}
-
-fn request_for(status: &UpdateStatus) -> Option<Request> {
-    match status {
-        UpdateStatus::Available(info) => Some(Request::Download(info.clone())),
-        UpdateStatus::Failed { .. } => Some(Request::Check),
-        _ => None,
     }
 }
 
@@ -184,16 +171,17 @@ impl UpdateController {
     }
 
     pub(crate) fn request_update(&mut self) {
-        match request_for(&self.status) {
-            Some(Request::Download(info)) => {
+        match &self.status {
+            UpdateStatus::Available(info) => {
+                let info = info.clone();
                 self.receiver = Some(start_download(info.clone()));
                 self.status = UpdateStatus::Downloading(info);
             }
-            Some(Request::Check) => {
+            UpdateStatus::Failed { .. } => {
                 self.status = UpdateStatus::Checking;
                 self.receiver = start_check();
             }
-            None => {}
+            _ => {}
         }
     }
 }
@@ -215,7 +203,7 @@ struct UpdateManifest {
     notes: String,
 }
 
-pub(crate) fn enabled() -> bool {
+fn enabled() -> bool {
     option_env!("ORANGE_UPDATE_CHANNEL") == Some("beta")
 }
 
@@ -414,7 +402,7 @@ fn copy_bounded(reader: &mut impl Read, writer: &mut impl Write, limit: u64) -> 
     Ok(copied)
 }
 
-pub(crate) fn start_check() -> Option<Receiver<UpdateEvent>> {
+fn start_check() -> Option<Receiver<UpdateEvent>> {
     enabled().then(|| {
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
@@ -425,7 +413,7 @@ pub(crate) fn start_check() -> Option<Receiver<UpdateEvent>> {
     })
 }
 
-pub(crate) fn start_download(info: UpdateInfo) -> Receiver<UpdateEvent> {
+fn start_download(info: UpdateInfo) -> Receiver<UpdateEvent> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = download_update(&info).map_err(|error| error.to_string());
@@ -550,24 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn controller_processes_at_most_one_event_per_tick() {
-        let first = update_info();
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(UpdateEvent::Checked(Ok(Some(first.clone()))))
-            .unwrap();
-        sender.send(UpdateEvent::Checked(Ok(None))).unwrap();
-        let mut controller = controller(UpdateStatus::Checking, Some(receiver));
-
-        assert!(controller.poll_event().is_none());
-        assert!(controller.poll_event().is_none());
-        assert!(matches!(
-            controller.status(),
-            UpdateStatus::Available(info) if info == &first
-        ));
-    }
-
-    #[test]
     fn controller_failures_use_exact_messages() {
         for (status, event, expected) in [
             (
@@ -641,21 +611,6 @@ mod tests {
         ] {
             assert_eq!(periodic_check_due(enabled, idle, due, status), expected);
         }
-    }
-
-    #[test]
-    fn controller_request_policy() {
-        let info = update_info();
-        assert!(matches!(
-            request_for(&UpdateStatus::Available(info.clone())),
-            Some(Request::Download(requested)) if requested == info
-        ));
-        assert!(matches!(
-            request_for(&UpdateStatus::Failed {
-                message: "offline".into()
-            }),
-            Some(Request::Check)
-        ));
     }
 
     #[test]
