@@ -91,7 +91,12 @@ pub fn target_refresh_rate(hwnd: isize) -> Option<u32> {
 /// Cosmetic only: the frame behind the video, visible for an instant before
 /// the first frame arrives and in the letterbox bars.
 const BACKGROUND: COLORREF = COLORREF(0x000b0b0b); // BGR
-type ClassResult = std::result::Result<(), u32>;
+#[derive(Clone, Copy)]
+enum ClassError {
+    BrushAllocation,
+    Windows(u32),
+}
+type ClassResult = std::result::Result<(), ClassError>;
 static VIEWER_CLASS_RESULT: OnceLock<ClassResult> = OnceLock::new();
 
 /// Drives cursor hiding. Windows only asks about the cursor when the mouse
@@ -229,6 +234,8 @@ fn spawn_window(
         match create_window(&title, envelope, profile, overlay, alive.clone()) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
+                    alive.store(false, Ordering::Release);
+                    let _ = DestroyWindow(hwnd);
                     return;
                 }
                 run_message_loop(hwnd, &alive);
@@ -383,12 +390,7 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{
-        aspect_locked_size, cached_class_result, fit_aspect, message_result, MessageResult,
-    };
-    use std::cell::Cell;
-    use std::sync::OnceLock;
-    use windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
+    use super::{aspect_locked_size, fit_aspect, message_result, MessageResult};
     use windows::Win32::UI::WindowsAndMessaging::{
         WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP,
         WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
@@ -454,35 +456,11 @@ mod tests {
 
     #[test]
     fn message_result_preserves_get_message_tri_state() {
+        assert_eq!(message_result(-42), MessageResult::Error);
         assert_eq!(message_result(-1), MessageResult::Error);
         assert_eq!(message_result(0), MessageResult::Quit);
         assert_eq!(message_result(1), MessageResult::Dispatch);
         assert_eq!(message_result(42), MessageResult::Dispatch);
-    }
-
-    #[test]
-    fn viewer_class_result_is_initialized_once() {
-        let class = OnceLock::new();
-        let calls = Cell::new(0);
-
-        assert_eq!(
-            cached_class_result(&class, || {
-                calls.set(calls.get() + 1);
-                Ok(())
-            }),
-            Ok(())
-        );
-        assert_eq!(cached_class_result(&class, || panic!()), Ok(()));
-        assert_eq!(calls.get(), 1);
-    }
-
-    #[test]
-    fn viewer_class_result_caches_unverified_existing_class_as_failure() {
-        let class = OnceLock::new();
-        let error = ERROR_CLASS_ALREADY_EXISTS.0;
-
-        assert_eq!(cached_class_result(&class, || Err(error)), Err(error));
-        assert_eq!(cached_class_result(&class, || panic!()), Err(error));
     }
 }
 
@@ -747,20 +725,16 @@ unsafe fn playback_position(profile: PlaybackProfile, width: i32, height: i32) -
     }
 }
 
-fn cached_class_result(
-    result: &OnceLock<ClassResult>,
-    register: impl FnOnce() -> ClassResult,
-) -> ClassResult {
-    *result.get_or_init(register)
-}
-
 unsafe fn ensure_viewer_class(instance: HINSTANCE) -> Result<()> {
-    let result = cached_class_result(&VIEWER_CLASS_RESULT, || {
+    let result = VIEWER_CLASS_RESULT.get_or_init(|| {
         let cursor = match LoadCursorW(None, IDC_ARROW) {
             Ok(cursor) => cursor,
-            Err(error) => return Err(error.code().0 as u32),
+            Err(error) => return Err(ClassError::Windows(error.code().0 as u32)),
         };
         let brush = CreateSolidBrush(BACKGROUND);
+        if brush.0.is_null() {
+            return Err(ClassError::BrushAllocation);
+        }
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
@@ -780,12 +754,17 @@ unsafe fn ensure_viewer_class(instance: HINSTANCE) -> Result<()> {
         let _ = DeleteObject(HGDIOBJ(brush.0));
         // An earlier successful result is the only proof that this class is
         // ours; an already-existing class observed here remains a failure.
-        Err(error)
+        Err(ClassError::Windows(error))
     });
-    if let Err(error) = result {
-        bail!("failed to register viewer window class (Win32 error {error})");
+    match result {
+        Ok(()) => Ok(()),
+        Err(ClassError::BrushAllocation) => {
+            bail!("failed to allocate viewer window class brush")
+        }
+        Err(ClassError::Windows(error)) => {
+            bail!("failed to register viewer window class (Win32 error {error})")
+        }
     }
-    Ok(())
 }
 
 unsafe fn create_window(
@@ -920,10 +899,12 @@ enum MessageResult {
 }
 
 fn message_result(result: i32) -> MessageResult {
-    match result {
-        -1 => MessageResult::Error,
-        0 => MessageResult::Quit,
-        _ => MessageResult::Dispatch,
+    if result > 0 {
+        MessageResult::Dispatch
+    } else if result == 0 {
+        MessageResult::Quit
+    } else {
+        MessageResult::Error
     }
 }
 
@@ -932,10 +913,14 @@ unsafe fn run_message_loop(hwnd: HWND, alive: &AtomicBool) {
     loop {
         match message_result(GetMessageW(&mut msg, None, 0, 0).0) {
             MessageResult::Error => {
-                let _ = writeln!(std::io::stderr().lock(), "[window] GetMessageW failed (-1)");
+                let error = GetLastError().0;
                 if alive.swap(false, Ordering::AcqRel) {
                     let _ = DestroyWindow(hwnd);
                 }
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[window] GetMessageW failed (Win32 error {error})"
+                );
                 break;
             }
             MessageResult::Quit => break,

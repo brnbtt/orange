@@ -13,7 +13,7 @@ use std::io::Write;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::{
@@ -46,17 +46,24 @@ pub fn install() -> Result<Receiver<TrayEvent>> {
     let (ready_tx, ready_rx) = channel::<Result<()>>();
     std::thread::spawn(move || unsafe {
         match create() {
-            Ok(hwnd) => {
-                let _ = ready_tx.send(Ok(()));
+            Ok((hwnd, owned_icon)) => {
+                if ready_tx.send(Ok(())).is_err() {
+                    let _ = DestroyWindow(hwnd);
+                    if let Some(icon) = owned_icon {
+                        let _ = DestroyIcon(icon);
+                    }
+                    return;
+                }
                 let mut msg = MSG::default();
                 loop {
                     match message_result(GetMessageW(&mut msg, None, 0, 0).0) {
                         MessageResult::Error => {
+                            let error = GetLastError().0;
+                            let _ = DestroyWindow(hwnd);
                             let _ = writeln!(
                                 std::io::stderr().lock(),
-                                "[tray] GetMessageW failed (-1)"
+                                "[tray] GetMessageW failed (Win32 error {error})"
                             );
-                            let _ = DestroyWindow(hwnd);
                             break;
                         }
                         MessageResult::Quit => break,
@@ -65,6 +72,9 @@ pub fn install() -> Result<Receiver<TrayEvent>> {
                             DispatchMessageW(&msg);
                         }
                     }
+                }
+                if let Some(icon) = owned_icon {
+                    let _ = DestroyIcon(icon);
                 }
             }
             Err(err) => {
@@ -85,14 +95,16 @@ enum MessageResult {
 }
 
 fn message_result(result: i32) -> MessageResult {
-    match result {
-        -1 => MessageResult::Error,
-        0 => MessageResult::Quit,
-        _ => MessageResult::Dispatch,
+    if result > 0 {
+        MessageResult::Dispatch
+    } else if result == 0 {
+        MessageResult::Quit
+    } else {
+        MessageResult::Error
     }
 }
 
-unsafe fn create() -> Result<HWND> {
+unsafe fn create() -> Result<(HWND, Option<HICON>)> {
     let instance = GetModuleHandleW(None)?;
     let class_name = w!("orange_tray_icon");
 
@@ -120,6 +132,27 @@ unsafe fn create() -> Result<HWND> {
         None,
     )?;
 
+    let (icon, owned_icon) = match LoadImageW(
+        Some(instance.into()),
+        PCWSTR(std::ptr::with_exposed_provenance(1)),
+        IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON),
+        GetSystemMetrics(SM_CYSMICON),
+        LR_DEFAULTCOLOR,
+    ) {
+        Ok(handle) => {
+            let icon = HICON(handle.0);
+            (icon, Some(icon))
+        }
+        Err(_) => match LoadIconW(None, IDI_APPLICATION) {
+            Ok(icon) => (icon, None),
+            Err(error) => {
+                let _ = DestroyWindow(hwnd);
+                return Err(error.into());
+            }
+        },
+    };
+
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -128,16 +161,7 @@ unsafe fn create() -> Result<HWND> {
         uCallbackMessage: WM_TRAY,
         // Load the optical small-size entry from the multi-resolution icon;
         // asking for the system tray metric avoids a blurry 32px downscale.
-        hIcon: LoadImageW(
-            Some(instance.into()),
-            PCWSTR(std::ptr::with_exposed_provenance(1)),
-            IMAGE_ICON,
-            GetSystemMetrics(SM_CXSMICON),
-            GetSystemMetrics(SM_CYSMICON),
-            LR_DEFAULTCOLOR,
-        )
-        .map(|handle| HICON(handle.0))
-        .or_else(|_| LoadIconW(None, IDI_APPLICATION))?,
+        hIcon: icon,
         ..Default::default()
     };
 
@@ -145,9 +169,13 @@ unsafe fn create() -> Result<HWND> {
     data.szTip[..tip.len()].copy_from_slice(&tip);
 
     if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
+        let _ = DestroyWindow(hwnd);
+        if let Some(icon) = owned_icon {
+            let _ = DestroyIcon(icon);
+        }
         anyhow::bail!("Shell_NotifyIcon refused to add the tray icon");
     }
-    Ok(hwnd)
+    Ok((hwnd, owned_icon))
 }
 
 fn emit(event: TrayEvent) {
@@ -283,6 +311,7 @@ mod tests {
 
     #[test]
     fn message_result_preserves_get_message_tri_state() {
+        assert_eq!(message_result(-42), MessageResult::Error);
         assert_eq!(message_result(-1), MessageResult::Error);
         assert_eq!(message_result(0), MessageResult::Quit);
         assert_eq!(message_result(1), MessageResult::Dispatch);
