@@ -105,13 +105,14 @@ git commit -m "Preserve rooms across code collisions"
 
 **Interfaces:**
 - Produces: non-cloneable `PlaybackWindow` containing one `Option<JoinHandle<()>>`.
-- Produces: cloneable `PlaybackWindowHandle` containing only the HWND, overlay, liveness state, and shutdown identity needed by passive callbacks.
+- Produces: cloneable `PlaybackWindowHandle` containing only synchronized native state and overlay access needed by passive callbacks.
 - Produces: `PlaybackWindow::handle(&self) -> PlaybackWindowHandle`.
-- Changes: `webrtc::Output::Window(PlaybackWindowHandle)` and callback/diagnostics arguments to passive handles.
+- Preserves: public `webrtc::Output::Window(PlaybackWindow)` as the unique ownership transfer into a session.
+- Produces: internal `ReceiveOutput::Window(PlaybackWindowHandle)` used only by GStreamer callbacks; callback/diagnostics arguments use passive handles.
 
 - [ ] **Step 1: Add failing owner/handle lifecycle tests**
 
-Add Windows tests proving that dropping a passive handle does not close the window, dropping the unique owner closes and joins while a passive handle remains, and a mismatched private shutdown identity is rejected.
+Add Windows tests proving that dropping a passive handle does not close the window, dropping the unique owner closes and joins while a passive handle remains, user close marks playback dead while reserving the HWND until owner teardown, and startup failure joins its thread.
 
 - [ ] **Step 2: Verify the tests fail because `PlaybackWindow` is cloneable and has no worker handle**
 
@@ -119,11 +120,11 @@ Run: `. .\dev.ps1; cargo test -p orange window::tests::playback_owner -- --nocap
 
 - [ ] **Step 3: Split owner from handle and retain the native thread**
 
-Change `spawn_window` to return the HWND plus its `JoinHandle`. Use one private shutdown message with a per-window identity; execute `DestroyWindow` only on the creator thread. `PlaybackWindow::drop` posts shutdown and joins without holding the overlay mutex.
+Change `spawn_window` to retain and return its `JoinHandle`. Put the live HWND in a mutex-protected shared slot that `WM_DESTROY` invalidates before reuse. Ordinary `WM_CLOSE` marks playback dead and hides the still-reserved HWND; owner-only shutdown posts one private message that executes `DestroyWindow` on the creator thread. `PlaybackWindow::drop` posts shutdown and joins without holding the overlay mutex.
 
 - [ ] **Step 4: Keep the owner outside every GStreamer graph**
 
-Retain `PlaybackWindow` in synchronous CLI command scope. Pass only `PlaybackWindowHandle` through `Output`, bus handlers, overlay callbacks, and diagnostics workers. Ensure host/watch/loopback/preview pipelines reach `Null` before the owner drops.
+Transfer `PlaybackWindow` through the high-level `Output`, then split it at the start of loopback/watch into a session-local owner plus internal `ReceiveOutput`. Pass only `PlaybackWindowHandle` through bus handlers, overlay callbacks, receive construction, and diagnostics workers. Ensure watch/loopback/preview pipelines reach `Null` before the session-local owner drops, including early errors.
 
 - [ ] **Step 5: Run focused playback and receive tests**
 
@@ -289,6 +290,132 @@ git add crates
 git commit -m "Close remaining process lifetimes"
 ```
 
+### Task 6A: Own The Native Tray Thread
+
+**Files:**
+- Modify: `crates/orange-tray/src/tray.rs`
+- Modify: `crates/orange-tray/src/main.rs:1679-1776` before the view extraction, or the corresponding post-extraction startup block
+- Test: `crates/orange-tray/src/tray.rs`
+
+**Interfaces:**
+- Replaces: `install() -> Result<Receiver<TrayEvent>>` with one `Tray` owner exposing event reception and explicit/idempotent shutdown.
+- Owns: native HWND, event receiver, and `JoinHandle<()>`.
+
+- [ ] **Step 1: Add a failing install/shutdown/reinstall test**
+
+Install a hidden tray owner, shut it down, require its native thread to finish within one second, then install and shut down a second owner in the same process.
+
+- [ ] **Step 2: Verify the test fails because HWND and worker are discarded**
+
+Run: `cargo test -p orange-tray tray::tests::tray_owner -- --nocapture`
+
+- [ ] **Step 3: Return and retain one tray owner**
+
+Send the HWND through readiness, retain the worker, replace the permanent global event sender with window-owned context where possible, and have shutdown post close/destroy on the native thread before joining. Keep the owner outside `Application::run` so app exit triggers deterministic icon removal and join.
+
+- [ ] **Step 4: Run tray tests and commit**
+
+Run: `cargo test -p orange-tray --locked`
+
+```text
+git add crates/orange-tray/src/tray.rs crates/orange-tray/src/main.rs
+git commit -m "Own the native tray lifecycle"
+```
+
+### Task 6B: Own Tray Thumbnail, Avatar, And Update Jobs
+
+**Files:**
+- Modify: `crates/orange-tray/src/main.rs`
+- Modify: `crates/orange-tray/src/update.rs`
+- Test: the same modules
+
+**Interfaces:**
+- Produces: feature-local thumbnail and avatar job owners with cancellation plus `JoinHandle`.
+- Produces: `UpdateController`-owned check/download job with result receiver, cancellation, and `JoinHandle`.
+
+- [ ] **Step 1: Add failing replacement/cancellation tests**
+
+Use private injected capture/fetch/copy closures to prove rapid thumbnail refresh joins the replaced job, avatar replacement has bounded cancellation, update cancellation leaves no temporary file, and completed jobs are joined when their event is polled.
+
+- [ ] **Step 2: Verify current receiver-only jobs fail ownership assertions**
+
+Run: `cargo test -p orange-tray background_job -- --nocapture`
+
+- [ ] **Step 3: Add local owners without a shared job framework**
+
+Check cancellation before and after each synchronous capture and between streamed download chunks. Add explicit avatar connect/total timeouts. Join completed workers after receiving their terminal result; cancel then join on owner replacement/drop. Do not move GPUI image construction off the UI thread.
+
+- [ ] **Step 4: Run tray tests and commit**
+
+Run: `cargo test -p orange-tray --locked`
+
+```text
+git add crates/orange-tray/src/main.rs crates/orange-tray/src/update.rs
+git commit -m "Own tray background jobs"
+```
+
+### Task 6C: Release Loopback Pads And Callback Cycles
+
+**Files:**
+- Modify: `crates/orange/src/webrtc.rs:50-224`
+- Test: `crates/orange/src/webrtc.rs`
+
+**Interfaces:**
+- Produces: private requested-pad owner that unlinks and calls `release_request_pad` on every exit path.
+- Produces: loopback signal callbacks that capture weak elements or are disconnected before pipeline destruction.
+
+- [ ] **Step 1: Add a failing repeated loopback-construction teardown test**
+
+Build and tear down the loopback signaling graph repeatedly in one process. Assert the requested sink-pad count returns to baseline and weak sender/receiver elements no longer upgrade after teardown.
+
+- [ ] **Step 2: Verify the test exposes the unreleased pad or strong callback cycle**
+
+Run: `. .\dev.ps1; cargo test -p orange webrtc::tests::loopback_teardown -- --nocapture`
+
+- [ ] **Step 3: Add local RAII/disconnection ownership**
+
+Release the requested pad on link failure and normal teardown. Replace strong cross-captures with GStreamer weak references, or retain/disconnect exact handler IDs before `Null`; do not create a general GObject callback manager.
+
+- [ ] **Step 4: Run WebRTC tests and commit**
+
+Run: `. .\dev.ps1; cargo test -p orange webrtc::tests`
+
+```text
+git add crates/orange/src/webrtc.rs
+git commit -m "Release loopback media resources"
+```
+
+### Task 6D: Guarantee Pipeline Null On Every Exit
+
+**Files:**
+- Modify: `crates/orange/src/main.rs:331-503`
+- Modify only if the common guard is reused: `crates/orange/src/peer.rs`
+- Test: `crates/orange/src/main.rs`
+
+**Interfaces:**
+- Produces: the smallest local pipeline-state owner or explicit error branches that attempt `State::Null` after every failed `Playing` transition and normal run.
+
+- [ ] **Step 1: Add a failing state-transition cleanup test**
+
+Use a test pipeline or private injected state setter to make `Playing` fail after pipeline creation; assert `Null` is attempted before the function returns.
+
+- [ ] **Step 2: Verify the existing early `?` bypasses cleanup**
+
+Run: `. .\dev.ps1; cargo test -p orange pipeline_run_failure_returns_to_null -- --nocapture`
+
+- [ ] **Step 3: Add the local cleanup boundary**
+
+Cover `run_pipeline` and `run_until_closed` without changing EOS timing or successful behavior. Reuse it in host/watch only if it reduces code and preserves their explicit worker-before-pipeline ordering.
+
+- [ ] **Step 4: Run Orange tests and commit**
+
+Run: `. .\dev.ps1; cargo test -p orange --locked`
+
+```text
+git add crates/orange/src/main.rs crates/orange/src/peer.rs
+git commit -m "Guarantee pipeline state cleanup"
+```
+
 ### Task 7: Split Stable Responsibilities Without Redesign
 
 **Files:**
@@ -299,7 +426,8 @@ git commit -m "Close remaining process lifetimes"
 - Create: `crates/orange/src/media_diagnostics/operation.rs`
 - Create: `crates/orange/src/media_diagnostics/progress.rs`
 - Create: `crates/orange/src/media_diagnostics/webrtc_monitor.rs`
-- Create: `crates/orange/src/overlay/render.rs`
+- Create: `crates/orange/src/overlay/raster.rs`
+- Create: `crates/orange/src/overlay/gst.rs`
 - Create: `crates/orange-tray/src/view.rs`
 - Create: `crates/orange-signal/src/protocol.rs`
 - Create: `crates/orange-signal/src/client.rs`
@@ -312,7 +440,7 @@ git commit -m "Close remaining process lifetimes"
 - `peer.rs` remains the facade and owns shared bus, connection-state, ICE, and SDP helpers.
 - `peer::host` owns host capture/signaling orchestration; `peer::host_branch` owns tee/request-pad construction, offer creation, and deterministic viewer removal; `peer::watch` owns receive-session orchestration.
 - `media_diagnostics.rs` remains the facade; `writer.rs` owns JSONL persistence, `operation.rs` owns timed operation events, `progress.rs` owns stage counters/probes, and `webrtc_monitor.rs` owns WebRTC stats polling.
-- `overlay.rs` owns interaction state and GStreamer attachment; `render.rs` owns rasterization.
+- `overlay.rs` owns interaction state, `raster.rs` owns layout/raster/composition generation, and `gst.rs` owns GStreamer attachment and panic containment.
 - tray `main.rs` owns `Orange` state/effects/bootstrap; `view.rs` owns the existing Render implementation, global chrome, listener wiring, and all six screen methods in one child module.
 - `orange-signal::protocol` owns `Signal`; `client` owns `SignalClient` and connection tasks; `relay` owns room/peer state; `diagnostics` owns upload storage, metadata validation, and its route handler. Existing public re-exports remain stable.
 
