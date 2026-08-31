@@ -172,11 +172,17 @@ enum DiagnosticCommand {
 
 pub(crate) struct DiagnosticsHandle {
     active: Arc<AtomicBool>,
+    stop: SyncSender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for DiagnosticsHandle {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
+        let _ = self.stop.try_send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -649,46 +655,54 @@ pub(crate) fn start_webrtc_diagnostics(
     let in_flight = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicBool::new(true));
     let active_for_worker = active.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(2));
-        if !active_for_worker.load(Ordering::Acquire) {
-            break;
-        }
-        let Some(bin) = bin.upgrade() else { break };
-
-        if let Some(progress) = &progress {
-            let snapshot = progress.snapshot();
-            let ui_responsive = playback
-                .as_ref()
-                .map(crate::window::PlaybackWindow::is_responsive);
-            emit_diagnostic(
-                "media-progress",
-                &label,
-                serde_json::json!({
-                    "ui_responsive": ui_responsive,
-                    "progress": snapshot,
-                }),
-            );
-        }
-
-        if in_flight.swap(true, Ordering::AcqRel) {
-            continue;
-        }
-        let in_flight_for_reply = in_flight.clone();
-        let active_for_reply = active_for_worker.clone();
-        let label_for_reply = label.clone();
-        let promise = gst::Promise::with_change_func(move |reply| {
-            if active_for_reply.load(Ordering::Acquire) {
-                if let Ok(Some(stats)) = reply {
-                    let report = parse_webrtc_stats(stats);
-                    emit_diagnostic("webrtc-stats", &label_for_reply, report);
-                }
+    let (stop, stopped) = sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            stopped.recv_timeout(Duration::from_secs(2))
+        {
+            if !active_for_worker.load(Ordering::Acquire) {
+                break;
             }
-            in_flight_for_reply.store(false, Ordering::Release);
-        });
-        bin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+            let Some(bin) = bin.upgrade() else { break };
+
+            if let Some(progress) = &progress {
+                let snapshot = progress.snapshot();
+                let ui_responsive = playback
+                    .as_ref()
+                    .map(crate::window::PlaybackWindow::is_responsive);
+                emit_diagnostic(
+                    "media-progress",
+                    &label,
+                    serde_json::json!({
+                        "ui_responsive": ui_responsive,
+                        "progress": snapshot,
+                    }),
+                );
+            }
+
+            if in_flight.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            let in_flight_for_reply = in_flight.clone();
+            let active_for_reply = active_for_worker.clone();
+            let label_for_reply = label.clone();
+            let promise = gst::Promise::with_change_func(move |reply| {
+                if active_for_reply.load(Ordering::Acquire) {
+                    if let Ok(Some(stats)) = reply {
+                        let report = parse_webrtc_stats(stats);
+                        emit_diagnostic("webrtc-stats", &label_for_reply, report);
+                    }
+                }
+                in_flight_for_reply.store(false, Ordering::Release);
+            });
+            bin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        }
     });
-    Some(DiagnosticsHandle { active })
+    Some(DiagnosticsHandle {
+        active,
+        stop,
+        worker: Some(worker),
+    })
 }
 
 #[cfg(test)]
@@ -937,13 +951,28 @@ mod tests {
     #[test]
     fn dropping_diagnostics_stops_its_worker() {
         let active = Arc::new(AtomicBool::new(true));
+        let stop_observed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = sync_channel(1);
+        let stop_observed_for_worker = stop_observed.clone();
+        let worker_completed_for_worker = worker_completed.clone();
+        let worker = std::thread::spawn(move || {
+            if stopped.recv_timeout(Duration::from_secs(5)).is_ok() {
+                stop_observed_for_worker.store(true, Ordering::Release);
+            }
+            worker_completed_for_worker.store(true, Ordering::Release);
+        });
         let handle = DiagnosticsHandle {
             active: active.clone(),
+            stop,
+            worker: Some(worker),
         };
 
         drop(handle);
 
         assert!(!active.load(Ordering::Acquire));
+        assert!(stop_observed.load(Ordering::Acquire));
+        assert!(worker_completed.load(Ordering::Acquire));
     }
 
     #[test]
