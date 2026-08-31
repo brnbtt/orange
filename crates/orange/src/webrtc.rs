@@ -1100,40 +1100,9 @@ pub(crate) fn build_audio_branch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_in_bounded_subprocess;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
-
-    fn run_in_bounded_subprocess(env: &str, test: &str) -> bool {
-        if std::env::var_os(env).is_some() {
-            return false;
-        }
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env(env, "1")
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    assert!(status.success(), "child test failed: {test}");
-                    return true;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("could not wait for child test {test}: {error}");
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child test exceeded deadline: {test}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
 
     fn wait_for_thread(worker: Option<&std::thread::JoinHandle<()>>) -> bool {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1238,14 +1207,6 @@ mod tests {
         (src, sink)
     }
 
-    fn wait_for_counter(counter: &AtomicU64, expected: u64, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while counter.load(Ordering::SeqCst) != expected && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        counter.load(Ordering::SeqCst) == expected
-    }
-
     #[test]
     fn audio_control_receive_worker_cancels_while_overlay_is_locked() {
         if run_in_bounded_subprocess(
@@ -1333,7 +1294,7 @@ mod tests {
             &[&gst::Buffer::with_size(17).unwrap()],
         );
         let first_arrival = wait_for_arrival.recv_timeout(Duration::from_secs(1));
-        let first_observed = wait_for_counter(&bytes, 17, Duration::from_secs(1));
+        let first_observed = bytes.load(Ordering::SeqCst) == 17;
         worker.stop.take();
         let worker_finished = wait_for_thread(worker.worker.as_ref());
         let shutdown_result = worker.shutdown();

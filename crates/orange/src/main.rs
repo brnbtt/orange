@@ -6,6 +6,8 @@ mod overlay;
 mod peer;
 mod pipeline;
 mod targets;
+#[cfg(test)]
+mod test_support;
 mod text;
 mod webrtc;
 mod window;

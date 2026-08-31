@@ -458,40 +458,9 @@ fn handle_watch_diagnostic_signal(signal: &Signal) {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::test_support::run_in_bounded_subprocess;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
-
-    fn run_in_bounded_subprocess(env: &str, test: &str) -> bool {
-        if std::env::var_os(env).is_some() {
-            return false;
-        }
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env(env, "1")
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    assert!(status.success(), "child test failed: {test}");
-                    return true;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("could not wait for child test {test}: {error}");
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child test exceeded deadline: {test}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
 
     fn shutdown_startup_worker_bounded(mut worker: StartupKeyframeWorker) -> bool {
         let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
