@@ -11,7 +11,10 @@ use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const BETA_MANIFEST_URL: &str =
@@ -21,6 +24,7 @@ const MAX_INSTALLER_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_JOIN_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdateInfo {
@@ -83,21 +87,59 @@ fn periodic_check_due(
 
 pub(crate) struct UpdateController {
     status: UpdateStatus,
-    receiver: Option<Receiver<UpdateEvent>>,
+    job: Option<UpdateJob>,
     next_update_check: Instant,
+}
+
+struct UpdateJob {
+    receiver: Receiver<UpdateEvent>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl UpdateJob {
+    fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn join(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let deadline = Instant::now() + UPDATE_JOIN_TIMEOUT;
+        while !worker.is_finished() {
+            if Instant::now() >= deadline {
+                crate::tray::fail_fast(
+                    "update worker did not terminate before its deadline",
+                    &anyhow::anyhow!("timeout after {UPDATE_JOIN_TIMEOUT:?}"),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if worker.join().is_err() {
+            eprintln!("[tray] update worker panicked");
+        }
+    }
+}
+
+impl Drop for UpdateJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.join();
+    }
 }
 
 impl UpdateController {
     pub(crate) fn new() -> Self {
-        let receiver = start_check();
-        let status = if receiver.is_some() {
+        let job = start_check();
+        let status = if job.is_some() {
             UpdateStatus::Checking
         } else {
             UpdateStatus::Disabled
         };
         Self {
             status,
-            receiver,
+            job,
             next_update_check: Instant::now() + UPDATE_CHECK_INTERVAL,
         }
     }
@@ -107,22 +149,28 @@ impl UpdateController {
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<(UpdateInfo, PathBuf)> {
+        if self.job.as_ref().is_some_and(|job| !job.is_finished()) {
+            return None;
+        }
         let event = self
-            .receiver
+            .job
             .as_ref()
-            .and_then(|receiver| match receiver.try_recv() {
+            .and_then(|job| match job.receiver.try_recv() {
                 Ok(event) => Some(Ok(event)),
                 Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
                 Err(mpsc::TryRecvError::Empty) => None,
             });
+        if event.is_some() {
+            if let Some(mut job) = self.job.take() {
+                job.join();
+            }
+        }
         match event {
             Some(Ok(UpdateEvent::Checked(Ok(Some(info))))) => {
                 self.status = UpdateStatus::Available(info);
-                self.receiver = None;
             }
             Some(Ok(UpdateEvent::Checked(Ok(None)))) => {
                 self.status = UpdateStatus::Current;
-                self.receiver = None;
             }
             Some(Ok(UpdateEvent::Checked(Err(_)))) | Some(Err(())) => {
                 let message = if matches!(self.status, UpdateStatus::Downloading(_)) {
@@ -133,19 +181,15 @@ impl UpdateController {
                 self.status = UpdateStatus::Failed {
                     message: message.into(),
                 };
-                self.receiver = None;
             }
-            Some(Ok(UpdateEvent::Downloaded { info, result })) => {
-                self.receiver = None;
-                match result {
-                    Ok(installer) => return Some((info, installer)),
-                    Err(_) => {
-                        self.status = UpdateStatus::Failed {
-                            message: "Update download failed".into(),
-                        };
-                    }
+            Some(Ok(UpdateEvent::Downloaded { info, result })) => match result {
+                Ok(installer) => return Some((info, installer)),
+                Err(_) => {
+                    self.status = UpdateStatus::Failed {
+                        message: "Update download failed".into(),
+                    };
                 }
-            }
+            },
             None => {}
         }
         None
@@ -160,12 +204,13 @@ impl UpdateController {
     pub(crate) fn schedule_periodic(&mut self) {
         if periodic_check_due(
             enabled(),
-            self.receiver.is_none(),
+            self.job.is_none(),
             Instant::now() >= self.next_update_check,
             &self.status,
         ) {
             self.status = UpdateStatus::Checking;
-            self.receiver = start_check();
+            self.stop_job();
+            self.job = start_check();
             self.next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
         }
     }
@@ -174,15 +219,21 @@ impl UpdateController {
         match &self.status {
             UpdateStatus::Available(info) => {
                 let info = info.clone();
-                self.receiver = Some(start_download(info.clone()));
+                self.stop_job();
+                self.job = Some(start_download(info.clone()));
                 self.status = UpdateStatus::Downloading(info);
             }
             UpdateStatus::Failed { .. } => {
                 self.status = UpdateStatus::Checking;
-                self.receiver = start_check();
+                self.stop_job();
+                self.job = start_check();
             }
             _ => {}
         }
+    }
+
+    fn stop_job(&mut self) {
+        drop(self.job.take());
     }
 }
 
@@ -308,10 +359,14 @@ fn installer_matches(path: &Path, expected: &str) -> Result<bool> {
     Ok(path.is_file() && sha256_file(path)? == expected.to_ascii_uppercase())
 }
 
-pub(crate) fn check_for_update(current_version: &str) -> Result<Option<UpdateInfo>> {
+pub(crate) fn check_for_update(
+    current_version: &str,
+    cancel: &AtomicBool,
+) -> Result<Option<UpdateInfo>> {
     if !enabled() {
         return Ok(None);
     }
+    check_cancelled(cancel)?;
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
@@ -325,6 +380,7 @@ pub(crate) fn check_for_update(current_version: &str) -> Result<Option<UpdateInf
         .context("could not check for updates")?
         .error_for_status()
         .context("update service rejected the check")?;
+    check_cancelled(cancel)?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MANIFEST_BYTES)
@@ -332,17 +388,24 @@ pub(crate) fn check_for_update(current_version: &str) -> Result<Option<UpdateInf
         bail!("update manifest is too large");
     }
     let mut manifest = Vec::new();
-    copy_bounded(&mut response, &mut manifest, MAX_MANIFEST_BYTES)?;
+    copy_bounded(
+        &mut response,
+        &mut manifest,
+        MAX_MANIFEST_BYTES,
+        Some(cancel),
+    )?;
+    check_cancelled(cancel)?;
     let manifest = String::from_utf8(manifest).context("update manifest is not UTF-8")?;
     parse_update_manifest(&manifest, current_version)
 }
 
-pub(crate) fn download_update(info: &UpdateInfo) -> Result<PathBuf> {
+pub(crate) fn download_update(info: &UpdateInfo, cancel: &AtomicBool) -> Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
     let directory = PathBuf::from(local).join("orange").join("updates");
     std::fs::create_dir_all(&directory)?;
     let filename = format!("orange-setup-{}.exe", info.version);
     let destination = directory.join(filename);
+    check_cancelled(cancel)?;
     if destination.is_file() && installer_matches(&destination, &info.sha256)? {
         return Ok(destination);
     }
@@ -355,71 +418,140 @@ pub(crate) fn download_update(info: &UpdateInfo) -> Result<PathBuf> {
         info.version,
         std::process::id()
     ));
-    let result = (|| -> Result<()> {
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(10 * 60))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        let mut response = client
-            .get(info.installer_url.clone())
-            .send()
-            .context("could not download update")?
-            .error_for_status()
-            .context("update download failed")?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_INSTALLER_BYTES)
-        {
-            bail!("update is larger than 250 MiB");
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        copy_bounded(&mut response, &mut file, MAX_INSTALLER_BYTES)?;
-        file.flush()?;
-        file.sync_all()?;
-        if !installer_matches(&temporary, &info.sha256)? {
-            bail!("update checksum mismatch");
-        }
-        std::fs::rename(&temporary, &destination)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    check_cancelled(cancel)?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let mut response = client
+        .get(info.installer_url.clone())
+        .send()
+        .context("could not download update")?
+        .error_for_status()
+        .context("update download failed")?;
+    check_cancelled(cancel)?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_INSTALLER_BYTES)
+    {
+        bail!("update is larger than 250 MiB");
     }
-    result?;
+    finish_download(
+        &mut response,
+        &temporary,
+        &destination,
+        &info.sha256,
+        cancel,
+    )?;
     Ok(destination)
 }
 
-fn copy_bounded(reader: &mut impl Read, writer: &mut impl Write, limit: u64) -> Result<u64> {
-    let copied = std::io::copy(&mut reader.take(limit + 1), writer)?;
-    if copied > limit {
-        bail!("download exceeds its size limit");
+fn finish_download(
+    reader: &mut impl Read,
+    temporary: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary)?;
+        copy_bounded(reader, &mut file, MAX_INSTALLER_BYTES, Some(cancel))?;
+        file.flush()?;
+        file.sync_all()?;
+        check_cancelled(cancel)?;
+        if !installer_matches(temporary, expected_sha256)? {
+            bail!("update checksum mismatch");
+        }
+        check_cancelled(cancel)?;
+        std::fs::rename(temporary, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+fn copy_bounded(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    limit: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64> {
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if let Some(cancel) = cancel {
+            check_cancelled(cancel)?;
+        }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if let Some(cancel) = cancel {
+            check_cancelled(cancel)?;
+        }
+        copied = copied
+            .checked_add(read as u64)
+            .context("download size overflow")?;
+        if copied > limit {
+            bail!("download exceeds its size limit");
+        }
+        writer.write_all(&buffer[..read])?;
     }
     Ok(copied)
 }
 
-fn start_check() -> Option<Receiver<UpdateEvent>> {
+fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        bail!("update cancelled");
+    }
+    Ok(())
+}
+
+fn start_update_job(run: impl FnOnce(&AtomicBool) -> UpdateEvent + Send + 'static) -> UpdateJob {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        if worker_cancel.load(Ordering::Acquire) {
+            return;
+        }
+        let event = run(&worker_cancel);
+        if worker_cancel.load(Ordering::Acquire) {
+            return;
+        }
+        if !worker_cancel.load(Ordering::Acquire) {
+            let _ = sender.send(event);
+        }
+    });
+    UpdateJob {
+        receiver,
+        cancel,
+        worker: Some(worker),
+    }
+}
+
+fn start_check() -> Option<UpdateJob> {
     enabled().then(|| {
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = check_for_update(current_version()).map_err(|error| error.to_string());
-            let _ = sender.send(UpdateEvent::Checked(result));
-        });
-        receiver
+        start_update_job(|cancel| {
+            let result =
+                check_for_update(current_version(), cancel).map_err(|error| error.to_string());
+            UpdateEvent::Checked(result)
+        })
     })
 }
 
-fn start_download(info: UpdateInfo) -> Receiver<UpdateEvent> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = download_update(&info).map_err(|error| error.to_string());
-        let _ = sender.send(UpdateEvent::Downloaded { info, result });
-    });
-    receiver
+fn start_download(info: UpdateInfo) -> UpdateJob {
+    start_update_job(move |cancel| {
+        let result = download_update(&info, cancel).map_err(|error| error.to_string());
+        UpdateEvent::Downloaded { info, result }
+    })
 }
 
 fn prepare_updater(
@@ -490,6 +622,8 @@ pub(crate) fn launch_updater(info: &UpdateInfo, installer: &Path) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn update_info() -> UpdateInfo {
         UpdateInfo {
@@ -501,21 +635,33 @@ mod tests {
         }
     }
 
-    fn controller(
-        status: UpdateStatus,
-        receiver: Option<Receiver<UpdateEvent>>,
-    ) -> UpdateController {
+    fn controller(status: UpdateStatus, job: Option<UpdateJob>) -> UpdateController {
         UpdateController {
             status,
-            receiver,
+            job,
             next_update_check: Instant::now() + UPDATE_CHECK_INTERVAL,
         }
+    }
+
+    fn finished_worker() -> JoinHandle<()> {
+        let worker = std::thread::spawn(|| {});
+        while !worker.is_finished() {
+            std::thread::yield_now();
+        }
+        worker
     }
 
     fn controller_with_event(status: UpdateStatus, event: UpdateEvent) -> UpdateController {
         let (sender, receiver) = mpsc::channel();
         sender.send(event).unwrap();
-        controller(status, Some(receiver))
+        controller(
+            status,
+            Some(UpdateJob {
+                receiver,
+                cancel: Arc::new(AtomicBool::new(false)),
+                worker: Some(finished_worker()),
+            }),
+        )
     }
 
     #[test]
@@ -563,8 +709,16 @@ mod tests {
             let mut controller = if let Some(event) = event {
                 controller_with_event(status, event)
             } else {
-                let (_, receiver) = mpsc::channel();
-                controller(status, Some(receiver))
+                let (sender, receiver) = mpsc::channel();
+                drop(sender);
+                controller(
+                    status,
+                    Some(UpdateJob {
+                        receiver,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        worker: Some(finished_worker()),
+                    }),
+                )
             };
 
             assert!(controller.poll_event().is_none());
@@ -588,6 +742,74 @@ mod tests {
         );
 
         assert_eq!(controller.poll_event(), Some((info, installer)));
+    }
+
+    #[test]
+    fn polling_waits_until_a_terminal_background_job_is_finished_then_joins_it() {
+        let (sender, receiver) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
+        let worker = std::thread::spawn(move || {
+            sender.send(UpdateEvent::Checked(Ok(None))).unwrap();
+            sent_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            worker_exited.store(true, Ordering::SeqCst);
+        });
+        sent_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("update event was not sent");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut controller = controller(
+            UpdateStatus::Checking,
+            Some(UpdateJob {
+                receiver,
+                cancel,
+                worker: Some(worker),
+            }),
+        );
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release_tx.send(()).unwrap();
+        });
+
+        let started = Instant::now();
+        assert!(controller.poll_event().is_none());
+        assert!(started.elapsed() < Duration::from_millis(25));
+        assert!(controller.job.is_some());
+
+        releaser.join().unwrap();
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(controller.poll_event().is_none());
+        assert!(controller.job.is_none());
+    }
+
+    #[test]
+    fn controller_drop_cancels_and_joins_its_background_job() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
+        let (_sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while !worker_cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_exited.store(true, Ordering::Release);
+        });
+        let controller = controller(
+            UpdateStatus::Checking,
+            Some(UpdateJob {
+                receiver,
+                cancel,
+                worker: Some(worker),
+            }),
+        );
+
+        drop(controller);
+
+        assert!(exited.load(Ordering::Acquire));
     }
 
     #[test]
@@ -688,11 +910,54 @@ mod tests {
     fn bounded_copy_accepts_the_limit_and_rejects_one_more_byte() {
         let mut exact = &b"1234"[..];
         let mut exact_output = Vec::new();
-        assert_eq!(copy_bounded(&mut exact, &mut exact_output, 4).unwrap(), 4);
+        assert_eq!(
+            copy_bounded(&mut exact, &mut exact_output, 4, None).unwrap(),
+            4
+        );
         assert_eq!(exact_output, b"1234");
 
         let mut oversized = &b"12345"[..];
-        assert!(copy_bounded(&mut oversized, &mut Vec::new(), 4).is_err());
+        assert!(copy_bounded(&mut oversized, &mut Vec::new(), 4, None).is_err());
+    }
+
+    #[test]
+    fn cancelled_download_copy_removes_its_temporary_file() {
+        struct CancelAfterFirstChunk {
+            reads: usize,
+            cancel: Arc<AtomicBool>,
+        }
+
+        impl Read for CancelAfterFirstChunk {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    self.cancel.store(true, Ordering::Release);
+                }
+                buffer[..4].copy_from_slice(b"data");
+                Ok(4)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("download.tmp");
+        let destination = directory.path().join("orange-setup.exe");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut reader = CancelAfterFirstChunk {
+            reads: 0,
+            cancel: Arc::clone(&cancel),
+        };
+
+        assert!(finish_download(
+            &mut reader,
+            &temporary,
+            &destination,
+            &"0".repeat(64),
+            &cancel,
+        )
+        .is_err());
+        assert_eq!(reader.reads, 2);
+        assert!(!temporary.exists());
+        assert!(!destination.exists());
     }
 
     #[test]
