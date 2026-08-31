@@ -827,18 +827,12 @@ mod tests {
     #[test]
     fn controller_drop_cancels_and_joins_its_background_job() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let (_sender, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while !worker_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            let _ = cancelled_tx.send(worker_cancel.load(Ordering::Acquire));
             let _ = release_rx.recv_timeout(Duration::from_secs(1));
             worker_exited.store(true, Ordering::Release);
         });
@@ -850,9 +844,17 @@ mod tests {
                 worker: Some(worker),
             }),
         );
+        let old_cancel = Arc::clone(&controller.job.as_ref().unwrap().cancel);
 
         std::thread::scope(|scope| {
             let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let observer = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !old_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let _ = cancelled_tx.send(old_cancel.load(Ordering::Acquire));
+            });
             let caller = scope.spawn(move || {
                 drop(controller);
                 let _ = caller_done_tx.send(());
@@ -872,24 +874,19 @@ mod tests {
                 .expect("controller drop did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
             caller.join().unwrap();
+            observer.join().unwrap();
         });
     }
 
     #[test]
     fn controller_job_replacement_cancels_and_joins_the_old_worker() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
         let (_sender, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while !worker_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            let _ = cancelled_tx.send(worker_cancel.load(Ordering::Acquire));
             let _ = release_rx.recv_timeout(Duration::from_secs(1));
             worker_exited.store(true, Ordering::Release);
         });
@@ -903,9 +900,17 @@ mod tests {
                 worker: Some(worker),
             }),
         );
+        let old_cancel = Arc::clone(&controller.job.as_ref().unwrap().cancel);
 
         std::thread::scope(|scope| {
             let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let observer = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !old_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let _ = cancelled_tx.send(old_cancel.load(Ordering::Acquire));
+            });
             let controller = &mut controller;
             let caller = scope.spawn(move || {
                 controller.stop_job();
@@ -926,6 +931,7 @@ mod tests {
                 .expect("controller replacement did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
             caller.join().unwrap();
+            observer.join().unwrap();
         });
         assert!(controller.job.is_none());
     }

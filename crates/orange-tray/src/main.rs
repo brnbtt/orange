@@ -124,7 +124,7 @@ fn join_background_worker(worker: JoinHandle<()>, timeout: Duration, name: &str)
 fn replace_thumbnail_job(
     job: &mut Option<ThumbnailJob>,
     handles: Vec<i64>,
-    capture: impl Fn(i64, &AtomicBool) -> Option<capture::Thumbnail> + Send + 'static,
+    capture: impl Fn(i64) -> Option<capture::Thumbnail> + Send + 'static,
 ) {
     stop_thumbnail_job(job);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -135,7 +135,7 @@ fn replace_thumbnail_job(
             if worker_cancel.load(Ordering::Acquire) {
                 return;
             }
-            let thumbnail = capture(hwnd, &worker_cancel);
+            let thumbnail = capture(hwnd);
             if worker_cancel.load(Ordering::Acquire) {
                 return;
             }
@@ -163,7 +163,7 @@ fn stop_thumbnail_job(job: &mut Option<ThumbnailJob>) {
 fn replace_avatar_job(
     job: &mut Option<AvatarJob>,
     url: Option<String>,
-    fetch: impl FnOnce(&str, &AtomicBool) -> Option<Vec<u8>> + Send + 'static,
+    fetch: impl FnOnce(&str) -> Option<Vec<u8>> + Send + 'static,
 ) {
     stop_avatar_job(job);
     let Some(url) = url else {
@@ -176,7 +176,7 @@ fn replace_avatar_job(
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
-        let bytes = fetch(&url, &worker_cancel);
+        let bytes = fetch(&url);
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
@@ -279,7 +279,7 @@ impl Orange {
         replace_avatar_job(
             &mut avatar_job,
             session.as_ref().and_then(|s| s.avatar_url.clone()),
-            |url, _| fetch_avatar(url),
+            fetch_avatar,
         );
         let updates = update::UpdateController::new();
         Self {
@@ -344,7 +344,7 @@ impl Orange {
                     replace_avatar_job(
                         &mut self.avatar_job,
                         session.avatar_url.clone(),
-                        |url, _| fetch_avatar(url),
+                        fetch_avatar,
                     );
                     self.session = Some(session);
                     self.logging_in = None;
@@ -499,7 +499,7 @@ impl Orange {
                 // costs tens of milliseconds per window, so doing this inline
                 // froze the app for as long as it took to walk the list.
                 let handles: Vec<i64> = windows.iter().map(|w| w.hwnd).collect();
-                replace_thumbnail_job(&mut self.thumbnail_job, handles, |hwnd, _| {
+                replace_thumbnail_job(&mut self.thumbnail_job, handles, |hwnd| {
                     if hwnd == 0 {
                         capture::screen_thumbnail(320, 180)
                     } else {
@@ -956,26 +956,29 @@ mod tests {
         let worker_exited = Arc::clone(&exited);
         let mut job = None;
 
-        replace_thumbnail_job(&mut job, vec![1, 2], move |_, cancel| {
+        replace_thumbnail_job(&mut job, vec![1, 2], move |_| {
             entered_tx.send(()).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            let _ = cancelled_tx.send(cancel.load(Ordering::Acquire));
             let _ = release_rx.recv_timeout(Duration::from_secs(1));
             worker_exited.store(true, Ordering::Release);
             Some((1, 1, vec![0; 4]))
         });
+        let old_cancel = Arc::clone(&job.as_ref().unwrap().cancel);
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("old capture did not start");
 
         std::thread::scope(|scope| {
             let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let observer = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !old_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let _ = cancelled_tx.send(old_cancel.load(Ordering::Acquire));
+            });
             let job = &mut job;
             let caller = scope.spawn(move || {
-                replace_thumbnail_job(job, vec![3], |_, _| None);
+                replace_thumbnail_job(job, vec![3], |_| None);
                 let _ = caller_done_tx.send(());
             });
             let mut release = ReleaseOnDrop::new(release_tx);
@@ -993,6 +996,7 @@ mod tests {
                 .expect("replacement did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
             caller.join().unwrap();
+            observer.join().unwrap();
         });
         stop_thumbnail_job(&mut job);
     }
@@ -1009,27 +1013,30 @@ mod tests {
         replace_avatar_job(
             &mut job,
             Some("https://example.com/old.png".into()),
-            move |_, cancel| {
+            move |_| {
                 entered_tx.send(()).unwrap();
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
-                let _ = cancelled_tx.send(cancel.load(Ordering::Acquire));
                 let _ = release_rx.recv_timeout(Duration::from_secs(1));
                 worker_exited.store(true, Ordering::Release);
                 Some(Vec::new())
             },
         );
+        let old_cancel = Arc::clone(&job.as_ref().unwrap().cancel);
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("old fetch did not start");
 
         std::thread::scope(|scope| {
             let (caller_done_tx, caller_done_rx) = mpsc::channel();
+            let observer = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !old_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let _ = cancelled_tx.send(old_cancel.load(Ordering::Acquire));
+            });
             let job = &mut job;
             let caller = scope.spawn(move || {
-                replace_avatar_job(job, Some("https://example.com/new.png".into()), |_, _| None);
+                replace_avatar_job(job, Some("https://example.com/new.png".into()), |_| None);
                 let _ = caller_done_tx.send(());
             });
             let mut release = ReleaseOnDrop::new(release_tx);
@@ -1047,6 +1054,7 @@ mod tests {
                 .expect("replacement did not return after worker release");
             assert!(exited.load(Ordering::Acquire));
             caller.join().unwrap();
+            observer.join().unwrap();
         });
         stop_avatar_job(&mut job);
     }
