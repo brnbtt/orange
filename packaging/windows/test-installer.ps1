@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $iss = Get-Content -LiteralPath (Join-Path $PSScriptRoot "orange.iss") -Raw
 $package = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent | Split-Path -Parent) "package.ps1") -Raw
+$provenance = Get-Content -LiteralPath (Join-Path $PSScriptRoot "package-provenance.ps1") -Raw
 
 $checks = [ordered]@{
     "directory page disabled" = 'DisableDirPage=yes'
@@ -33,6 +34,28 @@ if ($iss -match 'Tasks:\s*(desktopicon|startup)') {
 }
 if ($iss -match 'vc_redist|Microsoft Visual C\+\+ runtime installer') {
     $failures.Add("machine-wide VC runtime installer remains")
+}
+$provenanceCalls = [regex]::Matches($package, 'Assert-PackageProvenance -Root \$root -BuildId \$BuildId')
+$tests = $package.IndexOf('if (-not $SkipTests)')
+$build = $package.IndexOf('cargo build --locked --release')
+if ($provenanceCalls.Count -ne 2 -or $provenanceCalls[0].Index -gt $tests -or $provenanceCalls[0].Index -gt $build) {
+    $failures.Add("initial provenance check does not precede tests and build")
+}
+if ($package -cnotmatch 'Assert-PackageProvenance -Root \$root -BuildId \$BuildId \| Out-Null\r?\n\s*& \$iscc') {
+    $failures.Add("final provenance check is not immediately before Inno")
+}
+$worktreeCheck = $provenance.IndexOf('git -C $Root diff --quiet')
+$indexCheck = $provenance.IndexOf('git -C $Root diff --cached --quiet')
+$headRead = $provenance.IndexOf('git -C $Root rev-parse HEAD')
+$headExit = $provenance.IndexOf('$headExitCode = $LASTEXITCODE')
+$headNonempty = $provenance.IndexOf('[string]::IsNullOrWhiteSpace([string]$headOutput)')
+$headTrim = $provenance.IndexOf('$head = ([string]$headOutput).Trim()')
+$buildValidation = $provenance.IndexOf('if ($BuildId -and')
+$laterGit = if ($headRead -ge 0) { $provenance.IndexOf('git -C $Root', $headRead + 1) } else { -1 }
+if ($worktreeCheck -lt 0 -or $indexCheck -le $worktreeCheck -or $headRead -le $indexCheck -or
+    $headExit -le $headRead -or $headNonempty -le $headExit -or $headTrim -le $headNonempty -or
+    $buildValidation -le $headTrim -or $laterGit -ge 0) {
+    $failures.Add("provenance helper does not finish with a fresh HEAD validation")
 }
 if ($failures.Count) {
     throw "Installer checks failed: $($failures -join ', ')"
