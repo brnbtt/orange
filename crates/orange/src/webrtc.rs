@@ -600,6 +600,29 @@ mod loopback_lifecycle_tests {
     }
 
     #[test]
+    fn loopback_linked_sender_owner_unlinks_and_releases_on_drop() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
+        pipeline.add_many([&source, &sender]).unwrap();
+        let src_pad = source.static_pad("src").unwrap();
+        let baseline = requested_sink_pad_count(&sender);
+
+        let owner = link_loopback_sender(&sender, &src_pad).unwrap();
+
+        assert!(src_pad.is_linked());
+        assert_eq!(requested_sink_pad_count(&sender), baseline + 1);
+        drop(owner);
+        assert!(!src_pad.is_linked());
+        assert_eq!(requested_sink_pad_count(&sender), baseline);
+
+        pipeline.set_state(gst::State::Null).unwrap();
+        pipeline.remove(&source).unwrap();
+        pipeline.remove(&sender).unwrap();
+    }
+
+    #[test]
     fn loopback_link_error_releases_requested_sink_pad() {
         gst::init().unwrap();
         let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
