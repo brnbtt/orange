@@ -22,6 +22,10 @@ const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 const SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const PENDING_CAPACITY: usize = 1024;
 const SESSION_CAPACITY: usize = 4096;
+const PENDING_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+const DISCORD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CANCELLED_MESSAGE: &str = "Login was cancelled";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
@@ -126,6 +130,7 @@ struct AuthState {
     pending: HashMap<String, Pending>,
     /// session token -> who it belongs to
     sessions: HashMap<String, StoredSession>,
+    last_pending_sweep: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -140,7 +145,11 @@ impl Auth {
         Self {
             config,
             state: Arc::new(Mutex::new(AuthState::default())),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(DISCORD_CONNECT_TIMEOUT)
+                .timeout(DISCORD_REQUEST_TIMEOUT)
+                .build()
+                .expect("constant Discord HTTP client configuration is valid"),
         }
     }
 
@@ -155,20 +164,15 @@ impl Auth {
             .as_ref()
             .context("Discord login is not configured on this relay")?;
 
-        let state = random_token();
-        let url = config.authorize_url(&state);
-
         let mut auth = self.state.lock().await;
-        auth.prune();
-        if auth.pending.len() >= PENDING_CAPACITY {
+        let now = Instant::now();
+        if !auth.has_pending_capacity(now) {
             anyhow::bail!("too many login attempts; try again later");
         }
-        auth.pending.insert(
-            state.clone(),
-            Pending::Waiting {
-                since: Instant::now(),
-            },
-        );
+        let state = random_token();
+        let url = config.authorize_url(&state);
+        auth.pending
+            .insert(state.clone(), Pending::Waiting { since: now });
         Ok((url, state))
     }
 
@@ -181,27 +185,29 @@ impl Auth {
 
         {
             let mut auth = self.state.lock().await;
-            auth.prune();
+            auth.expire_pending(state, Instant::now());
             auth.claim(state)?;
         }
 
         let result = self.exchange(config, code).await;
 
         let mut auth = self.state.lock().await;
-        auth.prune();
+        auth.expire_pending(state, Instant::now());
         auth.finish_completion(state, result)
     }
 
     /// Terminalize a browser cancellation so the desktop poller does not wait
     /// until the pending-attempt timeout.
-    pub async fn fail(&self, state: &str, message: String) {
+    pub async fn fail(&self, state: &str) {
         let mut auth = self.state.lock().await;
+        let now = Instant::now();
+        auth.expire_pending(state, now);
         if matches!(auth.pending.get(state), Some(Pending::Waiting { .. })) {
             auth.pending.insert(
                 state.to_string(),
                 Pending::Failed {
-                    message,
-                    since: Instant::now(),
+                    message: CANCELLED_MESSAGE.into(),
+                    since: now,
                 },
             );
         }
@@ -269,7 +275,7 @@ impl Auth {
     /// Poll for the outcome of a login attempt.
     pub async fn poll(&self, state: &str) -> PollResult {
         let mut auth = self.state.lock().await;
-        auth.prune();
+        auth.expire_pending(state, Instant::now());
         match auth.pending.get(state) {
             None => PollResult::Unknown,
             Some(Pending::Waiting { .. } | Pending::Completing { .. }) => PollResult::Waiting,
@@ -297,7 +303,7 @@ impl Auth {
     /// Who a session belongs to, if it is still valid.
     pub async fn identify(&self, session: &str) -> Option<Identity> {
         let mut auth = self.state.lock().await;
-        auth.prune();
+        auth.expire_session(session, Instant::now());
         auth.sessions
             .get(session)
             .map(|stored| stored.identity.clone())
@@ -323,6 +329,41 @@ pub enum PollResult {
 }
 
 impl AuthState {
+    fn expire_pending(&mut self, state: &str, now: Instant) {
+        let expired = self
+            .pending
+            .get(state)
+            .is_some_and(|pending| now.saturating_duration_since(pending.since()) >= PENDING_TTL);
+        if expired {
+            self.pending.remove(state);
+        }
+    }
+
+    fn expire_session(&mut self, session: &str, now: Instant) {
+        let expired = self
+            .sessions
+            .get(session)
+            .is_some_and(|stored| now.saturating_duration_since(stored.created_at) >= SESSION_TTL);
+        if expired {
+            self.sessions.remove(session);
+        }
+    }
+
+    fn has_pending_capacity(&mut self, now: Instant) -> bool {
+        if self.pending.len() < PENDING_CAPACITY {
+            return true;
+        }
+        let may_sweep = self
+            .last_pending_sweep
+            .is_none_or(|last| now.saturating_duration_since(last) >= PENDING_SWEEP_INTERVAL);
+        if may_sweep {
+            self.pending
+                .retain(|_, pending| now.saturating_duration_since(pending.since()) < PENDING_TTL);
+            self.last_pending_sweep = Some(now);
+        }
+        self.pending.len() < PENDING_CAPACITY
+    }
+
     fn claim(&mut self, state: &str) -> Result<()> {
         let Some(pending) = self.pending.get_mut(state) else {
             anyhow::bail!("unknown or expired login attempt");
@@ -345,7 +386,7 @@ impl AuthState {
             Ok(identity) => {
                 let session = random_token();
                 let now = Instant::now();
-                if self.sessions.len() >= SESSION_CAPACITY {
+                if self.sessions.len() == SESSION_CAPACITY {
                     let oldest = self
                         .sessions
                         .iter()
@@ -382,13 +423,6 @@ impl AuthState {
                 Err(err)
             }
         }
-    }
-
-    fn prune(&mut self) {
-        self.pending
-            .retain(|_, p| p.since().elapsed() < PENDING_TTL);
-        self.sessions
-            .retain(|_, session| session.created_at.elapsed() < SESSION_TTL);
     }
 }
 
@@ -454,7 +488,7 @@ mod tests {
             },
         );
 
-        auth.prune();
+        auth.expire_pending("state", Instant::now());
 
         assert!(auth.claim("state").is_err());
         assert!(!auth.pending.contains_key("state"));
@@ -469,7 +503,7 @@ mod tests {
                 since: Instant::now() - PENDING_TTL,
             },
         );
-        auth.prune();
+        auth.expire_pending("state", Instant::now());
 
         let error = auth
             .finish_completion("state", Ok(identity("user")))
@@ -514,6 +548,40 @@ mod tests {
     }
 
     #[test]
+    fn pending_capacity_sweeps_are_full_only_when_throttled_admission_needs_them() {
+        let now = Instant::now();
+        let mut below_capacity = AuthState::default();
+        below_capacity.pending.insert(
+            "expired".into(),
+            Pending::Waiting {
+                since: now - PENDING_TTL,
+            },
+        );
+        assert!(below_capacity.has_pending_capacity(now));
+        assert!(below_capacity.pending.contains_key("expired"));
+        assert_eq!(below_capacity.last_pending_sweep, None);
+
+        let mut full = AuthState::default();
+        for attempt in 0..PENDING_CAPACITY {
+            full.pending
+                .insert(format!("state-{attempt}"), Pending::Waiting { since: now });
+        }
+        assert!(!full.has_pending_capacity(now));
+        assert_eq!(full.last_pending_sweep, Some(now));
+
+        full.pending.insert(
+            "state-0".into(),
+            Pending::Waiting {
+                since: now - PENDING_TTL,
+            },
+        );
+        assert!(!full.has_pending_capacity(now + Duration::from_millis(999)));
+        assert!(full.pending.contains_key("state-0"));
+        assert!(full.has_pending_capacity(now + Duration::from_secs(1)));
+        assert!(!full.pending.contains_key("state-0"));
+    }
+
+    #[test]
     fn successful_completion_at_4096_sessions_evicts_only_the_oldest() {
         let now = Instant::now();
         let mut auth = AuthState::default();
@@ -554,46 +622,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_terminalizes_a_waiting_attempt() {
+    async fn cancellation_stores_only_the_canonical_bounded_message() {
         let auth = Auth::new(None);
         *auth.state.lock().await = waiting_state();
 
-        auth.fail("state", "access_denied".into()).await;
+        auth.fail("state").await;
 
         assert!(matches!(
             auth.poll("state").await,
-            PollResult::Failed(message) if message == "access_denied"
+            PollResult::Failed(message) if message == "Login was cancelled" && message.len() == 19
         ));
     }
 
     #[tokio::test]
-    async fn identify_prunes_expired_sessions_and_retains_current_sessions() {
+    async fn poll_expires_only_the_requested_pending_attempt() {
         let auth = Auth::new(None);
+        let expired = Instant::now() - PENDING_TTL;
+        {
+            let mut state = auth.state.lock().await;
+            state
+                .pending
+                .insert("requested".into(), Pending::Waiting { since: expired });
+            state
+                .pending
+                .insert("unrelated".into(), Pending::Waiting { since: expired });
+        }
+
+        assert!(matches!(auth.poll("requested").await, PollResult::Unknown));
+
+        let state = auth.state.lock().await;
+        assert!(!state.pending.contains_key("requested"));
+        assert!(state.pending.contains_key("unrelated"));
+    }
+
+    #[tokio::test]
+    async fn identify_expires_only_the_requested_session() {
+        let auth = Auth::new(None);
+        let expired = Instant::now() - SESSION_TTL;
         {
             let mut state = auth.state.lock().await;
             state.sessions.insert(
-                "current".into(),
+                "requested".into(),
                 StoredSession {
-                    identity: identity("current-id"),
-                    created_at: Instant::now(),
+                    identity: identity("requested-id"),
+                    created_at: expired,
                 },
             );
             state.sessions.insert(
-                "expired".into(),
+                "unrelated".into(),
                 StoredSession {
-                    identity: identity("expired-id"),
-                    created_at: Instant::now() - SESSION_TTL,
+                    identity: identity("unrelated-id"),
+                    created_at: expired,
                 },
             );
         }
 
-        assert!(auth.identify("expired").await.is_none());
-        assert_eq!(
-            auth.identify("current").await.map(|identity| identity.id),
-            Some("current-id".into())
-        );
+        assert!(auth.identify("requested").await.is_none());
+
         let state = auth.state.lock().await;
-        assert!(!state.sessions.contains_key("expired"));
-        assert!(state.sessions.contains_key("current"));
+        assert!(!state.sessions.contains_key("requested"));
+        assert!(state.sessions.contains_key("unrelated"));
+    }
+
+    #[tokio::test]
+    async fn complete_expires_only_the_requested_pending_attempt() {
+        let auth = configured_auth();
+        let expired = Instant::now() - PENDING_TTL;
+        {
+            let mut state = auth.state.lock().await;
+            state
+                .pending
+                .insert("requested".into(), Pending::Waiting { since: expired });
+            state
+                .pending
+                .insert("unrelated".into(), Pending::Waiting { since: expired });
+        }
+
+        let error = auth.complete("requested", "unused").await.unwrap_err();
+
+        assert_eq!(error.to_string(), "unknown or expired login attempt");
+        let state = auth.state.lock().await;
+        assert!(!state.pending.contains_key("requested"));
+        assert!(state.pending.contains_key("unrelated"));
     }
 }

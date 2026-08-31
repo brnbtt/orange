@@ -370,7 +370,7 @@ async fn auth_callback(
 ) -> Response {
     if let Some(error) = params.error {
         if let Some(state) = params.state.as_deref() {
-            app.auth.fail(state, error.clone()).await;
+            app.auth.fail(state).await;
         }
         return auth_page("Login cancelled", &error);
     }
