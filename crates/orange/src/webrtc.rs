@@ -23,7 +23,9 @@ use gstreamer as gst;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_video::prelude::VideoOverlayExtManual;
 use gstreamer_webrtc as gst_webrtc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use crate::media_diagnostics::{
     measure_operation, track_pad, MediaProgress, MediaStage, Operation,
@@ -31,6 +33,304 @@ use crate::media_diagnostics::{
 use crate::pipeline::{
     build_capture_chain, check_elements, configure_encoder, CaptureSettings, Codec,
 };
+
+pub(crate) struct AudioControlWorker {
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AudioControlWorker {
+    fn spawn(
+        volume: gst::Element,
+        overlay: &crate::overlay::SharedOverlay,
+        initial_volume: f64,
+        diagnostic_role: &str,
+    ) -> Result<Self> {
+        let overlay = Arc::downgrade(overlay);
+        let (stop, wait_for_stop) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name(format!("{diagnostic_role}-audio-control"))
+            .spawn(move || {
+                let mut applied = initial_volume;
+                loop {
+                    match wait_for_stop.recv_timeout(Duration::from_millis(50)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let Some(overlay) = overlay.upgrade() else {
+                        return;
+                    };
+                    let state = match overlay.try_lock() {
+                        Ok(state) => state,
+                        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                        Err(TryLockError::WouldBlock) => continue,
+                    };
+                    let wanted = if state.muted { 0.0 } else { state.volume };
+                    drop(state);
+                    if (wanted - applied).abs() > f64::EPSILON {
+                        volume.set_property("volume", wanted);
+                        applied = wanted;
+                    }
+                }
+            })
+            .context("failed to spawn audio control worker")?;
+        Ok(Self {
+            stop: Some(stop),
+            worker: Some(worker),
+        })
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for AudioControlWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+pub(crate) struct IncomingBitrateWorker {
+    pad: gst::glib::WeakRef<gst::Pad>,
+    probe: Option<gst::PadProbeId>,
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IncomingBitrateWorker {
+    fn spawn_with_probe(
+        pad: &gst::Pad,
+        probe: gst::PadProbeId,
+        run: impl FnOnce(mpsc::Receiver<()>) + Send + 'static,
+    ) -> Result<Self> {
+        let (stop, wait_for_stop) = mpsc::channel();
+        let worker = match std::thread::Builder::new()
+            .name("incoming-bitrate".to_string())
+            .spawn(move || run(wait_for_stop))
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                pad.remove_probe(probe);
+                return Err(error).context("failed to spawn incoming bitrate worker");
+            }
+        };
+        Ok(Self {
+            pad: pad.downgrade(),
+            probe: Some(probe),
+            stop: Some(stop),
+            worker: Some(worker),
+        })
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.take();
+        if let (Some(pad), Some(probe)) = (self.pad.upgrade(), self.probe.take()) {
+            pad.remove_probe(probe);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for IncomingBitrateWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+pub(crate) fn watch_incoming_bitrate(
+    pad: &gst::Pad,
+    overlay: crate::overlay::SharedOverlay,
+) -> Result<IncomingBitrateWorker> {
+    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes_for_probe = bytes.clone();
+    let probe = pad
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                bytes_for_probe.fetch_add(buffer.size() as u64, Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Ok
+        })
+        .context("could not install incoming bitrate probe")?;
+    let overlay = Arc::downgrade(&overlay);
+    IncomingBitrateWorker::spawn_with_probe(pad, probe, move |stop| {
+        let mut sampled_at = Instant::now();
+        loop {
+            match stop.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let elapsed = sampled_at.elapsed().as_secs_f64();
+            sampled_at = Instant::now();
+            let received = bytes.swap(0, Ordering::Relaxed);
+            let Some(overlay) = overlay.upgrade() else {
+                return;
+            };
+            if received == 0 || elapsed == 0.0 {
+                continue;
+            }
+            let kbps = ((received as f64 * 8.0) / elapsed / 1000.0).round() as u32;
+            let mut state = match overlay.try_lock() {
+                Ok(state) => state,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
+            state.bitrate_kbps = Some(kbps);
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ReceiveKind {
+    Audio,
+    Video,
+}
+
+struct ReceiveWorkerState {
+    accepting: bool,
+    active_callbacks: usize,
+    audio_claimed: bool,
+    video_claimed: bool,
+    audio: Option<AudioControlWorker>,
+    bitrate: Option<IncomingBitrateWorker>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReceiveWorkerRegistry {
+    shared: Arc<(Mutex<ReceiveWorkerState>, Condvar)>,
+}
+
+impl ReceiveWorkerRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            shared: Arc::new((
+                Mutex::new(ReceiveWorkerState {
+                    accepting: true,
+                    active_callbacks: 0,
+                    audio_claimed: false,
+                    video_claimed: false,
+                    audio: None,
+                    bitrate: None,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn claim(&self, kind: ReceiveKind) -> Option<ReceivePadClaim> {
+        let mut state = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let claimed = match kind {
+            ReceiveKind::Audio => state.audio_claimed,
+            ReceiveKind::Video => state.video_claimed,
+        };
+        if !state.accepting || claimed {
+            return None;
+        }
+        match kind {
+            ReceiveKind::Audio => state.audio_claimed = true,
+            ReceiveKind::Video => state.video_claimed = true,
+        }
+        state.active_callbacks += 1;
+        Some(ReceivePadClaim {
+            shared: self.shared.clone(),
+            kind,
+            completed: false,
+        })
+    }
+
+    pub(crate) fn claim_audio(&self) -> Option<ReceivePadClaim> {
+        self.claim(ReceiveKind::Audio)
+    }
+
+    pub(crate) fn claim_video(&self) -> Option<ReceivePadClaim> {
+        self.claim(ReceiveKind::Video)
+    }
+
+    pub(crate) fn close_and_take(&self) -> ReceiveWorkers {
+        let (lock, callbacks_finished) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.accepting = false;
+        while state.active_callbacks != 0 {
+            state = callbacks_finished
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        ReceiveWorkers {
+            audio: state.audio.take(),
+            bitrate: state.bitrate.take(),
+        }
+    }
+}
+
+pub(crate) struct ReceivePadClaim {
+    shared: Arc<(Mutex<ReceiveWorkerState>, Condvar)>,
+    kind: ReceiveKind,
+    completed: bool,
+}
+
+impl ReceivePadClaim {
+    pub(crate) fn complete_audio(mut self, worker: Option<AudioControlWorker>) {
+        debug_assert!(matches!(self.kind, ReceiveKind::Audio));
+        let mut state = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.audio = worker;
+        self.completed = true;
+    }
+
+    pub(crate) fn complete_video(mut self, worker: Option<IncomingBitrateWorker>) {
+        debug_assert!(matches!(self.kind, ReceiveKind::Video));
+        let mut state = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.bitrate = worker;
+        self.completed = true;
+    }
+}
+
+impl Drop for ReceivePadClaim {
+    fn drop(&mut self) {
+        let (lock, callbacks_finished) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.completed {
+            match self.kind {
+                ReceiveKind::Audio => state.audio_claimed = false,
+                ReceiveKind::Video => state.video_claimed = false,
+            }
+        }
+        state.active_callbacks -= 1;
+        callbacks_finished.notify_all();
+    }
+}
+
+pub(crate) struct ReceiveWorkers {
+    audio: Option<AudioControlWorker>,
+    bitrate: Option<IncomingBitrateWorker>,
+}
+
+impl ReceiveWorkers {
+    pub(crate) fn shutdown(mut self) {
+        if let Some(worker) = &mut self.bitrate {
+            worker.shutdown();
+        }
+        if let Some(worker) = &mut self.audio {
+            worker.shutdown();
+        }
+    }
+}
 
 pub fn build_video_payloader(codec: Codec) -> Result<gst::Element> {
     let factory = codec.payloader();
@@ -217,25 +517,69 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
     // The receiver's pad appears only once media starts flowing.
     let pipeline_weak = pipeline.downgrade();
     let output = Arc::new(Mutex::new(Some(output)));
-    recv_bin.connect_pad_added(move |_, pad| {
+    let overlay = playback.as_ref().map(|playback| playback.overlay().clone());
+    let workers = ReceiveWorkerRegistry::new();
+    let workers_for_pad = workers.clone();
+    let overlay_for_pad = overlay.clone();
+    let pad_added = recv_bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
-        let Some(output) = output.lock().unwrap().take() else {
-            return; // only handle the first stream
-        };
-
-        if let Err(err) = build_receive_branch(&pipeline, pad, output, None, "loopback") {
-            eprintln!("[webrtc] could not build receive branch: {err}");
+        match encoding_name(pad).as_deref() {
+            Some("OPUS") => {
+                let Some(claim) = workers_for_pad.claim_audio() else {
+                    eprintln!("[webrtc] ignoring duplicate OPUS stream");
+                    return;
+                };
+                match build_audio_branch(&pipeline, pad, overlay_for_pad.clone(), "loopback") {
+                    Ok(worker) => claim.complete_audio(worker),
+                    Err(error) => eprintln!("[webrtc] could not build audio branch: {error}"),
+                }
+            }
+            Some("AV1" | "H264" | "H265") => {
+                let Some(claim) = workers_for_pad.claim_video() else {
+                    eprintln!("[webrtc] ignoring duplicate video stream");
+                    return;
+                };
+                let Some(output) = output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                else {
+                    return;
+                };
+                match build_receive_branch(&pipeline, pad, output, None, "loopback") {
+                    Ok(()) => {
+                        let bitrate =
+                            overlay_for_pad.clone().and_then(
+                                |overlay| match watch_incoming_bitrate(pad, overlay) {
+                                    Ok(worker) => Some(worker),
+                                    Err(error) => {
+                                        eprintln!(
+                                            "[webrtc] incoming bitrate telemetry disabled: {error}"
+                                        );
+                                        None
+                                    }
+                                },
+                            );
+                        claim.complete_video(bitrate);
+                    }
+                    Err(error) => eprintln!("[webrtc] could not build receive branch: {error}"),
+                }
+            }
+            _ => {}
         }
     });
 
     connect_signalling(Arc::new(Mutex::new(Peers {
         sender: send_bin,
-        receiver: recv_bin,
+        receiver: recv_bin.clone(),
     })));
 
-    crate::run_pipeline_while(&pipeline, seconds, playback.as_ref())
+    crate::run_pipeline_while_with_shutdown(&pipeline, seconds, playback.as_ref(), move || {
+        recv_bin.disconnect(pad_added);
+        workers.close_and_take().shutdown();
+    })
 }
 
 /// Which codec a newly-arrived pad carries, so the right branch is built.
@@ -625,12 +969,12 @@ pub fn build_receive_branch(
 /// The overlay's volume and mute state is applied here. A short poll is used
 /// rather than a callback because the state is owned by the window thread and
 /// changes only on user input; at 20 Hz the cost is unmeasurable.
-pub fn build_audio_branch(
+pub(crate) fn build_audio_branch(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
     overlay: Option<crate::overlay::SharedOverlay>,
     diagnostic_role: &str,
-) -> Result<()> {
+) -> Result<Option<AudioControlWorker>> {
     let initial_volume = overlay
         .as_ref()
         .and_then(|overlay| overlay.lock().ok())
@@ -668,33 +1012,135 @@ pub fn build_audio_branch(
         "remove-incoming-audio-block-probe",
     )?;
 
-    if let Some(overlay) = overlay {
-        let overlay = Arc::downgrade(&overlay);
-        let volume = all[4].element.clone();
-        std::thread::spawn(move || {
-            let mut applied = initial_volume;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                let Some(overlay) = overlay.upgrade() else {
-                    break;
-                };
-                let Ok(state) = overlay.lock() else { break };
-                let wanted = if state.muted { 0.0 } else { state.volume };
-                drop(state);
-                if (wanted - applied).abs() > f64::EPSILON {
-                    volume.set_property("volume", wanted);
-                    applied = wanted;
-                }
+    let worker = overlay.as_ref().and_then(|overlay| {
+        match AudioControlWorker::spawn(
+            all[4].element.clone(),
+            overlay,
+            initial_volume,
+            diagnostic_role,
+        ) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                eprintln!("[{diagnostic_role}] audio controls disabled: {error}");
+                None
             }
-        });
-    }
+        }
+    });
     println!("[webrtc] receiving audio");
-    Ok(())
+    Ok(worker)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn test_overlay() -> crate::overlay::SharedOverlay {
+        Arc::new(Mutex::new(crate::overlay::OverlayState::new(
+            crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
+        )))
+    }
+
+    #[test]
+    fn audio_control_receive_worker_cancels_while_overlay_is_locked() {
+        gst::init().unwrap();
+        let overlay = test_overlay();
+        let guard = overlay.lock().unwrap();
+        let volume = gst::ElementFactory::make("volume").build().unwrap();
+        let mut worker = AudioControlWorker::spawn(volume, &overlay, 0.3, "test").unwrap();
+        std::thread::sleep(Duration::from_millis(75));
+
+        let stopped_at = Instant::now();
+        worker.shutdown();
+
+        assert!(stopped_at.elapsed() < Duration::from_millis(100));
+        drop(guard);
+    }
+
+    #[test]
+    fn incoming_bitrate_receive_worker_cancels_while_overlay_is_locked() {
+        gst::init().unwrap();
+        let overlay = test_overlay();
+        let guard = overlay.lock().unwrap();
+        let pad = gst::Pad::builder(gst::PadDirection::Src).build();
+        let mut worker = watch_incoming_bitrate(&pad, overlay.clone()).unwrap();
+
+        let stopped_at = Instant::now();
+        worker.shutdown();
+
+        assert!(stopped_at.elapsed() < Duration::from_millis(100));
+        drop(guard);
+    }
+
+    #[test]
+    fn incoming_bitrate_receive_worker_removes_probe_on_shutdown() {
+        gst::init().unwrap();
+        let pad = gst::Pad::builder(gst::PadDirection::Src).build();
+        pad.set_active(true).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_probe = hits.clone();
+        let probe = pad
+            .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, _| {
+                hits_for_probe.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        let mut worker = IncomingBitrateWorker::spawn_with_probe(&pad, probe, |stop| {
+            let _ = stop.recv();
+        })
+        .unwrap();
+        let _ = pad.send_event(gst::event::Reconfigure::new());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        worker.shutdown();
+        let _ = pad.send_event(gst::event::Reconfigure::new());
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn receive_worker_registry_rejects_duplicate_audio_and_video() {
+        let registry = ReceiveWorkerRegistry::new();
+        let audio = registry.claim_audio().unwrap();
+        let video = registry.claim_video().unwrap();
+
+        assert!(registry.claim_audio().is_none());
+        assert!(registry.claim_video().is_none());
+
+        audio.complete_audio(None);
+        video.complete_video(None);
+        registry.close_and_take().shutdown();
+    }
+
+    #[test]
+    fn receive_worker_registry_close_waits_for_active_pad_callback() {
+        let registry = ReceiveWorkerRegistry::new();
+        let claim = registry.claim_audio().unwrap();
+        let registry_for_close = registry.clone();
+        let (closed, wait_for_close) = std::sync::mpsc::sync_channel(1);
+        let closer = std::thread::spawn(move || {
+            registry_for_close.close_and_take().shutdown();
+            closed.send(()).unwrap();
+        });
+        assert!(wait_for_close
+            .recv_timeout(Duration::from_millis(25))
+            .is_err());
+
+        claim.complete_audio(None);
+
+        wait_for_close.recv_timeout(Duration::from_secs(1)).unwrap();
+        closer.join().unwrap();
+    }
+
+    #[test]
+    fn closed_receive_worker_registry_rejects_late_install() {
+        let registry = ReceiveWorkerRegistry::new();
+        registry.close_and_take().shutdown();
+
+        assert!(registry.claim_audio().is_none());
+        assert!(registry.claim_video().is_none());
+    }
 
     #[test]
     fn rtp_caps_advertise_the_configured_frame_rate() {

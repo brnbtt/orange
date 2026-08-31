@@ -30,7 +30,8 @@ use crate::pipeline::{
 };
 use crate::webrtc::{
     audio_rtp_caps, build_audio_branch, build_receive_branch, build_video_payloader,
-    configure_receive_transport, encoding_name, rtp_caps, Output, ReceiveOutput,
+    configure_receive_transport, encoding_name, rtp_caps, watch_incoming_bitrate, Output,
+    ReceiveOutput, ReceiveWorkerRegistry,
 };
 use orange_signal::{connect, Signal};
 
@@ -367,46 +368,6 @@ fn check_promise_reply<'a>(
         }
     }
     Ok(reply)
-}
-
-/// Measure the encoded video arriving from WebRTC and expose it to the viewer.
-///
-/// The pad still carries RTP here, before depayloading and decoding, so this is
-/// the bitrate actually received rather than an estimate based on decoded
-/// frame sizes. The streaming callback only increments an atomic counter; a
-/// low-frequency worker does the division and touches UI state once a second.
-fn watch_incoming_bitrate(pad: &gst::Pad, overlay: crate::overlay::SharedOverlay) {
-    let bytes = Arc::new(AtomicU64::new(0));
-    let bytes_for_probe = bytes.clone();
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-        if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
-            bytes_for_probe.fetch_add(buffer.size() as u64, Ordering::Relaxed);
-        }
-        gst::PadProbeReturn::Ok
-    });
-
-    let overlay = Arc::downgrade(&overlay);
-    std::thread::spawn(move || {
-        let mut sampled_at = Instant::now();
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let elapsed = sampled_at.elapsed().as_secs_f64();
-            sampled_at = Instant::now();
-            let received = bytes.swap(0, Ordering::Relaxed);
-
-            let Some(overlay) = overlay.upgrade() else {
-                break;
-            };
-            if received == 0 || elapsed == 0.0 {
-                continue;
-            }
-
-            let kbps = ((received as f64 * 8.0) / elapsed / 1000.0).round() as u32;
-            if let Ok(mut state) = overlay.lock() {
-                state.bitrate_kbps = Some(kbps);
-            };
-        }
-    });
 }
 
 /// Forward locally-gathered ICE candidates to the other peer.
@@ -1511,6 +1472,25 @@ fn create_offer(
 }
 
 /// Viewer: join a stream by code.
+async fn stop_watch_receive_pipeline(
+    bin: &gst::Element,
+    pad_added: gst::glib::SignalHandlerId,
+    workers: ReceiveWorkerRegistry,
+    diagnostics: Option<DiagnosticsHandle>,
+    pipeline: &gst::Pipeline,
+) -> Result<()> {
+    bin.disconnect(pad_added);
+    let pipeline = pipeline.clone();
+    tokio::task::spawn_blocking(move || {
+        workers.close_and_take().shutdown();
+        drop(diagnostics);
+        pipeline.set_state(gst::State::Null)?;
+        Ok(())
+    })
+    .await
+    .context("watch receive teardown task failed")?
+}
+
 pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     // Keep the unique owner outside every callback and declare it before the
     // pipeline so explicit Null teardown precedes HWND destruction.
@@ -1570,7 +1550,9 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     let media_progress_for_pad = media_progress.clone();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Some(output)));
     let branch_errors = session_errors.clone();
-    bin.connect_pad_added(move |_, pad| {
+    let receive_workers = ReceiveWorkerRegistry::new();
+    let workers_for_pad = receive_workers.clone();
+    let pad_added = bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
@@ -1580,57 +1562,90 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
             "watch",
             serde_json::json!({ "encoding": &kind }),
         );
-        let (result, branch_ready) = match kind.as_str() {
-            "OPUS" => (
-                build_audio_branch(&pipeline, pad, overlay_for_audio.clone(), "watch"),
-                true,
-            ),
-            "AV1" | "H264" | "H265" => match output.lock().unwrap().take() {
-                Some(output) => {
-                    if let Some(progress) = &media_progress_for_pad {
-                        track_pad(pad, MediaStage::Rtp, progress.clone());
-                    }
-                    if let Some(overlay) = overlay_for_video.clone() {
-                        watch_incoming_bitrate(pad, overlay);
-                    }
-                    (
+        let result: Result<bool> = match kind.as_str() {
+            "OPUS" => {
+                let Some(claim) = workers_for_pad.claim_audio() else {
+                    eprintln!("[watch] ignoring duplicate OPUS stream");
+                    return;
+                };
+                build_audio_branch(&pipeline, pad, overlay_for_audio.clone(), "watch").map(
+                    |worker| {
+                        claim.complete_audio(worker);
+                        true
+                    },
+                )
+            }
+            "AV1" | "H264" | "H265" => {
+                let Some(claim) = workers_for_pad.claim_video() else {
+                    eprintln!("[watch] ignoring duplicate video stream");
+                    return;
+                };
+                match output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    Some(output) => {
+                        if let Some(progress) = &media_progress_for_pad {
+                            track_pad(pad, MediaStage::Rtp, progress.clone());
+                        }
                         build_receive_branch(
                             &pipeline,
                             pad,
                             output,
                             media_progress_for_pad.clone(),
                             "watch",
-                        ),
-                        true,
-                    )
+                        )
+                        .map(|()| {
+                            let bitrate = overlay_for_video.clone().and_then(|overlay| {
+                                match watch_incoming_bitrate(pad, overlay) {
+                                    Ok(worker) => Some(worker),
+                                    Err(error) => {
+                                        eprintln!(
+                                            "[watch] incoming bitrate telemetry disabled: {error}"
+                                        );
+                                        None
+                                    }
+                                }
+                            });
+                            claim.complete_video(bitrate);
+                            true
+                        })
+                    }
+                    None => {
+                        claim.complete_video(None);
+                        Ok(false)
+                    }
                 }
-                None => (Ok(()), false),
-            },
+            }
             other => {
                 eprintln!("[watch] ignoring unexpected stream '{other}'");
-                (Ok(()), false)
+                Ok(false)
             }
         };
-        if let Err(err) = result {
-            eprintln!("[watch] could not build {kind} branch: {err}");
-            let _ = branch_errors.send(PipelineError {
-                source: String::new(),
-                message: format!("could not build {kind} receive branch: {err}"),
-            });
-        } else if branch_ready {
-            emit_diagnostic(
+        match result {
+            Err(error) => {
+                eprintln!("[watch] could not build {kind} branch: {error}");
+                let _ = branch_errors.send(PipelineError {
+                    source: String::new(),
+                    message: format!("could not build {kind} receive branch: {error}"),
+                });
+            }
+            Ok(true) => emit_diagnostic(
                 "receive-branch-ready",
                 "watch",
                 serde_json::json!({ "encoding": &kind }),
-            );
+            ),
+            Ok(false) => {}
         }
     });
 
     if let Err(error) = pipeline.set_state(gst::State::Playing) {
-        let _ = pipeline.set_state(gst::State::Null);
+        let _ =
+            stop_watch_receive_pipeline(&bin, pad_added, receive_workers, None, &pipeline).await;
         return Err(error.into());
     }
-    let _diagnostics = start_webrtc_diagnostics(
+    let diagnostics = start_webrtc_diagnostics(
         &bin,
         "watch".to_string(),
         media_progress,
@@ -1713,8 +1728,8 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     }
     .await;
 
-    drop(_diagnostics);
-    let stop_result = pipeline.set_state(gst::State::Null);
+    let stop_result =
+        stop_watch_receive_pipeline(&bin, pad_added, receive_workers, diagnostics, &pipeline).await;
     client.close().await;
     session_result?;
     stop_result?;

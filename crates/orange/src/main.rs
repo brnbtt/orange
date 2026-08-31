@@ -492,7 +492,17 @@ pub(crate) fn run_pipeline_while(
     seconds: u64,
     playback: Option<&window::PlaybackWindowHandle>,
 ) -> Result<()> {
+    run_pipeline_while_with_shutdown(pipeline, seconds, playback, || {})
+}
+
+pub(crate) fn run_pipeline_while_with_shutdown(
+    pipeline: &gst::Pipeline,
+    seconds: u64,
+    playback: Option<&window::PlaybackWindowHandle>,
+    shutdown: impl FnOnce(),
+) -> Result<()> {
     if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        shutdown();
         let _ = pipeline.set_state(gst::State::Null);
         return Err(error.into());
     }
@@ -529,6 +539,7 @@ pub(crate) fn run_pipeline_while(
         gst::ClockTime::from_seconds(5),
         &[gst::MessageType::Eos, gst::MessageType::Error],
     );
+    shutdown();
     pipeline.set_state(gst::State::Null)?;
 
     match error {
