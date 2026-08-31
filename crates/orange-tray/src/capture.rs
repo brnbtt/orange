@@ -100,8 +100,15 @@ pub fn screen_thumbnail(max_w: u32, max_h: u32) -> Option<Thumbnail> {
             ..Default::default()
         };
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let bitmap =
-            CreateDIBSection(Some(mem_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let bitmap = match CreateDIBSection(Some(mem_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+        {
+            Ok(bitmap) => bitmap,
+            Err(_) => {
+                let _ = DeleteDC(mem_dc);
+                ReleaseDC(None, screen_dc);
+                return None;
+            }
+        };
         let previous = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
 
         // BitBlt from the screen rather than PrintWindow: there is no single
@@ -177,7 +184,14 @@ unsafe fn capture_bgra(hwnd: HWND, width: u32, height: u32) -> Option<Vec<u8>> {
 
     let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
     let bitmap: HBITMAP =
-        CreateDIBSection(Some(mem_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        match CreateDIBSection(Some(mem_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bitmap) => bitmap,
+            Err(_) => {
+                let _ = DeleteDC(mem_dc);
+                ReleaseDC(None, screen_dc);
+                return None;
+            }
+        };
 
     let previous = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
     let drawn = PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT).as_bool();
