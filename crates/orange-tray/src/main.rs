@@ -243,7 +243,7 @@ impl Orange {
                 Err(_) => self.updates.updater_launch_failed(),
             }
         }
-        self.updates.schedule_periodic(Instant::now());
+        self.updates.schedule_periodic();
     }
 
     fn quality(&self) -> Quality {
