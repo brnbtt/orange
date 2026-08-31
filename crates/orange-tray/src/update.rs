@@ -66,6 +66,19 @@ impl UpdateStatus {
     }
 }
 
+enum Request {
+    Check,
+    Download(UpdateInfo),
+}
+
+fn request_for(status: &UpdateStatus) -> Option<Request> {
+    match status {
+        UpdateStatus::Available(info) => Some(Request::Download(info.clone())),
+        UpdateStatus::Failed { .. } => Some(Request::Check),
+        _ => None,
+    }
+}
+
 fn periodic_check_due(
     updates_enabled: bool,
     receiver_idle: bool,
@@ -171,17 +184,16 @@ impl UpdateController {
     }
 
     pub(crate) fn request_update(&mut self) {
-        match &self.status {
-            UpdateStatus::Available(info) => {
-                let info = info.clone();
+        match request_for(&self.status) {
+            Some(Request::Download(info)) => {
                 self.receiver = Some(start_download(info.clone()));
                 self.status = UpdateStatus::Downloading(info);
             }
-            UpdateStatus::Failed { .. } => {
+            Some(Request::Check) => {
                 self.status = UpdateStatus::Checking;
                 self.receiver = start_check();
             }
-            _ => {}
+            None => {}
         }
     }
 }
@@ -629,6 +641,21 @@ mod tests {
         ] {
             assert_eq!(periodic_check_due(enabled, idle, due, status), expected);
         }
+    }
+
+    #[test]
+    fn controller_request_policy() {
+        let info = update_info();
+        assert!(matches!(
+            request_for(&UpdateStatus::Available(info.clone())),
+            Some(Request::Download(requested)) if requested == info
+        ));
+        assert!(matches!(
+            request_for(&UpdateStatus::Failed {
+                message: "offline".into()
+            }),
+            Some(Request::Check)
+        ));
     }
 
     #[test]
