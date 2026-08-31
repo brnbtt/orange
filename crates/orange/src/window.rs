@@ -16,20 +16,21 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, OnceLock,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, SetLastError, COLORREF, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GetLastError, SetLastError, COLORREF, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+    RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_DONOTROUND, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, ScreenToClient,
-    DEVMODEW, ENUM_CURRENT_SETTINGS, HBRUSH, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTOPRIMARY,
+    CreateSolidBrush, DeleteObject, EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow,
+    ScreenToClient, DEVMODEW, ENUM_CURRENT_SETTINGS, HGDIOBJ, MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -90,6 +91,8 @@ pub fn target_refresh_rate(hwnd: isize) -> Option<u32> {
 /// Cosmetic only: the frame behind the video, visible for an instant before
 /// the first frame arrives and in the letterbox bars.
 const BACKGROUND: COLORREF = COLORREF(0x000b0b0b); // BGR
+type ClassResult = std::result::Result<(), u32>;
+static VIEWER_CLASS_RESULT: OnceLock<ClassResult> = OnceLock::new();
 
 /// Drives cursor hiding. Windows only asks about the cursor when the mouse
 /// moves, and the point is to hide it when the mouse has stopped.
@@ -380,7 +383,12 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aspect_locked_size, fit_aspect, message_result, MessageResult};
+    use super::{
+        aspect_locked_size, cached_class_result, fit_aspect, message_result, MessageResult,
+    };
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+    use windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
     use windows::Win32::UI::WindowsAndMessaging::{
         WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP,
         WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
@@ -450,6 +458,31 @@ mod tests {
         assert_eq!(message_result(0), MessageResult::Quit);
         assert_eq!(message_result(1), MessageResult::Dispatch);
         assert_eq!(message_result(42), MessageResult::Dispatch);
+    }
+
+    #[test]
+    fn viewer_class_result_is_initialized_once() {
+        let class = OnceLock::new();
+        let calls = Cell::new(0);
+
+        assert_eq!(
+            cached_class_result(&class, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(cached_class_result(&class, || panic!()), Ok(()));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn viewer_class_result_caches_unverified_existing_class_as_failure() {
+        let class = OnceLock::new();
+        let error = ERROR_CLASS_ALREADY_EXISTS.0;
+
+        assert_eq!(cached_class_result(&class, || Err(error)), Err(error));
+        assert_eq!(cached_class_result(&class, || panic!()), Err(error));
     }
 }
 
@@ -714,6 +747,47 @@ unsafe fn playback_position(profile: PlaybackProfile, width: i32, height: i32) -
     }
 }
 
+fn cached_class_result(
+    result: &OnceLock<ClassResult>,
+    register: impl FnOnce() -> ClassResult,
+) -> ClassResult {
+    *result.get_or_init(register)
+}
+
+unsafe fn ensure_viewer_class(instance: HINSTANCE) -> Result<()> {
+    let result = cached_class_result(&VIEWER_CLASS_RESULT, || {
+        let cursor = match LoadCursorW(None, IDC_ARROW) {
+            Ok(cursor) => cursor,
+            Err(error) => return Err(error.code().0 as u32),
+        };
+        let brush = CreateSolidBrush(BACKGROUND);
+        let class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: instance,
+            lpszClassName: w!("orange_viewer"),
+            hIcon: LoadIconW(Some(instance), PCWSTR(std::ptr::with_exposed_provenance(1)))
+                .unwrap_or_default(),
+            hCursor: cursor,
+            hbrBackground: brush,
+            ..Default::default()
+        };
+        if RegisterClassW(&class) != 0 {
+            return Ok(());
+        }
+
+        let error = GetLastError().0;
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+        // An earlier successful result is the only proof that this class is
+        // ours; an already-existing class observed here remains a failure.
+        Err(error)
+    });
+    if let Err(error) = result {
+        bail!("failed to register viewer window class (Win32 error {error})");
+    }
+    Ok(())
+}
+
 unsafe fn create_window(
     title: &[u16],
     envelope: (i32, i32),
@@ -723,23 +797,7 @@ unsafe fn create_window(
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
     let class_name = w!("orange_viewer");
-
-    let class = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(wnd_proc),
-        hInstance: instance.into(),
-        lpszClassName: class_name,
-        hIcon: LoadIconW(
-            Some(instance.into()),
-            PCWSTR(std::ptr::with_exposed_provenance(1)),
-        )
-        .unwrap_or_default(),
-        hCursor: LoadCursorW(None, IDC_ARROW)?,
-        hbrBackground: HBRUSH(CreateSolidBrush(BACKGROUND).0),
-        ..Default::default()
-    };
-    // A zero return can mean "already registered", which is fine.
-    RegisterClassW(&class);
+    ensure_viewer_class(instance.into())?;
 
     // Callers pass logical sizes. Now that the process is DPI aware, scale
     // them so the window covers the same area of screen as before - the
