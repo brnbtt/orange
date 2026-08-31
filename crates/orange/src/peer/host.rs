@@ -69,7 +69,7 @@ fn handle_host_diagnostic_signal(signal: &Signal) {
 /// a fresh RTP payloader per viewer, so late joiners receive their own RTP
 /// stream and initialization while still sharing the expensive encoder.
 pub(crate) async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
-    check_elements(settings.codec)?;
+    check_elements(settings)?;
     let mut client = connect(url).await?;
 
     // Identity is optional: without it viewers show up as opaque ids.
@@ -87,7 +87,7 @@ pub(crate) async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()
     let encoder = capture
         .by_name("stream-encoder")
         .context("capture chain has no named encoder")?;
-    configure_encoder(&encoder, settings.codec, settings.fps);
+    configure_encoder(&encoder, settings.encoder, settings.codec, settings.fps);
     let initial_gop_size = initial_host_gop_size(settings.fps);
     set_encoder_gop(&encoder, initial_gop_size);
     let tee = gst::ElementFactory::make("tee")

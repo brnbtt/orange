@@ -20,6 +20,7 @@ use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_video::prelude::VideoOverlayExtManual;
 use pipeline::{CaptureSettings, Codec};
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -162,9 +163,19 @@ impl QualityArgs {
         if fps == 0 {
             anyhow::bail!("fps must be greater than zero");
         }
+        let requested = if self.codec.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            Some(Codec::parse(&self.codec)?)
+        };
+        let (codec, encoder) = pipeline::select_encoder(requested)?;
+        if requested.is_none() && encoder != "mfh265enc" {
+            println!("Encoder auto-selected {codec:?} via {encoder} zero-copy fallback.");
+        }
         Ok(CaptureSettings {
             hwnd,
-            codec: Codec::parse(&self.codec)?,
+            codec,
+            encoder,
             bitrate: self.bitrate,
             fps,
             scale: self.scale.as_deref().map(parse_scale).transpose()?,
@@ -189,7 +200,22 @@ fn parse_scale(s: &str) -> Result<(u32, u32)> {
     Ok((w.trim().parse()?, h.trim().parse()?))
 }
 
-fn main() -> Result<()> {
+fn format_error_chain(error: &anyhow::Error) -> String {
+    format!("Error: {error:#}").replace(['\r', '\n'], " ")
+}
+
+fn write_error_chain(error: &anyhow::Error) -> io::Result<()> {
+    writeln!(io::stderr().lock(), "{}", format_error_chain(error))
+}
+
+fn main() {
+    if let Err(error) = entry() {
+        let _ = write_error_chain(&error);
+        std::process::exit(1);
+    }
+}
+
+fn entry() -> Result<()> {
     let cli = Cli::parse();
     let _diagnostics = media_diagnostics::DiagnosticWriter::new();
     run(cli)
@@ -608,7 +634,7 @@ fn report_file(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        gst, run_pipeline_while, run_pipeline_while_with_shutdown,
+        format_error_chain, gst, run_pipeline_while, run_pipeline_while_with_shutdown,
         run_pipeline_while_with_shutdown_and_state, start_pipeline_with, stop_pipeline_with,
         timed_pipeline_should_continue,
     };
@@ -618,6 +644,17 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_CLOSE,
     };
+
+    #[test]
+    fn formatted_error_includes_outer_and_inner_causes_on_one_line() {
+        let error = anyhow::anyhow!("inner cause").context("outer context");
+
+        let message = format_error_chain(&error);
+
+        assert!(message.starts_with("Error: outer context"));
+        assert!(message.contains("inner cause"));
+        assert_eq!(message.lines().count(), 1);
+    }
 
     #[test]
     fn timed_pipeline_runs_only_before_deadline_and_while_playback_is_open() {

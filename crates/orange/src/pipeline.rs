@@ -1,7 +1,7 @@
 //! The capture and encode pipeline.
 //!
-//! The default cross-vendor path uses Media Foundation H.265 encoding. The
-//! original NVIDIA AV1 path remains available for development and comparison.
+//! The tray prefers H.265 and selects the first hardware encoder that can link
+//! directly to the D3D11 conversion path. Explicit CLI codec choices stay strict.
 //!
 //! The property that makes it cheap is that frames never leave VRAM.
 //! `d3d11screencapturesrc` outputs `memory:D3D11Memory`, `d3d11convert` scales
@@ -12,6 +12,13 @@
 use anyhow::{bail, Context, Result};
 use gst::prelude::*;
 use gstreamer as gst;
+
+const AUTO_ENCODERS: [(Codec, &str); 4] = [
+    (Codec::H265, "mfh265enc"),
+    (Codec::H265, "nvd3d11h265enc"),
+    (Codec::H264, "mfh264enc"),
+    (Codec::H264, "nvd3d11h264enc"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -90,10 +97,49 @@ impl Codec {
     }
 }
 
+fn select_encoder_with(
+    requested: Option<Codec>,
+    mut is_compatible: impl FnMut(&str) -> bool,
+) -> Result<(Codec, &'static str)> {
+    if let Some(codec) = requested {
+        return Ok((codec, codec.encoder()));
+    }
+
+    AUTO_ENCODERS
+        .into_iter()
+        .find(|(_, factory)| is_compatible(factory))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no compatible zero-copy D3D11 encoder found; attempted {}. Update the graphics driver or install a GStreamer hardware encoder plugin",
+                AUTO_ENCODERS
+                    .iter()
+                    .map(|(_, factory)| *factory)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn supports_d3d11_input(factory: &str) -> bool {
+    let description = format!(
+        "d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12,width=1280,height=720 ! {factory}"
+    );
+    let Ok(probe) = gst::parse::bin_from_description(&description, true) else {
+        return false;
+    };
+    drop(probe);
+    true
+}
+
+pub(crate) fn select_encoder(requested: Option<Codec>) -> Result<(Codec, &'static str)> {
+    select_encoder_with(requested, supports_d3d11_input)
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureSettings {
     pub hwnd: isize,
     pub codec: Codec,
+    pub encoder: &'static str,
     /// Kilobits per second.
     pub bitrate: u32,
     pub fps: u32,
@@ -108,6 +154,7 @@ impl Default for CaptureSettings {
         Self {
             hwnd: 0,
             codec: Codec::H265,
+            encoder: "mfh265enc",
             bitrate: 30_000,
             fps: 60,
             scale: None,
@@ -172,12 +219,12 @@ pub fn check_audio_elements() -> Result<()> {
 
 /// Verify the elements we depend on are actually present, and say precisely
 /// which one is missing rather than failing with an opaque link error.
-pub fn check_elements(codec: Codec) -> Result<()> {
+pub fn check_elements(settings: &CaptureSettings) -> Result<()> {
     let required = [
         "d3d11screencapturesrc",
         "d3d11convert",
-        codec.encoder(),
-        codec.parser(),
+        settings.encoder,
+        settings.codec.parser(),
     ];
     let missing: Vec<_> = required
         .iter()
@@ -231,7 +278,7 @@ pub fn build_capture_chain(settings: &CaptureSettings) -> String {
          ! {encoder} name=stream-encoder bitrate={bitrate} \
          ! {parser}",
         fps = settings.fps,
-        encoder = settings.codec.encoder(),
+        encoder = settings.encoder,
         bitrate = settings.bitrate,
         parser = settings.codec.parser(),
     )
@@ -253,20 +300,17 @@ fn set_from_str_if_supported(element: &gst::Element, property: &str, value: &str
     }
 }
 
-pub fn configure_encoder(element: &gst::Element, codec: Codec, fps: u32) {
+pub fn configure_encoder(element: &gst::Element, encoder: &str, codec: Codec, fps: u32) {
     set_encoder_gop(element, gop_size(fps) as u32);
-    match codec {
-        Codec::H264 | Codec::H265 => {
-            set_if_supported(element, "low-latency", true);
-            set_from_str_if_supported(element, "rc-mode", "cbr");
-            set_if_supported(element, "quality-vs-speed", 50u32);
-        }
-        Codec::Av1 => {
-            set_from_str_if_supported(element, "preset", "p5");
-            set_from_str_if_supported(element, "tune", "low-latency");
-            set_from_str_if_supported(element, "rc-mode", "cbr");
-            set_if_supported(element, "spatial-aq", true);
-        }
+    if encoder.starts_with("nvd3d11") {
+        set_from_str_if_supported(element, "preset", "p5");
+        set_from_str_if_supported(element, "tune", "low-latency");
+        set_from_str_if_supported(element, "rc-mode", "cbr");
+        set_if_supported(element, "spatial-aq", true);
+    } else if matches!(codec, Codec::H264 | Codec::H265) {
+        set_if_supported(element, "low-latency", true);
+        set_from_str_if_supported(element, "rc-mode", "cbr");
+        set_if_supported(element, "quality-vs-speed", 50u32);
     }
 }
 
@@ -281,7 +325,7 @@ pub fn set_encoder_gop(element: &gst::Element, frames: u32) {
 /// GStreamer's parse syntax treats backslashes as escapes, so interpolating a
 /// Windows path into a pipeline description silently mangles it.
 pub fn build_record_pipeline(settings: &CaptureSettings, output: &str) -> Result<gst::Pipeline> {
-    check_elements(settings.codec)?;
+    check_elements(settings)?;
 
     let pipeline = gst::Pipeline::new();
 
@@ -290,7 +334,7 @@ pub fn build_record_pipeline(settings: &CaptureSettings, output: &str) -> Result
     let encoder = capture
         .by_name("stream-encoder")
         .context("capture chain has no named encoder")?;
-    configure_encoder(&encoder, settings.codec, settings.fps);
+    configure_encoder(&encoder, settings.encoder, settings.codec, settings.fps);
     let muxer = gst::ElementFactory::make("matroskamux")
         .build()
         .context("matroskamux missing")?;
@@ -309,6 +353,79 @@ pub fn build_record_pipeline(settings: &CaptureSettings, output: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compatible_factories<'a>(factories: &'a [&'a str]) -> impl FnMut(&str) -> bool + 'a {
+        move |factory| factories.contains(&factory)
+    }
+
+    #[test]
+    fn auto_prefers_compatible_media_foundation_h265() {
+        let selected =
+            select_encoder_with(None, compatible_factories(&["mfh265enc", "nvd3d11h265enc"]))
+                .unwrap();
+
+        assert_eq!(selected, (Codec::H265, "mfh265enc"));
+    }
+
+    #[test]
+    fn auto_keeps_h265_when_nvidia_is_the_compatible_encoder() {
+        let selected =
+            select_encoder_with(None, compatible_factories(&["nvd3d11h265enc", "mfh264enc"]))
+                .unwrap();
+
+        assert_eq!(selected, (Codec::H265, "nvd3d11h265enc"));
+    }
+
+    #[test]
+    fn auto_falls_back_to_media_foundation_h264() {
+        let selected =
+            select_encoder_with(None, compatible_factories(&["mfh264enc", "nvd3d11h264enc"]))
+                .unwrap();
+
+        assert_eq!(selected, (Codec::H264, "mfh264enc"));
+    }
+
+    #[test]
+    fn auto_uses_nvidia_h264_as_the_last_zero_copy_option() {
+        let selected =
+            select_encoder_with(None, compatible_factories(&["nvd3d11h264enc"])).unwrap();
+
+        assert_eq!(selected, (Codec::H264, "nvd3d11h264enc"));
+    }
+
+    #[test]
+    fn auto_error_names_every_attempted_zero_copy_encoder() {
+        let error = select_encoder_with(None, |_| false).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("zero-copy"));
+        for encoder in ["mfh265enc", "nvd3d11h265enc", "mfh264enc", "nvd3d11h264enc"] {
+            assert!(message.contains(encoder), "error omitted {encoder}");
+        }
+    }
+
+    #[test]
+    fn explicit_codecs_keep_their_existing_encoder_without_fallback() {
+        for (codec, encoder) in [
+            (Codec::H265, "mfh265enc"),
+            (Codec::H264, "mfh264enc"),
+            (Codec::Av1, "nvd3d11av1enc"),
+        ] {
+            let selected = select_encoder_with(Some(codec), |_| {
+                panic!("explicit codec must not run auto compatibility selection")
+            })
+            .unwrap();
+            assert_eq!(selected, (codec, encoder));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local Windows GStreamer hardware stack"]
+    fn local_auto_probe_selects_media_foundation_h265() {
+        gst::init().unwrap();
+
+        assert_eq!(select_encoder(None).unwrap(), (Codec::H265, "mfh265enc"));
+    }
 
     #[test]
     fn streaming_encoder_uses_a_bounded_recovery_gop() {
@@ -334,10 +451,26 @@ mod tests {
     fn streaming_encoder_uses_consistent_low_latency_quality_settings() {
         gst::init().unwrap();
         let encoder = gst::ElementFactory::make("nvd3d11av1enc").build().unwrap();
-        configure_encoder(&encoder, Codec::Av1, 60);
+        configure_encoder(&encoder, "nvd3d11av1enc", Codec::Av1, 60);
 
         assert_eq!(encoder.property::<i32>("gop-size"), 120);
         assert!(encoder.property::<bool>("spatial-aq"));
+    }
+
+    #[test]
+    fn nvidia_h265_and_h264_encoders_use_nvidia_low_latency_tuning() {
+        gst::init().unwrap();
+
+        for (factory, codec) in [
+            ("nvd3d11h265enc", Codec::H265),
+            ("nvd3d11h264enc", Codec::H264),
+        ] {
+            let encoder = gst::ElementFactory::make(factory).build().unwrap();
+            configure_encoder(&encoder, factory, codec, 60);
+
+            assert_eq!(encoder.property::<i32>("gop-size"), 120);
+            assert!(encoder.property::<bool>("spatial-aq"), "{factory}");
+        }
     }
 
     #[test]
@@ -350,6 +483,21 @@ mod tests {
         assert!(chain.contains("h265parse"));
         assert!(!chain.contains("low-latency="));
         assert!(!chain.contains("quality-vs-speed="));
+    }
+
+    #[test]
+    fn capture_chain_uses_selected_encoder_independently_of_codec_identity() {
+        let settings = CaptureSettings {
+            codec: Codec::H265,
+            encoder: "nvd3d11h265enc",
+            ..CaptureSettings::default()
+        };
+
+        let chain = build_capture_chain(&settings);
+
+        assert!(chain.contains("nvd3d11h265enc"));
+        assert!(chain.contains("h265parse"));
+        assert!(!chain.contains("mfh265enc"));
     }
 
     #[test]

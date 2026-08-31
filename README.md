@@ -87,7 +87,9 @@ Without this configuration, anonymous signalling remains available and
 
 ## Media Path
 
-The production default is cross-vendor H.265 through Windows Media Foundation:
+The tray production policy prefers zero-copy H.265. It first tries Windows
+Media Foundation, then NVIDIA, and falls back to a compatible zero-copy H.264
+encoder when neither H.265 encoder can accept D3D11 textures:
 
 ```text
 d3d11screencapturesrc -> d3d11convert -> mfh265enc -> h265parse
@@ -105,8 +107,9 @@ D3D11 frames stay GPU-resident through capture, conversion, and the hardware
 encoder. CPU conversion elements such as `videoconvert` or `videoscale` in that
 production chain would change its performance profile.
 
-AV1 with NVIDIA encoding and H.264 remain explicit CLI diagnostic/development
-options. They are not the production default.
+The CLI default remains explicit Media Foundation H.265. `--codec auto` uses
+the tray policy; explicit `h265`, `h264`, and `av1` choices never fall back to a
+different factory or codec.
 
 ### Audio scope
 

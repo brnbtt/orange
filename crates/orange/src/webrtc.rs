@@ -210,7 +210,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         Output::File(path) => (None, ReceiveOutput::File(path)),
     };
     let playback = playback_owner.as_ref().map(|owner| owner.handle());
-    check_elements(settings.codec)?;
+    check_elements(settings)?;
 
     let pipeline = gst::Pipeline::new();
 
@@ -220,7 +220,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
     let encoder = capture
         .by_name("stream-encoder")
         .context("capture chain has no named encoder")?;
-    configure_encoder(&encoder, settings.codec, settings.fps);
+    configure_encoder(&encoder, settings.encoder, settings.codec, settings.fps);
     let pay = build_video_payloader(settings.codec)?;
     let caps_filter = gst::ElementFactory::make("capsfilter")
         .property("caps", rtp_caps(settings.codec, settings.fps))

@@ -476,7 +476,7 @@ pub const QUALITIES: &[Quality] = &[
         max_width: 1280,
         max_height: 720,
         bitrate: 4_000,
-        codec: "h265",
+        codec: "auto",
         mbps: 4,
     },
     Quality {
@@ -484,7 +484,7 @@ pub const QUALITIES: &[Quality] = &[
         max_width: 1920,
         max_height: 1080,
         bitrate: 8_000,
-        codec: "h265",
+        codec: "auto",
         mbps: 8,
     },
     Quality {
@@ -492,7 +492,7 @@ pub const QUALITIES: &[Quality] = &[
         max_width: 2560,
         max_height: 1440,
         bitrate: 18_000,
-        codec: "h265",
+        codec: "auto",
         mbps: 18,
     },
 ];
@@ -516,6 +516,11 @@ mod tests {
         assert_eq!(QUALITIES[1].scale_for(&target(2002, 1804)), "1198x1080");
         assert_eq!(QUALITIES[1].scale_for(&target(3440, 1440)), "1920x804");
         assert_eq!(QUALITIES[1].scale_for(&target(1280, 720)), "1280x720");
+    }
+
+    #[test]
+    fn tray_quality_tiers_request_compatible_encoder_selection() {
+        assert!(QUALITIES.iter().all(|quality| quality.codec == "auto"));
     }
 
     #[test]

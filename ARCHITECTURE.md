@@ -63,14 +63,14 @@ Compile dependencies point `orange -> orange-signal <- orange-relay`; tray/updat
 | `crates/orange-tray/src/tray.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-tray/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
 
-The tray quality table in `crates/orange-tray/src/supervisor.rs` is H.265 at 4/8/18 Mbps for 720p/1080p/1440p. The CLI defaults to 25 Mbps.
+The tray quality table in `crates/orange-tray/src/supervisor.rs` requests automatic zero-copy encoder selection at 4/8/18 Mbps for 720p/1080p/1440p. Selection prefers H.265 (Media Foundation, then NVIDIA) and falls back to H.264 (Media Foundation, then NVIDIA). The CLI defaults to explicit Media Foundation H.265 at 25 Mbps unless `--codec auto` is supplied.
 
 ## Media CLI Source Map
 
 | File | Authoritative responsibility |
 | --- | --- |
 | `crates/orange/src/main.rs` | CLI schema and dispatch for list, record, loopback, serve, login/logout, host/watch, preview; timed pipeline shutdown |
-| `crates/orange/src/pipeline.rs` | Codec mapping, capture/audio chains, encoder settings, record pipeline; default H.265 selection |
+| `crates/orange/src/pipeline.rs` | Codec mapping, zero-copy encoder compatibility selection, capture/audio chains, encoder settings, record pipeline |
 | `crates/orange/src/peer.rs` | Peer facade and shared signalling/WebRTC helpers, STUN setting, bus and connection-state reporting |
 | `crates/orange/src/peer/host.rs` | Host session, shared capture/audio tees, viewer map, idle redraw, keyframe cadence, signal loop, final teardown |
 | `crates/orange/src/peer/host_branch.rs` | Per-viewer WebRTC branches, request-pad ownership, offer creation, startup keyframes, blocked branch removal worker |
@@ -109,8 +109,9 @@ The tray quality table in `crates/orange-tray/src/supervisor.rs` is H.265 at 4/8
 
 ## Host Media Flow
 
-The validated production default is H.265. Frames remain D3D11-backed through
-capture, GPU conversion, and hardware encoding:
+The production tray policy prefers H.265 and falls back to H.264 only when no
+H.265 factory can statically link to D3D11 input. Frames remain D3D11-backed
+through capture, GPU conversion, and hardware encoding:
 
 ```text
 d3d11screencapturesrc
@@ -123,7 +124,7 @@ d3d11screencapturesrc
 - The shared tee is after the parser: capture and hardware encode happen once.
 - Every viewer receives its own payloader, RTP stream, WebRTC peer, offer, ICE, startup keyframe worker, diagnostics handle, and requested pads.
 - NACK, periodic keyframes, and redraw requests support recovery and late joins, including windows that are not repainting.
-- AV1/NVIDIA and H.264 are explicit diagnostic/development choices, not defaults.
+- `--codec auto` tries `mfh265enc`, `nvd3d11h265enc`, `mfh264enc`, then `nvd3d11h264enc`; explicit CLI codec choices retain their fixed factories without fallback.
 
 Audio construction failure disables optional audio. Once linked into the shared pipeline, a later audio error can end the host session.
 
