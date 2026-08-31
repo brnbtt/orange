@@ -332,7 +332,7 @@ mod tests {
     use std::cell::RefCell;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, TryLockError};
     use std::time::{Duration, Instant};
 
     #[derive(Clone)]
@@ -376,13 +376,14 @@ mod tests {
     fn wait_for_sender_close(sink: &DiagnosticSink) -> bool {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if sink
-                .sender
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_none()
-            {
-                return true;
+            match sink.sender.try_lock() {
+                Ok(sender) if sender.is_none() => return true,
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    if poisoned.into_inner().is_none() {
+                        return true;
+                    }
+                }
+                Ok(_) | Err(TryLockError::WouldBlock) => {}
             }
             if Instant::now() >= deadline {
                 return false;
