@@ -10,6 +10,7 @@
 //! whoever turns up.
 
 pub mod auth;
+mod diagnostics;
 mod server;
 
 pub use auth::Identity;
@@ -619,7 +620,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -657,7 +658,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -717,7 +718,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -838,7 +839,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -887,7 +888,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -937,7 +938,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms,
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -973,7 +974,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms,
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1049,7 +1050,7 @@ mod tests {
         let app = server::router(server::AppState {
             rooms: rooms.clone(),
             auth: auth::Auth::new(None),
-            diagnostics: server::DiagnosticsStorage::Disabled,
+            diagnostics: diagnostics::DiagnosticsStorage::Disabled,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
