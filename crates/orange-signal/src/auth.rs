@@ -20,6 +20,8 @@ use tokio::sync::Mutex;
 /// How long an unclaimed login attempt stays valid.
 const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 const SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const PENDING_CAPACITY: usize = 1024;
+const SESSION_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
@@ -158,6 +160,9 @@ impl Auth {
 
         let mut auth = self.state.lock().await;
         auth.prune();
+        if auth.pending.len() >= PENDING_CAPACITY {
+            anyhow::bail!("too many login attempts; try again later");
+        }
         auth.pending.insert(
             state.clone(),
             Pending::Waiting {
@@ -340,6 +345,16 @@ impl AuthState {
             Ok(identity) => {
                 let session = random_token();
                 let now = Instant::now();
+                if self.sessions.len() >= SESSION_CAPACITY {
+                    let oldest = self
+                        .sessions
+                        .iter()
+                        .min_by_key(|(_, stored)| stored.created_at)
+                        .map(|(session, _)| session.clone());
+                    if let Some(oldest) = oldest {
+                        self.sessions.remove(&oldest);
+                    }
+                }
                 self.sessions.insert(
                     session.clone(),
                     StoredSession {
@@ -413,6 +428,14 @@ mod tests {
         auth
     }
 
+    fn configured_auth() -> Auth {
+        Auth::new(Some(DiscordConfig {
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://relay.invalid/auth/callback".into(),
+        }))
+    }
+
     #[test]
     fn callback_state_can_only_be_claimed_once() {
         let mut auth = waiting_state();
@@ -455,6 +478,79 @@ mod tests {
         assert_eq!(error.to_string(), "login attempt expired");
         assert!(!auth.pending.contains_key("state"));
         assert!(auth.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_prunes_then_rejects_more_than_1024_pending_attempts() {
+        let auth = configured_auth();
+        let now = Instant::now();
+        {
+            let mut state = auth.state.lock().await;
+            state.pending.insert(
+                "expired".into(),
+                Pending::Waiting {
+                    since: now - PENDING_TTL,
+                },
+            );
+            for attempt in 0..PENDING_CAPACITY - 1 {
+                state
+                    .pending
+                    .insert(format!("state-{attempt}"), Pending::Waiting { since: now });
+            }
+        }
+
+        auth.start()
+            .await
+            .expect("attempt at capacity was rejected");
+        let error = auth.start().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "too many login attempts; try again later"
+        );
+        let state = auth.state.lock().await;
+        assert_eq!(state.pending.len(), PENDING_CAPACITY);
+        assert!(!state.pending.contains_key("expired"));
+    }
+
+    #[test]
+    fn successful_completion_at_4096_sessions_evicts_only_the_oldest() {
+        let now = Instant::now();
+        let mut auth = AuthState::default();
+        auth.pending
+            .insert("state".into(), Pending::Completing { since: now });
+        auth.sessions.insert(
+            "oldest".into(),
+            StoredSession {
+                identity: identity("oldest"),
+                created_at: now - Duration::from_secs(2),
+            },
+        );
+        for session in 1..SESSION_CAPACITY {
+            auth.sessions.insert(
+                format!("session-{session}"),
+                StoredSession {
+                    identity: identity(&format!("user-{session}")),
+                    created_at: now - Duration::from_secs(1),
+                },
+            );
+        }
+
+        auth.finish_completion("state", Ok(identity("new")))
+            .unwrap();
+
+        assert_eq!(auth.sessions.len(), SESSION_CAPACITY);
+        assert!(!auth.sessions.contains_key("oldest"));
+        for session in 1..SESSION_CAPACITY {
+            assert!(auth.sessions.contains_key(&format!("session-{session}")));
+        }
+        assert_eq!(
+            auth.sessions
+                .values()
+                .filter(|stored| stored.identity.id == "new")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

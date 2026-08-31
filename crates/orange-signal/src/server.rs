@@ -23,13 +23,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
 const DIAGNOSTICS_LIMIT: usize = 8 * 1024 * 1024;
+const CONNECTION_CAPACITY: usize = 512;
+static CONNECTIONS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(CONNECTION_CAPACITY)));
 
 #[derive(Clone)]
 pub(crate) enum DiagnosticsStorage {
@@ -424,8 +427,23 @@ async fn auth_poll(
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
+    ws_upgrade_with_limit(ws, app, CONNECTIONS.clone())
+}
+
+fn ws_upgrade_with_limit(
+    ws: WebSocketUpgrade,
+    app: AppState,
+    connections: Arc<Semaphore>,
+) -> Response {
+    let Ok(permit) = connections.try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     ws.max_message_size(64 * 1024)
-        .on_upgrade(move |socket| handle_socket(socket, app))
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            handle_socket(socket, app).await;
+        })
+        .into_response()
 }
 
 async fn handle_socket(socket: WebSocket, app: AppState) {
@@ -488,6 +506,13 @@ mod tests {
     const RUN: &str = "12345678-1234-4abc-8def-1234567890ab";
     const DEVICE: &str = "87654321-4321-4abc-8def-ba0987654321";
 
+    async fn limited_ws_upgrade(
+        ws: WebSocketUpgrade,
+        State((app, connections)): State<(AppState, Arc<tokio::sync::Semaphore>)>,
+    ) -> Response {
+        ws_upgrade_with_limit(ws, app, connections)
+    }
+
     #[tokio::test]
     async fn oauth_callback_escapes_untrusted_html_and_sets_csp() {
         let app = router(AppState {
@@ -512,6 +537,46 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[tokio::test]
+    async fn websocket_permit_is_held_until_the_connection_closes() {
+        assert_eq!(CONNECTION_CAPACITY, 512);
+        let connections = Arc::new(tokio::sync::Semaphore::new(1));
+        let app = Router::new()
+            .route("/ws", get(limited_ws_upgrade))
+            .with_state((
+                AppState {
+                    rooms: Rooms::default(),
+                    auth: Auth::new(None),
+                    diagnostics: DiagnosticsStorage::Disabled,
+                },
+                connections.clone(),
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        assert_eq!(connections.available_permits(), 0);
+        let error = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("capacity rejection was not an HTTP response: {error}");
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(connections.available_permits(), 0);
+
+        socket.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while connections.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection permit was not released");
+        assert_eq!(connections.available_permits(), 1);
+        relay.abort();
     }
 
     fn headers() -> HeaderMap {

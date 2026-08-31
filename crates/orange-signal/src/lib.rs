@@ -651,6 +651,49 @@ mod tests {
         relay.abort();
     }
 
+    #[tokio::test]
+    async fn sixty_four_sequential_host_connections_leave_no_rooms() {
+        let rooms = Rooms::default();
+        let app = server::router(server::AppState {
+            rooms: rooms.clone(),
+            auth: auth::Auth::new(None),
+            diagnostics: server::DiagnosticsStorage::Disabled,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for cycle in 0..64 {
+                let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+                host.send(tokio_tungstenite::tungstenite::Message::Text(
+                    Signal::Host.to_json(),
+                ))
+                .await
+                .unwrap();
+                assert!(matches!(
+                    receive_signal(&mut host).await,
+                    Signal::Hosting { .. }
+                ));
+                host.close(None).await.unwrap();
+
+                while !rooms.lock().await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    rooms.lock().await.is_empty(),
+                    "room remained after cycle {cycle}"
+                );
+            }
+        })
+        .await
+        .expect("64 host create/close cycles timed out");
+
+        assert!(rooms.lock().await.is_empty());
+        relay.abort();
+    }
+
     async fn receive_signal(
         socket: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
