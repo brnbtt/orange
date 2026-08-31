@@ -463,9 +463,7 @@ fn connect_signalling(sender: &gst::Element, receiver: &gst::Element) {
     // Trickle ICE, in both directions.
     let rx = receiver.downgrade();
     sender.connect("on-ice-candidate", false, move |values| {
-        let Some(rx) = rx.upgrade() else {
-            return None;
-        };
+        let rx = rx.upgrade()?;
         let mlineindex = values[1].get::<u32>().unwrap();
         let candidate = values[2].get::<String>().unwrap();
         rx.emit_by_name::<()>("add-ice-candidate", &[&mlineindex, &candidate]);
@@ -474,9 +472,7 @@ fn connect_signalling(sender: &gst::Element, receiver: &gst::Element) {
 
     let tx = sender.downgrade();
     receiver.connect("on-ice-candidate", false, move |values| {
-        let Some(tx) = tx.upgrade() else {
-            return None;
-        };
+        let tx = tx.upgrade()?;
         let mlineindex = values[1].get::<u32>().unwrap();
         let candidate = values[2].get::<String>().unwrap();
         tx.emit_by_name::<()>("add-ice-candidate", &[&mlineindex, &candidate]);
