@@ -14,6 +14,7 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -531,7 +532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn viewer_teardown_drains_before_drop_returns() {
+    async fn viewer_teardown_worker_removes_enqueued_branch() {
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let bin = gst::ElementFactory::make("identity")
@@ -900,7 +901,14 @@ impl ViewerTeardown {
             .name("viewer-teardown".to_string())
             .spawn(move || {
                 while let Some(branch) = receiver.blocking_recv() {
-                    remove_viewer(&worker_pipeline, branch);
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        remove_viewer(&worker_pipeline, branch);
+                    }))
+                    .is_err()
+                    {
+                        let _ =
+                            writeln!(std::io::stderr().lock(), "[host] viewer teardown panicked");
+                    }
                 }
             })
             .context("failed to spawn viewer teardown worker")?;
@@ -912,10 +920,10 @@ impl ViewerTeardown {
     }
 
     async fn enqueue(&self, branch: ViewerBranch) {
-        let Some(sender) = &self.sender else {
-            remove_viewer(&self.pipeline, branch);
-            return;
-        };
+        let sender = self
+            .sender
+            .as_ref()
+            .expect("sender exists until viewer teardown drop");
         if let Err(error) = sender.send(branch).await {
             remove_viewer(&self.pipeline, error.0);
         }
@@ -1141,7 +1149,11 @@ fn remove_tee_branch(pipeline: &gst::Pipeline, bin: &gst::Element, branch: TeeBr
     for element in &branch.elements {
         let _ = element.set_state(gst::State::Null);
     }
-    if let Some(src_pad) = branch.elements.last().unwrap().static_pad("src") {
+    if let Some(src_pad) = branch
+        .elements
+        .last()
+        .and_then(|element| element.static_pad("src"))
+    {
         let _ = src_pad.unlink(&branch.bin_pad);
     }
     branch.tee.release_request_pad(&branch.tee_pad);
