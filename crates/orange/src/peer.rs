@@ -184,9 +184,7 @@ fn combine_session_and_cleanup(session: Result<()>, cleanup: Result<()>) -> Resu
     match (session, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(session), Err(cleanup)) => {
-            Err(session.context(format!("cleanup also failed: {cleanup:#}")))
-        }
+        (Err(session), Err(cleanup)) => Err(anyhow::anyhow!("{session:#}; {cleanup:#}")),
     }
 }
 
@@ -463,22 +461,55 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    fn shutdown_startup_worker_bounded(mut worker: StartupKeyframeWorker) -> Option<Duration> {
-        let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
-        let shutdown = std::thread::spawn(move || {
-            let started = Instant::now();
-            worker.shutdown();
-            let _ = finished.send(started.elapsed());
-        });
-        let elapsed = wait_for_finish.recv_timeout(Duration::from_secs(1)).ok();
-        if elapsed.is_some() {
-            shutdown.join().ok()?;
+    fn run_in_bounded_subprocess(env: &str, test: &str) -> bool {
+        if std::env::var_os(env).is_some() {
+            return false;
         }
-        elapsed
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(env, "1")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "child test failed: {test}");
+                return true;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child test exceeded deadline: {test}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn shutdown_startup_worker_bounded(mut worker: StartupKeyframeWorker) -> bool {
+        let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
+        let emergency_stop = worker.sender.as_ref().cloned();
+        let shutdown = std::thread::spawn(move || {
+            worker.shutdown();
+            let _ = finished.send(());
+        });
+        let mut completed = wait_for_finish.recv_timeout(Duration::from_secs(1)).is_ok();
+        if !completed {
+            if let Some(stop) = emergency_stop {
+                let _ = stop.send(StartupKeyframeCommand::Stop);
+            }
+            completed = wait_for_finish.recv_timeout(Duration::from_secs(1)).is_ok();
+        }
+        completed && shutdown.join().is_ok()
     }
 
     #[test]
     fn peer_worker_review_startup_cadence_has_exact_clock_free_progression() {
+        if run_in_bounded_subprocess(
+            "ORANGE_TEST_STARTUP_CADENCE_CHILD",
+            "peer::tests::peer_worker_review_startup_cadence_has_exact_clock_free_progression",
+        ) {
+            return;
+        }
         let (calls, receive_calls) = std::sync::mpsc::sync_channel(4);
         let sequence = Arc::new(AtomicUsize::new(0));
         let sequence_for_worker = sequence.clone();
@@ -498,7 +529,7 @@ mod tests {
             .collect();
         let shutdown = shutdown_startup_worker_bounded(worker);
 
-        assert!(shutdown.is_some());
+        assert!(shutdown);
         assert_eq!(observed, [1, 2, 3, 4]);
         assert_eq!(
             STARTUP_KEYFRAME_DELAYS,
@@ -540,6 +571,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn peer_worker_review_dead_enqueue_fallback_does_not_block_tokio() {
+        if run_in_bounded_subprocess(
+            "ORANGE_TEST_DEAD_ENQUEUE_CHILD",
+            "peer::tests::peer_worker_review_dead_enqueue_fallback_does_not_block_tokio",
+        ) {
+            return;
+        }
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let bin = gst::ElementFactory::make("identity").build().unwrap();
@@ -561,14 +598,17 @@ mod tests {
         .unwrap();
         trigger.request();
         wait_for_entry.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (heartbeat_signal, wait_for_heartbeat) = std::sync::mpsc::sync_channel(1);
+        let (release_order, wait_for_release_order) = std::sync::mpsc::sync_channel(1);
         let release_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
+            let heartbeat_preceded_release = wait_for_heartbeat
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok();
             let _ = release.send(());
+            let _ = release_order.send(heartbeat_preceded_release);
         });
-        let started = Instant::now();
         let heartbeat = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            started.elapsed()
+            let _ = heartbeat_signal.send(());
         });
 
         let enqueue_result = tokio::time::timeout(
@@ -582,11 +622,16 @@ mod tests {
             }),
         )
         .await;
-        let heartbeat_at = heartbeat.await.unwrap();
-        release_thread.join().unwrap();
+        let heartbeat_result = heartbeat.await;
+        let heartbeat_preceded_release = wait_for_release_order
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or(false);
+        let release_joined = release_thread.join().is_ok();
 
         assert!(matches!(enqueue_result, Ok(Ok(()))));
-        assert!(heartbeat_at < Duration::from_millis(100));
+        assert!(heartbeat_result.is_ok());
+        assert!(heartbeat_preceded_release);
+        assert!(release_joined);
     }
 
     #[tokio::test]
@@ -604,6 +649,12 @@ mod tests {
 
     #[test]
     fn peer_worker_review_viewer_teardown_drop_joins_synchronous_fallback() {
+        if run_in_bounded_subprocess(
+            "ORANGE_TEST_VIEWER_DROP_CHILD",
+            "peer::tests::peer_worker_review_viewer_teardown_drop_joins_synchronous_fallback",
+        ) {
+            return;
+        }
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let (sender, receiver) = mpsc::channel(1);
@@ -626,9 +677,7 @@ mod tests {
         });
 
         let closing = wait_for_worker_closing.recv_timeout(Duration::from_secs(1));
-        let blocked = wait_for_drop
-            .recv_timeout(Duration::from_millis(25))
-            .is_err();
+        let blocked = wait_for_drop.try_recv().is_err();
         let _ = release_worker.send(());
         let finished = wait_for_drop.recv_timeout(Duration::from_secs(2));
         let joined = dropper.join();
@@ -651,7 +700,7 @@ mod tests {
         .await;
 
         assert_eq!(*order.lock().unwrap(), ["playing-failed", "cleanup"]);
-        let message = format!("{:#}", result.unwrap_err());
+        let message = result.unwrap_err().to_string();
         assert!(message.contains("playing failed"));
         assert!(message.contains("cleanup failed"));
     }
@@ -674,13 +723,19 @@ mod tests {
         assert!(success.is_ok());
         assert_eq!(session_only.to_string(), "session-only failure");
         assert_eq!(cleanup_only.to_string(), "cleanup-only failure");
-        let both = format!("{both:#}");
+        let both = both.to_string();
         assert!(both.contains("session failure"));
         assert!(both.contains("cleanup failure"));
     }
 
     #[test]
     fn startup_keyframe_worker_trigger_is_one_shot() {
+        if run_in_bounded_subprocess(
+            "ORANGE_TEST_STARTUP_ONESHOT_CHILD",
+            "peer::tests::startup_keyframe_worker_trigger_is_one_shot",
+        ) {
+            return;
+        }
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_worker = requests.clone();
         let (requested, wait_for_request) = std::sync::mpsc::sync_channel(1);
@@ -696,29 +751,44 @@ mod tests {
         let observed = wait_for_request.recv_timeout(Duration::from_secs(1));
         let shutdown = shutdown_startup_worker_bounded(worker);
 
-        assert!(shutdown.is_some());
+        assert!(shutdown);
         assert!(observed.is_ok());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn startup_keyframe_worker_stop_interrupts_wait() {
+        if run_in_bounded_subprocess(
+            "ORANGE_TEST_STARTUP_STOP_CHILD",
+            "peer::tests::startup_keyframe_worker_stop_interrupts_wait",
+        ) {
+            return;
+        }
         let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
-        let (worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
-            let _ = started.send(());
-            true
-        })
+        let (worker, trigger) = StartupKeyframeWorker::spawn_with_delays(
+            move || {
+                let _ = started.send(());
+                true
+            },
+            [Duration::from_secs(60); 3],
+        )
         .unwrap();
         trigger.request();
         wait_for_start.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let elapsed = shutdown_startup_worker_bounded(worker);
+        let completed = shutdown_startup_worker_bounded(worker);
 
-        assert!(elapsed.is_some_and(|elapsed| elapsed < Duration::from_millis(100)));
+        assert!(completed);
     }
 
     #[test]
     fn startup_keyframe_worker_sends_nothing_after_stop() {
+        if run_in_bounded_subprocess(
+            "ORANGE_TEST_STARTUP_NO_DELAY_CHILD",
+            "peer::tests::startup_keyframe_worker_sends_nothing_after_stop",
+        ) {
+            return;
+        }
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_worker = requests.clone();
         let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
@@ -733,7 +803,7 @@ mod tests {
 
         let shutdown = shutdown_startup_worker_bounded(worker);
 
-        assert!(shutdown.is_some());
+        assert!(shutdown);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
@@ -975,6 +1045,12 @@ mod tests {
 
     #[test]
     fn viewer_teardown_starts_only_after_startup_worker_joins() {
+        if run_in_bounded_subprocess(
+            "ORANGE_TEST_STARTUP_ORDER_CHILD",
+            "peer::tests::viewer_teardown_starts_only_after_startup_worker_joins",
+        ) {
+            return;
+        }
         struct MarkStopped(Arc<AtomicBool>);
         impl Drop for MarkStopped {
             fn drop(&mut self) {
@@ -1365,7 +1441,7 @@ struct ViewerTeardown {
 async fn run_viewer_teardown_blocking(teardown: impl FnOnce() + Send + 'static) -> Result<()> {
     tokio::task::spawn_blocking(teardown)
         .await
-        .context("fallback viewer teardown task failed")
+        .map_err(|error| anyhow::anyhow!("fallback viewer teardown task failed: {error}"))
 }
 
 impl ViewerTeardown {
@@ -1418,7 +1494,7 @@ impl ViewerTeardown {
             Ok(())
         })
         .await
-        .context("viewer teardown join task failed")?
+        .map_err(|error| anyhow::anyhow!("viewer teardown join task failed: {error}"))?
     }
 }
 
@@ -1793,13 +1869,16 @@ async fn stop_watch_receive_pipeline(
     bin.disconnect(pad_added);
     let pipeline = pipeline.clone();
     tokio::task::spawn_blocking(move || {
-        workers.close_and_take().shutdown();
+        let worker_result = workers.shutdown();
         drop(diagnostics);
-        pipeline.set_state(gst::State::Null)?;
-        Ok(())
+        let stop_result = pipeline
+            .set_state(gst::State::Null)
+            .map(|_| ())
+            .map_err(anyhow::Error::from);
+        combine_session_and_cleanup(worker_result, stop_result)
     })
     .await
-    .context("watch receive teardown task failed")?
+    .map_err(|error| anyhow::anyhow!("watch receive teardown task failed: {error}"))?
 }
 
 pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {

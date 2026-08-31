@@ -492,19 +492,33 @@ pub(crate) fn run_pipeline_while(
     seconds: u64,
     playback: Option<&window::PlaybackWindowHandle>,
 ) -> Result<()> {
-    run_pipeline_while_with_shutdown(pipeline, seconds, playback, || {})
+    run_pipeline_while_with_shutdown(pipeline, seconds, playback, || Ok(()))
+}
+
+fn combine_pipeline_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(anyhow::anyhow!("{primary:#}; {cleanup:#}")),
+    }
 }
 
 pub(crate) fn run_pipeline_while_with_shutdown(
     pipeline: &gst::Pipeline,
     seconds: u64,
     playback: Option<&window::PlaybackWindowHandle>,
-    shutdown: impl FnOnce(),
+    shutdown: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     if let Err(error) = pipeline.set_state(gst::State::Playing) {
-        shutdown();
-        let _ = pipeline.set_state(gst::State::Null);
-        return Err(error.into());
+        let shutdown_result = shutdown();
+        let stop_result = pipeline
+            .set_state(gst::State::Null)
+            .map(|_| ())
+            .map_err(anyhow::Error::from);
+        return combine_pipeline_results(
+            Err(error.into()),
+            combine_pipeline_results(shutdown_result, stop_result),
+        );
     }
 
     let bus = pipeline.bus().expect("pipeline without bus");
@@ -539,13 +553,19 @@ pub(crate) fn run_pipeline_while_with_shutdown(
         gst::ClockTime::from_seconds(5),
         &[gst::MessageType::Eos, gst::MessageType::Error],
     );
-    shutdown();
-    pipeline.set_state(gst::State::Null)?;
-
-    match error {
+    let shutdown_result = shutdown();
+    let stop_result = pipeline
+        .set_state(gst::State::Null)
+        .map(|_| ())
+        .map_err(anyhow::Error::from);
+    let run_result = match error {
         Some(err) => Err(err),
         None => Ok(()),
-    }
+    };
+    combine_pipeline_results(
+        run_result,
+        combine_pipeline_results(shutdown_result, stop_result),
+    )
 }
 
 fn report_file(path: &str) -> Result<()> {
@@ -562,7 +582,9 @@ fn report_file(path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gst, run_pipeline_while, timed_pipeline_should_continue};
+    use super::{
+        gst, run_pipeline_while, run_pipeline_while_with_shutdown, timed_pipeline_should_continue,
+    };
     use gst::prelude::*;
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -576,6 +598,22 @@ mod tests {
         assert!(!timed_pipeline_should_continue(true, Some(false)));
         assert!(!timed_pipeline_should_continue(false, None));
         assert!(!timed_pipeline_should_continue(false, Some(true)));
+    }
+
+    #[test]
+    fn remaining_peer_review_pipeline_reaches_null_after_cleanup_error() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+
+        let result = run_pipeline_while_with_shutdown(&pipeline, 0, None, || {
+            Err(anyhow::anyhow!("worker cleanup failed"))
+        });
+
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("worker cleanup failed"));
     }
 
     #[test]
