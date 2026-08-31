@@ -1,22 +1,58 @@
 use super::{tray, update, Orange, Screen};
 use crate::{supervisor::QUALITIES, ui::*};
 use gpui::{
-    div, prelude::*, px, rgb, size, Animation, AnimationExt, Context, FontWeight, SharedString,
-    Window,
+    div, prelude::*, px, rgb, size, Animation, AnimationExt, Context, FontWeight, Pixels,
+    SharedString, Size, Window,
 };
 use std::time::{Duration, Instant};
 
-impl Render for Orange {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The picker needs room for a two-column grid; every other screen is a
-        // narrow column. Resizing on transition keeps both comfortable rather
-        // than compromising on one size for all of them.
-        let update_visible = self.updates.status().is_visible();
-        let mut wanted = match self.screen {
+/// Per-screen view metadata.
+///
+/// Every match here is exhaustive with no `_` arm on purpose. Adding a screen
+/// should be a compile error in each of these, not a window that silently opens
+/// at the wrong size or a titlebar that silently shows nothing.
+impl Screen {
+    /// The picker needs room for a two-column grid; every other screen is a
+    /// narrow column. Resizing on transition keeps both comfortable rather
+    /// than compromising on one size for all of them.
+    fn size(self) -> Size<Pixels> {
+        match self {
             Screen::PickWindow => size(px(576.0), px(660.0)),
             Screen::Streaming => size(px(480.0), px(640.0)),
-            _ => size(px(400.0), px(540.0)),
-        };
+            Screen::SignedOut | Screen::Home | Screen::Watching | Screen::Settings => {
+                size(px(400.0), px(540.0))
+            }
+        }
+    }
+
+    /// Distinguishes screens for the entry animation, which restarts when this
+    /// changes.
+    fn animation_key(self) -> &'static str {
+        match self {
+            Screen::SignedOut => "signedout",
+            Screen::Home => "home",
+            Screen::PickWindow => "pick",
+            Screen::Streaming => "streaming",
+            Screen::Watching => "watching",
+            Screen::Settings => "settings",
+        }
+    }
+
+    fn breadcrumb(self) -> Option<&'static str> {
+        match self {
+            Screen::PickWindow => Some("/ SHARE"),
+            Screen::Streaming => Some("/ STREAMING"),
+            Screen::Watching => Some("/ WATCHING"),
+            Screen::Settings => Some("/ SETTINGS"),
+            Screen::SignedOut | Screen::Home => None,
+        }
+    }
+}
+
+impl Render for Orange {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let update_visible = self.updates.status().is_visible();
+        let mut wanted = self.screen.size();
         if update_visible {
             wanted.height += px(84.0);
         }
@@ -25,14 +61,7 @@ impl Render for Orange {
             window.resize(wanted);
         }
 
-        let key = match self.screen {
-            Screen::SignedOut => "signedout",
-            Screen::Home => "home",
-            Screen::PickWindow => "pick",
-            Screen::Streaming => "streaming",
-            Screen::Watching => "watching",
-            Screen::Settings => "settings",
-        };
+        let key = self.screen.animation_key();
 
         let body = match self.screen {
             Screen::SignedOut => self.render_signed_out(cx).into_any_element(),
@@ -165,13 +194,7 @@ impl Orange {
     /// draggable regions have to be declared. The buttons are deliberately
     /// left out of those regions, or the hit test would swallow their clicks.
     fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let breadcrumb = match self.screen {
-            Screen::PickWindow => Some("/ SHARE"),
-            Screen::Streaming => Some("/ STREAMING"),
-            Screen::Watching => Some("/ WATCHING"),
-            Screen::Settings => Some("/ SETTINGS"),
-            _ => None,
-        };
+        let breadcrumb = self.screen.breadcrumb();
 
         div()
             .flex()
