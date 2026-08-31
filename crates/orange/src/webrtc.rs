@@ -176,98 +176,6 @@ fn connect_signalling(sender: &gst::Element, receiver: &gst::Element) {
     let _ = gst_sdp::SDPMessage::new();
 }
 
-#[cfg(test)]
-mod loopback_lifecycle_tests {
-    use super::*;
-
-    fn requested_sink_pad_count(element: &gst::Element) -> usize {
-        element
-            .pads()
-            .into_iter()
-            .filter(|pad| pad.direction() == gst::PadDirection::Sink)
-            .count()
-    }
-
-    #[test]
-    fn loopback_signalling_does_not_keep_peers_alive() {
-        gst::init().unwrap();
-
-        for index in 0..3 {
-            let sender = gst::ElementFactory::make("webrtcbin")
-                .name(format!("lifecycle-sender-{index}"))
-                .build()
-                .unwrap();
-            let receiver = gst::ElementFactory::make("webrtcbin")
-                .name(format!("lifecycle-receiver-{index}"))
-                .build()
-                .unwrap();
-            let sender_weak = sender.downgrade();
-            let receiver_weak = receiver.downgrade();
-
-            connect_signalling(&sender, &receiver);
-            drop(sender);
-            drop(receiver);
-
-            assert!(sender_weak.upgrade().is_none());
-            assert!(receiver_weak.upgrade().is_none());
-        }
-    }
-
-    #[test]
-    fn loopback_requested_sink_pad_returns_to_baseline_after_owner_drop() {
-        gst::init().unwrap();
-        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
-        let baseline = requested_sink_pad_count(&sender);
-
-        for _ in 0..3 {
-            let pad = LoopbackSender::request(&sender).unwrap();
-            assert_eq!(requested_sink_pad_count(&sender), baseline + 1);
-            drop(pad);
-        }
-
-        assert_eq!(requested_sink_pad_count(&sender), baseline);
-    }
-
-    #[test]
-    fn loopback_linked_sender_owner_unlinks_and_releases_on_drop() {
-        gst::init().unwrap();
-        let pipeline = gst::Pipeline::new();
-        let source = gst::ElementFactory::make("fakesrc").build().unwrap();
-        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
-        pipeline.add_many([&source, &sender]).unwrap();
-        let src_pad = source.static_pad("src").unwrap();
-        let baseline = requested_sink_pad_count(&sender);
-
-        let owner = link_loopback_sender(&sender, &src_pad).unwrap();
-
-        assert!(src_pad.is_linked());
-        assert_eq!(requested_sink_pad_count(&sender), baseline + 1);
-        drop(owner);
-        assert!(!src_pad.is_linked());
-        assert_eq!(requested_sink_pad_count(&sender), baseline);
-
-        pipeline.set_state(gst::State::Null).unwrap();
-        pipeline.remove(&source).unwrap();
-        pipeline.remove(&sender).unwrap();
-    }
-
-    #[test]
-    fn loopback_link_error_releases_requested_sink_pad() {
-        gst::init().unwrap();
-        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
-        let baseline = requested_sink_pad_count(&sender);
-        let source = gst::ElementFactory::make("fakesrc").build().unwrap();
-        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
-        source.link(&sink).unwrap();
-        let already_linked = source.static_pad("src").unwrap();
-
-        let result = link_loopback_sender(&sender, &already_linked);
-
-        assert!(result.is_err());
-        assert_eq!(requested_sink_pad_count(&sender), baseline);
-    }
-}
-
 /// Where the received video should end up.
 pub enum Output {
     /// Render into a window we own, by HWND, with controls composited on top.
@@ -395,4 +303,96 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         recv_bin.disconnect(pad_added);
         workers.shutdown()
     })
+}
+
+#[cfg(test)]
+mod loopback_lifecycle_tests {
+    use super::*;
+
+    fn requested_sink_pad_count(element: &gst::Element) -> usize {
+        element
+            .pads()
+            .into_iter()
+            .filter(|pad| pad.direction() == gst::PadDirection::Sink)
+            .count()
+    }
+
+    #[test]
+    fn loopback_signalling_does_not_keep_peers_alive() {
+        gst::init().unwrap();
+
+        for index in 0..3 {
+            let sender = gst::ElementFactory::make("webrtcbin")
+                .name(format!("lifecycle-sender-{index}"))
+                .build()
+                .unwrap();
+            let receiver = gst::ElementFactory::make("webrtcbin")
+                .name(format!("lifecycle-receiver-{index}"))
+                .build()
+                .unwrap();
+            let sender_weak = sender.downgrade();
+            let receiver_weak = receiver.downgrade();
+
+            connect_signalling(&sender, &receiver);
+            drop(sender);
+            drop(receiver);
+
+            assert!(sender_weak.upgrade().is_none());
+            assert!(receiver_weak.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn loopback_requested_sink_pad_returns_to_baseline_after_owner_drop() {
+        gst::init().unwrap();
+        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
+        let baseline = requested_sink_pad_count(&sender);
+
+        for _ in 0..3 {
+            let pad = LoopbackSender::request(&sender).unwrap();
+            assert_eq!(requested_sink_pad_count(&sender), baseline + 1);
+            drop(pad);
+        }
+
+        assert_eq!(requested_sink_pad_count(&sender), baseline);
+    }
+
+    #[test]
+    fn loopback_linked_sender_owner_unlinks_and_releases_on_drop() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
+        pipeline.add_many([&source, &sender]).unwrap();
+        let src_pad = source.static_pad("src").unwrap();
+        let baseline = requested_sink_pad_count(&sender);
+
+        let owner = link_loopback_sender(&sender, &src_pad).unwrap();
+
+        assert!(src_pad.is_linked());
+        assert_eq!(requested_sink_pad_count(&sender), baseline + 1);
+        drop(owner);
+        assert!(!src_pad.is_linked());
+        assert_eq!(requested_sink_pad_count(&sender), baseline);
+
+        pipeline.set_state(gst::State::Null).unwrap();
+        pipeline.remove(&source).unwrap();
+        pipeline.remove(&sender).unwrap();
+    }
+
+    #[test]
+    fn loopback_link_error_releases_requested_sink_pad() {
+        gst::init().unwrap();
+        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
+        let baseline = requested_sink_pad_count(&sender);
+        let source = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        source.link(&sink).unwrap();
+        let already_linked = source.static_pad("src").unwrap();
+
+        let result = link_loopback_sender(&sender, &already_linked);
+
+        assert!(result.is_err());
+        assert_eq!(requested_sink_pad_count(&sender), baseline);
+    }
 }
