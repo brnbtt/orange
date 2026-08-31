@@ -1074,9 +1074,23 @@ impl Orange {
             .flex_col()
             .gap_3()
             .flex_1()
-            .child(micro("ACCOUNT AND RELAY", ORANGE))
+            .min_h(px(0.0))
+            .child(
+                // The settings list outgrew the window once Updates and
+                // Diagnostics were added. Scroll the list and pin the footer so
+                // Done is always reachable without scrolling to find it.
+                div()
+                    .id("settings-scroll")
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+            .child(micro("ACCOUNT AND RELAY", ORANGE).flex_shrink_0())
             .child(
                 card()
+                    .flex_shrink_0()
                     .flex_row()
                     .items_center()
                     .justify_between()
@@ -1098,6 +1112,7 @@ impl Orange {
             )
             .child(
                 card()
+                    .flex_shrink_0()
                     .gap_2()
                     .child(label("Default quality", TEXT))
                     .child(
@@ -1127,6 +1142,7 @@ impl Orange {
             )
             .child(
                 card()
+                    .flex_shrink_0()
                     .gap_2()
                     .child(label("Frame rate", TEXT))
                     .child(
@@ -1161,9 +1177,9 @@ impl Orange {
                             .text_xs(),
                     ),
             )
-            .child(div().flex_1())
             .child(
                 card()
+                    .flex_shrink_0()
                     .flex_row()
                     .items_center()
                     .justify_between()
@@ -1178,12 +1194,15 @@ impl Orange {
                     )
                     .child({
                         // Always rendered so the row does not reflow while a
-                        // check runs; dimmed and inert when one cannot start.
-                        let button = quiet("check-updates", "Check now");
-                        if self.updates.can_check_now() {
+                        // check runs; dimmed and inert when nothing applies.
+                        // The label follows the state: an available update
+                        // installs, anything else checks.
+                        let action = self.updates.settings_action();
+                        let button = quiet("check-updates", action.unwrap_or("Check now"));
+                        if action.is_some() {
                             button
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.updates.check_now();
+                                    this.updates.activate_settings_action();
                                     cx.notify();
                                 }))
                                 .into_any_element()
@@ -1194,6 +1213,7 @@ impl Orange {
             )
             .child(
                 card()
+                    .flex_shrink_0()
                     .flex_row()
                     .items_center()
                     .justify_between()
@@ -1214,6 +1234,7 @@ impl Orange {
                             cx.notify();
                         },
                     ))),
+            ),
             )
             .child(micro(
                 format!(

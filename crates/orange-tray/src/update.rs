@@ -261,11 +261,31 @@ impl UpdateController {
         self.next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
     }
 
-    /// One line describing update state for the settings screen.
+    /// The settings row's action, if one applies.
     ///
-    /// `Available` deliberately states the version without offering an action:
-    /// the banner already owns "Update now", and duplicating it would give two
-    /// controls that must agree.
+    /// Mirrors the banner: an available update offers to install it, anything
+    /// else offers a check. Both routes call the same status machine, so the
+    /// two controls are views of one state rather than two states to reconcile.
+    pub(crate) fn settings_action(&self) -> Option<&'static str> {
+        if matches!(self.status, UpdateStatus::Available(_)) {
+            Some("Update now")
+        } else if self.can_check_now() {
+            Some("Check now")
+        } else {
+            None
+        }
+    }
+
+    /// Perform whatever `settings_action` offers. No-op when it offers nothing.
+    pub(crate) fn activate_settings_action(&mut self) {
+        if matches!(self.status, UpdateStatus::Available(_)) {
+            self.request_update();
+        } else {
+            self.check_now();
+        }
+    }
+
+    /// One line describing update state for the settings screen.
     pub(crate) fn settings_detail(&self) -> String {
         match &self.status {
             UpdateStatus::Disabled => "Automatic updates apply to installed builds only.".into(),
@@ -1115,6 +1135,53 @@ mod tests {
         controller.check_now();
         // Still Checking: check_now must not restart or clobber a live job.
         assert!(matches!(controller.status(), UpdateStatus::Checking));
+    }
+
+    #[test]
+    fn settings_action_offers_install_for_available_and_nothing_while_busy() {
+        // `Available` offers to install regardless of the compile-time channel;
+        // it is unreachable when updates are off, since a disabled build never
+        // starts a check. The check-offering states route through
+        // `can_check_now`, which is false here because tests are not built with
+        // ORANGE_UPDATE_CHANNEL set.
+        assert_eq!(
+            controller(UpdateStatus::Available(update_info()), None).settings_action(),
+            Some("Update now")
+        );
+        for status in [
+            UpdateStatus::Disabled,
+            UpdateStatus::Checking,
+            UpdateStatus::Downloading(update_info()),
+            UpdateStatus::Current,
+            UpdateStatus::Failed {
+                message: "offline".into(),
+            },
+        ] {
+            let controller = controller(status.clone(), None);
+            assert_eq!(
+                controller.settings_action(),
+                None,
+                "unexpected action for {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_action_is_inert_when_it_offers_nothing() {
+        for status in [
+            UpdateStatus::Checking,
+            UpdateStatus::Downloading(update_info()),
+            UpdateStatus::Disabled,
+        ] {
+            let mut controller = controller(status.clone(), None);
+            assert!(controller.settings_action().is_none());
+            controller.activate_settings_action();
+            assert_eq!(
+                std::mem::discriminant(controller.status()),
+                std::mem::discriminant(&status),
+                "activating a offerless action changed {status:?}"
+            );
+        }
     }
 
     #[test]
