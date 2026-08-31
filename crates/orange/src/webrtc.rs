@@ -148,6 +148,14 @@ pub(crate) fn watch_incoming_bitrate(
     overlay: crate::overlay::SharedOverlay,
 ) -> Result<IncomingBitrateWorker> {
     let bytes = Arc::new(AtomicU64::new(0));
+    watch_incoming_bitrate_with_counter(pad, overlay, bytes)
+}
+
+fn watch_incoming_bitrate_with_counter(
+    pad: &gst::Pad,
+    overlay: crate::overlay::SharedOverlay,
+    bytes: Arc<AtomicU64>,
+) -> Result<IncomingBitrateWorker> {
     let bytes_for_probe = bytes.clone();
     let probe = pad
         .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
@@ -203,6 +211,22 @@ struct ReceiveWorkerState {
 #[derive(Clone)]
 pub(crate) struct ReceiveWorkerRegistry {
     shared: Arc<(Mutex<ReceiveWorkerState>, Condvar)>,
+}
+
+pub(crate) enum AcceptedReceivePad {
+    Audio(ReceivePadClaim),
+    Video(ReceivePadClaim),
+}
+
+pub(crate) fn accept_receive_pad(
+    registry: &ReceiveWorkerRegistry,
+    pad: &gst::Pad,
+) -> Option<AcceptedReceivePad> {
+    match encoding_name(pad).as_deref() {
+        Some("OPUS") => registry.claim_audio().map(AcceptedReceivePad::Audio),
+        Some("AV1" | "H264" | "H265") => registry.claim_video().map(AcceptedReceivePad::Video),
+        _ => None,
+    }
 }
 
 impl ReceiveWorkerRegistry {
@@ -525,22 +549,14 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
-        match encoding_name(pad).as_deref() {
-            Some("OPUS") => {
-                let Some(claim) = workers_for_pad.claim_audio() else {
-                    eprintln!("[webrtc] ignoring duplicate OPUS stream");
-                    return;
-                };
+        match accept_receive_pad(&workers_for_pad, pad) {
+            Some(AcceptedReceivePad::Audio(claim)) => {
                 match build_audio_branch(&pipeline, pad, overlay_for_pad.clone(), "loopback") {
                     Ok(worker) => claim.complete_audio(worker),
                     Err(error) => eprintln!("[webrtc] could not build audio branch: {error}"),
                 }
             }
-            Some("AV1" | "H264" | "H265") => {
-                let Some(claim) = workers_for_pad.claim_video() else {
-                    eprintln!("[webrtc] ignoring duplicate video stream");
-                    return;
-                };
+            Some(AcceptedReceivePad::Video(claim)) => {
                 let Some(output) = output
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -567,7 +583,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
                     Err(error) => eprintln!("[webrtc] could not build receive branch: {error}"),
                 }
             }
-            _ => {}
+            None => eprintln!("[webrtc] ignoring duplicate or unexpected stream"),
         }
     });
 
@@ -1033,13 +1049,36 @@ pub(crate) fn build_audio_branch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     fn test_overlay() -> crate::overlay::SharedOverlay {
         Arc::new(Mutex::new(crate::overlay::OverlayState::new(
             crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
         )))
+    }
+
+    fn rtp_test_pads(encoding: &str) -> (gst::Pad, gst::Pad) {
+        let caps = gst::Caps::builder("application/x-rtp")
+            .field("encoding-name", encoding)
+            .build();
+        let src = gst::Pad::builder(gst::PadDirection::Src).build();
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .event_function(|_, _, _| true)
+            .build();
+        src.link(&sink).unwrap();
+        src.set_active(true).unwrap();
+        sink.set_active(true).unwrap();
+        assert!(src.push_event(gst::event::Caps::new(&caps)));
+        (src, sink)
+    }
+
+    fn wait_for_counter(counter: &AtomicU64, expected: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while counter.load(Ordering::SeqCst) != expected && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        counter.load(Ordering::SeqCst) == expected
     }
 
     #[test]
@@ -1053,9 +1092,10 @@ mod tests {
 
         let stopped_at = Instant::now();
         worker.shutdown();
-
-        assert!(stopped_at.elapsed() < Duration::from_millis(100));
+        let elapsed = stopped_at.elapsed();
         drop(guard);
+
+        assert!(elapsed < Duration::from_millis(100));
     }
 
     #[test]
@@ -1068,35 +1108,103 @@ mod tests {
 
         let stopped_at = Instant::now();
         worker.shutdown();
-
-        assert!(stopped_at.elapsed() < Duration::from_millis(100));
+        let elapsed = stopped_at.elapsed();
         drop(guard);
+
+        assert!(elapsed < Duration::from_millis(100));
     }
 
     #[test]
     fn incoming_bitrate_receive_worker_removes_probe_on_shutdown() {
         gst::init().unwrap();
-        let pad = gst::Pad::builder(gst::PadDirection::Src).build();
-        pad.set_active(true).unwrap();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_for_probe = hits.clone();
-        let probe = pad
-            .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, _| {
-                hits_for_probe.fetch_add(1, Ordering::SeqCst);
-                gst::PadProbeReturn::Ok
-            })
-            .unwrap();
-        let mut worker = IncomingBitrateWorker::spawn_with_probe(&pad, probe, |stop| {
-            let _ = stop.recv();
-        })
+        let pipeline = gst::parse::launch(
+            "appsrc name=bitrate-source is-live=true format=time ! fakesink sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
         .unwrap();
-        let _ = pad.send_event(gst::event::Reconfigure::new());
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-
+        let source = pipeline.by_name("bitrate-source").unwrap();
+        let pad = source.static_pad("src").unwrap();
+        let bytes = Arc::new(AtomicU64::new(0));
+        let mut worker =
+            watch_incoming_bitrate_with_counter(&pad, test_overlay(), bytes.clone()).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let first_push = source.emit_by_name::<gst::FlowReturn>(
+            "push-buffer",
+            &[&gst::Buffer::with_size(17).unwrap()],
+        );
+        let first_observed = wait_for_counter(&bytes, 17, Duration::from_secs(1));
         worker.shutdown();
-        let _ = pad.send_event(gst::event::Reconfigure::new());
+        bytes.store(0, Ordering::SeqCst);
+        let second_push = source.emit_by_name::<gst::FlowReturn>(
+            "push-buffer",
+            &[&gst::Buffer::with_size(23).unwrap()],
+        );
+        std::thread::sleep(Duration::from_millis(25));
+        let after_shutdown = bytes.load(Ordering::SeqCst);
+        let stop_result = pipeline.set_state(gst::State::Null);
 
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(first_push, gst::FlowSuccess::Ok.into());
+        assert!(first_observed);
+        assert_eq!(second_push, gst::FlowSuccess::Ok.into());
+        assert_eq!(after_shutdown, 0);
+        assert!(stop_result.is_ok());
+    }
+
+    #[test]
+    fn receive_pad_acceptance_keeps_first_audio_and_video_owners() {
+        gst::init().unwrap();
+        let registry = ReceiveWorkerRegistry::new();
+        let overlay = test_overlay();
+        let volume = gst::ElementFactory::make("volume").build().unwrap();
+        let audio_worker = AudioControlWorker::spawn(volume, &overlay, 0.3, "test").unwrap();
+        let (audio_pad, _audio_sink) = rtp_test_pads("OPUS");
+        let (duplicate_audio_pad, _duplicate_audio_sink) = rtp_test_pads("OPUS");
+        let (video_pad, _video_sink) = rtp_test_pads("AV1");
+        let (duplicate_video_pad, _duplicate_video_sink) = rtp_test_pads("AV1");
+        let bitrate_worker = watch_incoming_bitrate(&video_pad, overlay).unwrap();
+        let audio = match accept_receive_pad(&registry, &audio_pad) {
+            Some(AcceptedReceivePad::Audio(claim)) => claim,
+            _ => panic!("first audio pad was not accepted"),
+        };
+        let video = match accept_receive_pad(&registry, &video_pad) {
+            Some(AcceptedReceivePad::Video(claim)) => claim,
+            _ => panic!("first video pad was not accepted"),
+        };
+        audio.complete_audio(Some(audio_worker));
+        video.complete_video(Some(bitrate_worker));
+
+        let duplicate_audio = accept_receive_pad(&registry, &duplicate_audio_pad).is_none();
+        let duplicate_video = accept_receive_pad(&registry, &duplicate_video_pad).is_none();
+        let workers = registry.close_and_take();
+        let retained = (workers.audio.is_some(), workers.bitrate.is_some());
+        workers.shutdown();
+
+        assert!(duplicate_audio);
+        assert!(duplicate_video);
+        assert_eq!(retained, (true, true));
+    }
+
+    #[test]
+    fn receive_pad_acceptance_rolls_back_failed_claim_and_rejects_closed_registry() {
+        gst::init().unwrap();
+        let registry = ReceiveWorkerRegistry::new();
+        let (opus, _opus_sink) = rtp_test_pads("OPUS");
+        let failed = match accept_receive_pad(&registry, &opus) {
+            Some(AcceptedReceivePad::Audio(claim)) => claim,
+            _ => panic!("first OPUS claim was not accepted"),
+        };
+        drop(failed);
+        let retry = accept_receive_pad(&registry, &opus);
+        let retried = matches!(retry, Some(AcceptedReceivePad::Audio(_)));
+        if let Some(AcceptedReceivePad::Audio(claim)) = retry {
+            claim.complete_audio(None);
+        }
+        registry.close_and_take().shutdown();
+        let rejected_after_close = accept_receive_pad(&registry, &opus).is_none();
+
+        assert!(retried);
+        assert!(rejected_after_close);
     }
 
     #[test]
@@ -1105,12 +1213,15 @@ mod tests {
         let audio = registry.claim_audio().unwrap();
         let video = registry.claim_video().unwrap();
 
-        assert!(registry.claim_audio().is_none());
-        assert!(registry.claim_video().is_none());
+        let duplicate_audio = registry.claim_audio().is_none();
+        let duplicate_video = registry.claim_video().is_none();
 
         audio.complete_audio(None);
         video.complete_video(None);
         registry.close_and_take().shutdown();
+
+        assert!(duplicate_audio);
+        assert!(duplicate_video);
     }
 
     #[test]
@@ -1123,14 +1234,18 @@ mod tests {
             registry_for_close.close_and_take().shutdown();
             closed.send(()).unwrap();
         });
-        assert!(wait_for_close
+        let blocked = wait_for_close
             .recv_timeout(Duration::from_millis(25))
-            .is_err());
+            .is_err();
 
         claim.complete_audio(None);
 
-        wait_for_close.recv_timeout(Duration::from_secs(1)).unwrap();
-        closer.join().unwrap();
+        let completed = wait_for_close.recv_timeout(Duration::from_secs(1));
+        let joined = closer.join();
+
+        assert!(blocked);
+        assert!(completed.is_ok());
+        assert!(joined.is_ok());
     }
 
     #[test]
