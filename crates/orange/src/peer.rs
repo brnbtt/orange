@@ -529,6 +529,30 @@ mod tests {
         assert_eq!(super::gop_update(480, 475), None);
         assert_eq!(super::gop_update(480, 120), Some(120));
     }
+
+    #[tokio::test]
+    async fn viewer_teardown_drains_before_drop_returns() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let bin = gst::ElementFactory::make("identity")
+            .name("viewer-teardown-test")
+            .build()
+            .unwrap();
+        pipeline.add(&bin).unwrap();
+        let teardown = super::ViewerTeardown::new(&pipeline).unwrap();
+
+        teardown
+            .enqueue(ViewerBranch {
+                bin,
+                links: Vec::new(),
+                label: "test viewer".to_string(),
+                _diagnostics: None,
+            })
+            .await;
+        drop(teardown);
+
+        assert!(pipeline.by_name("viewer-teardown-test").is_none());
+    }
 }
 
 /// Host: capture a window and serve any number of viewers.
@@ -601,6 +625,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
 
     let (_session_errors, mut bus_errors) = watch_bus(&pipeline, "host", None)?;
     let (viewer_failures, mut failed_viewers) = mpsc::unbounded_channel();
+    let viewer_teardown = ViewerTeardown::new(&pipeline)?;
     // Do not let WGC emit its one guaranteed initial frame before a viewer
     // branch exists. READY keeps the graph prepared without starting capture.
     if let Err(error) = pipeline.set_state(gst::State::Ready) {
@@ -675,7 +700,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 Some((peer, error)) = failed_viewers.recv() => {
                     if let Some(branch) = viewers.remove(&peer) {
                         let label = branch.label.clone();
-                        remove_viewer(&pipeline, branch);
+                        viewer_teardown.enqueue(branch).await;
                         print_viewer_status("left", &peer, &label);
                         println!(
                             "[host] {label} left ({} remaining)",
@@ -737,7 +762,7 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
                 Signal::ViewerLeft { peer } => {
                     if let Some(branch) = viewers.remove(&peer) {
                         let label = branch.label.clone();
-                        remove_viewer(&pipeline, branch);
+                        viewer_teardown.enqueue(branch).await;
                         println!("[host] {label} left ({} remaining)", viewers.len());
                         print_viewer_status("left", &peer, &label);
                     }
@@ -797,8 +822,9 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     .await;
 
     for (_, branch) in viewers.drain() {
-        remove_viewer(&pipeline, branch);
+        viewer_teardown.enqueue(branch).await;
     }
+    drop(viewer_teardown);
     let stop_result = pipeline.set_state(gst::State::Null);
     client.close().await;
     flush_diagnostics();
@@ -858,6 +884,51 @@ struct ViewerBranch {
     links: Vec<TeeBranch>,
     label: String,
     _diagnostics: Option<DiagnosticsHandle>,
+}
+
+struct ViewerTeardown {
+    sender: Option<mpsc::Sender<ViewerBranch>>,
+    pipeline: gst::Pipeline,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ViewerTeardown {
+    fn new(pipeline: &gst::Pipeline) -> Result<Self> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let worker_pipeline = pipeline.clone();
+        let worker = std::thread::Builder::new()
+            .name("viewer-teardown".to_string())
+            .spawn(move || {
+                while let Some(branch) = receiver.blocking_recv() {
+                    remove_viewer(&worker_pipeline, branch);
+                }
+            })
+            .context("failed to spawn viewer teardown worker")?;
+        Ok(Self {
+            sender: Some(sender),
+            pipeline: pipeline.clone(),
+            worker: Some(worker),
+        })
+    }
+
+    async fn enqueue(&self, branch: ViewerBranch) {
+        let Some(sender) = &self.sender else {
+            remove_viewer(&self.pipeline, branch);
+            return;
+        };
+        if let Err(error) = sender.send(branch).await {
+            remove_viewer(&self.pipeline, error.0);
+        }
+    }
+}
+
+impl Drop for ViewerTeardown {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn link_tee_branch(
