@@ -1,4 +1,5 @@
 /target
+/graphify-out
 /dist
 
 # Recordings and capture output land in the working directory.
