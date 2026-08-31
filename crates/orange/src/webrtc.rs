@@ -1052,6 +1052,16 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
+    fn run_bounded(run: impl FnOnce() + Send + 'static) -> bool {
+        let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            run();
+            let _ = finished.send(());
+        });
+        let completed = wait_for_finish.recv_timeout(Duration::from_secs(1));
+        completed.is_ok() && worker.join().is_ok()
+    }
+
     fn test_overlay() -> crate::overlay::SharedOverlay {
         Arc::new(Mutex::new(crate::overlay::OverlayState::new(
             crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
@@ -1162,7 +1172,7 @@ mod tests {
             &[&gst::Buffer::with_size(17).unwrap()],
         );
         let first_observed = wait_for_counter(&bytes, 17, Duration::from_secs(1));
-        worker.shutdown();
+        let shutdown_completed = run_bounded(move || worker.shutdown());
         bytes.store(0, Ordering::SeqCst);
         let second_push = source.emit_by_name::<gst::FlowReturn>(
             "push-buffer",
@@ -1174,6 +1184,7 @@ mod tests {
 
         assert_eq!(first_push, gst::FlowSuccess::Ok.into());
         assert!(first_observed);
+        assert!(shutdown_completed);
         assert_eq!(second_push, gst::FlowSuccess::Ok.into());
         assert_eq!(after_shutdown, 0);
         assert!(stop_result.is_ok());
@@ -1206,11 +1217,12 @@ mod tests {
         let duplicate_video = accept_receive_pad(&registry, &duplicate_video_pad).is_none();
         let workers = registry.close_and_take();
         let retained = (workers.audio.is_some(), workers.bitrate.is_some());
-        workers.shutdown();
+        let shutdown_completed = run_bounded(move || workers.shutdown());
 
         assert!(duplicate_audio);
         assert!(duplicate_video);
         assert_eq!(retained, (true, true));
+        assert!(shutdown_completed);
     }
 
     #[test]

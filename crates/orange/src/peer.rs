@@ -463,12 +463,26 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
+    fn shutdown_startup_worker_bounded(mut worker: StartupKeyframeWorker) -> Option<Duration> {
+        let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            let started = Instant::now();
+            worker.shutdown();
+            let _ = finished.send(started.elapsed());
+        });
+        let elapsed = wait_for_finish.recv_timeout(Duration::from_secs(1)).ok();
+        if elapsed.is_some() {
+            shutdown.join().ok()?;
+        }
+        elapsed
+    }
+
     #[test]
     fn peer_worker_review_startup_cadence_has_exact_clock_free_progression() {
         let (calls, receive_calls) = std::sync::mpsc::sync_channel(4);
         let sequence = Arc::new(AtomicUsize::new(0));
         let sequence_for_worker = sequence.clone();
-        let (mut worker, trigger) = StartupKeyframeWorker::spawn_with_delays(
+        let (worker, trigger) = StartupKeyframeWorker::spawn_with_delays(
             move || {
                 let call = sequence_for_worker.fetch_add(1, Ordering::SeqCst) + 1;
                 calls.send(call).unwrap();
@@ -482,8 +496,9 @@ mod tests {
         let observed: Vec<_> = (0..4)
             .map(|_| receive_calls.recv_timeout(Duration::from_secs(1)).unwrap())
             .collect();
-        worker.shutdown();
+        let shutdown = shutdown_startup_worker_bounded(worker);
 
+        assert!(shutdown.is_some());
         assert_eq!(observed, [1, 2, 3, 4]);
         assert_eq!(
             STARTUP_KEYFRAME_DELAYS,
@@ -669,7 +684,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_worker = requests.clone();
         let (requested, wait_for_request) = std::sync::mpsc::sync_channel(1);
-        let (mut worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
+        let (worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
             requests_for_worker.fetch_add(1, Ordering::SeqCst);
             let _ = requested.try_send(());
             true
@@ -679,8 +694,9 @@ mod tests {
         trigger.request();
         trigger.request();
         let observed = wait_for_request.recv_timeout(Duration::from_secs(1));
-        worker.shutdown();
+        let shutdown = shutdown_startup_worker_bounded(worker);
 
+        assert!(shutdown.is_some());
         assert!(observed.is_ok());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
@@ -688,7 +704,7 @@ mod tests {
     #[test]
     fn startup_keyframe_worker_stop_interrupts_wait() {
         let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
-        let (mut worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
+        let (worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
             let _ = started.send(());
             true
         })
@@ -696,10 +712,9 @@ mod tests {
         trigger.request();
         wait_for_start.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let stopped_at = Instant::now();
-        worker.shutdown();
+        let elapsed = shutdown_startup_worker_bounded(worker);
 
-        assert!(stopped_at.elapsed() < Duration::from_millis(100));
+        assert!(elapsed.is_some_and(|elapsed| elapsed < Duration::from_millis(100)));
     }
 
     #[test]
@@ -707,7 +722,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_worker = requests.clone();
         let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
-        let (mut worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
+        let (worker, trigger) = StartupKeyframeWorker::spawn_with(move || {
             requests_for_worker.fetch_add(1, Ordering::SeqCst);
             let _ = started.try_send(());
             true
@@ -716,8 +731,9 @@ mod tests {
         trigger.request();
         wait_for_start.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        worker.shutdown();
+        let shutdown = shutdown_startup_worker_bounded(worker);
 
+        assert!(shutdown.is_some());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
@@ -973,10 +989,29 @@ mod tests {
             false
         })
         .unwrap();
-
-        shutdown_startup_then(&mut startup_keyframes, || {
-            assert!(worker_stopped.load(Ordering::SeqCst));
+        let teardown_started_after_join = Arc::new(AtomicBool::new(false));
+        let teardown_observation = teardown_started_after_join.clone();
+        let worker_stopped_for_teardown = worker_stopped.clone();
+        let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            shutdown_startup_then(&mut startup_keyframes, || {
+                teardown_observation.store(
+                    worker_stopped_for_teardown.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            });
+            let _ = finished.send(());
         });
+        let completed = wait_for_finish.recv_timeout(Duration::from_secs(1));
+        let joined = if completed.is_ok() {
+            shutdown.join().is_ok()
+        } else {
+            false
+        };
+
+        assert!(completed.is_ok());
+        assert!(joined);
+        assert!(teardown_started_after_join.load(Ordering::SeqCst));
     }
 }
 
