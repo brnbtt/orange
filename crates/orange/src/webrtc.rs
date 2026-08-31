@@ -542,7 +542,7 @@ pub fn build_receive_branch(
                         .context("overlaycomposition missing")
                 },
             )?;
-            crate::overlay::attach(&composition.element, &playback);
+            crate::overlay::attach(&composition.element, &playback)?;
             let queue = build_live_video_queue(diagnostic_role)?;
 
             let sink = build_video_sink(diagnostic_role)?;

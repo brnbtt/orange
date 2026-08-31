@@ -20,11 +20,13 @@
 //! Each cluster is composited as its own rectangle. Nothing rasterises a
 //! full-frame pixmap, so the cost does not grow with the stream resolution.
 
+use anyhow::Context;
 use gst::prelude::{ObjectExt, ToValue};
 use gstreamer as gst;
 use gstreamer_video as gst_video;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
@@ -1058,11 +1060,29 @@ fn to_composition(panels: Vec<Panel>) -> Option<gst_video::VideoOverlayCompositi
     gst_video::VideoOverlayComposition::new(rectangles.iter()).ok()
 }
 
+fn draw_composition(
+    state: &SharedOverlay,
+    fallback: &gst_video::VideoOverlayComposition,
+) -> gst_video::VideoOverlayComposition {
+    catch_unwind(AssertUnwindSafe(|| {
+        let mut state = state.lock().ok()?;
+        render(&mut state)
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| fallback.clone())
+}
+
 /// Bind an `overlaycomposition` element to shared overlay state.
 ///
 /// Both the real viewer and the design harness call this, so what you see
 /// while iterating on the layout is what a viewer actually gets.
-pub fn attach(composition: &gst::Element, playback: &crate::window::PlaybackWindow) {
+pub fn attach(
+    composition: &gst::Element,
+    playback: &crate::window::PlaybackWindow,
+) -> anyhow::Result<()> {
+    let fallback = transparent_composition().context("failed to build overlay fallback")?;
+
     // Learn the video size and frame rate; the former is the coordinate space
     // the overlay and all hit testing work in, and both are shown to the
     // viewer.
@@ -1105,9 +1125,10 @@ pub fn attach(composition: &gst::Element, playback: &crate::window::PlaybackWind
 
     let state = playback.overlay().clone();
     composition.connect("draw", false, move |_values| {
-        let mut state = state.lock().ok()?;
-        render(&mut state).map(|c| c.to_value())
+        let composition = draw_composition(&state, &fallback);
+        Some(composition.to_value())
     });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1213,5 +1234,27 @@ mod tests {
                 .iter()
                 .any(|pixel| pixel[3] > 0));
         }
+    }
+
+    #[test]
+    fn poisoned_overlay_returns_the_valid_prebuilt_fallback() {
+        gst::init().unwrap();
+        let fallback = transparent_composition().unwrap();
+        let state = Arc::new(Mutex::new(OverlayState::new(
+            crate::window::PlaybackProfile::LiveMonitor,
+        )));
+        let poison = state.clone();
+        std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison overlay state");
+        })
+        .join()
+        .unwrap_err();
+
+        let composition = draw_composition(&state, &fallback);
+
+        assert_eq!(composition.seqnum(), fallback.seqnum());
+        assert_eq!(composition.n_rectangles(), 1);
+        assert!(composition.rectangle(0).is_ok());
     }
 }
