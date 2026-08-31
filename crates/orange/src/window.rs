@@ -14,16 +14,17 @@
 
 use anyhow::{bail, Result};
 use std::io::Write;
+use std::os::windows::io::AsRawHandle;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, COLORREF, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND,
-    LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -35,7 +36,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -109,6 +110,9 @@ const REVEAL_MESSAGE: u32 = WM_APP + 1;
 const ASPECT_MESSAGE: u32 = WM_APP + 2;
 const REVEAL_MS: u32 = 180;
 const WORKER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const WINDOW_WAIT_MS: u32 = 100;
+const MESSAGE_BATCH_LIMIT: usize = 64;
+const DESTROY_ATTEMPTS: usize = 3;
 const WAIT_FOR_MESSAGES: u32 = WAIT_OBJECT_0.0 + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,7 +154,8 @@ impl PlaybackProfile {
 pub struct PlaybackWindow {
     handle: PlaybackWindowHandle,
     shutdown: Arc<ShutdownEvent>,
-    completed: mpsc::Receiver<()>,
+    completed: mpsc::Receiver<CleanupResult>,
+    cleanup: Option<CleanupResult>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -164,6 +169,7 @@ pub struct PlaybackWindowHandle {
 struct NativeWindowState {
     hwnd: Mutex<Option<isize>>,
     alive: AtomicBool,
+    context_cleanup_error: AtomicU32,
 }
 
 struct ShutdownEvent {
@@ -214,6 +220,13 @@ impl ShutdownEvent {
                 .unwrap_or_else(|poison| poison.into_inner());
         }
     }
+
+    fn is_requested(&self) -> bool {
+        *self
+            .requested
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 }
 
 impl Drop for ShutdownEvent {
@@ -229,12 +242,63 @@ impl Drop for ShutdownEvent {
     }
 }
 
-struct CompletionAck(Option<mpsc::SyncSender<()>>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupFailure {
+    DestroyFailed(u32),
+    ContextCleanupFailed(u32),
+    WorkerPanicked,
+}
+
+type CleanupResult = std::result::Result<(), CleanupFailure>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerFinish {
+    Joined(CleanupResult),
+    Pending,
+    SelfJoin,
+    CompletionDisconnected,
+    ThreadWaitFailed(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownPolicy {
+    Complete,
+    Abort,
+}
+
+fn shutdown_policy(finish: &WorkerFinish) -> ShutdownPolicy {
+    match finish {
+        WorkerFinish::Joined(Ok(())) => ShutdownPolicy::Complete,
+        WorkerFinish::Joined(Err(_))
+        | WorkerFinish::Pending
+        | WorkerFinish::SelfJoin
+        | WorkerFinish::CompletionDisconnected
+        | WorkerFinish::ThreadWaitFailed(_) => ShutdownPolicy::Abort,
+    }
+}
+
+struct CompletionAck {
+    completed: Option<mpsc::SyncSender<CleanupResult>>,
+    result: CleanupResult,
+}
+
+impl CompletionAck {
+    fn new(completed: mpsc::SyncSender<CleanupResult>) -> Self {
+        Self {
+            completed: Some(completed),
+            result: Err(CleanupFailure::WorkerPanicked),
+        }
+    }
+
+    fn finish(&mut self, result: CleanupResult) {
+        self.result = result;
+    }
+}
 
 impl Drop for CompletionAck {
     fn drop(&mut self) {
-        if let Some(completed) = self.0.take() {
-            let _ = completed.send(());
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(self.result);
         }
     }
 }
@@ -244,6 +308,7 @@ impl NativeWindowState {
         Self {
             hwnd: Mutex::new(None),
             alive: AtomicBool::new(true),
+            context_cleanup_error: AtomicU32::new(ERROR_SUCCESS.0),
         }
     }
 
@@ -300,6 +365,7 @@ impl PlaybackWindow {
             handle: PlaybackWindowHandle { native, overlay },
             shutdown: window.shutdown,
             completed: window.completed,
+            cleanup: None,
             worker: Some(window.worker),
         })
     }
@@ -308,10 +374,16 @@ impl PlaybackWindow {
         self.handle.clone()
     }
 
-    fn shutdown_worker(&mut self) -> bool {
-        let Some(worker) = self.worker.take() else {
-            return true;
+    fn try_shutdown_worker(&mut self, timeout: Duration) -> WorkerFinish {
+        let Some(worker) = self.worker.as_ref() else {
+            return self
+                .cleanup
+                .map(WorkerFinish::Joined)
+                .unwrap_or(WorkerFinish::CompletionDisconnected);
         };
+        if worker.thread().id() == std::thread::current().id() {
+            return WorkerFinish::SelfJoin;
+        }
         self.handle.native.alive.store(false, Ordering::Release);
         if let Err(error) = self.shutdown.signal() {
             let _ = writeln!(
@@ -319,17 +391,14 @@ impl PlaybackWindow {
                 "[window] failed to signal shutdown event: {error}"
             );
         }
-        if worker.thread().id() == std::thread::current().id() {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "[window] refused to wait for playback worker from itself during shutdown"
-            );
-            return false;
-        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
         join_after_worker_completion(
             &self.completed,
-            worker,
-            WORKER_COMPLETION_TIMEOUT,
+            &mut self.cleanup,
+            &mut self.worker,
+            deadline,
             "shutdown",
         )
     }
@@ -337,8 +406,22 @@ impl PlaybackWindow {
 
 impl Drop for PlaybackWindow {
     fn drop(&mut self) {
-        self.shutdown_worker();
+        let finish = self.try_shutdown_worker(WORKER_COMPLETION_TIMEOUT);
+        if shutdown_policy(&finish) == ShutdownPolicy::Abort {
+            fail_fast_native_cleanup("shutdown", finish);
+        }
     }
+}
+
+fn fail_fast_native_cleanup(phase: &str, finish: WorkerFinish) -> ! {
+    // Returning would drop or detach a thread that may still own a live HWND
+    // and GWLP_USERDATA allocation. Terminating is safer than allowing media
+    // callbacks to continue with unprovable native ownership.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "[window] unrecoverable native cleanup failure during {phase}: {finish:?}; aborting to avoid a live HWND/context leak"
+    );
+    std::process::abort()
 }
 
 impl PlaybackWindowHandle {
@@ -408,7 +491,7 @@ impl PlaybackWindowHandle {
 
 struct SpawnedWindow {
     shutdown: Arc<ShutdownEvent>,
-    completed: mpsc::Receiver<()>,
+    completed: mpsc::Receiver<CleanupResult>,
     worker: JoinHandle<()>,
 }
 
@@ -420,7 +503,7 @@ fn spawn_window(
     native: Arc<NativeWindowState>,
 ) -> Result<SpawnedWindow> {
     let (tx, rx) = mpsc::sync_channel::<Result<isize>>(1);
-    let (completion, completed) = mpsc::sync_channel(1);
+    let (completion, completed) = mpsc::sync_channel::<CleanupResult>(1);
     let shutdown = Arc::new(ShutdownEvent::new()?);
     let shutdown_for_worker = shutdown.clone();
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -428,89 +511,128 @@ fn spawn_window(
     let worker = std::thread::Builder::new()
         .name("orange-playback-window".to_string())
         .spawn(move || unsafe {
-            let _completion = CompletionAck(Some(completion));
-            match create_window(&title, envelope, profile, overlay, native.clone()) {
+            let mut completion = CompletionAck::new(completion);
+            let cleanup = match create_window(&title, envelope, profile, overlay, native.clone()) {
                 Ok(hwnd) => {
                     native.install(hwnd.0 as isize);
                     if tx.send(Ok(hwnd.0 as isize)).is_err() {
-                        destroy_window_for_owner(hwnd, &native);
-                        return;
+                        destroy_window_for_owner(hwnd, &native)
+                    } else {
+                        run_message_loop(hwnd, &native, &shutdown_for_worker)
                     }
-                    run_message_loop(hwnd, &native, &shutdown_for_worker);
                 }
                 Err(err) => {
                     native.alive.store(false, Ordering::Release);
                     let _ = tx.send(Err(err));
+                    Ok(())
                 }
-            }
+            };
+            completion.finish(cleanup);
         })?;
 
-    let (_, worker) = finish_window_startup(rx, &completed, worker)?;
+    let mut worker = Some(worker);
+    finish_window_startup(rx, &completed, &mut worker)?;
     Ok(SpawnedWindow {
         shutdown,
         completed,
-        worker,
+        worker: worker.expect("successful startup retained its window worker"),
     })
 }
 
 fn finish_window_startup(
     ready: mpsc::Receiver<Result<isize>>,
-    completed: &mpsc::Receiver<()>,
-    worker: JoinHandle<()>,
-) -> Result<(isize, JoinHandle<()>)> {
+    completed: &mpsc::Receiver<CleanupResult>,
+    worker: &mut Option<JoinHandle<()>>,
+) -> Result<isize> {
     match ready.recv() {
-        Ok(Ok(hwnd)) => Ok((hwnd, worker)),
+        Ok(Ok(hwnd)) => Ok(hwnd),
         Ok(Err(error)) => {
-            join_after_worker_completion(
+            let mut cleanup = None;
+            let finish = join_after_worker_completion(
                 completed,
+                &mut cleanup,
                 worker,
-                WORKER_COMPLETION_TIMEOUT,
+                Instant::now() + WORKER_COMPLETION_TIMEOUT,
                 "startup failure",
             );
+            if shutdown_policy(&finish) == ShutdownPolicy::Abort {
+                fail_fast_native_cleanup("startup failure", finish);
+            }
             Err(error)
         }
         Err(_) => {
-            join_after_worker_completion(
+            let mut cleanup = None;
+            let finish = join_after_worker_completion(
                 completed,
+                &mut cleanup,
                 worker,
-                WORKER_COMPLETION_TIMEOUT,
+                Instant::now() + WORKER_COMPLETION_TIMEOUT,
                 "startup disconnect",
             );
+            if shutdown_policy(&finish) == ShutdownPolicy::Abort {
+                fail_fast_native_cleanup("startup disconnect", finish);
+            }
             bail!("window thread died before it was ready")
         }
     }
 }
 
 fn join_after_worker_completion(
-    completed: &mpsc::Receiver<()>,
-    worker: JoinHandle<()>,
-    timeout: Duration,
+    completed: &mpsc::Receiver<CleanupResult>,
+    cleanup: &mut Option<CleanupResult>,
+    worker: &mut Option<JoinHandle<()>>,
+    deadline: Instant,
     phase: &str,
-) -> bool {
-    match completed.recv_timeout(timeout) {
-        Ok(()) => {}
-        Err(error) => {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "[window] playback worker did not acknowledge {phase}: {error}"
-            );
-            return false;
+) -> WorkerFinish {
+    let Some(thread) = worker.as_ref() else {
+        return cleanup
+            .map(WorkerFinish::Joined)
+            .unwrap_or(WorkerFinish::CompletionDisconnected);
+    };
+    if thread.thread().id() == std::thread::current().id() {
+        return WorkerFinish::SelfJoin;
+    }
+    if cleanup.is_none() {
+        match completed.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => *cleanup = Some(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => return WorkerFinish::Pending,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return WorkerFinish::CompletionDisconnected;
+            }
         }
     }
-    if worker.thread().id() == std::thread::current().id() {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "[window] refused to join playback worker from itself during {phase}"
-        );
-        return false;
+
+    let wait_ms = duration_to_wait_millis(deadline.saturating_duration_since(Instant::now()));
+    // SAFETY: AsRawHandle borrows the kernel thread handle from the JoinHandle,
+    // which remains in `worker` for the entire wait.
+    let wait = unsafe { WaitForSingleObject(HANDLE(thread.as_raw_handle()), wait_ms) };
+    if wait == WAIT_TIMEOUT {
+        return WorkerFinish::Pending;
     }
-    if worker.join().is_err() {
+    if wait == WAIT_FAILED {
+        return WorkerFinish::ThreadWaitFailed(unsafe { GetLastError().0 });
+    }
+    if wait != WAIT_OBJECT_0 {
+        return WorkerFinish::ThreadWaitFailed(wait.0);
+    }
+
+    let thread = worker
+        .take()
+        .expect("worker remained present after its thread handle was signaled");
+    let mut result = cleanup.unwrap_or(Err(CleanupFailure::WorkerPanicked));
+    if thread.join().is_err() {
         let _ = writeln!(
             std::io::stderr().lock(),
             "[window] playback worker panicked during {phase}"
         );
+        result = Err(CleanupFailure::WorkerPanicked);
     }
-    true
+    *cleanup = Some(result);
+    WorkerFinish::Joined(result)
+}
+
+fn duration_to_wait_millis(duration: Duration) -> u32 {
+    duration.as_millis().min(u128::from(u32::MAX - 1)) as u32
 }
 
 /// Per-window state reachable from the window procedure.
@@ -628,10 +750,12 @@ unsafe fn resize_to_video_aspect(hwnd: HWND, width: u32, height: u32) {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        aspect_locked_size, classify_wait_result, finalize_owner_destroy, finish_window_startup,
-        fit_aspect, join_after_worker_completion, message_result, CompletionAck, MessageResult,
-        NativeWindowState, PlaybackProfile, PlaybackWindow, WaitResult, WindowLoopState,
-        WAIT_FOR_MESSAGES,
+        aspect_locked_size, classify_wait_result, cleanup_decision, complete_destroyed_window,
+        finish_window_startup, fit_aspect, join_after_worker_completion, message_result,
+        should_drain_another_message, shutdown_policy, CleanupDecision, CleanupFailure,
+        CleanupResult, CompletionAck, MessageResult, NativeWindowState, PlaybackProfile,
+        PlaybackWindow, ShutdownPolicy, WaitResult, WindowLoopState, WorkerFinish,
+        MESSAGE_BATCH_LIMIT, WAIT_FOR_MESSAGES, WINDOW_WAIT_MS,
     };
     use anyhow::anyhow;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -648,7 +772,10 @@ mod tests {
     }
 
     fn shutdown_hidden(mut owner: PlaybackWindow) {
-        assert!(owner.shutdown_worker());
+        assert_eq!(
+            owner.try_shutdown_worker(Duration::from_secs(5)),
+            WorkerFinish::Joined(Ok(()))
+        );
     }
 
     #[test]
@@ -724,7 +851,10 @@ mod tests {
         let handle = owner.handle();
         assert!(handle.hwnd().is_some());
 
-        assert!(owner.shutdown_worker());
+        assert_eq!(
+            owner.try_shutdown_worker(Duration::from_secs(5)),
+            WorkerFinish::Joined(Ok(()))
+        );
 
         assert_eq!(handle.hwnd(), None);
         assert!(!handle.is_alive());
@@ -835,7 +965,7 @@ mod tests {
     #[test]
     fn startup_error_joins_window_worker_without_scheduling_delay() {
         let (startup, ready) = mpsc::sync_channel(1);
-        let (completed, completion) = mpsc::sync_channel(1);
+        let (completed, completion) = mpsc::sync_channel::<CleanupResult>(1);
         let (release, released) = mpsc::sync_channel(1);
         let (blocked, worker_blocked) = mpsc::sync_channel(1);
         let worker_finished = Arc::new(AtomicBool::new(false));
@@ -845,70 +975,165 @@ mod tests {
             blocked.send(()).unwrap();
             released.recv().unwrap();
             worker_finished_in_thread.store(true, Ordering::Release);
-            completed.send(()).unwrap();
+            completed.send(Ok(())).unwrap();
         });
+        let mut worker = Some(worker);
 
         worker_blocked.recv_timeout(Duration::from_secs(5)).unwrap();
         release.send(()).unwrap();
-        assert!(finish_window_startup(ready, &completion, worker).is_err());
+        assert!(finish_window_startup(ready, &completion, &mut worker).is_err());
+        assert!(worker.is_none());
         assert!(worker_finished.load(Ordering::Acquire));
     }
 
     #[test]
     fn completion_acknowledgement_gates_worker_join() {
-        let (completed, completion) = mpsc::sync_channel(1);
+        let (completed, completion) = mpsc::sync_channel::<CleanupResult>(1);
         let worker_finished = Arc::new(AtomicBool::new(false));
         let worker_finished_in_thread = worker_finished.clone();
         let worker = std::thread::spawn(move || {
             worker_finished_in_thread.store(true, Ordering::Release);
-            completed.send(()).unwrap();
+            completed.send(Ok(())).unwrap();
         });
+        let mut worker = Some(worker);
+        let mut cleanup = None;
 
-        assert!(join_after_worker_completion(
-            &completion,
-            worker,
-            Duration::from_secs(5),
-            "test"
-        ));
+        assert_eq!(
+            join_after_worker_completion(
+                &completion,
+                &mut cleanup,
+                &mut worker,
+                std::time::Instant::now() + Duration::from_secs(5),
+                "test"
+            ),
+            WorkerFinish::Joined(Ok(()))
+        );
+        assert!(worker.is_none());
         assert!(worker_finished.load(Ordering::Acquire));
     }
 
     #[test]
     fn panicking_worker_acknowledges_before_bounded_join() {
-        let (completed, completion) = mpsc::sync_channel(1);
+        let (completed, completion) = mpsc::sync_channel::<CleanupResult>(1);
         let worker = std::thread::spawn(move || {
-            let _completion = CompletionAck(Some(completed));
+            let _completion = CompletionAck::new(completed);
             panic!("simulated worker panic");
         });
+        let mut worker = Some(worker);
+        let mut cleanup = None;
 
-        assert!(join_after_worker_completion(
-            &completion,
-            worker,
-            Duration::from_secs(5),
-            "panic test"
-        ));
+        assert_eq!(
+            join_after_worker_completion(
+                &completion,
+                &mut cleanup,
+                &mut worker,
+                std::time::Instant::now() + Duration::from_secs(5),
+                "panic test"
+            ),
+            WorkerFinish::Joined(Err(CleanupFailure::WorkerPanicked))
+        );
+        assert!(worker.is_none());
     }
 
     #[test]
-    fn completion_timeout_does_not_join_or_strand_test_worker() {
-        let (_completed, completion) = mpsc::sync_channel(1);
+    fn completion_timeout_retains_worker_for_explicit_retry() {
+        let (completed, completion) = mpsc::sync_channel::<CleanupResult>(1);
         let (release, released) = mpsc::sync_channel(1);
-        let (finished, worker_finished) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             released.recv().unwrap();
-            finished.send(()).unwrap();
+            completed.send(Ok(())).unwrap();
         });
+        let mut worker = Some(worker);
+        let mut cleanup = None;
 
-        assert!(!join_after_worker_completion(
-            &completion,
-            worker,
-            Duration::ZERO,
-            "timeout test"
-        ));
+        assert_eq!(
+            join_after_worker_completion(
+                &completion,
+                &mut cleanup,
+                &mut worker,
+                std::time::Instant::now(),
+                "timeout test"
+            ),
+            WorkerFinish::Pending
+        );
+        assert!(worker.is_some());
         release.send(()).unwrap();
-        worker_finished
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
+        assert_eq!(
+            join_after_worker_completion(
+                &completion,
+                &mut cleanup,
+                &mut worker,
+                std::time::Instant::now() + Duration::from_secs(5),
+                "timeout retry test"
+            ),
+            WorkerFinish::Joined(Ok(()))
+        );
+        assert!(worker.is_none());
+    }
+
+    #[test]
+    fn acknowledged_but_running_worker_is_retained_for_retry() {
+        let (completed, completion) = mpsc::sync_channel::<CleanupResult>(1);
+        let (blocked, worker_blocked) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            completed.send(Ok(())).unwrap();
+            blocked.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        let mut worker = Some(worker);
+        let mut cleanup = None;
+        worker_blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            join_after_worker_completion(
+                &completion,
+                &mut cleanup,
+                &mut worker,
+                std::time::Instant::now(),
+                "thread wait timeout test"
+            ),
+            WorkerFinish::Pending
+        );
+        assert_eq!(cleanup, Some(Ok(())));
+        assert!(worker.is_some());
+
+        release.send(()).unwrap();
+        assert_eq!(
+            join_after_worker_completion(
+                &completion,
+                &mut cleanup,
+                &mut worker,
+                std::time::Instant::now() + Duration::from_secs(5),
+                "thread wait retry test"
+            ),
+            WorkerFinish::Joined(Ok(()))
+        );
+        assert!(worker.is_none());
+    }
+
+    #[test]
+    fn destroy_failure_completion_is_preserved_through_join() {
+        let (completed, completion) = mpsc::sync_channel::<CleanupResult>(1);
+        let worker = std::thread::spawn(move || {
+            completed
+                .send(Err(CleanupFailure::DestroyFailed(87)))
+                .unwrap();
+        });
+        let mut worker = Some(worker);
+        let mut cleanup = None;
+
+        assert_eq!(
+            join_after_worker_completion(
+                &completion,
+                &mut cleanup,
+                &mut worker,
+                std::time::Instant::now() + Duration::from_secs(5),
+                "destroy failure test"
+            ),
+            WorkerFinish::Joined(Err(CleanupFailure::DestroyFailed(87)))
+        );
+        assert!(worker.is_none());
     }
 
     #[test]
@@ -933,19 +1158,69 @@ mod tests {
             WaitResult::Messages
         );
         assert_eq!(classify_wait_result(WAIT_FAILED.0), WaitResult::Failed);
+        assert_eq!(
+            classify_wait_result(windows::Win32::Foundation::WAIT_TIMEOUT.0),
+            WaitResult::Timeout
+        );
         assert_eq!(classify_wait_result(42), WaitResult::Unexpected(42));
+        assert_eq!(WINDOW_WAIT_MS, 100);
     }
 
     #[test]
-    fn destroy_failure_is_reported_and_invalidates_only_at_owner_boundary() {
+    fn message_drain_is_bounded_before_shutdown_recheck() {
+        assert!(should_drain_another_message(MESSAGE_BATCH_LIMIT - 1));
+        assert!(!should_drain_another_message(MESSAGE_BATCH_LIMIT));
+    }
+
+    #[test]
+    fn cleanup_policy_requires_destroyed_or_absent_window() {
+        assert_eq!(cleanup_decision(false, false, 0), CleanupDecision::Complete);
+        assert_eq!(cleanup_decision(true, true, 0), CleanupDecision::Complete);
+        assert_eq!(cleanup_decision(true, false, 0), CleanupDecision::Retry);
+        assert_eq!(cleanup_decision(true, false, 2), CleanupDecision::Abort);
+    }
+
+    #[test]
+    fn context_cleanup_failure_is_not_reported_as_native_success() {
         let native = NativeWindowState::new();
         native.install(1234);
+        native.context_cleanup_error.store(5, Ordering::Release);
 
-        let failure = finalize_owner_destroy(&native, 1234, Err(87));
-
-        assert_eq!(failure, Some(87));
+        assert_eq!(
+            complete_destroyed_window(&native, 1234),
+            Err(CleanupFailure::ContextCleanupFailed(5))
+        );
         assert_eq!(native.with_hwnd(|hwnd| hwnd), None);
-        assert!(!native.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_policy_fails_fast_on_every_unresolved_native_outcome() {
+        assert_eq!(
+            shutdown_policy(&WorkerFinish::Joined(Ok(()))),
+            ShutdownPolicy::Complete
+        );
+        assert_eq!(
+            shutdown_policy(&WorkerFinish::Joined(Err(CleanupFailure::DestroyFailed(
+                87
+            )))),
+            ShutdownPolicy::Abort
+        );
+        assert_eq!(
+            shutdown_policy(&WorkerFinish::Pending),
+            ShutdownPolicy::Abort
+        );
+        assert_eq!(
+            shutdown_policy(&WorkerFinish::SelfJoin),
+            ShutdownPolicy::Abort
+        );
+        assert_eq!(
+            shutdown_policy(&WorkerFinish::CompletionDisconnected),
+            ShutdownPolicy::Abort
+        );
+        assert_eq!(
+            shutdown_policy(&WorkerFinish::ThreadWaitFailed(6)),
+            ShutdownPolicy::Abort
+        );
     }
 }
 
@@ -1313,6 +1588,7 @@ unsafe fn create_window(
     );
 
     // Ownership transfers to GWLP_USERDATA and is reclaimed in WM_DESTROY.
+    let native_for_creation_cleanup = native.clone();
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
         native,
@@ -1331,7 +1607,9 @@ unsafe fn create_window(
             // SAFETY: Installation failed, so the fresh allocation was never
             // transferred to the HWND and remains exclusively owned here.
             drop(Box::from_raw(ctx));
-            let _ = DestroyWindow(hwnd);
+            if let Err(cleanup) = destroy_window_for_owner(hwnd, &native_for_creation_cleanup) {
+                fail_fast_native_cleanup("window creation", WorkerFinish::Joined(Err(cleanup)));
+            }
             bail!("failed to install window context (Win32 error {})", error.0);
         }
     } else {
@@ -1388,6 +1666,7 @@ enum MessageResult {
 enum WaitResult {
     Shutdown,
     Messages,
+    Timeout,
     Failed,
     Unexpected(u32),
 }
@@ -1396,6 +1675,7 @@ fn classify_wait_result(result: u32) -> WaitResult {
     match result {
         result if result == WAIT_OBJECT_0.0 => WaitResult::Shutdown,
         WAIT_FOR_MESSAGES => WaitResult::Messages,
+        result if result == WAIT_TIMEOUT.0 => WaitResult::Timeout,
         result if result == WAIT_FAILED.0 => WaitResult::Failed,
         result => WaitResult::Unexpected(result),
     }
@@ -1429,9 +1709,17 @@ impl WindowLoopState {
     }
 }
 
+fn should_drain_another_message(processed: usize) -> bool {
+    processed < MESSAGE_BATCH_LIMIT
+}
+
 unsafe fn drain_window_messages() -> bool {
     let mut msg = MSG::default();
-    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+    let mut processed = 0;
+    while should_drain_another_message(processed)
+        && PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool()
+    {
+        processed += 1;
         if msg.message == WM_QUIT {
             return false;
         }
@@ -1441,12 +1729,20 @@ unsafe fn drain_window_messages() -> bool {
     true
 }
 
-unsafe fn run_message_loop(hwnd: HWND, native: &NativeWindowState, shutdown: &ShutdownEvent) {
+unsafe fn run_message_loop(
+    hwnd: HWND,
+    native: &NativeWindowState,
+    shutdown: &ShutdownEvent,
+) -> CleanupResult {
     let mut state = WindowLoopState::default();
     loop {
+        if shutdown.is_requested() {
+            state.observe_shutdown();
+            break;
+        }
         let wait = MsgWaitForMultipleObjectsEx(
             Some(&[shutdown.handle]),
-            u32::MAX,
+            WINDOW_WAIT_MS,
             QS_ALLINPUT,
             MWMO_INPUTAVAILABLE,
         );
@@ -1461,6 +1757,7 @@ unsafe fn run_message_loop(hwnd: HWND, native: &NativeWindowState, shutdown: &Sh
                     native.alive.store(false, Ordering::Release);
                 }
             }
+            WaitResult::Timeout => continue,
             WaitResult::Failed => {
                 let error = GetLastError().0;
                 let _ = writeln!(
@@ -1490,33 +1787,75 @@ unsafe fn run_message_loop(hwnd: HWND, native: &NativeWindowState, shutdown: &Sh
         native.alive.store(false, Ordering::Release);
     }
     if state.should_destroy() {
-        destroy_window_for_owner(hwnd, native);
+        destroy_window_for_owner(hwnd, native)
+    } else {
+        Err(CleanupFailure::WorkerPanicked)
     }
 }
 
-fn finalize_owner_destroy(
-    native: &NativeWindowState,
-    hwnd: isize,
-    result: std::result::Result<(), u32>,
-) -> Option<u32> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupDecision {
+    Complete,
+    Retry,
+    Abort,
+}
+
+fn cleanup_decision(
+    window_exists: bool,
+    destroy_succeeded: bool,
+    attempt: usize,
+) -> CleanupDecision {
+    if !window_exists || destroy_succeeded {
+        CleanupDecision::Complete
+    } else if attempt + 1 < DESTROY_ATTEMPTS {
+        CleanupDecision::Retry
+    } else {
+        CleanupDecision::Abort
+    }
+}
+
+fn complete_destroyed_window(native: &NativeWindowState, hwnd: isize) -> CleanupResult {
     native.alive.store(false, Ordering::Release);
     native.invalidate(hwnd);
-    result.err()
+    let context_error = native.context_cleanup_error.load(Ordering::Acquire);
+    if context_error == ERROR_SUCCESS.0 {
+        Ok(())
+    } else {
+        Err(CleanupFailure::ContextCleanupFailed(context_error))
+    }
 }
 
-unsafe fn destroy_window_for_owner(hwnd: HWND, native: &NativeWindowState) {
-    let result = if IsWindow(Some(hwnd)).as_bool() {
-        SetLastError(ERROR_SUCCESS);
-        DestroyWindow(hwnd).map_err(|_| GetLastError().0)
-    } else {
-        Ok(())
-    };
-    if let Some(error) = finalize_owner_destroy(native, hwnd.0 as isize, result) {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "[window] failed to destroy playback window (Win32 error {error})"
-        );
+unsafe fn destroy_window_for_owner(hwnd: HWND, native: &NativeWindowState) -> CleanupResult {
+    let mut last_error = ERROR_SUCCESS.0;
+    for attempt in 0..DESTROY_ATTEMPTS {
+        let window_exists = IsWindow(Some(hwnd)).as_bool();
+        let destroy_succeeded = if window_exists {
+            SetLastError(ERROR_SUCCESS);
+            match DestroyWindow(hwnd) {
+                Ok(()) => true,
+                Err(_) => {
+                    last_error = GetLastError().0;
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        match cleanup_decision(window_exists, destroy_succeeded, attempt) {
+            CleanupDecision::Complete => {
+                return complete_destroyed_window(native, hwnd.0 as isize);
+            }
+            CleanupDecision::Retry => std::thread::yield_now(),
+            CleanupDecision::Abort => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[window] failed to destroy playback window after {DESTROY_ATTEMPTS} attempts (Win32 error {last_error})"
+                );
+                return Err(CleanupFailure::DestroyFailed(last_error));
+            }
+        }
     }
+    Err(CleanupFailure::DestroyFailed(last_error))
 }
 
 #[cfg(test)]
@@ -1781,7 +2120,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 LRESULT(0)
             }
             WM_DESTROY => {
-                if let Some(native) = with_context(hwnd, |ctx| ctx.native.clone()) {
+                let native = with_context(hwnd, |ctx| ctx.native.clone());
+                if let Some(native) = &native {
                     native.alive.store(false, Ordering::Release);
                     native.invalidate(hwnd.0 as isize);
                 }
@@ -1791,6 +2131,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 if ptr.is_null() {
                     let error = GetLastError();
                     if error != ERROR_SUCCESS {
+                        if let Some(native) = &native {
+                            native
+                                .context_cleanup_error
+                                .store(error.0, Ordering::Release);
+                        }
                         eprintln!(
                             "[window] failed to clear window context (Win32 error {})",
                             error.0
