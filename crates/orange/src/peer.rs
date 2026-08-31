@@ -29,16 +29,16 @@ pub(crate) use watch::run_watch;
 /// machines behind different routers will never find each other.
 const STUN: &str = "stun://stun.l.google.com:19302";
 
-pub(super) struct PipelineError {
-    pub(super) source: String,
-    pub(super) message: String,
+struct PipelineError {
+    source: String,
+    message: String,
 }
 
 fn should_report_pipeline_error(playback_alive: Option<bool>) -> bool {
     playback_alive != Some(false)
 }
 
-pub(super) fn combine_session_and_cleanup(session: Result<()>, cleanup: Result<()>) -> Result<()> {
+fn combine_session_and_cleanup(session: Result<()>, cleanup: Result<()>) -> Result<()> {
     match (session, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -46,7 +46,7 @@ pub(super) fn combine_session_and_cleanup(session: Result<()>, cleanup: Result<(
     }
 }
 
-pub(super) fn make_webrtcbin(name: &str) -> Result<gst::Element> {
+fn make_webrtcbin(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make("webrtcbin")
         .name(name)
         .property_from_str("bundle-policy", "max-bundle")
@@ -60,7 +60,7 @@ pub(super) fn make_webrtcbin(name: &str) -> Result<gst::Element> {
 /// Without this, a failure inside the receive branch (a decoder refusing caps,
 /// an element failing to start) is completely silent: the peer connection
 /// reports Connected and nothing ever explains why no frames appear.
-pub(super) fn watch_bus(
+fn watch_bus(
     pipeline: &gst::Pipeline,
     label: &'static str,
     playback: Option<crate::window::PlaybackWindowHandle>,
@@ -133,8 +133,8 @@ pub(super) fn watch_bus(
 /// `pad-added` fires when the transceiver is created, which happens whether or
 /// not any media ever arrives. The states below are the difference between
 /// "negotiated" and "actually connected".
-pub(super) type ConnectionFailure = Arc<dyn Fn(String) + Send + Sync>;
-pub(super) type ConnectionReady = Arc<dyn Fn() + Send + Sync>;
+type ConnectionFailure = Arc<dyn Fn(String) + Send + Sync>;
+type ConnectionReady = Arc<dyn Fn() + Send + Sync>;
 
 fn is_terminal_connection_state(state: gst_webrtc::WebRTCPeerConnectionState) -> bool {
     matches!(
@@ -144,7 +144,7 @@ fn is_terminal_connection_state(state: gst_webrtc::WebRTCPeerConnectionState) ->
     )
 }
 
-pub(super) fn watch_connection(
+fn watch_connection(
     bin: &gst::Element,
     label: String,
     diagnostic_role: String,
@@ -188,11 +188,11 @@ pub(super) fn watch_connection(
     });
 }
 
-pub(super) fn enable_nack(transceiver: &gst_webrtc::WebRTCRTPTransceiver) {
+fn enable_nack(transceiver: &gst_webrtc::WebRTCRTPTransceiver) {
     transceiver.set_property("do-nack", true);
 }
 
-pub(super) fn check_promise_reply<'a>(
+fn check_promise_reply<'a>(
     reply: std::result::Result<Option<&'a gst::StructureRef>, gst::PromiseError>,
     operation: &str,
 ) -> Result<Option<&'a gst::StructureRef>> {
@@ -206,7 +206,7 @@ pub(super) fn check_promise_reply<'a>(
 }
 
 /// Forward locally-gathered ICE candidates to the other peer.
-pub(super) fn forward_ice(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
+fn forward_ice(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
     bin.connect("on-ice-candidate", false, move |values| {
         let (Ok(mline), Ok(candidate)) = (values[1].get::<u32>(), values[2].get::<String>()) else {
             eprintln!("[webrtc] malformed ICE candidate callback");
@@ -221,7 +221,7 @@ pub(super) fn forward_ice(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>
     });
 }
 
-pub(super) fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescription> {
+fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescription> {
     let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())
         .map_err(|_| anyhow::anyhow!("malformed SDP"))?;
     let sdp_type = match kind {
