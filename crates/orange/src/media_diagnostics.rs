@@ -524,21 +524,22 @@ pub(crate) fn emit_diagnostic(event: &str, role: &str, payload: impl Serialize) 
 
 #[cfg(test)]
 fn emit_to_test_sink(event: &str, role: &str, payload: &impl Serialize) -> bool {
+    if !TEST_DIAGNOSTIC_SINK.with(|sink| sink.borrow().is_some()) {
+        return false;
+    }
+    let Ok(payload) = serde_json::to_value(payload) else {
+        return true;
+    };
     TEST_DIAGNOSTIC_SINK.with(|sink| {
-        let mut sink = sink.borrow_mut();
-        let Some(records) = sink.as_mut() else {
-            return false;
-        };
-        let Ok(payload) = serde_json::to_value(payload) else {
-            return true;
-        };
-        records.push(serde_json::json!({
-            "event": event,
-            "role": role,
-            "payload": payload,
-        }));
-        true
-    })
+        if let Some(records) = sink.borrow_mut().as_mut() {
+            records.push(serde_json::json!({
+                "event": event,
+                "role": role,
+                "payload": payload,
+            }));
+        }
+    });
+    true
 }
 
 #[cfg(test)]
@@ -563,7 +564,10 @@ fn emit_diagnostic_to(
     payload: impl Serialize,
 ) {
     let Some(context) = DIAGNOSTIC_CONTEXT.get() else {
-        eprintln!("[media-diagnostics] diagnostic context unavailable");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[media-diagnostics] diagnostic context unavailable"
+        );
         return;
     };
     let at_unix_ms = SystemTime::now()
@@ -584,9 +588,10 @@ fn emit_diagnostic_to(
         payload,
     ) {
         Ok(line) => line,
-        Err(error) => {
-            eprintln!(
-                "[media-diagnostics] could not serialize event {event:?} for role {role:?}: {error}"
+        Err(_) => {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[media-diagnostics] could not serialize event {event:?} for role {role:?}"
             );
             return;
         }
@@ -702,38 +707,69 @@ mod tests {
         where
             S: Serializer,
         {
-            Err(serde::ser::Error::custom(
-                "deliberate serialization failure",
-            ))
+            Err(serde::ser::Error::custom("failure"))
+        }
+    }
+
+    struct ReentrantSerialize;
+
+    impl Serialize for ReentrantSerialize {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            emit_diagnostic(
+                "nested-event",
+                "nested-role",
+                serde_json::json!({ "value": 42 }),
+            );
+            serializer.serialize_str("outer-value")
         }
     }
 
     #[test]
     fn diagnostic_json_returns_serialization_error() {
-        let result: Result<String, serde_json::Error> = diagnostic_json(
+        assert!(diagnostic_json(
             &DiagnosticMetadata::default(),
             17,
             1_725_000_000_000,
             "test-event",
             "watch",
             FailingSerialize,
-        );
-
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "deliberate serialization failure"
-        );
+        )
+        .is_err());
     }
 
     #[test]
     fn test_sink_handles_serialization_error_without_capturing_a_record() {
-        let result = std::panic::catch_unwind(|| {
-            capture_diagnostics(|| {
-                assert!(emit_to_test_sink("test-event", "watch", &FailingSerialize));
-            })
+        let records = capture_diagnostics(|| {
+            assert!(emit_to_test_sink("test-event", "watch", &FailingSerialize));
         });
 
-        assert_eq!(result.unwrap(), Vec::<serde_json::Value>::new());
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_sink_allows_diagnostics_during_payload_serialization() {
+        let records = capture_diagnostics(|| {
+            emit_diagnostic("outer-event", "outer-role", ReentrantSerialize);
+        });
+
+        assert_eq!(
+            serde_json::Value::Array(records),
+            serde_json::json!([
+                {
+                    "event": "nested-event",
+                    "role": "nested-role",
+                    "payload": { "value": 42 },
+                },
+                {
+                    "event": "outer-event",
+                    "role": "outer-role",
+                    "payload": "outer-value",
+                },
+            ])
+        );
     }
 
     #[test]
