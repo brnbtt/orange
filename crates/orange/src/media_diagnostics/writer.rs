@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static DIAGNOSTIC_SINK: OnceLock<Option<Arc<DiagnosticSink>>> = OnceLock::new();
+static DIAGNOSTIC_STATE: OnceLock<Arc<DiagnosticState>> = OnceLock::new();
 const DIAGNOSTIC_QUEUE_CAPACITY: usize = 128;
 const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -85,7 +85,24 @@ pub(super) struct DiagnosticSink {
     sender: Mutex<Option<SyncSender<String>>>,
 }
 
+struct DiagnosticState {
+    runtime: Mutex<DiagnosticRuntime>,
+}
+
+enum DiagnosticRuntime {
+    Pending {
+        directory: PathBuf,
+        metadata: DiagnosticMetadata,
+    },
+    Running {
+        sink: Arc<DiagnosticSink>,
+        worker: JoinHandle<()>,
+    },
+    Stopped,
+}
+
 pub(crate) struct DiagnosticWriter {
+    state: Option<Arc<DiagnosticState>>,
     sink: Option<Arc<DiagnosticSink>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -100,40 +117,30 @@ impl DiagnosticWriter {
     }
 
     fn new_with_destination(destination: Option<PathBuf>) -> Self {
+        Self::new_with_destination_in(destination, &DIAGNOSTIC_STATE)
+    }
+
+    fn new_with_destination_in(
+        destination: Option<PathBuf>,
+        process_state: &OnceLock<Arc<DiagnosticState>>,
+    ) -> Self {
         let Some(directory) = destination else {
             return Self::disabled();
         };
-        let mut worker = None;
-        let sink = DIAGNOSTIC_SINK
-            .get_or_init(|| {
-                if let Err(error) = std::fs::create_dir_all(&directory) {
-                    eprintln!("[media-diagnostics] could not create log directory: {error}");
-                    return None;
-                }
-                let path = diagnostic_file_path(&directory, std::process::id());
-                let file = match OpenOptions::new().create(true).append(true).open(&path) {
-                    Ok(file) => file,
-                    Err(error) => {
-                        eprintln!(
-                            "[media-diagnostics] could not open {}: {error}",
-                            path.display()
-                        );
-                        return None;
-                    }
-                };
-                let remaining = MAX_DIAGNOSTIC_BYTES
-                    .saturating_sub(file.metadata().map(|metadata| metadata.len()).unwrap_or(0));
-                let (sink, handle) = Self::start_parts(
-                    BufWriter::new(file),
-                    remaining,
-                    DiagnosticMetadata::from_lookup(|name| std::env::var(name).ok()),
-                    Some(path),
-                );
-                worker = Some(handle);
-                Some(sink)
-            })
-            .clone();
-        Self { sink, worker }
+        let state = Arc::new(DiagnosticState {
+            runtime: Mutex::new(DiagnosticRuntime::Pending {
+                directory,
+                metadata: DiagnosticMetadata::from_lookup(|name| std::env::var(name).ok()),
+            }),
+        });
+        if process_state.set(state.clone()).is_err() {
+            return Self::disabled();
+        }
+        Self {
+            state: Some(state),
+            sink: None,
+            worker: None,
+        }
     }
 
     #[cfg(test)]
@@ -141,6 +148,7 @@ impl DiagnosticWriter {
         let (sink, worker) =
             Self::start_parts(writer, max_bytes, DiagnosticMetadata::default(), None);
         Self {
+            state: None,
             sink: Some(sink),
             worker: Some(worker),
         }
@@ -178,12 +186,16 @@ impl DiagnosticWriter {
 
     const fn disabled() -> Self {
         Self {
+            state: None,
             sink: None,
             worker: None,
         }
     }
 
     fn shutdown(&mut self) {
+        if let Some(state) = self.state.take() {
+            state.shutdown();
+        }
         if let Some(sink) = &self.sink {
             sink.sender
                 .lock()
@@ -195,6 +207,79 @@ impl DiagnosticWriter {
         }
         self.sink.take();
     }
+}
+
+impl DiagnosticState {
+    fn sink(&self) -> Option<Arc<DiagnosticSink>> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*runtime {
+            DiagnosticRuntime::Running { sink, .. } => return Some(sink.clone()),
+            DiagnosticRuntime::Stopped => return None,
+            DiagnosticRuntime::Pending { .. } => {}
+        }
+        let DiagnosticRuntime::Pending {
+            directory,
+            metadata,
+        } = std::mem::replace(&mut *runtime, DiagnosticRuntime::Stopped)
+        else {
+            unreachable!();
+        };
+        let (sink, worker) = start_diagnostic_file(directory, metadata)?;
+        *runtime = DiagnosticRuntime::Running {
+            sink: sink.clone(),
+            worker,
+        };
+        Some(sink)
+    }
+
+    fn shutdown(&self) {
+        let running = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::replace(&mut *runtime, DiagnosticRuntime::Stopped)
+        };
+        if let DiagnosticRuntime::Running { sink, worker } = running {
+            sink.sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let _ = worker.join();
+        }
+    }
+}
+
+fn start_diagnostic_file(
+    directory: PathBuf,
+    metadata: DiagnosticMetadata,
+) -> Option<(Arc<DiagnosticSink>, JoinHandle<()>)> {
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        eprintln!("[media-diagnostics] could not create log directory: {error}");
+        return None;
+    }
+    let path = diagnostic_file_path(&directory, std::process::id());
+    let file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "[media-diagnostics] could not open {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let remaining = MAX_DIAGNOSTIC_BYTES
+        .saturating_sub(file.metadata().map(|metadata| metadata.len()).unwrap_or(0));
+    Some(DiagnosticWriter::start_parts(
+        BufWriter::new(file),
+        remaining,
+        metadata,
+        Some(path),
+    ))
 }
 
 impl Drop for DiagnosticWriter {
@@ -271,8 +356,12 @@ fn drain_diagnostics(
     writer.flush()
 }
 
+fn diagnostic_sink_from(state: &OnceLock<Arc<DiagnosticState>>) -> Option<Arc<DiagnosticSink>> {
+    state.get()?.sink()
+}
+
 pub(super) fn diagnostic_sink() -> Option<Arc<DiagnosticSink>> {
-    DIAGNOSTIC_SINK.get().and_then(Clone::clone)
+    diagnostic_sink_from(&DIAGNOSTIC_STATE)
 }
 
 pub(crate) fn diagnostics_enabled() -> bool {
@@ -756,7 +845,7 @@ mod tests {
 
     #[test]
     fn diagnostic_writer_without_destination_is_disabled_and_shutdown_is_idempotent() {
-        assert!(DIAGNOSTIC_SINK.get().is_none());
+        assert!(DIAGNOSTIC_STATE.get().is_none());
         let mut writer = DiagnosticWriter::new_with_destination(None);
 
         writer.shutdown();
@@ -764,7 +853,46 @@ mod tests {
 
         assert!(writer.sink.is_none());
         assert!(writer.worker.is_none());
-        assert!(DIAGNOSTIC_SINK.get().is_none());
+        assert!(DIAGNOSTIC_STATE.get().is_none());
+    }
+
+    #[test]
+    fn diagnostic_writer_starts_on_first_sink_access_and_joins_on_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("diagnostics");
+        let path = diagnostic_file_path(&destination, std::process::id());
+        let process_state = OnceLock::new();
+
+        let mut writer =
+            DiagnosticWriter::new_with_destination_in(Some(destination.clone()), &process_state);
+
+        assert!(!destination.exists());
+        assert!(!path.exists());
+        assert!(writer.worker.is_none());
+        assert!(matches!(
+            *process_state.get().unwrap().runtime.lock().unwrap(),
+            DiagnosticRuntime::Pending { .. }
+        ));
+
+        let sink = diagnostic_sink_from(&process_state).unwrap();
+        assert!(path.exists());
+        assert!(matches!(
+            *process_state.get().unwrap().runtime.lock().unwrap(),
+            DiagnosticRuntime::Running { .. }
+        ));
+        assert!(sink.emit("lazy-start", "test", serde_json::json!({})));
+
+        writer.shutdown();
+
+        assert!(writer.worker.is_none());
+        assert!(matches!(
+            *process_state.get().unwrap().runtime.lock().unwrap(),
+            DiagnosticRuntime::Stopped
+        ));
+        assert!(diagnostic_sink_from(&process_state).is_none());
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("\"event\":\"lazy-start\""));
     }
 
     #[test]
