@@ -1,0 +1,12 @@
+# rust-lld links the orange binary about five times faster than the default
+# MSVC link.exe (measured: 15.1s -> 2.9s for an incremental rebuild after
+# touching crates/orange/src/peer/host.rs). It ships with the pinned toolchain,
+# so there is nothing extra to install.
+#
+# This applies to local development only. package.ps1 overrides it back to
+# link.exe for release builds: every beta in the field was linked with link.exe,
+# and a linker change to an unsigned binary doing D3D11 and GStreamer FFI is not
+# something to discover from a user bug report. Revisit once releases are signed
+# and there is a way to validate a build before it reaches anyone.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

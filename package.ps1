@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $previousBuildId = $env:ORANGE_BUILD_ID
 $previousChannel = $env:ORANGE_UPDATE_CHANNEL
+$previousLinker = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
 $packageLock = $null
 $iscc = @(
     (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
@@ -46,6 +47,9 @@ try {
 
     $env:ORANGE_BUILD_ID = $BuildId
     $env:ORANGE_UPDATE_CHANNEL = "beta"
+    # .cargo/config.toml selects rust-lld to keep local iteration fast. Release
+    # artifacts stay on link.exe, which is what every shipped beta used.
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "link.exe"
     cargo build --locked --release -p orange -p orange-tray -p orange-updater
     if ($LASTEXITCODE -ne 0) {
         throw "Release build failed."
@@ -84,5 +88,6 @@ finally {
     if ($packageLock) { $packageLock.Dispose() }
     $env:ORANGE_BUILD_ID = $previousBuildId
     $env:ORANGE_UPDATE_CHANNEL = $previousChannel
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $previousLinker
     Pop-Location
 }
