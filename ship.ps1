@@ -30,7 +30,14 @@ try {
     function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
     function Invoke-Git {
         param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-        & git @Arguments
+        # git writes ordinary progress ("From https://...") to stderr. Under
+        # ErrorActionPreference=Stop that becomes a terminating NativeCommandError,
+        # so the exit code has to be the only success signal.
+        $previous = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & git @Arguments 2>&1 | ForEach-Object { Write-Host "   $_" -ForegroundColor DarkGray }
+        } finally { $ErrorActionPreference = $previous }
         if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed" }
     }
 

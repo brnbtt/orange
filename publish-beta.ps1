@@ -65,7 +65,14 @@ function Test-BetaManifest {
 
 function Invoke-Checked {
     param([Parameter(Mandatory = $true)][string]$Command, [Parameter(Mandatory = $true)][string[]]$Arguments)
-    & $Command @Arguments
+    # Native tools write ordinary progress to stderr (git fetch, az, gh). Under
+    # ErrorActionPreference=Stop that becomes a terminating NativeCommandError
+    # before the exit code is ever read, so success must be judged by the code.
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $Command @Arguments 2>&1 | ForEach-Object { Write-Host "   $_" -ForegroundColor DarkGray }
+    } finally { $ErrorActionPreference = $previous }
     if ($LASTEXITCODE -ne 0) { throw "$Command failed with exit code $LASTEXITCODE" }
 }
 
