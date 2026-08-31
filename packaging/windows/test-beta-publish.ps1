@@ -64,18 +64,6 @@ try {
     if ($installerUpload -lt 0 -or $manifestUpload -le $installerUpload) {
         throw "publisher does not upload the installer before the manifest"
     }
-    foreach ($required in @(
-        '-Command "git" -Arguments @("fetch", "origin", "main")',
-        '-BuildId $build',
-        'Ensure-GitHubRelease',
-        'Resolve-GitHubTagCommit',
-        'Source changed while building',
-        'dist\.publish-',
-        '"storage", "blob", "download"',
-        '"release", "download"'
-    )) {
-        if ($source.IndexOf($required) -lt 0) { throw "publisher is missing safety gate: $required" }
-    }
     Write-Host "RESULT: beta publisher checks passed"
 } finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

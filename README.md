@@ -165,31 +165,46 @@ Build the installer with:
 The output is `dist\orange-setup-<version>.exe`. The current target is 64-bit
 Windows 10/11.
 
-### Alpha testing
+### Releasing
 
-Alpha testers download
-[`orange-alpha-launcher.zip`](https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha-launcher.zip)
-once, extract it, and run `orange-alpha.cmd`. The launcher verifies the channel
-manifest and archive SHA-256, keeps the previous build for rollback, and starts
-the selected version.
-
-Diagnostics are written under `%LOCALAPPDATA%\Orange Alpha\diagnostics`.
-Signed-in testers upload completed ZIPs after Orange exits; failed uploads are
-retried later. Archives contain structured counters, timings, and build/profile
-identifiers, not media, tokens, authorization headers, room codes, SDP, ICE,
-window titles, or process names. Storage uses a one-way digest of the Discord ID.
-
-Build and validate an alpha locally with:
+Ship a new beta with one command. It bumps the version, runs the full test
+suite, commits, pushes, builds the installer, and publishes:
 
 ```powershell
-.\alpha\publish-alpha.ps1
+.\ship.ps1 -Notes "Fixes audio dropping out when the game loses focus."
 ```
 
-Publication is explicit and requires the commit to exist on `origin/main`:
+Everything that can fail cheaply runs first, so a failure never leaves you with
+a committed-and-pushed version bump to unwind. `-Notes` is required: users see
+that text in the update banner.
+
+If the publish itself fails partway, do **not** re-run `ship.ps1` — it would
+bump the version again. Re-run the publisher directly instead; it is idempotent
+and converges on the same commit:
 
 ```powershell
-.\alpha\publish-alpha.ps1 -Publish
+.\publish-beta.ps1 -Publish -Notes "<same notes>"
 ```
+
+Build an installer locally without publishing anything:
+
+```powershell
+.\package.ps1
+```
+
+Installers are immutable. A published version can never be replaced, only
+superseded, and clients ignore any manifest version older than the one they are
+running — so a bad release is fixed by publishing a newer one, not by rolling
+the manifest back.
+
+### Diagnostics
+
+Every session writes structured JSONL counters and timings to
+`%LOCALAPPDATA%\orange\diagnostics`. Nothing is uploaded. When someone reports a
+problem, ask them for those files: **Settings → Diagnostics → Open folder**.
+
+Records contain counters, timings, and build identifiers — not media, tokens,
+room codes, SDP, ICE, or window titles.
 
 ## Build
 
@@ -199,6 +214,13 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait
 
 . .\dev.ps1
 cargo build --locked
+```
+
+Install the pre-push hook once. It runs formatting, Clippy, and the media-free
+crate tests in about fifteen seconds; bypass it with `git push --no-verify`:
+
+```powershell
+git config core.hooksPath packaging/hooks
 ```
 
 Run the complete validation matrix from [ARCHITECTURE.md#validation](ARCHITECTURE.md#validation).

@@ -3,7 +3,7 @@ param(
     [switch]$Publish,
     [switch]$SkipTests,
     [switch]$LibraryOnly,
-    [string]$Notes = "First beta: faster joining, automatic updates, and streamlined installation."
+    [string]$Notes = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,18 +69,6 @@ function Invoke-Checked {
     if ($LASTEXITCODE -ne 0) { throw "$Command failed with exit code $LASTEXITCODE" }
 }
 
-function Test-NativeSuccess {
-    param([Parameter(Mandatory = $true)][string]$Command, [Parameter(Mandatory = $true)][string[]]$Arguments)
-    $old = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        & $Command @Arguments *> $null
-        return $LASTEXITCODE -eq 0
-    } finally {
-        $ErrorActionPreference = $old
-    }
-}
-
 function Get-OptionalNativeJson {
     param([Parameter(Mandatory = $true)][string]$Command, [Parameter(Mandatory = $true)][string[]]$Arguments)
     $old = $ErrorActionPreference
@@ -91,6 +79,42 @@ function Get-OptionalNativeJson {
         return ($output | Out-String | ConvertFrom-Json)
     } finally {
         $ErrorActionPreference = $old
+    }
+}
+
+function Get-WorkspaceVersion {
+    $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw "Could not read the workspace version" }
+    ($metadata.packages | Where-Object name -eq "orange-tray").version
+}
+
+# Fails in seconds on the two mistakes that otherwise surface only after a full
+# release build: forgetting to bump the version, and forgetting -Notes.
+function Assert-Publishable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$Build,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Notes
+    )
+
+    if ($Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') {
+        throw "Workspace version '$Version' is not a beta version. Set it in Cargo.toml."
+    }
+    if ([string]::IsNullOrWhiteSpace($Notes)) {
+        throw "Publishing requires -Notes. Users see this text in the update banner."
+    }
+    if ([Text.Encoding]::UTF8.GetByteCount($Notes) -gt 500) {
+        throw "Release notes exceed the 500 byte client limit."
+    }
+
+    $existing = Get-OptionalNativeJson -Command "az" -Arguments @(
+        "storage", "blob", "show", "--account-name", $script:BetaStorageAccount,
+        "--container-name", $script:BetaContainer, "--name", "orange-setup-$Version.exe",
+        "--auth-mode", "key", "--output", "json", "--only-show-errors"
+    )
+    if ($null -ne $existing -and $existing.metadata.build -cne $Build) {
+        throw ("Version $Version was already published from commit $($existing.metadata.build). " +
+               "Installers are immutable: bump the version in Cargo.toml.")
     }
 }
 
@@ -233,11 +257,16 @@ function Invoke-BetaPublish {
 
         & (Join-Path $root "packaging\windows\test-installer.ps1")
         & (Join-Path $root "packaging\windows\test-beta-publish.ps1")
+        $version = Get-WorkspaceVersion
+        if ($Publish) {
+            Assert-Publishable -Version $version -Build $build -Notes $Notes
+        } elseif ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') {
+            throw "Workspace version '$version' is not a beta version. Set it in Cargo.toml."
+        }
+        Write-Host "==> Publishing $version from $($build.Substring(0, 12))" -ForegroundColor Cyan
+
         & (Join-Path $root "package.ps1") -SkipTests:$SkipTests -BuildId $build
         if ($LASTEXITCODE -ne 0) { throw "Installer packaging failed" }
-        $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-        $version = ($metadata.packages | Where-Object name -eq "orange-tray").version
-        if ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') { throw "Workspace version is not a beta version" }
         $installerName = "orange-setup-$version.exe"
         $outputInstaller = Join-Path $root "dist\$installerName"
         if (-not (Test-Path -LiteralPath $outputInstaller -PathType Leaf)) { throw "Installer was not created" }

@@ -101,9 +101,8 @@ The tray quality table in `crates/orange-tray/src/supervisor.rs` requests automa
 | `crates/orange-signal/src/protocol.rs` | Serde-tagged `Signal` protocol and relay-controlled peer routing IDs |
 | `crates/orange-signal/src/client.rs` | WebSocket tasks/channels, heartbeat, graceful-close request, task await/reap, abort fallback |
 | `crates/orange-signal/src/relay.rs` | Room codes, in-memory rooms, role rules, routing, viewer cap, queues and rate limit |
-| `crates/orange-signal/src/server.rs` | Axum routes, 512-connection semaphore, OAuth HTTP endpoints, `/ws`, diagnostics endpoint |
+| `crates/orange-signal/src/server.rs` | Axum routes, 512-connection semaphore, OAuth HTTP endpoints, `/ws` |
 | `crates/orange-signal/src/auth.rs` | Discord OAuth exchange, pending attempts, opaque in-memory sessions, expiration and capacities |
-| `crates/orange-signal/src/diagnostics.rs` | Authenticated ZIP upload, strict metadata, local/Azure Blob storage, pseudonymous keys |
 | `crates/orange-relay/src/main.rs` | Production relay entry, `PORT`, Ctrl-C shutdown selection |
 | `crates/orange-updater/src/main.rs` | Updater argument parser, parent wait, checksum, silent installer, restart/failure record |
 
@@ -179,14 +178,13 @@ webrtcbin OPUS pad
 | Signal JSON tags, fields, defaults, and peer stamping | `crates/orange-signal/src/protocol.rs` |
 | Tray window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --bitrate --scale [--fps]`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
-| Host stdout markers `Share this code:`, `[host] signed in as`, `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
+| Host stdout markers `Share this code:` and `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | Session file `%APPDATA%\orange\session.json` | writer: `crates/orange/src/auth.rs`; reader: `crates/orange-tray/src/session.rs` |
 | Preferences `%APPDATA%\orange\preferences.json` | `crates/orange-tray/src/session.rs` |
 | Beta manifest schema/host/name/hash | producer: `publish-beta.ps1`; consumer: `crates/orange-tray/src/update.rs` |
 | Updater flags `--installer --sha256 --parent --install-dir` | producer: `crates/orange-tray/src/update.rs`; consumer: `crates/orange-updater/src/main.rs` |
 | RTP video payload 96, RTX 97, Opus 111, clocks and 100 ms receive latency | `crates/orange/src/webrtc/transport.rs` |
-| Local diagnostic JSONL fields and `ORANGE_*` metadata | producer: `crates/orange/src/media_diagnostics/writer.rs`; orchestrator: `alpha/orange-alpha.ps1` |
-| Alpha upload: `/diagnostics`, bearer session, ZIP content type, and `x-orange-build/run/device/profile` headers | producer: `alpha/orange-alpha.ps1`; consumer: `crates/orange-signal/src/server.rs`, `crates/orange-signal/src/diagnostics.rs` |
+| Local diagnostic JSONL fields and `ORANGE_*` metadata | producer: `crates/orange/src/media_diagnostics/writer.rs`; consumer: a human, via Settings -> Diagnostics -> Open folder |
 
 ## Where Do I Change...?
 
@@ -208,10 +206,10 @@ webrtcbin OPUS pad
 | Relay room policy and limits | `crates/orange-signal/src/relay.rs`, `crates/orange-signal/src/server.rs` |
 | Discord OAuth/session policy | `crates/orange-signal/src/auth.rs` |
 | Local media diagnostic records | `crates/orange/src/media_diagnostics/writer.rs` |
-| Relay diagnostic upload/auth/storage | `crates/orange-signal/src/server.rs`, `crates/orange-signal/src/diagnostics.rs` |
-| Alpha diagnostic environment/archive/upload headers | `alpha/orange-alpha.ps1` |
 | Update manifest/client handoff | `publish-beta.ps1`, `crates/orange-tray/src/update.rs`, `crates/orange-updater/src/main.rs` |
 | Installer contents/prerequisites | `package.ps1`, `packaging/windows/orange.iss` |
+| Release procedure (bump, test, commit, push, publish) | `ship.ps1` |
+| Pre-push gate | `packaging/hooks/pre-push.ps1` |
 | Azure single-replica deployment | `deploy/azure.ps1` |
 
 ## Validation
@@ -234,6 +232,11 @@ cargo build --locked --release --workspace --all-features
 .\package.ps1
 ```
 
+The fast subset of the source gates runs automatically on `git push` once
+`git config core.hooksPath packaging/hooks` is set. See
+`packaging/hooks/pre-push.ps1` for what it covers and what it deliberately
+leaves to the full matrix above.
+
 Direct PowerShell contract tests do not publish or deploy:
 
 ```powershell
@@ -241,8 +244,6 @@ Direct PowerShell contract tests do not publish or deploy:
 .\packaging\windows\test-installer.ps1
 .\packaging\windows\test-package-provenance.ps1
 .\packaging\windows\test-beta-publish.ps1
-.\alpha\test-orange-alpha.ps1
-.\alpha\test-publish-alpha.ps1
 ```
 
 External gates are installed interactive media acceptance on required GPU

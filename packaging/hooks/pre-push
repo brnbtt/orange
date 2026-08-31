@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs the fast checks before a push. Bypass with: git push --no-verify
+exec powershell -NoProfile -ExecutionPolicy Bypass -File \
+  "$(git rev-parse --show-toplevel)/packaging/hooks/pre-push.ps1"
