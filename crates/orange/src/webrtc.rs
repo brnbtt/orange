@@ -7,7 +7,7 @@
 //! but it owns the encoder and expects raw video. That would re-encode frames
 //! we have already encoded on the GPU, discarding the whole reason this
 //! project is cheap. `webrtcbin` accepts RTP-payloaded, already-encoded media,
-//! so our NVENC output goes straight onto the wire.
+//! so hardware-encoded output goes straight onto the wire.
 //!
 //! The price is that we do signalling ourselves. This module proves the media
 //! path with both peers in one process, exchanging SDP by direct call.

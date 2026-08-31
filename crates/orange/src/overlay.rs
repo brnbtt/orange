@@ -108,7 +108,8 @@ impl OverlayState {
             fps: None,
             bitrate_kbps: None,
             profile,
-            // Start hidden; the first mouse move reveals the controls.
+            // Start hidden; pointer activity or the first known source size
+            // briefly reveals the controls.
             shown_at: Instant::now() - HIDE_AFTER * 2,
             hot: None,
             hits: Vec::new(),

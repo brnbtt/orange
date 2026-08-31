@@ -52,9 +52,9 @@ pub fn attach(
                     if fps.is_some() {
                         state.fps = fps;
                     }
-                    // Show the controls once, on the first frame. A viewer who
-                    // never happens to move the mouse would otherwise have no
-                    // way to learn they exist.
+                    // Show the controls once, when caps first provide a source
+                    // size. A viewer who never moves the mouse would otherwise
+                    // have no way to learn they exist.
                     if state.video != (0, 0) && state.video != previous {
                         if previous == (0, 0) {
                             state.wake();

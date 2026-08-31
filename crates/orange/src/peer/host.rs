@@ -65,9 +65,9 @@ fn handle_host_diagnostic_signal(signal: &Signal) {
 
 /// Host: capture a window and serve any number of viewers.
 ///
-/// The window is captured and encoded **once**. Encoded AV1 is fanned out to a
-/// fresh RTP payloader per viewer, so late joiners receive their own RTP stream
-/// and initialization while still sharing the expensive encoder.
+/// The window is captured and encoded **once**. Encoded video is fanned out to
+/// a fresh RTP payloader per viewer, so late joiners receive their own RTP
+/// stream and initialization while still sharing the expensive encoder.
 pub(crate) async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     check_elements(settings.codec)?;
     let mut client = connect(url).await?;

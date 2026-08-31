@@ -107,7 +107,7 @@ enum Command {
     /// seconds rather than by waiting out a full loopback.
     Preview {
         /// Stream resolution to design against, e.g. 3840x2160. This is the
-        /// overlay's coordinate space, so the bar's proportions follow it.
+        /// overlay's coordinate space, so the controls scale with it.
         #[arg(long, default_value = "1920x1080")]
         size: String,
         /// The viewer window's size on screen.
@@ -335,9 +335,8 @@ fn run(cli: Cli) -> Result<()> {
 
 /// A stand-in for the decoded stream, feeding the real overlay and sink.
 ///
-/// The tail of this pipeline is deliberately identical to the one
-/// `webrtc::build_receive_branch` assembles, so the harness cannot flatter the
-/// design in ways the real viewer will not reproduce.
+/// After its synthetic raw source, this uses the viewer's real overlay element
+/// and D3D11 sink. It deliberately bypasses RTP, parsing, and decoding.
 fn build_preview_pipeline(
     size: (u32, u32),
     fps: u32,

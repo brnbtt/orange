@@ -5,72 +5,72 @@
 <h1 align="center">orange</h1>
 
 <p align="center">
-  Low-overhead window streaming for friends. Share a game window at high
-  bitrate without the compression Discord puts on it, and without costing
-  yourself FPS.
+  Low-overhead Windows game and window streaming for friends, with direct
+  peer-to-peer media and a small signalling relay.
 </p>
 
 ## Status
 
-Nine milestones done, and the tray UI is usable. Everything below has only ever
-run on a single machine: the two-machine path across the internet is the next
-real test, and the biggest unknown.
+Ten core product milestones are implemented:
 
 | # | Milestone | State |
 | --- | --- | --- |
-| 1 | Window enumeration, GPU capture, hardware encode | **done** |
-| 2 | WebRTC transport, no transcode | **done** (loopback) |
-| 3 | Signalling relay, host/watch as separate processes | **done** (one machine) |
-| 4 | Multiple simultaneous viewers, single encode | **done** |
-| 5 | Relay deployed to Azure | **done** |
-| 6 | Viewer window: borderless + rounded, video embedded | **done** |
-| 7 | Per-process game audio | **done** |
-| 8 | Overlay controls on the video | **done** |
-| 9 | Discord identity | **done** |
-| 10 | Tray UI (window picker, quality, share code) | **done** |
-| 11 | Two machines across the internet | next |
-| 12 | Installer, autostart | |
+| 1 | Window enumeration, D3D11 capture, hardware encoding | done |
+| 2 | WebRTC transport without a production-path re-encode | done |
+| 3 | Signalling relay with separate host/watch processes | done |
+| 4 | Multiple viewers sharing one host encode | done |
+| 5 | Single-replica Azure relay deployment | done |
+| 6 | Native borderless viewer window with embedded video | done |
+| 7 | Window process-tree audio and whole-screen system audio | done |
+| 8 | GPU-composited viewer controls | done |
+| 9 | Optional Discord identity | done |
+| 10 | Tray UI, installer, and verified beta updates | done |
 
-## Identity
+Autostart is not implemented. Current local installed acceptance covers H.265
+streaming checks, preview, and file output. Two-machine WAN behavior, including
+networks that require TURN, remains an external acceptance gate.
 
-```
-tray → browser → Discord consent
-                     ↓
-             relay /auth/callback     client_secret lives ONLY here
-                     ↓ exchange code, GET /users/@me
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for process boundaries, crate and source
+maps, media flows, teardown rules, compatibility contracts, limits, and the
+authoritative validation commands.
+
+## Identity And Access
+
+Discord identity is optional in the signalling protocol and CLI. It adds names
+and avatars and authorizes alpha diagnostic uploads; anonymous peers can still
+host and watch when the relay is not configured for Discord.
+
+```text
+tray -> browser -> Discord consent
+                     |
+                     v
+             relay /auth/callback       client_secret stays on relay
+                     |
+                     v
                session token
-                     ↑
-tray polls /auth/poll?state=… ──┘     no local server, no fixed port
+                     ^
+                     |
+tray polls /auth/poll?state=...          no local callback port
 ```
 
 ```powershell
-orange login     # opens the browser, stores the session
+orange login
 orange logout
 ```
 
-Two decisions worth keeping:
+The desktop receives an Orange session token, never the Discord client secret.
+The browser callback lands on the relay because Discord redirect URIs must match
+exactly; the desktop polls with the generated state value.
 
-- **The desktop app never holds `client_secret`.** Anything shipped to a user's
-  machine can be extracted from it, so the code-for-token exchange happens on
-  the relay and the app only ever receives an opaque session token.
-- **Polling, not a loopback redirect.** Discord requires redirect URIs to match
-  exactly, which would pin the app to a hardcoded port that may be in use.
-  The browser lands back on the relay; the app polls with a nonce it generated.
+Identity is not authorization to a room. The room code is the access credential:
+anyone who has it can attempt to join and can share it with someone else.
 
-Once signed in, hosts see `Ale joined (2 watching)` instead of `cd6da841`, and
-viewers see whose stream they opened.
+Relay OAuth sessions are in memory. A relay restart, deploy, or Container Apps
+revision switch signs users out and interrupts active rooms.
 
-**Identity is not an access boundary.** Possession of the room code still grants
-access; logging in only attaches a name. Guild-based authorisation would change
-that, and needs the `guilds` scope.
-
-### Friends lists
-
-Discord's `relationships.read` scope exists but is **gated behind Social SDK
-approval**. The approval-free equivalent is `identify` + `guilds`: match users
-who share a Discord server. Functionally the same for a group of friends.
-
-### Relay configuration
+### Relay OAuth configuration
 
 ```powershell
 az containerapp secret set --name orange-relay --resource-group orange-rg `
@@ -82,58 +82,105 @@ az containerapp update --name orange-relay --resource-group orange-rg `
                  DISCORD_REDIRECT_URI=https://<fqdn>/auth/callback
 ```
 
-Unconfigured, the relay still works for anonymous peers and returns a readable
-503 from `/auth/start`, so local development needs no credentials.
+Without this configuration, anonymous signalling remains available and
+`/auth/start` returns a readable service-unavailable response.
 
-**Sessions are in memory.** Every relay restart or redeploy signs everyone out.
-That needs a datastore before this goes to real users.
+## Media Path
 
-## Audio is scoped to the game
+The production default is cross-vendor H.265 through Windows Media Foundation:
 
-`wasapi2src` can record a single process tree rather than the whole output
-device:
-
-```
-wasapi2src loopback=true loopback-mode=include-process-tree loopback-target-pid=<game>
-```
-
-**Your voice chat, music and notification sounds never enter the stream.** The
-PID comes from the captured window automatically, so there is nothing to
-configure. Opus at 128 kbps stereo is transparent for games and a rounding
-error next to the video bitrate.
-
-Pass `--no-audio` to disable it. Audio failing never blocks the stream — if the
-process makes no sound or capture fails, video continues and the reason is
-logged.
-
-## Measured, not assumed
-
-On an RTX 4080 SUPER / i9-14900K, capturing a live UE5 game:
-
-| | |
-| --- | --- |
-| Resolution | 3840x2160 @ 60fps |
-| Codec | AV1, NVENC, D3D11 zero-copy |
-| Bitrate | ~29 Mbps |
-| CPU | **1.03s over 11.5s wall** — ~9% of one core |
-| In-game FPS cost | **none observed** |
-
-For comparison, Discord's free tier caps at 1080p60 with far heavier
-compression. This is not an incremental improvement.
-
-## Why it is cheap
-
-Frames never leave VRAM:
-
-```
-d3d11screencapturesrc   -> memory:D3D11Memory   (Windows Graphics Capture)
-d3d11convert            -> scale/convert on GPU
-nvd3d11av1enc           -> NVENC, a dedicated ASIC, not CUDA cores
+```text
+d3d11screencapturesrc -> d3d11convert -> mfh265enc -> h265parse
+  -> rtph265pay -> webrtcbin ===== peer to peer ===== webrtcbin
+  -> rtph265depay -> h265parse -> d3d11h265dec
+  -> overlaycomposition -> d3d11videosink
 ```
 
-**Inserting any element that forces a download to system memory
-(`videoconvert`, `videoscale`, most CPU filters) destroys this property.** If a
-change makes CPU usage jump, that is the first thing to check.
+The host captures and hardware-encodes once. A tee creates an RTP/WebRTC branch
+per viewer, so GPU encode cost stays largely flat while host upload bandwidth
+grows once per viewer. `webrtcbin` accepts encoded RTP; `webrtcsink` would own
+an encoder and require raw video, causing another encode.
+
+D3D11 frames stay GPU-resident through capture, conversion, and the hardware
+encoder. CPU conversion elements such as `videoconvert` or `videoscale` in that
+production chain would change its performance profile.
+
+AV1 with NVIDIA encoding and H.264 remain explicit CLI diagnostic/development
+options. They are not the production default.
+
+### Audio scope
+
+For a window, `wasapi2src` includes only the owning process tree, excluding
+voice chat, music, notifications, and other applications:
+
+```text
+wasapi2src loopback=true loopback-mode=include-process-tree \
+  loopback-target-pid=<game> -> opusenc -> rtpopuspay
+```
+
+Whole-screen sharing includes system output audio. Pass `--no-audio` to disable
+audio. Audio capture failure does not block video.
+
+### Historical diagnostic measurement
+
+An earlier AV1/NVIDIA RTX 4080 SUPER diagnostic run captured a live UE5 game at
+3840x2160 60 fps and about 29 Mbps. It measured about 1.03 CPU-seconds over
+11.5 seconds wall time (roughly 9% of one core) with no in-game FPS loss
+observed in that run. This is historical characterization, not the active codec
+or a cross-vendor performance guarantee.
+
+## Install
+
+The beta uses a one-click per-user installer. Open
+`orange-setup-<version>.exe`; it installs Orange under
+`%LOCALAPPDATA%\Programs\orange`, creates a Start menu shortcut, installs the
+pinned GStreamer runtime per-user when missing, and opens the app. Rust, Visual
+Studio, and the source tree are not required on the receiving machine.
+
+Installed beta builds check the public update channel at startup and every six
+hours. `Update now` downloads from the fixed release host, enforces size and
+manifest rules, verifies SHA-256, hands off to `orange-updater.exe`, closes the
+tray and media children, applies the installer silently, and reopens the tray.
+Failed checks and downloads do not stop streaming.
+
+The installer is not yet Authenticode-signed. HTTPS host restrictions and
+SHA-256 protect update integrity, but public production promotion remains
+blocked on obtaining a trusted external code-signing certificate.
+
+Build the installer with:
+
+```powershell
+.\package.ps1
+```
+
+The output is `dist\orange-setup-<version>.exe`. The current target is 64-bit
+Windows 10/11.
+
+### Alpha testing
+
+Alpha testers download
+[`orange-alpha-launcher.zip`](https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha-launcher.zip)
+once, extract it, and run `orange-alpha.cmd`. The launcher verifies the channel
+manifest and archive SHA-256, keeps the previous build for rollback, and starts
+the selected version.
+
+Diagnostics are written under `%LOCALAPPDATA%\Orange Alpha\diagnostics`.
+Signed-in testers upload completed ZIPs after Orange exits; failed uploads are
+retried later. Archives contain structured counters, timings, and build/profile
+identifiers, not media, tokens, authorization headers, room codes, SDP, ICE,
+window titles, or process names. Storage uses a one-way digest of the Discord ID.
+
+Build and validate an alpha locally with:
+
+```powershell
+.\alpha\publish-alpha.ps1
+```
+
+Publication is explicit and requires the commit to exist on `origin/main`:
+
+```powershell
+.\alpha\publish-alpha.ps1 -Publish
+```
 
 ## Build
 
@@ -141,197 +188,83 @@ change makes CPU usage jump, that is the first thing to check.
 winget install gstreamerproject.gstreamer Rustlang.Rustup pkgconf.pkgconf
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools"
 
-. .\dev.ps1      # sets PKG_CONFIG_PATH and PATH - note the leading dot
-cargo build
+. .\dev.ps1
+cargo build --locked
 ```
 
-## Install
-
-The beta uses a one-click per-user installer. Open
-`orange-setup-0.2.0-beta.5.exe`; it installs prerequisites when needed,
-installs Orange under `%LOCALAPPDATA%\Programs\orange`, creates a Start menu
-shortcut, and opens the app. There are no destination, shortcut, or completion
-pages to step through.
-
-Installed beta builds check the public update channel at startup and every six
-hours. When a newer beta is available, Orange shows an update banner. Clicking
-`Update now` downloads and verifies the installer, closes Orange, applies the
-update silently, and reopens the app. Failed checks and downloads do not stop
-streaming.
-
-The first beta is not Authenticode-signed, so Windows SmartScreen may warn on
-the initial install. HTTPS host pinning and SHA-256 verification protect update
-downloads, but production promotion remains blocked on obtaining a trusted
-code-signing certificate.
-
-Build the friend-facing Windows installer with:
-
-```powershell
-.\package.ps1
-```
-
-The result is `dist\orange-setup-<version>.exe`. It installs `orange` for the
-current user and creates a Start menu shortcut. If the required GStreamer media
-runtime is missing, setup downloads the pinned official x64 runtime from the
-GStreamer project and verifies its SHA-256 hash before installing it. Rust,
-Visual Studio, and the source tree are not needed on the receiving machine.
-
-The current build targets 64-bit Windows 10/11. Beta streaming uses H.265
-through Windows Media Foundation so recent AMD, Intel, and NVIDIA hosts share
-one efficient hardware path with substantially better quality than H.264.
-
-### Alpha testing
-
-Alpha testers download
-[`orange-alpha-launcher.zip`](https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-alpha-launcher.zip)
-once, extract it, and run `orange-alpha.cmd`. The launcher checks the
-channel manifest, verifies the build's SHA-256 hash, keeps the previous build
-for rollback, and starts the selected version. No installer is replaced.
-
-Each launch writes diagnostics under `%LOCALAPPDATA%\Orange Alpha\diagnostics`
-and retries completed archives from `%LOCALAPPDATA%\Orange Alpha\pending`.
-After Orange closes, signed-in alpha testers automatically upload the archive
-to the relay. Upload failure does not block Orange and retries on the next run.
-
-Uploaded archives contain build/profile identifiers and Orange's structured
-media counters and timings. They do not contain video, audio, Discord tokens,
-authorization headers, room codes, SDP, ICE candidates, window titles, or
-process names. The server stores a one-way digest rather than the Discord ID.
-
-Maintainers build and validate the next alpha locally with:
-
-```powershell
-.\alpha\publish-alpha.ps1
-```
-
-After the commit is on `origin/main`, publication is explicit:
-
-```powershell
-.\alpha\publish-alpha.ps1 -Publish
-```
-
-## Transport: why `webrtcbin`, not `webrtcsink`
-
-`webrtcsink` is the friendlier element — it handles negotiation and codec
-selection for you — but **it owns the encoder and expects raw video**. Using it
-would re-encode frames we already encoded on the GPU, throwing away the reason
-this project is cheap.
-
-`webrtcbin` accepts RTP-payloaded, already-encoded media, so NVENC output goes
-straight onto the wire:
-
-```
-nvd3d11av1enc -> av1parse -> rtpav1pay -> webrtcbin
-                                             |
-webrtcbin -> rtpav1depay -> av1parse -> d3d11av1dec -> d3d11videosink
-```
-
-The price is writing signalling ourselves. `orange loopback` runs both peers in
-one process and passes SDP by direct function call, which exercises the whole
-media path with no network code in the way.
+Run the complete validation matrix from [ARCHITECTURE.md#validation](ARCHITECTURE.md#validation).
 
 ## Usage
 
 ```powershell
 orange list
-# HWND                SIZE  PROCESS                          TITLE
-# 395876         2560x1440  MortalShell2-Win64-Shipping.exe  MortalShell2
+orange list --json
 
-# capture + encode only
-orange record --hwnd 395876 --codec av1 --bitrate 25000 --scale 1920x1080 --seconds 8 --out test.mkv
+# Capture and encode only; H.265 is the default.
+orange record --hwnd 395876 --bitrate 18000 --scale 2560x1440 --seconds 8 --out test.mkv
 
-# capture -> encode -> WebRTC -> decode -> render
+# Capture, WebRTC transport, decode, and local render.
 orange loopback --hwnd 395876 --scale 1280x720 --bitrate 8000 --show
+
+# Local relay and two peer processes.
+orange serve
+orange host --hwnd 395876 --scale 1920x1080 --bitrate 8000
+# Share this code: BC2-VH3
+orange watch --code BC2-VH3
 ```
 
-Both subcommands are diagnostics: `record` isolates the capture half, `loopback`
-adds transport. When a real stream misbehaves, they tell you which half is at
-fault.
+Point host and watch at another relay with `--server ws://host:9000/ws` or set
+`ORANGE_SERVER`. `record` isolates capture/encode; `loopback` adds the media
+transport without the network relay.
 
-## Streaming between machines
+The CLI defaults to H.265 at 25 Mbps and can choose another bitrate. The tray
+offers fixed H.265 tiers: 4 Mbps at 720p, 8 Mbps at 1080p, and 18 Mbps at 1440p.
 
-```powershell
-orange serve                              # the relay (one instance, anywhere reachable)
-orange host --hwnd 395876 --scale 1920x1080 --bitrate 25000
-#   Share this code:  BC2-VH3
-orange watch --code BC2-VH3               # on a friend's machine
-```
+## Relay Limits And Deployment
 
-Point both ends at the same relay with `--server ws://host:9000`.
+The relay forwards signalling only. SDP and ICE pass through it; media remains
+peer to peer. The process is deliberately bounded to 512 concurrent WebSocket
+connections and 16 viewers per room. It also uses bounded outbound queues and
+an inbound signalling rate limit; these are fixed process limits.
 
-### The relay carries no video
+Host upload remains the practical media limit because every viewer receives a
+separate peer-to-peer stream:
 
-It knows nothing about media. It matches peers by room code and forwards a few
-kilobytes of SDP and ICE, then gets out of the way — video goes directly peer
-to peer. That is what keeps hosting costs near zero.
-
-### How many viewers?
-
-The relay is not the limit. It handles thousands of concurrent connections on
-the cheapest tier, because a whole session costs it perhaps 10-20 KB of
-handshake plus an idle socket.
-
-**The limit is the host's upload bandwidth.** The window is captured and encoded
-*once* — a `tee` fans the encoded stream out — so GPU and CPU cost stay flat no
-matter how many people watch. Bandwidth does not:
-
-| Bitrate | 2 viewers | 4 viewers | 8 viewers |
+| Tray tier | 2 viewers | 4 viewers | 8 viewers |
 | --- | --- | --- | --- |
-| 25 Mbps (1440p60, excellent) | 50 Mbps | 100 Mbps | 200 Mbps |
-| 8 Mbps (1080p60, good) | 16 Mbps | 32 Mbps | 64 Mbps |
-| 4 Mbps (720p60, fine) | 8 Mbps | 16 Mbps | 32 Mbps |
+| 18 Mbps | 36 Mbps | 72 Mbps | 144 Mbps |
+| 8 Mbps | 16 Mbps | 32 Mbps | 64 Mbps |
+| 4 Mbps | 8 Mbps | 16 Mbps | 32 Mbps |
 
-On 100 Mbps upload that is roughly **4 viewers at 25 Mbps, or a dozen at 8
-Mbps**. Lower the bitrate as the audience grows; the tray UI should make that
-tradeoff visible rather than hiding it.
+Rooms and auth sessions are process-local memory. `deploy/azure.ps1` therefore
+pins `min-replicas = max-replicas = 1`. Deploying or restarting that one replica
+drops active rooms and signs users out. Horizontal scaling would require shared
+room and auth state; Orange makes no current multi-replica claim.
 
-Beyond that, an SFU would be needed — the host uploads once and a server fans
-out — but that server *does* carry video, at roughly 9 GB per hour per viewer
-in egress. That is a completely different cost structure and not worth it for a
-group of friends.
+Public STUN (`stun.l.google.com:19302`) is configured for address discovery.
+No TURN server is bundled. Peers that cannot establish a direct path need a
+separately operated TURN service, which carries media and incurs bandwidth cost.
 
-### One replica, on purpose
-
-Rooms live in memory, so the deployment pins `min-replicas = max-replicas = 1`.
-Two replicas behind one ingress could put a host and viewer on different
-instances, and they would never find each other. Scaling horizontally would
-need shared state (Redis or similar) — unnecessary at this size, but it is why
-the relay is a single point of failure.
-
-**The room code is the only credential.** Anyone you give it to can watch, and
-can pass it on. That is the deliberate cost of "no accounts, no logins".
-
-Public STUN (`stun.l.google.com:19302`) is used for address discovery. Peers
-that cannot hole-punch will need a TURN server, which *does* relay video and
-therefore costs real bandwidth.
-
-## Deploying the relay
+Deploy the relay with a cloud source build:
 
 ```powershell
 az login
 .\deploy\azure.ps1
-#   wss://orange-relay.<region>.azurecontainerapps.io
 ```
 
-Azure Container Apps terminates TLS and provides an HTTPS hostname, so clients
-get `wss://` with no certificate work. The relay crate deliberately has no
-GStreamer dependency — three direct dependencies total — so the container stays
-small.
+The script uses `az containerapp up --source .`; local Docker availability is
+not evidence for or against the source or deployment design.
 
-## Gotchas found the hard way
+## Gotchas
 
-- **Backslashes are escape characters in GStreamer's parse syntax.** Building a
-  pipeline string with a Windows path in it silently mangles the path and you
-  get an empty file with no error. Sinks are constructed programmatically for
-  this reason.
-- **WGC only produces frames when the window redraws.** A minimised or idle
-  window starves the pipeline and it will hang forever. Anything waiting on
-  frames needs a timeout.
-- **Framerate caps must sit directly after the source.** `d3d11convert` does
-  not do framerate conversion, so requesting a rate downstream of it fails to
-  negotiate.
-- `BOOL` lives in `windows::core`, not `windows::Win32::Foundation`.
+- Backslashes are escapes in GStreamer parse strings. File sinks are created
+  programmatically, and preview paths are normalized.
+- Windows Graphics Capture can stop producing frames when a window is idle or
+  minimized. Timed diagnostics and late-join redraw requests account for this.
+- Capture framerate caps belong directly after `d3d11screencapturesrc` because
+  `d3d11convert` does not perform framerate conversion.
+- Pipelines must reach `Null` before their native playback HWND owner drops.
 
 ## License
 
-MIT. GStreamer is LGPL-2.1 and linked dynamically; GPUI is Apache-2.0.
+MIT. GStreamer is LGPL-2.1 and dynamically linked; GPUI is Apache-2.0.
