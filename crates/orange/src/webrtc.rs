@@ -740,19 +740,6 @@ mod tests {
     }
 
     #[test]
-    fn audio_payload_does_not_collide_with_video_rtx() {
-        gst::init().unwrap();
-        let payload = audio_rtp_caps()
-            .structure(0)
-            .unwrap()
-            .get::<i32>("payload")
-            .unwrap();
-
-        assert_eq!(payload, transport::AUDIO_PAYLOAD);
-        assert_ne!(payload, transport::VIDEO_RTX_PAYLOAD);
-    }
-
-    #[test]
     fn software_decoder_can_be_selected_for_diagnostic_comparison() {
         assert_eq!(av1_decoder_factory(Some("software"), false), "dav1ddec");
         assert_eq!(av1_decoder_factory(Some("software"), true), "d3d11av1dec");

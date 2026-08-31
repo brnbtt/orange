@@ -450,6 +450,48 @@ mod tests {
     }
 
     #[test]
+    fn generated_video_offer_maps_rtx_to_the_primary_payload() {
+        gst::init().unwrap();
+        let bin = super::make_webrtcbin("rtx-offer-test").unwrap();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property("caps", rtp_caps(Codec::Av1, 60))
+            .build()
+            .unwrap();
+        let pad = bin.request_pad_simple("sink_%u").unwrap();
+        let transceiver = pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+        super::enable_nack(&transceiver);
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&caps, &bin]).unwrap();
+        caps.static_pad("src").unwrap().link(&pad).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let sdp = reply.ok().flatten().and_then(|reply| {
+                reply
+                    .value("offer")
+                    .ok()?
+                    .get::<gst_webrtc::WebRTCSessionDescription>()
+                    .ok()?
+                    .sdp()
+                    .as_text()
+                    .ok()
+            });
+            let _ = send.send(sdp);
+        });
+
+        bin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
+        let sdp = receive
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("offer was not generated");
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert!(sdp.contains("a=rtpmap:96 AV1/90000"));
+        assert!(sdp.contains("a=rtpmap:97 rtx/90000"));
+        assert!(sdp.contains("a=fmtp:97 apt=96"));
+    }
+
+    #[test]
     fn failed_or_closed_peer_connections_end_the_session() {
         assert!(super::is_terminal_connection_state(
             gst_webrtc::WebRTCPeerConnectionState::Failed

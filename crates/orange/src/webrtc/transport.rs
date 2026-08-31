@@ -4,18 +4,16 @@ use gstreamer as gst;
 
 use crate::pipeline::Codec;
 
-pub(super) const VIDEO_PAYLOAD: i32 = 96;
-pub(super) const VIDEO_RTX_PAYLOAD: i32 = 97;
-pub(super) const AUDIO_PAYLOAD: i32 = 111;
-const VIDEO_PAYLOAD_U8: u8 = VIDEO_PAYLOAD as u8;
-const VIDEO_RTX_PAYLOAD_U8: u8 = VIDEO_RTX_PAYLOAD as u8;
-const AUDIO_PAYLOAD_U8: u8 = AUDIO_PAYLOAD as u8;
+const VIDEO_PAYLOAD: u8 = 96;
+const VIDEO_RTX_PAYLOAD: u8 = 97;
+const AUDIO_PAYLOAD: u8 = 111;
+const LATENCY_MS: u32 = 100;
 
 pub(crate) fn video_rtp_caps(codec: Codec, frame_rate: u32) -> gst::Caps {
     let builder = gst::Caps::builder("application/x-rtp")
         .field("media", "video")
         .field("encoding-name", codec.rtp_encoding())
-        .field("payload", VIDEO_PAYLOAD)
+        .field("payload", i32::from(VIDEO_PAYLOAD))
         .field("clock-rate", 90_000i32)
         .field("a-framerate", frame_rate.to_string());
     match codec {
@@ -28,7 +26,7 @@ pub(crate) fn audio_rtp_caps() -> gst::Caps {
     gst::Caps::builder("application/x-rtp")
         .field("media", "audio")
         .field("encoding-name", "OPUS")
-        .field("payload", AUDIO_PAYLOAD)
+        .field("payload", i32::from(AUDIO_PAYLOAD))
         .field("clock-rate", 48_000i32)
         .field("encoding-params", "2")
         .build()
@@ -38,7 +36,6 @@ pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool)
     if !live_output {
         return Ok(());
     }
-    const LATENCY_MS: u32 = 100;
     bin.set_property("latency", LATENCY_MS);
     let rtpbin = bin
         .dynamic_cast_ref::<gst::Bin>()
@@ -62,7 +59,7 @@ pub(crate) fn configure_receive_transport(bin: &gst::Element, live_output: bool)
 }
 
 fn prepare_media_jitterbuffer(jitterbuffer: &gst::Element) {
-    jitterbuffer.set_property("latency", 100u32);
+    jitterbuffer.set_property("latency", LATENCY_MS);
     jitterbuffer.set_property("do-lost", true);
     // Bundled audio and video can share one RTP session index. Default to no
     // silent drops until the first RTP packet identifies its payload type.
@@ -109,11 +106,11 @@ fn rtp_payload_type(packet: &[u8]) -> Option<u8> {
 
 fn configure_jitterbuffer_for_payload(jitterbuffer: &gst::Element, payload: u8) -> bool {
     match payload {
-        AUDIO_PAYLOAD_U8 => {
+        AUDIO_PAYLOAD => {
             jitterbuffer.set_property("drop-on-latency", false);
             true
         }
-        VIDEO_PAYLOAD_U8 | VIDEO_RTX_PAYLOAD_U8 => {
+        VIDEO_PAYLOAD | VIDEO_RTX_PAYLOAD => {
             jitterbuffer.set_property("drop-on-latency", true);
             true
         }
@@ -156,6 +153,8 @@ fn configure_jitterbuffer_for_caps(jitterbuffer: &gst::Element, caps: &gst::Caps
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn jitterbuffer() -> gst::Element {
         gst::ElementFactory::make("rtpjitterbuffer")
             .build()
@@ -166,38 +165,60 @@ mod tests {
         caps.structure(0).unwrap().get::<i32>("payload").unwrap()
     }
 
-    #[test]
-    fn generated_caps_select_the_expected_jitterbuffer_policy() {
-        gst::init().unwrap();
-        for codec in [Codec::Av1, Codec::H265, Codec::H264] {
-            let jitter = jitterbuffer();
-            assert!(configure_jitterbuffer_for_caps(
-                &jitter,
-                video_rtp_caps(codec, 60).as_ref(),
-            ));
-            assert!(jitter.property::<bool>("drop-on-latency"));
-        }
-        let audio = jitterbuffer();
-        assert!(configure_jitterbuffer_for_caps(
-            &audio,
-            audio_rtp_caps().as_ref(),
-        ));
-        assert!(!audio.property::<bool>("drop-on-latency"));
+    fn enum_property_nick(element: &gst::Element, property: &str) -> String {
+        let value = element.property_value(property);
+        gst::glib::EnumValue::from_value(&value)
+            .unwrap()
+            .1
+            .nick()
+            .to_string()
     }
 
     #[test]
     fn generated_caps_use_non_overlapping_payload_assignments() {
         gst::init().unwrap();
         for codec in [Codec::Av1, Codec::H265, Codec::H264] {
-            assert_eq!(payload(&video_rtp_caps(codec, 60)), VIDEO_PAYLOAD);
+            assert_eq!(
+                payload(&video_rtp_caps(codec, 60)),
+                i32::from(VIDEO_PAYLOAD)
+            );
         }
-        assert_eq!(payload(&audio_rtp_caps()), AUDIO_PAYLOAD);
+        assert_eq!(payload(&audio_rtp_caps()), i32::from(AUDIO_PAYLOAD));
         assert_ne!(AUDIO_PAYLOAD, VIDEO_PAYLOAD);
         assert_ne!(AUDIO_PAYLOAD, VIDEO_RTX_PAYLOAD);
     }
 
     #[test]
+    fn none_buffer_override_disables_rtp_synchronization() {
+        let lock = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("ORANGE_RTP_BUFFER_MODE");
+        std::env::set_var("ORANGE_RTP_BUFFER_MODE", "none");
+        let result = std::panic::catch_unwind(|| {
+            gst::init().unwrap();
+            let bin = gst::ElementFactory::make("webrtcbin").build().unwrap();
+
+            configure_receive_transport(&bin, true).unwrap();
+
+            let rtpbin = bin
+                .dynamic_cast_ref::<gst::Bin>()
+                .unwrap()
+                .by_name("rtpbin")
+                .unwrap();
+            assert_eq!(enum_property_nick(&rtpbin, "buffer-mode"), "none");
+            assert_eq!(enum_property_nick(&rtpbin, "rtcp-sync"), "never");
+        });
+        if let Some(previous) = previous {
+            std::env::set_var("ORANGE_RTP_BUFFER_MODE", previous);
+        } else {
+            std::env::remove_var("ORANGE_RTP_BUFFER_MODE");
+        }
+        drop(lock);
+        result.unwrap();
+    }
+
+    #[test]
     fn receiver_transport_keeps_video_live_without_silently_dropping_audio() {
+        let _lock = ENV_LOCK.lock().unwrap();
         gst::init().unwrap();
         let bin = gst::ElementFactory::make("webrtcbin")
             .name("latency-test")
@@ -223,6 +244,10 @@ mod tests {
         ));
         assert!(video.property::<bool>("drop-on-latency"));
 
+        let rtx = jitterbuffer();
+        assert!(configure_jitterbuffer_for_payload(&rtx, VIDEO_RTX_PAYLOAD));
+        assert!(rtx.property::<bool>("drop-on-latency"));
+
         let audio = jitterbuffer();
         prepare_media_jitterbuffer(&audio);
         assert!(configure_jitterbuffer_for_caps(
@@ -232,8 +257,8 @@ mod tests {
         assert_eq!(audio.property::<u32>("latency"), 100);
         assert!(audio.property::<bool>("do-lost"));
         assert!(!audio.property::<bool>("drop-on-latency"));
-        assert_eq!(rtp_payload_type(&[0x80, 0xe0]), Some(VIDEO_PAYLOAD_U8));
-        assert_eq!(rtp_payload_type(&[0x80, 0xef]), Some(AUDIO_PAYLOAD_U8));
+        assert_eq!(rtp_payload_type(&[0x80, 0xe0]), Some(VIDEO_PAYLOAD));
+        assert_eq!(rtp_payload_type(&[0x80, 0xef]), Some(AUDIO_PAYLOAD));
         assert_eq!(rtp_payload_type(&[0x00, 0x60]), None);
     }
 }
