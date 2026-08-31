@@ -57,6 +57,41 @@ git add crates/orange-signal/src/lib.rs
 git commit -m "Own signaling client tasks"
 ```
 
+### Task 1A: Preserve Live Rooms On Code Collisions
+
+**Files:**
+- Modify: `crates/orange-signal/src/relay.rs` after the Task 7 move, or the current `crates/orange-signal/src/lib.rs:271-287` before that move
+- Test: the same module
+
+**Interfaces:**
+- Produces: private room insertion helper that accepts a code generator and retries while a generated code is occupied.
+- Preserves: six-character room code format and every signaling message.
+
+- [ ] **Step 1: Add a failing deterministic collision test**
+
+Provide one occupied code followed by one free code. Assert hosting preserves the existing room and inserts the new room under the free code.
+
+- [ ] **Step 2: Verify the test fails because `HashMap::insert` replaces the occupied room**
+
+Run: `cargo test -p orange-signal room_code_collision_preserves_the_live_room -- --exact`
+
+- [ ] **Step 3: Retry generation under the existing room mutex**
+
+Generate until `rooms.contains_key(&code)` is false, then insert. Keep generation and insertion in the same critical section so two hosts cannot claim one code.
+
+- [ ] **Step 4: Remove the room credential from production logs**
+
+Change room-close logging to a fixed event/message with no room code, peer id, identity, SDP, ICE, OAuth value, or session token.
+
+- [ ] **Step 5: Run relay tests and commit**
+
+Run: `cargo test -p orange-signal --locked`
+
+```text
+git add crates/orange-signal/src
+git commit -m "Preserve rooms across code collisions"
+```
+
 ### Task 2: Give Playback Windows One Thread Owner
 
 **Files:**
@@ -188,8 +223,8 @@ git commit -m "Own receive monitor workers"
 - Test: `crates/orange/src/media_diagnostics.rs`
 
 **Interfaces:**
-- Produces: private `DiagnosticWriter` owning `Mutex<Option<SyncSender<DiagnosticCommand>>>` and `Mutex<Option<JoinHandle<()>>>`.
-- Produces: `DiagnosticsGuard` whose explicit stack lifetime shuts down the global writer after command resources are gone.
+- Produces: stack-owned `DiagnosticWriter` containing the only writer `JoinHandle`.
+- Produces: global non-owning `Arc<DiagnosticSink>` whose `Mutex<Option<SyncSender<String>>>` can be taken by the stack owner during shutdown.
 - Removes: synchronous `flush_diagnostics` calls from async host/watch teardown.
 
 - [ ] **Step 1: Add local writer shutdown tests**
@@ -200,9 +235,9 @@ Using a locally constructed writer and in-memory destination, test that shutdown
 
 Run: `. .\dev.ps1; cargo test -p orange media_diagnostics::tests::diagnostic_writer_shutdown -- --nocapture`
 
-- [ ] **Step 3: Make the global value own sender and worker**
+- [ ] **Step 3: Make the stack guard own the worker and close the global sink**
 
-Serialize payloads before locking. Clone no sender beyond a single send operation. Shutdown takes and drops the persistent sender, lets the receiver drain, flushes once at loop end, then takes and joins the writer handle.
+Clone the sender while briefly holding its poison-recovering mutex, then release the mutex before payload serialization. Shutdown takes and drops the globally reachable sender, lets in-flight sender clones finish, drains accepted lines, flushes once at loop end, then joins the stack-owned writer handle.
 
 - [ ] **Step 4: Put one guard in synchronous CLI scope**
 
@@ -257,24 +292,29 @@ git commit -m "Close remaining process lifetimes"
 ### Task 7: Split Stable Responsibilities Without Redesign
 
 **Files:**
-- Create: `crates/orange/src/peer/connection.rs`
-- Create: `crates/orange/src/peer/viewer_branch.rs`
+- Create: `crates/orange/src/peer/host.rs`
+- Create: `crates/orange/src/peer/host_branch.rs`
+- Create: `crates/orange/src/peer/watch.rs`
 - Create: `crates/orange/src/media_diagnostics/writer.rs`
+- Create: `crates/orange/src/media_diagnostics/operation.rs`
+- Create: `crates/orange/src/media_diagnostics/progress.rs`
+- Create: `crates/orange/src/media_diagnostics/webrtc_monitor.rs`
 - Create: `crates/orange/src/overlay/render.rs`
-- Create: `crates/orange-tray/src/screens.rs`
+- Create: `crates/orange-tray/src/view.rs`
 - Create: `crates/orange-signal/src/protocol.rs`
 - Create: `crates/orange-signal/src/client.rs`
+- Create: `crates/orange-signal/src/relay.rs`
+- Create: `crates/orange-signal/src/diagnostics.rs`
 - Modify: corresponding current facade files and module declarations
 - Test: move existing tests with the code they characterize
 
 **Interfaces:**
-- `peer.rs` remains the host/watch session orchestrator.
-- `peer::connection` owns WebRTC state observation, ICE forwarding, SDP parsing, and offer/answer callbacks.
-- `peer::viewer_branch` owns tee/request-pad construction and deterministic viewer removal.
-- `media_diagnostics.rs` remains the facade for media progress and WebRTC stats; `writer.rs` owns JSONL persistence.
+- `peer.rs` remains the facade and owns shared bus, connection-state, ICE, and SDP helpers.
+- `peer::host` owns host capture/signaling orchestration; `peer::host_branch` owns tee/request-pad construction, offer creation, and deterministic viewer removal; `peer::watch` owns receive-session orchestration.
+- `media_diagnostics.rs` remains the facade; `writer.rs` owns JSONL persistence, `operation.rs` owns timed operation events, `progress.rs` owns stage counters/probes, and `webrtc_monitor.rs` owns WebRTC stats polling.
 - `overlay.rs` owns interaction state and GStreamer attachment; `render.rs` owns rasterization.
-- tray `main.rs` owns `Orange` state/effects/bootstrap; `screens.rs` owns existing GPUI render methods.
-- `orange-signal::protocol` owns `Signal`; `client` owns `SignalClient` and connection tasks; relay room handling remains in the crate facade unless moving it makes the facade shorter without adding visibility churn.
+- tray `main.rs` owns `Orange` state/effects/bootstrap; `view.rs` owns the existing Render implementation, global chrome, listener wiring, and all six screen methods in one child module.
+- `orange-signal::protocol` owns `Signal`; `client` owns `SignalClient` and connection tasks; `relay` owns room/peer state; `diagnostics` owns upload storage, metadata validation, and its route handler. Existing public re-exports remain stable.
 
 - [ ] **Step 1: Record baseline test names and file sizes**
 
@@ -284,7 +324,7 @@ Run: `Get-ChildItem crates -Recurse -Filter '*.rs' | ForEach-Object { "{0,5} {1}
 
 - [ ] **Step 2: Move one responsibility at a time**
 
-Move function/type bodies verbatim, then use only `pub(super)` or `pub(crate)` needed by the parent facade. Do not rename behavior, introduce traits, group unrelated arguments, or rewrite callbacks during file moves.
+Move function/type bodies verbatim, then use only `pub(super)` or `pub(crate)` needed by the parent facade. Do not rename behavior, introduce traits, group unrelated arguments, rewrite callbacks during file moves, or create one tray file per screen.
 
 - [ ] **Step 3: Run the owning package after each move**
 
