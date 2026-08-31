@@ -35,8 +35,7 @@ ownership, media defaults, compatibility contracts, and validation paths.
 - The updater is a temporary successor that waits, installs, and reopens the tray.
 - `orange-relay` is the production relay entry point; `orange serve` exposes the
   same signal server for local use.
-- Video and audio travel directly between peers unless a separately configured
-  TURN service is used. No TURN service is bundled.
+- Direct ICE media and public STUN are implemented. No TURN configuration exists, so TURN-required networks are unsupported.
 
 ## Crates
 
@@ -47,6 +46,8 @@ ownership, media defaults, compatibility contracts, and validation paths.
 | `orange-signal` | library | Signal wire format, client, room relay, Discord identity, HTTP/WebSocket server, diagnostic upload |
 | `orange-relay` | `orange-relay` | Small production process that binds `PORT` and runs `orange_signal::serve` |
 | `orange-updater` | `orange-updater.exe` | Verifies handoff, waits for the tray, runs Inno Setup silently, reopens the tray |
+
+Compile dependencies point `orange -> orange-signal <- orange-relay`; tray/updater communicate through processes/files and have no workspace crate dependency.
 
 ## Tray Source Map
 
@@ -60,10 +61,9 @@ ownership, media defaults, compatibility contracts, and validation paths.
 | `crates/orange-tray/src/supervisor.rs` | Finds GStreamer, launches `orange.exe`, parses child stdout/stderr, quality tiers, diagnostic retention |
 | `crates/orange-tray/src/session.rs` | Reads CLI session JSON; atomically reads/writes tray preferences |
 | `crates/orange-tray/src/tray.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
-| `crates/orange-tray/src/update.rs` | Beta manifest validation, pinned-host download, SHA-256, update job state, updater CLI handoff |
+| `crates/orange-tray/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
 
-The tray quality table in `crates/orange-tray/src/supervisor.rs` is H.265 at 4
-Mbps for 720p, 8 Mbps for 1080p, and 18 Mbps for 1440p. The CLI defaults to 25 Mbps.
+The tray quality table in `crates/orange-tray/src/supervisor.rs` is H.265 at 4/8/18 Mbps for 720p/1080p/1440p. The CLI defaults to 25 Mbps.
 
 ## Media CLI Source Map
 
@@ -99,7 +99,7 @@ Mbps for 720p, 8 Mbps for 1080p, and 18 Mbps for 1440p. The CLI defaults to 25 M
 | --- | --- |
 | `crates/orange-signal/src/lib.rs` | Media-free facade and public signal/client/relay/server exports |
 | `crates/orange-signal/src/protocol.rs` | Serde-tagged `Signal` protocol and relay-controlled peer routing IDs |
-| `crates/orange-signal/src/client.rs` | WebSocket client tasks, heartbeat, channels, close frame, bounded abort-and-join cleanup |
+| `crates/orange-signal/src/client.rs` | WebSocket tasks/channels, heartbeat, graceful-close request, task await/reap, abort fallback |
 | `crates/orange-signal/src/relay.rs` | Room codes, in-memory rooms, role rules, routing, viewer cap, queues and rate limit |
 | `crates/orange-signal/src/server.rs` | Axum routes, 512-connection semaphore, OAuth HTTP endpoints, `/ws`, diagnostics endpoint |
 | `crates/orange-signal/src/auth.rs` | Discord OAuth exchange, pending attempts, opaque in-memory sessions, expiration and capacities |
@@ -121,22 +121,20 @@ d3d11screencapturesrc
 ```
 
 - The shared tee is after the parser: capture and hardware encode happen once.
-- Every viewer receives its own payloader, RTP stream, WebRTC peer, offer, ICE,
-  startup keyframe worker, diagnostics handle, and requested pads.
-- NACK is enabled for video. Periodic keyframes and redraw requests support
-  recovery and late joins, including windows that are not repainting.
+- Every viewer receives its own payloader, RTP stream, WebRTC peer, offer, ICE, startup keyframe worker, diagnostics handle, and requested pads.
+- NACK, periodic keyframes, and redraw requests support recovery and late joins, including windows that are not repainting.
 - AV1/NVIDIA and H.264 are explicit diagnostic/development choices, not defaults.
 
-Host audio is optional and does not block video:
+Audio construction failure disables optional audio. Once linked into the shared pipeline, a later audio error can end the host session.
 
 ```text
 wasapi2src loopback=true [process-tree scope]
   -> leaky queue -> audioconvert -> audioresample -> stereo 48 kHz
-  -> opusenc 128 kbps -> rtpopuspay -> caps -> tee -> per-viewer webrtcbin
+  -> opusenc 128 kbps -> rtpopuspay -> caps -> tee
+  -> per-viewer leaky queue -> webrtcbin
 ```
 
-Window capture supplies its process PID and excludes other applications.
-Whole-screen capture uses PID zero and includes system output audio.
+Window capture supplies its process PID and excludes other applications; whole-screen capture uses PID zero and includes system output audio.
 
 ## Watch Media Flow
 
@@ -150,18 +148,14 @@ webrtcbin OPUS pad
   -> volume -> wasapi2sink (fallback: wasapisink)
 ```
 
-- The receive registry accepts only the first supported video pad and first
-  Opus pad. A video pad consumes the one output target.
-- Dynamic receive construction blocks the incoming pad, adds and links all
-  elements, synchronizes them, then removes the block probe. Failures unlink,
-  set added elements to Null, remove them, and remove the probe.
+- The receive registry accepts only the first supported video and Opus pads; video consumes the one output target.
+- Dynamic receive construction blocks the pad, links and synchronizes all elements, then removes the probe; failure unlinks, sets Null, removes elements, and removes the probe.
 - Live receive latency is 100 ms. Video/RTX jitterbuffers drop at the live edge;
   Opus does not silently drop late packets and uses decoder packet-loss concealment.
 
 ## Ownership And Teardown
 
-- Unique owners initiate teardown: `PlaybackWindow`, `Tray`, `Supervisor`,
-  `SignalClient`, `ViewerBranch`, `ReceiveWorkerRegistry`, and job handles.
+- Unique owners initiate teardown: `PlaybackWindow`, `Tray`, `Supervisor`, `SignalClient`, `ViewerBranch`, `ReceiveWorkerRegistry`, and job handles.
 - Passive `PlaybackWindowHandle` clones may inspect the HWND/alive state and
   overlay, but dropping a handle never destroys the window.
 - Playback owners are declared before pipelines. Receive pipelines reach
@@ -169,8 +163,7 @@ webrtcbin OPUS pad
 - Tray and playback HWNDs are created, messaged, and destroyed on their native
   creator threads. Incomplete native cleanup is fail-fast; detaching a thread
   with unprovable HWND/context ownership is not allowed.
-- Background, diagnostics, socket, keyframe, teardown, audio-control, and
-  bitrate workers are cancelled or disconnected and then joined/awaited.
+- `SignalClient::close` requests graceful WebSocket close and awaits/reaps tasks; abort handles unfinished work and drop fallback. Other workers are cancelled/disconnected and joined.
 - Requested `webrtcbin` and tee pads are owned by branch guards and released.
   Temporary block/idle and bitrate probes are removed on rollback or teardown.
 - Teardown combines primary and cleanup errors rather than hiding either one.
@@ -181,20 +174,21 @@ webrtcbin OPUS pad
 | --- | --- |
 | Signal JSON tags, fields, defaults, and peer stamping | `crates/orange-signal/src/protocol.rs` |
 | Tray window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
+| Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --bitrate --scale [--fps]`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
 | Host stdout markers `Share this code:`, `[host] signed in as`, `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | Session file `%APPDATA%\orange\session.json` | writer: `crates/orange/src/auth.rs`; reader: `crates/orange-tray/src/session.rs` |
 | Preferences `%APPDATA%\orange\preferences.json` | `crates/orange-tray/src/session.rs` |
 | Beta manifest schema/host/name/hash | producer: `publish-beta.ps1`; consumer: `crates/orange-tray/src/update.rs` |
 | Updater flags `--installer --sha256 --parent --install-dir` | producer: `crates/orange-tray/src/update.rs`; consumer: `crates/orange-updater/src/main.rs` |
 | RTP video payload 96, RTX 97, Opus 111, clocks and 100 ms receive latency | `crates/orange/src/webrtc/transport.rs` |
-
-Treat changes as migrations and update both sides of each contract.
+| Local diagnostic JSONL fields and `ORANGE_*` metadata | producer: `crates/orange/src/media_diagnostics/writer.rs`; orchestrator: `alpha/orange-alpha.ps1` |
+| Alpha upload: `/diagnostics`, bearer session, ZIP content type, and `x-orange-build/run/device/profile` headers | producer: `alpha/orange-alpha.ps1`; consumer: `crates/orange-signal/src/server.rs`, `crates/orange-signal/src/diagnostics.rs` |
 
 ## Where Do I Change...?
 
 | Change | Start here |
 | --- | --- |
-| CLI flags/default codec/default CLI bitrate | `crates/orange/src/main.rs` |
+| CLI flags/defaults and tray child invocations | `crates/orange/src/main.rs`, `crates/orange-tray/src/supervisor.rs` |
 | Capture elements, encoder choice, Opus send chain | `crates/orange/src/pipeline.rs` |
 | Host fan-out, late join, keyframe behavior | `crates/orange/src/peer/host.rs`, `crates/orange/src/peer/host_branch.rs` |
 | Viewer negotiation and session lifetime | `crates/orange/src/peer/watch.rs` |
@@ -209,6 +203,9 @@ Treat changes as migrations and update both sides of each contract.
 | Signal wire format | `crates/orange-signal/src/protocol.rs` |
 | Relay room policy and limits | `crates/orange-signal/src/relay.rs`, `crates/orange-signal/src/server.rs` |
 | Discord OAuth/session policy | `crates/orange-signal/src/auth.rs` |
+| Local media diagnostic records | `crates/orange/src/media_diagnostics/writer.rs` |
+| Relay diagnostic upload/auth/storage | `crates/orange-signal/src/server.rs`, `crates/orange-signal/src/diagnostics.rs` |
+| Alpha diagnostic environment/archive/upload headers | `alpha/orange-alpha.ps1` |
 | Update manifest/client handoff | `publish-beta.ps1`, `crates/orange-tray/src/update.rs`, `crates/orange-updater/src/main.rs` |
 | Installer contents/prerequisites | `package.ps1`, `packaging/windows/orange.iss` |
 | Azure single-replica deployment | `deploy/azure.ps1` |
@@ -245,7 +242,7 @@ Direct PowerShell contract tests do not publish or deploy:
 ```
 
 External gates are installed interactive media acceptance on required GPU
-vendors, two-machine WAN/TURN paths, deployment, publication, and signing.
+vendors, direct two-machine WAN, deployment, publication, and signing.
 `deploy/azure.ps1` uses a cloud source build, so local Docker availability is
 not a source-level result.
 
@@ -256,5 +253,5 @@ not a source-level result.
 - The process accepts at most 512 concurrent WebSocket connections and each room accepts at most 16 viewers.
 - Each peer has a 64-message outbound queue. Inbound signalling permits 256 text messages per 10-second fixed window; WebSocket messages cap at 64 KiB.
 - Auth memory is bounded to 1,024 pending attempts and 4,096 sessions, with 10-minute pending and 30-day session lifetimes while the process survives.
-- Public Google STUN is configured. No TURN server is bundled, so restrictive NAT/firewall combinations remain an external connectivity boundary.
-- HTTPS host restrictions and SHA-256 protect update integrity, but production promotion is blocked until a trusted external code-signing certificate is available.
+- Direct ICE and public Google STUN are configured; no TURN configuration exists, so TURN-required networks are unsupported.
+- HTTPS host restrictions constrain download origin and the manifest SHA-256 detects corruption, but neither authenticates the publisher if the origin or manifest is compromised. Production promotion remains blocked on a trusted Authenticode certificate.

@@ -24,11 +24,11 @@ Ten core product milestones are implemented:
 | 7 | Window process-tree audio and whole-screen system audio | done |
 | 8 | GPU-composited viewer controls | done |
 | 9 | Optional Discord identity | done |
-| 10 | Tray UI, installer, and verified beta updates | done |
+| 10 | Tray UI, installer, beta update checks and SHA-256 download verification | done |
 
 Autostart is not implemented. Current local installed acceptance covers H.265
-streaming checks, preview, and file output. Two-machine WAN behavior, including
-networks that require TURN, remains an external acceptance gate.
+streaming checks, preview, and file output. Direct two-machine WAN remains an
+external acceptance gate. Networks that require TURN are currently unsupported.
 
 ## Architecture
 
@@ -119,7 +119,8 @@ wasapi2src loopback=true loopback-mode=include-process-tree \
 ```
 
 Whole-screen sharing includes system output audio. Pass `--no-audio` to disable
-audio. Audio capture failure does not block video.
+audio. Failure while constructing optional audio disables it and leaves video
+running; a later audio error in the shared host pipeline can end the session.
 
 ### Historical diagnostic measurement
 
@@ -143,9 +144,10 @@ manifest rules, verifies SHA-256, hands off to `orange-updater.exe`, closes the
 tray and media children, applies the installer silently, and reopens the tray.
 Failed checks and downloads do not stop streaming.
 
-The installer is not yet Authenticode-signed. HTTPS host restrictions and
-SHA-256 protect update integrity, but public production promotion remains
-blocked on obtaining a trusted external code-signing certificate.
+The installer is not yet Authenticode-signed. HTTPS host restrictions constrain
+the download origin and the manifest SHA-256 detects corruption, but neither
+authenticates the publisher if the origin or manifest is compromised. Public
+production promotion remains blocked on a trusted Authenticode certificate.
 
 Build the installer with:
 
@@ -224,8 +226,9 @@ offers fixed H.265 tiers: 4 Mbps at 720p, 8 Mbps at 1080p, and 18 Mbps at 1440p.
 
 The relay forwards signalling only. SDP and ICE pass through it; media remains
 peer to peer. The process is deliberately bounded to 512 concurrent WebSocket
-connections and 16 viewers per room. It also uses bounded outbound queues and
-an inbound signalling rate limit; these are fixed process limits.
+connections and 16 viewers per room. Each peer has a 64-message outbound queue;
+inbound signalling permits 256 text messages per 10 seconds, and each WebSocket
+message is capped at 64 KiB.
 
 Host upload remains the practical media limit because every viewer receives a
 separate peer-to-peer stream:
@@ -242,8 +245,8 @@ drops active rooms and signs users out. Horizontal scaling would require shared
 room and auth state; Orange makes no current multi-replica claim.
 
 Public STUN (`stun.l.google.com:19302`) is configured for address discovery.
-No TURN server is bundled. Peers that cannot establish a direct path need a
-separately operated TURN service, which carries media and incurs bandwidth cost.
+There is no TURN configuration. Peers must establish a direct ICE path; networks
+that require TURN are currently unsupported.
 
 Deploy the relay with a cloud source build:
 
