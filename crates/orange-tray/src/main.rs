@@ -61,6 +61,21 @@ struct Notice {
     expires_at: Instant,
 }
 
+fn poll_login(
+    mut load: impl FnMut() -> anyhow::Result<Option<session::Session>>,
+    mut failure: impl FnMut() -> Option<String>,
+) -> Option<Result<session::Session, String>> {
+    if let Ok(Some(session)) = load() {
+        return Some(Ok(session));
+    }
+    let reason = failure()?;
+    Some(match load() {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err(reason),
+        Err(error) => Err(format!("Could not read session: {error}")),
+    })
+}
+
 struct Orange {
     tray_available: bool,
     screen: Screen,
@@ -174,32 +189,20 @@ impl Orange {
 
         // Login happens in a child process; notice when it lands, and when it
         // dies without producing a session.
-        if self.logging_in.is_some() {
-            match session::load() {
-                Ok(Some(session)) => {
+        if let Some(attempt) = self.logging_in.as_mut() {
+            match poll_login(session::load, || attempt.failure()) {
+                Some(Ok(session)) => {
                     self.avatar = None;
                     self.avatar_rx = request_avatar(session.avatar_url.clone());
                     self.session = Some(session);
                     self.logging_in = None;
                     self.screen = Screen::Home;
                 }
-                Ok(None) => {
-                    if let Some(reason) = self.logging_in.as_mut().and_then(|a| a.failure()) {
-                        self.show_error(reason);
-                        self.logging_in = None;
-                    }
+                Some(Err(error)) => {
+                    self.show_error(error);
+                    self.logging_in = None;
                 }
-                Err(error) => {
-                    if self
-                        .logging_in
-                        .as_mut()
-                        .and_then(|attempt| attempt.failure())
-                        .is_some()
-                    {
-                        self.show_error(format!("Could not read session: {error}"));
-                        self.logging_in = None;
-                    }
-                }
+                None => {}
             }
         }
 
@@ -2137,6 +2140,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn login_session() -> session::Session {
+        session::Session {
+            name: "Orange User".into(),
+            id: "123".into(),
+            avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn login_poll_preserves_session_success_across_child_exit_races() {
+        let mut loads = 0;
+        let session = poll_login(
+            || {
+                loads += 1;
+                Ok((loads == 2).then(login_session))
+            },
+            || Some("child exited".into()),
+        )
+        .expect("login should be terminal")
+        .expect("second load should win");
+        assert_eq!(session.name, "Orange User");
+        assert_eq!(loads, 2);
+
+        let mut failure_checks = 0;
+        let session = poll_login(
+            || Ok(Some(login_session())),
+            || {
+                failure_checks += 1;
+                Some("child exited".into())
+            },
+        )
+        .expect("login should be terminal")
+        .expect("initial load should win");
+        assert_eq!(session.name, "Orange User");
+        assert_eq!(failure_checks, 0);
+    }
 
     #[test]
     fn animated_logo_identity_changes_when_the_window_reopens() {
