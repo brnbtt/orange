@@ -1,6 +1,6 @@
 use crate::{
     auth::{self, Identity},
-    Signal,
+    protocol::Signal,
 };
 #[cfg(test)]
 use crate::{diagnostics, server};

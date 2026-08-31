@@ -97,7 +97,7 @@ The tray quality table in `crates/orange-tray/src/supervisor.rs` is H.265 at 4/8
 
 | File | Authoritative responsibility |
 | --- | --- |
-| `crates/orange-signal/src/lib.rs` | Media-free facade and public signal/client/relay/server exports |
+| `crates/orange-signal/src/lib.rs` | Media-free facade exporting `Signal`, `SignalClient`/`connect`, and `serve` |
 | `crates/orange-signal/src/protocol.rs` | Serde-tagged `Signal` protocol and relay-controlled peer routing IDs |
 | `crates/orange-signal/src/client.rs` | WebSocket tasks/channels, heartbeat, graceful-close request, task await/reap, abort fallback |
 | `crates/orange-signal/src/relay.rs` | Room codes, in-memory rooms, role rules, routing, viewer cap, queues and rate limit |
@@ -221,10 +221,10 @@ Run from a PowerShell prompt at the repository root:
 cargo test --locked -p orange
 
 # Full local source gates.
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-cargo build --locked --release --workspace
+cargo build --locked --release --workspace --all-features
 
 # Builds and validates the per-user installer; requires Inno Setup 6.
 .\package.ps1

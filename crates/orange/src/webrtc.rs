@@ -20,9 +20,7 @@ pub use receive::{build_receive_branch, encoding_name};
 pub(crate) use transport::{
     audio_rtp_caps, configure_receive_transport, video_rtp_caps as rtp_caps,
 };
-pub(crate) use workers::{
-    watch_incoming_bitrate, AcceptedReceivePad, AudioControlWorker, ReceiveWorkerRegistry,
-};
+pub(crate) use workers::{watch_incoming_bitrate, AcceptedReceivePad, ReceiveWorkerRegistry};
 
 use anyhow::{Context, Result};
 use gst::prelude::*;

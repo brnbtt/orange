@@ -194,6 +194,7 @@ impl ViewerTeardown {
                     {
                         let _ =
                             writeln!(std::io::stderr().lock(), "[host] viewer teardown panicked");
+                        std::process::abort();
                     }
                 }
             })

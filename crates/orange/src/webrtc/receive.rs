@@ -4,7 +4,7 @@ use gstreamer as gst;
 use gstreamer_video::prelude::VideoOverlayExtManual;
 use std::sync::Arc;
 
-use super::{AudioControlWorker, ReceiveOutput};
+use super::{workers::AudioControlWorker, ReceiveOutput};
 use crate::media_diagnostics::{
     measure_operation, track_pad, MediaProgress, MediaStage, Operation,
 };
