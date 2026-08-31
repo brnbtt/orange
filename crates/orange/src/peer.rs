@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::media_diagnostics::{
-    diagnostics_enabled, emit_diagnostic, flush_diagnostics, start_webrtc_diagnostics, track_pad,
-    DiagnosticsHandle, MediaProgress, MediaStage,
+    diagnostics_enabled, emit_diagnostic, start_webrtc_diagnostics, track_pad, DiagnosticsHandle,
+    MediaProgress, MediaStage,
 };
 use crate::pipeline::{
     build_audio_chain, build_capture_chain, check_audio_elements, check_elements,
@@ -866,7 +866,6 @@ pub async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
     drop(viewer_teardown);
     let stop_result = pipeline.set_state(gst::State::Null);
     client.close().await;
-    flush_diagnostics();
     session_result?;
     stop_result?;
     Ok(())
@@ -1522,7 +1521,6 @@ pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
     drop(_diagnostics);
     let stop_result = pipeline.set_state(gst::State::Null);
     client.close().await;
-    flush_diagnostics();
     session_result?;
     stop_result?;
     Ok(())

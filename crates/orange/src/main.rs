@@ -189,6 +189,11 @@ fn parse_scale(s: &str) -> Result<(u32, u32)> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let _diagnostics = media_diagnostics::DiagnosticWriter::new();
+    run(cli)
+}
+
+fn run(cli: Cli) -> Result<()> {
     // Before anything creates a window or asks Windows about the screen.
     window::set_dpi_aware();
     gst::init()?;

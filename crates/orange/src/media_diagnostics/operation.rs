@@ -93,7 +93,7 @@ pub(crate) fn measure_operation<R: OperationOutcome>(
         return action();
     };
     measure_operation_with(operation, action, |event, payload| {
-        emit_diagnostic_to(sink, event, role, payload);
+        emit_diagnostic_to(&sink, event, role, payload);
     })
 }
 

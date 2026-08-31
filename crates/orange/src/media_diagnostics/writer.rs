@@ -2,13 +2,14 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static DIAGNOSTIC_SINK: OnceLock<Option<SyncSender<DiagnosticCommand>>> = OnceLock::new();
-static DIAGNOSTIC_CONTEXT: OnceLock<DiagnosticContext> = OnceLock::new();
+static DIAGNOSTIC_SINK: OnceLock<Option<Arc<DiagnosticSink>>> = OnceLock::new();
+const DIAGNOSTIC_QUEUE_CAPACITY: usize = 128;
 const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ impl DiagnosticMetadata {
     }
 }
 
-pub(super) struct DiagnosticContext {
+struct DiagnosticContext {
     started: Instant,
     metadata: DiagnosticMetadata,
 }
@@ -79,9 +80,160 @@ fn diagnostic_json(
     })
 }
 
-pub(super) enum DiagnosticCommand {
-    Line(String),
-    Flush(SyncSender<()>),
+pub(super) struct DiagnosticSink {
+    context: DiagnosticContext,
+    sender: Mutex<Option<SyncSender<String>>>,
+}
+
+pub(crate) struct DiagnosticWriter {
+    sink: Option<Arc<DiagnosticSink>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DiagnosticWriter {
+    pub(crate) fn new() -> Self {
+        let mut worker = None;
+        let sink = DIAGNOSTIC_SINK
+            .get_or_init(|| {
+                let destination = std::env::var("ORANGE_MEDIA_DIAGNOSTICS").ok()?;
+                let directory = PathBuf::from(destination);
+                if let Err(error) = std::fs::create_dir_all(&directory) {
+                    eprintln!("[media-diagnostics] could not create log directory: {error}");
+                    return None;
+                }
+                let path = diagnostic_file_path(&directory, std::process::id());
+                let file = match OpenOptions::new().create(true).append(true).open(&path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        eprintln!(
+                            "[media-diagnostics] could not open {}: {error}",
+                            path.display()
+                        );
+                        return None;
+                    }
+                };
+                let remaining = MAX_DIAGNOSTIC_BYTES
+                    .saturating_sub(file.metadata().map(|metadata| metadata.len()).unwrap_or(0));
+                let (sink, handle) = Self::start_parts(
+                    BufWriter::new(file),
+                    remaining,
+                    DiagnosticMetadata::from_lookup(|name| std::env::var(name).ok()),
+                    Some(path),
+                );
+                worker = Some(handle);
+                Some(sink)
+            })
+            .clone();
+        Self { sink, worker }
+    }
+
+    #[cfg(test)]
+    fn start(writer: impl Write + Send + 'static, max_bytes: u64) -> Self {
+        let (sink, worker) =
+            Self::start_parts(writer, max_bytes, DiagnosticMetadata::default(), None);
+        Self {
+            sink: Some(sink),
+            worker: Some(worker),
+        }
+    }
+
+    fn start_parts(
+        writer: impl Write + Send + 'static,
+        max_bytes: u64,
+        metadata: DiagnosticMetadata,
+        path: Option<PathBuf>,
+    ) -> (Arc<DiagnosticSink>, JoinHandle<()>) {
+        let (sender, receiver) = sync_channel(DIAGNOSTIC_QUEUE_CAPACITY);
+        let sink = Arc::new(DiagnosticSink {
+            context: DiagnosticContext {
+                started: Instant::now(),
+                metadata,
+            },
+            sender: Mutex::new(Some(sender)),
+        });
+        let worker = std::thread::spawn(move || {
+            let mut writer = writer;
+            if let Err(error) = drain_diagnostics(receiver, &mut writer, max_bytes) {
+                if let Some(path) = path {
+                    eprintln!(
+                        "[media-diagnostics] could not write {}: {error}",
+                        path.display()
+                    );
+                } else {
+                    eprintln!("[media-diagnostics] could not write diagnostics: {error}");
+                }
+            }
+        });
+        (sink, worker)
+    }
+
+    #[cfg(test)]
+    const fn disabled() -> Self {
+        Self {
+            sink: None,
+            worker: None,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(sink) = &self.sink {
+            sink.sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.sink.take();
+    }
+}
+
+impl Drop for DiagnosticWriter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl DiagnosticSink {
+    fn emit(&self, event: &str, role: &str, payload: impl Serialize) -> bool {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(sender) = sender else {
+            return false;
+        };
+        let at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let elapsed_ms = self
+            .context
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let line = match diagnostic_json(
+            &self.context.metadata,
+            elapsed_ms,
+            at_unix_ms,
+            event,
+            role,
+            payload,
+        ) {
+            Ok(line) => line,
+            Err(_) => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[media-diagnostics] could not serialize event {event:?} for role {role:?}"
+                );
+                return false;
+            }
+        };
+        sender.try_send(line).is_ok()
+    }
 }
 
 fn diagnostic_file_path(directory: &Path, pid: u32) -> PathBuf {
@@ -89,73 +241,30 @@ fn diagnostic_file_path(directory: &Path, pid: u32) -> PathBuf {
 }
 
 fn drain_diagnostics(
-    receiver: Receiver<DiagnosticCommand>,
+    receiver: Receiver<String>,
     writer: &mut impl Write,
     max_bytes: u64,
 ) -> std::io::Result<()> {
     let mut written = 0u64;
     let mut capped = false;
-    while let Ok(command) = receiver.recv() {
-        match command {
-            DiagnosticCommand::Line(line) if !capped => {
-                let line_size = line.len() as u64 + 1;
-                if written.saturating_add(line_size) > max_bytes {
-                    capped = true;
-                    continue;
-                }
-                writeln!(writer, "{line}")?;
-                writer.flush()?;
-                written += line_size;
-            }
-            DiagnosticCommand::Line(_) => {}
-            DiagnosticCommand::Flush(acknowledge) => {
-                writer.flush()?;
-                let _ = acknowledge.try_send(());
-            }
+    while let Ok(line) = receiver.recv() {
+        if capped {
+            continue;
         }
+        let line_size = line.len() as u64 + 1;
+        if written.saturating_add(line_size) > max_bytes {
+            capped = true;
+            continue;
+        }
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        written += line_size;
     }
-    Ok(())
+    writer.flush()
 }
 
-pub(super) fn diagnostic_sink() -> Option<&'static SyncSender<DiagnosticCommand>> {
-    DIAGNOSTIC_SINK
-        .get_or_init(|| {
-            let destination = std::env::var("ORANGE_MEDIA_DIAGNOSTICS").ok()?;
-            let (sender, receiver) = sync_channel::<DiagnosticCommand>(128);
-            let directory = PathBuf::from(destination);
-            if let Err(error) = std::fs::create_dir_all(&directory) {
-                eprintln!("[media-diagnostics] could not create log directory: {error}");
-                return None;
-            }
-            let path = diagnostic_file_path(&directory, std::process::id());
-            let file = match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(file) => file,
-                Err(error) => {
-                    eprintln!(
-                        "[media-diagnostics] could not open {}: {error}",
-                        path.display()
-                    );
-                    return None;
-                }
-            };
-            DIAGNOSTIC_CONTEXT.get_or_init(|| DiagnosticContext {
-                started: Instant::now(),
-                metadata: DiagnosticMetadata::from_lookup(|name| std::env::var(name).ok()),
-            });
-            let remaining = MAX_DIAGNOSTIC_BYTES
-                .saturating_sub(file.metadata().map(|metadata| metadata.len()).unwrap_or(0));
-            std::thread::spawn(move || {
-                let mut writer = BufWriter::new(file);
-                if let Err(error) = drain_diagnostics(receiver, &mut writer, remaining) {
-                    eprintln!(
-                        "[media-diagnostics] could not write {}: {error}",
-                        path.display()
-                    );
-                }
-            });
-            Some(sender)
-        })
-        .as_ref()
+pub(super) fn diagnostic_sink() -> Option<Arc<DiagnosticSink>> {
+    DIAGNOSTIC_SINK.get().and_then(Clone::clone)
 }
 
 pub(crate) fn diagnostics_enabled() -> bool {
@@ -170,7 +279,7 @@ pub(crate) fn emit_diagnostic(event: &str, role: &str, payload: impl Serialize) 
     let Some(sink) = diagnostic_sink() else {
         return;
     };
-    emit_diagnostic_to(sink, event, role, payload);
+    emit_diagnostic_to(&sink, event, role, payload);
 }
 
 #[cfg(test)]
@@ -209,71 +318,12 @@ pub(crate) fn capture_diagnostics(action: impl FnOnce()) -> Vec<serde_json::Valu
 }
 
 pub(super) fn emit_diagnostic_to(
-    sink: &SyncSender<DiagnosticCommand>,
+    sink: &DiagnosticSink,
     event: &str,
     role: &str,
     payload: impl Serialize,
 ) {
-    let Some(context) = DIAGNOSTIC_CONTEXT.get() else {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "[media-diagnostics] diagnostic context unavailable"
-        );
-        return;
-    };
-    let at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let elapsed_ms = context
-        .started
-        .elapsed()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
-    let line = match diagnostic_json(
-        &context.metadata,
-        elapsed_ms,
-        at_unix_ms,
-        event,
-        role,
-        payload,
-    ) {
-        Ok(line) => line,
-        Err(_) => {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "[media-diagnostics] could not serialize event {event:?} for role {role:?}"
-            );
-            return;
-        }
-    };
-    let _ = sink.try_send(DiagnosticCommand::Line(line));
-}
-
-pub(crate) fn flush_diagnostics() {
-    let Some(sink) = diagnostic_sink() else {
-        return;
-    };
-    let _ = enqueue_flush(sink, Duration::from_millis(500));
-}
-
-fn enqueue_flush(sink: &SyncSender<DiagnosticCommand>, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    let (acknowledge, acknowledged) = sync_channel(1);
-    let mut command = DiagnosticCommand::Flush(acknowledge);
-    loop {
-        match sink.try_send(command) {
-            Ok(()) => break,
-            Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
-                command = returned;
-                std::thread::yield_now();
-            }
-            Err(_) => return false,
-        }
-    }
-    acknowledged
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .is_ok()
+    let _ = sink.emit(event, role, payload);
 }
 
 #[cfg(test)]
@@ -281,6 +331,103 @@ mod tests {
     use super::*;
     use serde::Serializer;
     use std::cell::RefCell;
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct SharedWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for SharedWriter {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    struct FlushCountingWriter(Arc<AtomicUsize>);
+
+    impl Write for FlushCountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct BlockingWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+        blocked: bool,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.blocked {
+                self.blocked = true;
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            self.output.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingSerialize {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Serialize for BlockingSerialize {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            serializer.serialize_str("accepted-in-flight")
+        }
+    }
+
+    struct ProductionReentrantSerialize {
+        sink: Arc<DiagnosticSink>,
+    }
+
+    impl Serialize for ProductionReentrantSerialize {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            assert!(self.sink.emit(
+                "nested-event",
+                "nested-role",
+                serde_json::json!({ "value": 42 }),
+            ));
+            serializer.serialize_str("outer-value")
+        }
+    }
 
     struct FailingSerialize;
 
@@ -307,6 +454,176 @@ mod tests {
             );
             serializer.serialize_str("outer-value")
         }
+    }
+
+    fn local_writer() -> (DiagnosticWriter, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let writer = DiagnosticWriter::start(
+            SharedWriter {
+                output: output.clone(),
+                dropped: dropped.clone(),
+            },
+            1024 * 1024,
+        );
+        (writer, output, dropped)
+    }
+
+    #[test]
+    fn diagnostic_writer_shutdown_drains_accepted_lines_and_joins_once() {
+        let (mut writer, output, dropped) = local_writer();
+        let sink = writer.sink.as_ref().unwrap().clone();
+        assert!(sink.emit("first", "test", serde_json::json!({ "index": 1 })));
+        assert!(sink.emit("second", "test", serde_json::json!({ "index": 2 })));
+
+        writer.shutdown();
+
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let records = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "first");
+        assert_eq!(records[1]["event"], "second");
+
+        writer.shutdown();
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn diagnostic_writer_shutdown_flushes_after_channel_disconnect() {
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut writer = DiagnosticWriter::start(FlushCountingWriter(flushes.clone()), 1024);
+
+        writer.shutdown();
+
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn diagnostic_writer_shutdown_drains_a_full_queue_without_a_command_slot() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (entered, blocked) = sync_channel(1);
+        let (release, released) = sync_channel(1);
+        let writer = DiagnosticWriter::start(
+            BlockingWriter {
+                output: output.clone(),
+                entered,
+                release: released,
+                blocked: false,
+            },
+            1024 * 1024,
+        );
+        let sink = writer.sink.as_ref().unwrap().clone();
+        assert!(sink.emit("first", "test", serde_json::json!({})));
+        blocked.recv_timeout(Duration::from_secs(1)).unwrap();
+        for index in 0..128 {
+            assert!(sink.emit("queued", "test", serde_json::json!({ "index": index })));
+        }
+        assert!(!sink.emit("dropped", "test", serde_json::json!({})));
+
+        let shutdown = std::thread::spawn(move || {
+            let mut writer = writer;
+            writer.shutdown();
+        });
+        release.send(()).unwrap();
+        shutdown.join().unwrap();
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 129);
+        assert!(!output.contains("\"event\":\"dropped\""));
+    }
+
+    #[test]
+    fn diagnostic_writer_shutdown_cuts_off_new_senders_but_drains_in_flight_sender() {
+        let (writer, output, _) = local_writer();
+        let sink = writer.sink.as_ref().unwrap().clone();
+        let (entered, serializing) = sync_channel(1);
+        let (release, released) = sync_channel(1);
+        let sink_for_emit = sink.clone();
+        let emitting = std::thread::spawn(move || {
+            sink_for_emit.emit(
+                "in-flight",
+                "test",
+                BlockingSerialize {
+                    entered,
+                    release: released,
+                },
+            )
+        });
+        serializing.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let shutdown = std::thread::spawn(move || {
+            let mut writer = writer;
+            writer.shutdown();
+        });
+        while sink
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            std::thread::yield_now();
+        }
+        assert!(!sink.emit("too-late", "test", serde_json::json!({})));
+        release.send(()).unwrap();
+
+        assert!(emitting.join().unwrap());
+        shutdown.join().unwrap();
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("\"event\":\"in-flight\""));
+        assert!(!output.contains("\"event\":\"too-late\""));
+    }
+
+    #[test]
+    fn diagnostic_writer_production_sink_allows_nested_emission() {
+        let (mut writer, output, _) = local_writer();
+        let sink = writer.sink.as_ref().unwrap().clone();
+
+        assert!(sink.emit(
+            "outer-event",
+            "outer-role",
+            ProductionReentrantSerialize { sink: sink.clone() },
+        ));
+        writer.shutdown();
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(events, ["nested-event", "outer-event"]);
+    }
+
+    #[test]
+    fn diagnostic_writer_recovers_a_poisoned_sender_lock() {
+        let (mut writer, output, _) = local_writer();
+        let sink = writer.sink.as_ref().unwrap().clone();
+        let sink_for_poison = sink.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = sink_for_poison.sender.lock().unwrap();
+            panic!("poison sender lock");
+        })
+        .join();
+
+        assert!(sink.emit("after-poison", "test", serde_json::json!({})));
+        writer.shutdown();
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("\"event\":\"after-poison\""));
+    }
+
+    #[test]
+    fn diagnostic_writer_shutdown_is_a_disabled_idempotent_no_op() {
+        let mut writer = DiagnosticWriter::disabled();
+
+        writer.shutdown();
+        writer.shutdown();
+
+        assert!(writer.sink.is_none());
+        assert!(writer.worker.is_none());
     }
 
     #[test]
@@ -445,43 +762,15 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_flush_acknowledges_after_queued_lines_are_written() {
-        let (commands, receiver) = sync_channel(4);
-        let (acknowledge, acknowledged) = sync_channel(1);
-        commands
-            .send(DiagnosticCommand::Line("first".into()))
-            .unwrap();
-        commands
-            .send(DiagnosticCommand::Flush(acknowledge))
-            .unwrap();
-        drop(commands);
+    fn diagnostic_writer_stops_writing_at_the_byte_cap() {
+        let (sender, receiver) = sync_channel(2);
+        sender.send("1234".to_string()).unwrap();
+        sender.send("x".to_string()).unwrap();
+        drop(sender);
         let mut output = Vec::new();
 
-        drain_diagnostics(receiver, &mut output, 1024).unwrap();
+        drain_diagnostics(receiver, &mut output, 6).unwrap();
 
-        assert!(acknowledged.try_recv().is_ok());
-        assert_eq!(String::from_utf8(output).unwrap(), "first\n");
-    }
-
-    #[test]
-    fn flush_waits_bounded_for_queue_capacity() {
-        let (commands, receiver) = sync_channel(1);
-        commands
-            .send(DiagnosticCommand::Line("pending".into()))
-            .unwrap();
-        let commands_for_flush = commands.clone();
-        let flushing =
-            std::thread::spawn(move || enqueue_flush(&commands_for_flush, Duration::from_secs(1)));
-
-        assert!(matches!(
-            receiver.recv().unwrap(),
-            DiagnosticCommand::Line(_)
-        ));
-        let DiagnosticCommand::Flush(acknowledge) = receiver.recv().unwrap() else {
-            panic!("flush command was not queued");
-        };
-        acknowledge.send(()).unwrap();
-
-        assert!(flushing.join().unwrap());
+        assert_eq!(String::from_utf8(output).unwrap(), "1234\n");
     }
 }
