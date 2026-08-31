@@ -139,6 +139,38 @@ fn generate_diagnostic_session() -> String {
     format!("{:032x}", rand::thread_rng().gen::<u128>())
 }
 
+#[cfg(test)]
+#[test]
+fn hosting_collision_preserves_live_room_and_uses_next_code() {
+    let (messages, _rx) = mpsc::channel(1);
+    let (disconnect, _disconnect_rx) = tokio::sync::watch::channel(false);
+    let mut rooms = HashMap::from([(
+        "ABC-234".to_string(),
+        Room {
+            host: Some(Tx {
+                messages,
+                disconnect,
+            }),
+            host_name: Some("existing host".into()),
+            diagnostic_session: "existing session".into(),
+            viewers: HashMap::new(),
+        },
+    )]);
+    let mut codes = ["ABC-234", "XYZ-789"].into_iter();
+
+    let code = insert_room_with_code(&mut rooms, Room::default(), || {
+        codes.next().expect("code generator exhausted").to_string()
+    });
+
+    assert_eq!(code, "XYZ-789");
+    assert_eq!(rooms.len(), 2);
+    let existing = rooms.get("ABC-234").expect("existing room was removed");
+    assert!(existing.host.is_some());
+    assert_eq!(existing.host_name.as_deref(), Some("existing host"));
+    assert_eq!(existing.diagnostic_session, "existing session");
+    assert!(rooms.contains_key("XYZ-789"));
+}
+
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
 struct FixedWindow {
@@ -189,6 +221,20 @@ pub struct Room {
 }
 
 pub type Rooms = Arc<Mutex<HashMap<String, Room>>>;
+
+fn insert_room_with_code(
+    rooms: &mut HashMap<String, Room>,
+    room: Room,
+    mut generate: impl FnMut() -> String,
+) -> String {
+    loop {
+        if let std::collections::hash_map::Entry::Vacant(entry) = rooms.entry(generate()) {
+            let code = entry.key().clone();
+            entry.insert(room);
+            return code;
+        }
+    }
+}
 
 enum Role {
     Host,
@@ -273,18 +319,21 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                     if joined.is_some() {
                         bail!("peer attempted to change signalling role");
                     }
-                    let code = generate_code();
                     let diagnostic_session = generate_diagnostic_session();
                     let name = identity.as_ref().map(|i| i.name.clone());
-                    rooms.lock().await.insert(
-                        code.clone(),
-                        Room {
-                            host: Some(tx.clone()),
-                            host_name: name,
-                            diagnostic_session: diagnostic_session.clone(),
-                            viewers: HashMap::new(),
-                        },
-                    );
+                    let code = {
+                        let mut rooms = rooms.lock().await;
+                        insert_room_with_code(
+                            &mut rooms,
+                            Room {
+                                host: Some(tx.clone()),
+                                host_name: name,
+                                diagnostic_session: diagnostic_session.clone(),
+                                viewers: HashMap::new(),
+                            },
+                            generate_code,
+                        )
+                    };
                     joined = Some((code.clone(), Role::Host));
                     tx.try_send(Message::Text(
                         Signal::Hosting {
@@ -395,7 +444,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                     ));
                 }
             }
-            println!("[signal] room {code} closed");
+            println!("[signal] room closed");
         }
         Some((code, Role::Viewer(peer))) => {
             let mut rooms = rooms.lock().await;
