@@ -21,9 +21,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 
 const SIGNAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const INBOUND_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const INBOUND_MESSAGE_LIMIT: usize = 256;
+const ROOM_VIEWER_CAPACITY: usize = 16;
 
 /// Messages exchanged between peers and the relay.
 ///
@@ -136,6 +140,25 @@ fn generate_diagnostic_session() -> String {
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
+struct FixedWindow {
+    started: Instant,
+    count: usize,
+}
+
+impl FixedWindow {
+    fn allow(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.started) >= INBOUND_WINDOW {
+            self.started = now;
+            self.count = 0;
+        }
+        if self.count >= INBOUND_MESSAGE_LIMIT {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
 #[derive(Clone)]
 struct Tx {
     messages: mpsc::Sender<Message>,
@@ -158,6 +181,12 @@ pub struct Room {
     host_name: Option<String>,
     diagnostic_session: String,
     viewers: HashMap<String, Tx>,
+}
+
+impl Room {
+    fn can_accept_viewer(&self) -> bool {
+        self.host.is_some() && self.viewers.len() < ROOM_VIEWER_CAPACITY
+    }
 }
 
 pub type Rooms = Arc<Mutex<HashMap<String, Room>>>;
@@ -187,6 +216,10 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
 
     let mut joined: Option<(String, Role)> = None;
     let mut identity: Option<Identity> = None;
+    let mut inbound_budget = FixedWindow {
+        started: Instant::now(),
+        count: 0,
+    };
 
     let session_result: Result<()> = async {
         loop {
@@ -203,6 +236,9 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                 }
             };
             let Message::Text(text) = msg? else { continue };
+            if !inbound_budget.allow(Instant::now()) {
+                bail!("signalling rate limit exceeded");
+            }
             let signal: Signal = match serde_json::from_str(&text) {
                 Ok(s) => s,
                 Err(err) => {
@@ -267,7 +303,7 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                     let peer = generate_peer_id();
                     let mut rooms = rooms.lock().await;
                     match rooms.get_mut(&code) {
-                        Some(room) if room.host.is_some() => {
+                        Some(room) if room.can_accept_viewer() => {
                             room.viewers.insert(peer.clone(), tx.clone());
                             let host_name = room.host_name.clone();
                             let diagnostic_session = room.diagnostic_session.clone();
@@ -289,6 +325,14 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                                     .to_json(),
                                 ));
                             }
+                        }
+                        Some(room) if room.host.is_some() => {
+                            tx.try_send(Message::Text(
+                                Signal::Error {
+                                    message: "stream is full".into(),
+                                }
+                                .to_json(),
+                            ))?;
                         }
                         _ => {
                             tx.try_send(Message::Text(
@@ -500,6 +544,43 @@ mod tests {
             Err(mpsc::error::TrySendError::Full(_))
         ));
         assert!(*disconnect_rx.borrow());
+    }
+
+    #[test]
+    fn inbound_budget_allows_256_messages_and_resets_at_ten_seconds() {
+        let started = std::time::Instant::now();
+        let mut budget = FixedWindow { started, count: 0 };
+
+        for _ in 0..256 {
+            assert!(budget.allow(started));
+        }
+        assert!(!budget.allow(started));
+        assert!(budget.allow(started + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn room_accepts_fewer_than_16_viewers_only_while_hosted() {
+        let (messages, _rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let (disconnect, _disconnect_rx) = tokio::sync::watch::channel(false);
+        let tx = Tx {
+            messages,
+            disconnect,
+        };
+        let mut room = Room {
+            host: Some(tx.clone()),
+            ..Room::default()
+        };
+
+        for peer in 0..15 {
+            room.viewers.insert(peer.to_string(), tx.clone());
+        }
+        assert!(room.can_accept_viewer());
+        room.viewers.insert("last".into(), tx);
+        assert!(!room.can_accept_viewer());
+
+        room.host = None;
+        room.viewers.clear();
+        assert!(!room.can_accept_viewer());
     }
 
     #[tokio::test]
