@@ -20,8 +20,7 @@ use gpui::{
     prelude::*, px, size, App, Application, Bounds, Context, Timer, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
@@ -536,14 +535,32 @@ fn request_avatar(url: Option<String>) -> Option<std::sync::mpsc::Receiver<captu
     Some(rx)
 }
 
-type TrayOwner = Rc<RefCell<Option<tray::Tray>>>;
+type TrayOwner = Arc<Mutex<Option<tray::Tray>>>;
 
 fn shutdown_owned_tray(owner: &TrayOwner) -> anyhow::Result<()> {
-    let Some(mut tray) = owner.borrow_mut().take() else {
+    shutdown_owned_tray_with(owner, tray::Tray::shutdown)
+}
+
+fn finish_owned_tray(owner: &TrayOwner) -> anyhow::Result<()> {
+    shutdown_owned_tray_with(owner, tray::Tray::shutdown_blocking)
+}
+
+fn shutdown_owned_tray_with(
+    owner: &TrayOwner,
+    shutdown: impl FnOnce(&mut tray::Tray) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let Some(mut tray) = owner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
         return Ok(());
     };
-    if let Err(error) = tray.shutdown() {
-        owner.borrow_mut().replace(tray);
+    if let Err(error) = shutdown(&mut tray) {
+        owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(tray);
         return Err(error);
     }
     Ok(())
@@ -578,13 +595,17 @@ fn main() {
 
     // Installed before the UI so a failure here is visible as a missing icon
     // rather than a half-started app.
-    let tray_owner = Rc::new(RefCell::new(tray::Tray::install().ok()));
-    let tray_available = tray_owner.borrow().is_some();
+    let tray_owner = Arc::new(Mutex::new(tray::Tray::install().ok()));
+    let tray_available = tray_owner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some();
+    let app_tray_owner = Arc::clone(&tray_owner);
 
     Application::new().run(move |cx: &mut App| {
-        let quit_owner = Rc::clone(&tray_owner);
+        let quit_owner = Arc::clone(&app_tray_owner);
         cx.on_app_quit(move |_| {
-            let quit_owner = Rc::clone(&quit_owner);
+            let quit_owner = Arc::clone(&quit_owner);
             async move {
                 if let Err(error) = shutdown_owned_tray(&quit_owner) {
                     eprintln!("[tray] app-quit shutdown failed: {error:#}");
@@ -633,11 +654,16 @@ fn main() {
         // The tray runs its own Win32 message loop on another thread, so its
         // events arrive over a channel and are drained on a timer here.
         if tray_available {
-            let event_owner = Rc::clone(&tray_owner);
+            let event_owner = Arc::clone(&app_tray_owner);
             cx.spawn(async move |cx| loop {
                 Timer::after(Duration::from_millis(200)).await;
                 loop {
-                    let event = match event_owner.borrow().as_ref().map(tray::Tray::try_recv) {
+                    let event = match event_owner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .map(tray::Tray::try_recv)
+                    {
                         None => return,
                         Some(Ok(event)) => event,
                         Some(Err(std::sync::mpsc::TryRecvError::Empty)) => break,
@@ -669,6 +695,10 @@ fn main() {
             .detach();
         }
     });
+
+    if let Err(error) = finish_owned_tray(&tray_owner) {
+        eprintln!("[tray] final shutdown failed: {error:#}");
+    }
 }
 
 #[cfg(test)]
