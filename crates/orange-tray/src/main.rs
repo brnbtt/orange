@@ -563,8 +563,8 @@ fn main() {
 
     // Installed before the UI so a failure here is visible as a missing icon
     // rather than a half-started app.
-    let tray_events = tray::install().ok();
-    let tray_available = tray_events.is_some();
+    let tray = tray::Tray::install().ok();
+    let tray_available = tray.is_some();
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(400.0), px(540.0)), cx);
@@ -604,10 +604,15 @@ fn main() {
 
         // The tray runs its own Win32 message loop on another thread, so its
         // events arrive over a channel and are drained on a timer here.
-        if let Some(events) = tray_events {
+        if let Some(mut tray) = tray {
             cx.spawn(async move |cx| loop {
                 Timer::after(Duration::from_millis(200)).await;
-                while let Ok(event) = events.try_recv() {
+                loop {
+                    let event = match tray.try_recv() {
+                        Ok(event) => event,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    };
                     match event {
                         tray::TrayEvent::Show => {
                             // The window may be hidden rather than merely
@@ -622,6 +627,7 @@ fn main() {
                             });
                         }
                         tray::TrayEvent::Quit => {
+                            tray.shutdown();
                             let _ = cx.update(|cx| cx.quit());
                             return;
                         }
