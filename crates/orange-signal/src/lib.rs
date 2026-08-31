@@ -686,7 +686,7 @@ mod tests {
             Signal::Host.to_json(),
         ))
         .await
-        .unwrap();
+        .expect("failed to send host command");
         let Signal::Hosting { code, .. } = receive_signal(&mut host).await else {
             panic!("host did not receive a room code");
         };
@@ -697,7 +697,7 @@ mod tests {
                 Signal::Join { code: code.clone() }.to_json(),
             ))
             .await
-            .unwrap();
+            .expect("failed to send viewer join");
         let _ = receive_signal(&mut viewer).await;
         let Signal::ViewerJoined { peer, .. } = receive_signal(&mut host).await else {
             panic!("host did not receive viewer join");
@@ -706,19 +706,11 @@ mod tests {
         viewer
             .send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
             .await
-            .unwrap();
+            .expect("failed to send viewer ping");
         viewer
             .send(tokio_tungstenite::tungstenite::Message::Binary(vec![0]))
             .await
-            .unwrap();
-        viewer
-            .send(tokio_tungstenite::tungstenite::Message::Text("{".into()))
-            .await
-            .unwrap();
-        let Signal::Error { message } = receive_signal(&mut viewer).await else {
-            panic!("malformed text did not return an error");
-        };
-        assert!(message.starts_with("bad message:"));
+            .expect("failed to send viewer binary frame");
 
         let invalid_auth = Signal::Authenticate {
             session: "invalid".into(),
@@ -730,12 +722,21 @@ mod tests {
                     invalid_auth.clone(),
                 ))
                 .await
-                .unwrap();
+                .expect("failed to send invalid authentication");
         }
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text("{".into()))
+            .await
+            .expect("failed to send malformed message 256");
+        let Signal::Error { message } = receive_signal(&mut viewer).await else {
+            panic!("malformed text did not return an error");
+        };
+        assert!(message.starts_with("bad message:"));
+
         viewer
             .send(tokio_tungstenite::tungstenite::Message::Text(invalid_auth))
             .await
-            .unwrap();
+            .expect("failed to send rate-limit trigger message 257");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -764,33 +765,20 @@ mod tests {
     #[tokio::test]
     async fn viewer_can_retry_after_a_full_room_on_the_same_socket() {
         let rooms = Rooms::default();
-        let (full_host_messages, _full_host_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-        let (full_host_disconnect, _full_host_disconnect_rx) = tokio::sync::watch::channel(false);
-        let full_host = Tx {
-            messages: full_host_messages,
-            disconnect: full_host_disconnect,
-        };
-        let (open_host_messages, _open_host_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-        let (open_host_disconnect, _open_host_disconnect_rx) = tokio::sync::watch::channel(false);
-        let open_host = Tx {
-            messages: open_host_messages,
-            disconnect: open_host_disconnect,
-        };
-        let (dummy_viewer_messages, _dummy_viewer_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-        let (dummy_viewer_disconnect, _dummy_viewer_disconnect_rx) =
-            tokio::sync::watch::channel(false);
-        let dummy_viewer = Tx {
-            messages: dummy_viewer_messages,
-            disconnect: dummy_viewer_disconnect,
+        let (messages, _rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let (disconnect, _disconnect_rx) = tokio::sync::watch::channel(false);
+        let dummy = Tx {
+            messages,
+            disconnect,
         };
         rooms.lock().await.extend([
             (
                 "FULL".into(),
                 Room {
-                    host: Some(full_host),
+                    host: Some(dummy.clone()),
                     diagnostic_session: "full-session".into(),
                     viewers: (0..16)
-                        .map(|peer| (peer.to_string(), dummy_viewer.clone()))
+                        .map(|peer| (peer.to_string(), dummy.clone()))
                         .collect(),
                     ..Room::default()
                 },
@@ -798,7 +786,7 @@ mod tests {
             (
                 "OPEN".into(),
                 Room {
-                    host: Some(open_host),
+                    host: Some(dummy),
                     diagnostic_session: "open-session".into(),
                     ..Room::default()
                 },
@@ -823,7 +811,7 @@ mod tests {
                 .to_json(),
             ))
             .await
-            .unwrap();
+            .expect("failed to send full-room join");
         let Signal::Error { message } = receive_signal(&mut viewer).await else {
             panic!("full room did not return an error");
         };
@@ -837,7 +825,7 @@ mod tests {
                 .to_json(),
             ))
             .await
-            .unwrap();
+            .expect("failed to send open-room retry");
         assert!(matches!(
             receive_signal(&mut viewer).await,
             Signal::StreamInfo { .. }
