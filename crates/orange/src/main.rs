@@ -318,7 +318,7 @@ fn main() -> Result<()> {
 
             let pipeline =
                 build_preview_pipeline((vw, vh), fps, &pattern, image.as_deref(), &playback)?;
-            run_until_closed(&pipeline, playback.hwnd())
+            run_until_closed(&pipeline, &playback)
         }
     }
 }
@@ -379,20 +379,20 @@ fn build_preview_pipeline(
 }
 
 /// Run until the viewer window goes away, rather than for a fixed duration.
-fn run_until_closed(pipeline: &gst::Pipeline, hwnd: isize) -> Result<()> {
+fn run_until_closed(pipeline: &gst::Pipeline, playback: &window::PlaybackWindow) -> Result<()> {
     pipeline.set_state(gst::State::Playing)?;
-    window::reveal(hwnd);
+    playback.reveal();
 
     let bus = pipeline.bus().expect("pipeline without bus");
     let mut error = None;
 
-    while window::is_alive(hwnd) {
+    while playback.is_alive() {
         let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
             continue;
         };
         match msg.view() {
             gst::MessageView::Error(err) => {
-                if window::is_alive(hwnd) {
+                if playback.is_alive() {
                     error = Some(anyhow::anyhow!(
                         "{} ({})",
                         err.error(),

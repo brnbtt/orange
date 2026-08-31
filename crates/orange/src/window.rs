@@ -13,7 +13,10 @@
 //! it, so the window lives on its own thread and hands the HWND back.
 
 use anyhow::{bail, Result};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, COLORREF, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -136,6 +139,7 @@ impl PlaybackProfile {
 pub struct PlaybackWindow {
     hwnd: isize,
     overlay: crate::overlay::SharedOverlay,
+    alive: Arc<AtomicBool>,
 }
 
 impl PlaybackWindow {
@@ -162,8 +166,13 @@ impl PlaybackWindow {
         let overlay = std::sync::Arc::new(std::sync::Mutex::new(
             crate::overlay::OverlayState::new(profile),
         ));
-        let hwnd = spawn_window(title, envelope, profile, overlay.clone())?;
-        Ok(Self { hwnd, overlay })
+        let alive = Arc::new(AtomicBool::new(true));
+        let hwnd = spawn_window(title, envelope, profile, overlay.clone(), alive.clone())?;
+        Ok(Self {
+            hwnd,
+            overlay,
+            alive,
+        })
     }
 
     pub fn hwnd(&self) -> isize {
@@ -175,7 +184,7 @@ impl PlaybackWindow {
     }
 
     pub fn is_alive(&self) -> bool {
-        is_alive(self.hwnd)
+        self.alive.load(Ordering::Acquire)
     }
 
     pub fn is_responsive(&self) -> bool {
@@ -207,12 +216,13 @@ fn spawn_window(
     envelope: (i32, i32),
     profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
+    alive: Arc<AtomicBool>,
 ) -> Result<isize> {
     let (tx, rx) = mpsc::channel::<Result<isize>>();
     let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
     std::thread::spawn(move || unsafe {
-        match create_window(&title, envelope, profile, overlay) {
+        match create_window(&title, envelope, profile, overlay, alive) {
             Ok(hwnd) => {
                 if tx.send(Ok(hwnd.0 as isize)).is_err() {
                     return;
@@ -235,6 +245,7 @@ fn spawn_window(
 /// Per-window state reachable from the window procedure.
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
+    alive: Arc<AtomicBool>,
     revealed: std::cell::Cell<bool>,
     profile: PlaybackProfile,
     envelope: std::cell::Cell<(i32, i32)>,
@@ -699,6 +710,7 @@ unsafe fn create_window(
     envelope: (i32, i32),
     profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
+    alive: Arc<AtomicBool>,
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
     let class_name = w!("orange_viewer");
@@ -772,6 +784,7 @@ unsafe fn create_window(
     // Ownership transfers to GWLP_USERDATA and is reclaimed in WM_DESTROY.
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
+        alive,
         revealed: std::cell::Cell::new(false),
         profile,
         envelope: std::cell::Cell::new(envelope),
@@ -1082,7 +1095,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 }
                 LRESULT(0)
             }
+            WM_CLOSE => {
+                let _ = with_context(hwnd, |ctx| ctx.alive.store(false, Ordering::Release));
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_DESTROY => {
+                let _ = with_context(hwnd, |ctx| ctx.alive.store(false, Ordering::Release));
                 let _ = KillTimer(Some(hwnd), CURSOR_TIMER);
                 SetLastError(ERROR_SUCCESS);
                 let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut WindowContext;
@@ -1105,9 +1123,4 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
-}
-
-/// Whether the window still exists, so the viewer can exit when it is closed.
-pub fn is_alive(hwnd: isize) -> bool {
-    unsafe { IsWindow(Some(HWND(hwnd as *mut _))).as_bool() }
 }
