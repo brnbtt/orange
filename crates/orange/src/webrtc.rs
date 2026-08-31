@@ -422,9 +422,36 @@ pub fn build_video_payloader(codec: Codec) -> Result<gst::Element> {
     .with_context(|| format!("{factory} missing"))
 }
 
-struct Peers {
-    sender: gst::Element,
-    receiver: gst::Element,
+struct LoopbackSender {
+    element: gst::Element,
+    sink_pad: gst::Pad,
+}
+
+impl LoopbackSender {
+    fn request(element: &gst::Element) -> Result<Self> {
+        let sink_pad = element
+            .request_pad_simple("sink_%u")
+            .context("webrtcbin refused a sink pad")?;
+        Ok(Self {
+            element: element.clone(),
+            sink_pad,
+        })
+    }
+}
+
+impl Drop for LoopbackSender {
+    fn drop(&mut self) {
+        if let Some(peer) = self.sink_pad.peer() {
+            let _ = peer.unlink(&self.sink_pad);
+        }
+        self.element.release_request_pad(&self.sink_pad);
+    }
+}
+
+fn link_loopback_sender(element: &gst::Element, src_pad: &gst::Pad) -> Result<LoopbackSender> {
+    let sender = LoopbackSender::request(element)?;
+    src_pad.link(&sender.sink_pad)?;
+    Ok(sender)
 }
 
 /// Wire the two `webrtcbin` elements together: offer/answer plus ICE.
@@ -432,23 +459,24 @@ struct Peers {
 /// Normally these messages would cross a network via a signalling server. Here
 /// they are function calls, which isolates the media path from any networking
 /// concerns while we verify it.
-fn connect_signalling(peers: Arc<Mutex<Peers>>) {
-    let (sender, receiver) = {
-        let p = peers.lock().unwrap();
-        (p.sender.clone(), p.receiver.clone())
-    };
-
+fn connect_signalling(sender: &gst::Element, receiver: &gst::Element) {
     // Trickle ICE, in both directions.
-    let rx = receiver.clone();
+    let rx = receiver.downgrade();
     sender.connect("on-ice-candidate", false, move |values| {
+        let Some(rx) = rx.upgrade() else {
+            return None;
+        };
         let mlineindex = values[1].get::<u32>().unwrap();
         let candidate = values[2].get::<String>().unwrap();
         rx.emit_by_name::<()>("add-ice-candidate", &[&mlineindex, &candidate]);
         None
     });
 
-    let tx = sender.clone();
+    let tx = sender.downgrade();
     receiver.connect("on-ice-candidate", false, move |values| {
+        let Some(tx) = tx.upgrade() else {
+            return None;
+        };
         let mlineindex = values[1].get::<u32>().unwrap();
         let candidate = values[2].get::<String>().unwrap();
         tx.emit_by_name::<()>("add-ice-candidate", &[&mlineindex, &candidate]);
@@ -456,17 +484,21 @@ fn connect_signalling(peers: Arc<Mutex<Peers>>) {
     });
 
     // The sender drives negotiation as soon as its sink pad is linked.
-    let peers_for_neg = peers.clone();
+    let sender_weak = sender.downgrade();
+    let receiver_weak = receiver.downgrade();
     sender.connect("on-negotiation-needed", false, move |_| {
-        let peers = peers_for_neg.clone();
-        let (sender, receiver) = {
-            let p = peers.lock().unwrap();
-            (p.sender.clone(), p.receiver.clone())
+        let (Some(sender), Some(receiver)) = (sender_weak.upgrade(), receiver_weak.upgrade())
+        else {
+            return None;
         };
-        // The closure below takes ownership, so keep a handle for the emit.
-        let sender_for_offer = sender.clone();
+        let offer_sender = sender.downgrade();
+        let offer_receiver = receiver.downgrade();
 
         let promise = gst::Promise::with_change_func(move |reply| {
+            let (Some(sender), Some(receiver)) = (offer_sender.upgrade(), offer_receiver.upgrade())
+            else {
+                return;
+            };
             let Ok(Some(reply)) = reply else {
                 eprintln!("[webrtc] offer failed");
                 return;
@@ -481,9 +513,14 @@ fn connect_signalling(peers: Arc<Mutex<Peers>>) {
             receiver.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
 
             // Answer back the other way.
-            let sender2 = sender.clone();
-            let receiver2 = receiver.clone();
+            let answer_sender = sender.downgrade();
+            let answer_receiver = receiver.downgrade();
             let answer_promise = gst::Promise::with_change_func(move |reply| {
+                let (Some(sender), Some(receiver)) =
+                    (answer_sender.upgrade(), answer_receiver.upgrade())
+                else {
+                    return;
+                };
                 let Ok(Some(reply)) = reply else {
                     eprintln!("[webrtc] answer failed");
                     return;
@@ -493,9 +530,9 @@ fn connect_signalling(peers: Arc<Mutex<Peers>>) {
                     .unwrap()
                     .get::<gst_webrtc::WebRTCSessionDescription>()
                     .unwrap();
-                receiver2
+                receiver
                     .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
-                sender2.emit_by_name::<()>(
+                sender.emit_by_name::<()>(
                     "set-remote-description",
                     &[&answer, &None::<gst::Promise>],
                 );
@@ -505,13 +542,82 @@ fn connect_signalling(peers: Arc<Mutex<Peers>>) {
                 .emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
         });
 
-        sender_for_offer.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
+        sender.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
         None
     });
 
     // Silence the unused warning on the SDP import while keeping it available
     // for the real signalling module that replaces this.
     let _ = gst_sdp::SDPMessage::new();
+}
+
+#[cfg(test)]
+mod loopback_lifecycle_tests {
+    use super::*;
+
+    fn requested_sink_pad_count(element: &gst::Element) -> usize {
+        element
+            .pads()
+            .into_iter()
+            .filter(|pad| pad.direction() == gst::PadDirection::Sink)
+            .count()
+    }
+
+    #[test]
+    fn loopback_signalling_does_not_keep_peers_alive() {
+        gst::init().unwrap();
+
+        for index in 0..3 {
+            let sender = gst::ElementFactory::make("webrtcbin")
+                .name(format!("lifecycle-sender-{index}"))
+                .build()
+                .unwrap();
+            let receiver = gst::ElementFactory::make("webrtcbin")
+                .name(format!("lifecycle-receiver-{index}"))
+                .build()
+                .unwrap();
+            let sender_weak = sender.downgrade();
+            let receiver_weak = receiver.downgrade();
+
+            connect_signalling(&sender, &receiver);
+            drop(sender);
+            drop(receiver);
+
+            assert!(sender_weak.upgrade().is_none());
+            assert!(receiver_weak.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn loopback_requested_sink_pad_returns_to_baseline_after_owner_drop() {
+        gst::init().unwrap();
+        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
+        let baseline = requested_sink_pad_count(&sender);
+
+        for _ in 0..3 {
+            let pad = LoopbackSender::request(&sender).unwrap();
+            assert_eq!(requested_sink_pad_count(&sender), baseline + 1);
+            drop(pad);
+        }
+
+        assert_eq!(requested_sink_pad_count(&sender), baseline);
+    }
+
+    #[test]
+    fn loopback_link_error_releases_requested_sink_pad() {
+        gst::init().unwrap();
+        let sender = gst::ElementFactory::make("webrtcbin").build().unwrap();
+        let baseline = requested_sink_pad_count(&sender);
+        let source = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        source.link(&sink).unwrap();
+        let already_linked = source.static_pad("src").unwrap();
+
+        let result = link_loopback_sender(&sender, &already_linked);
+
+        assert!(result.is_err());
+        assert_eq!(requested_sink_pad_count(&sender), baseline);
+    }
 }
 
 /// Where the received video should end up.
@@ -584,10 +690,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
 
     // webrtcbin takes media on request pads.
     let src_pad = caps_filter.static_pad("src").unwrap();
-    let sink_pad = send_bin
-        .request_pad_simple("sink_%u")
-        .context("webrtcbin refused a sink pad")?;
-    src_pad.link(&sink_pad)?;
+    let _loopback_sender = link_loopback_sender(&send_bin, &src_pad)?;
 
     // The receiver's pad appears only once media starts flowing.
     let pipeline_weak = pipeline.downgrade();
@@ -638,10 +741,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         }
     });
 
-    connect_signalling(Arc::new(Mutex::new(Peers {
-        sender: send_bin,
-        receiver: recv_bin.clone(),
-    })));
+    connect_signalling(&send_bin, &recv_bin);
 
     crate::run_pipeline_while_with_shutdown(&pipeline, seconds, playback.as_ref(), move || {
         recv_bin.disconnect(pad_added);

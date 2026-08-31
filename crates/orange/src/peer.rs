@@ -870,6 +870,7 @@ mod tests {
         super::enable_nack(&transceiver);
 
         assert!(transceiver.property::<bool>("do-nack"));
+        bin.release_request_pad(&pad);
     }
 
     #[test]
@@ -905,6 +906,8 @@ mod tests {
         bin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
         let sdp = receive.recv_timeout(Duration::from_secs(5));
         pipeline.set_state(gst::State::Null).unwrap();
+        caps.static_pad("src").unwrap().unlink(&pad).unwrap();
+        bin.release_request_pad(&pad);
         let sdp = sdp.unwrap().expect("offer was not generated");
 
         assert!(sdp.contains("a=rtpmap:96 AV1/90000"));
