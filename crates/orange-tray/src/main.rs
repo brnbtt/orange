@@ -90,9 +90,7 @@ struct Orange {
     copied_code: Option<String>,
     own_codes: Vec<String>,
     logo_epoch: u64,
-    update_status: update::UpdateStatus,
-    update_rx: Option<std::sync::mpsc::Receiver<update::UpdateEvent>>,
-    next_update_check: Instant,
+    updates: update::UpdateController,
 }
 
 impl Orange {
@@ -111,12 +109,7 @@ impl Orange {
         let session = session::load();
         let preferences = session::load_preferences();
         let avatar_rx = request_avatar(session.as_ref().and_then(|s| s.avatar_url.clone()));
-        let update_rx = update::start_check();
-        let update_status = if update_rx.is_some() {
-            update::UpdateStatus::Checking
-        } else {
-            update::UpdateStatus::Disabled
-        };
+        let updates = update::UpdateController::new();
         Self {
             tray_available,
             screen: if session.is_some() {
@@ -144,9 +137,7 @@ impl Orange {
             copied_code: None,
             own_codes: preferences.own_codes,
             logo_epoch: 0,
-            update_status,
-            update_rx,
-            next_update_check: Instant::now() + Duration::from_secs(6 * 60 * 60),
+            updates,
         }
     }
 
@@ -242,89 +233,17 @@ impl Orange {
     }
 
     fn poll_updates(&mut self, cx: &mut Context<Self>) {
-        let event = self
-            .update_rx
-            .as_ref()
-            .and_then(|receiver| match receiver.try_recv() {
-                Ok(event) => Some(Ok(event)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(())),
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            });
-        match event {
-            Some(Ok(update::UpdateEvent::Checked(Ok(Some(info))))) => {
-                self.update_status = update::UpdateStatus::Available(info);
-                self.update_rx = None;
-            }
-            Some(Ok(update::UpdateEvent::Checked(Ok(None)))) => {
-                self.update_status = update::UpdateStatus::Current;
-                self.update_rx = None;
-            }
-            Some(Ok(update::UpdateEvent::Checked(Err(_)))) | Some(Err(())) => {
-                let message = if matches!(self.update_status, update::UpdateStatus::Downloading(_))
-                {
-                    "Update download failed"
-                } else {
-                    "Could not check for updates"
-                };
-                self.update_status = update::UpdateStatus::Failed {
-                    message: message.into(),
-                };
-                self.update_rx = None;
-            }
-            Some(Ok(update::UpdateEvent::Downloaded { info, result })) => {
-                self.update_rx = None;
-                match result {
-                    Ok(installer) => match update::launch_updater(&info, &installer) {
-                        Ok(()) => {
-                            self.stop_host();
-                            self.stop_all_watches();
-                            cx.quit();
-                        }
-                        Err(_) => {
-                            self.update_status = update::UpdateStatus::Failed {
-                                message: "Could not start the updater".into(),
-                            };
-                        }
-                    },
-                    Err(_) => {
-                        self.update_status = update::UpdateStatus::Failed {
-                            message: "Update download failed".into(),
-                        };
-                    }
+        if let Some((info, installer)) = self.updates.poll_event() {
+            match update::launch_updater(&info, &installer) {
+                Ok(()) => {
+                    self.stop_host();
+                    self.stop_all_watches();
+                    cx.quit();
                 }
+                Err(_) => self.updates.updater_launch_failed(),
             }
-            None => {}
         }
-
-        if update::enabled()
-            && self.update_rx.is_none()
-            && Instant::now() >= self.next_update_check
-            && matches!(
-                self.update_status,
-                update::UpdateStatus::Current
-                    | update::UpdateStatus::Available(_)
-                    | update::UpdateStatus::Failed { .. }
-            )
-        {
-            self.update_status = update::UpdateStatus::Checking;
-            self.update_rx = update::start_check();
-            self.next_update_check = Instant::now() + Duration::from_secs(6 * 60 * 60);
-        }
-    }
-
-    fn request_update(&mut self) {
-        match &self.update_status {
-            update::UpdateStatus::Available(info) => {
-                let info = info.clone();
-                self.update_rx = Some(update::start_download(info.clone()));
-                self.update_status = update::UpdateStatus::Downloading(info);
-            }
-            update::UpdateStatus::Failed { .. } => {
-                self.update_status = update::UpdateStatus::Checking;
-                self.update_rx = update::start_check();
-            }
-            _ => {}
-        }
+        self.updates.schedule_periodic(Instant::now());
     }
 
     fn quality(&self) -> Quality {
@@ -905,7 +824,7 @@ impl Render for Orange {
         // The picker needs room for a two-column grid; every other screen is a
         // narrow column. Resizing on transition keeps both comfortable rather
         // than compromising on one size for all of them.
-        let update_visible = self.update_status.is_visible();
+        let update_visible = self.updates.status().is_visible();
         let mut wanted = match self.screen {
             Screen::PickWindow => size(px(576.0), px(660.0)),
             Screen::Streaming => size(px(480.0), px(640.0)),
@@ -993,11 +912,11 @@ impl Render for Orange {
 
 impl Orange {
     fn render_update_banner(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if !self.update_status.is_visible() {
+        if !self.updates.status().is_visible() {
             return None;
         }
-        let action = self.update_status.action_label();
-        let (heading, detail, action) = match &self.update_status {
+        let action = self.updates.status().action_label();
+        let (heading, detail, action) = match self.updates.status() {
             update::UpdateStatus::Available(info) => (
                 format!("UPDATE {} AVAILABLE", info.version),
                 if info.notes.is_empty() {
@@ -1015,7 +934,7 @@ impl Orange {
             update::UpdateStatus::Failed { message, .. } => (
                 "UPDATE PAUSED".to_string(),
                 message.clone(),
-                self.update_status.action_label(),
+                self.updates.status().action_label(),
             ),
             _ => return None,
         };
@@ -1043,7 +962,7 @@ impl Orange {
                 )
                 .children(action.map(|text| {
                     update_action("apply-update", text).on_click(cx.listener(|this, _, _, cx| {
-                        this.request_update();
+                        this.updates.request_update();
                         cx.notify();
                     }))
                 }))

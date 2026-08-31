@@ -12,7 +12,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BETA_MANIFEST_URL: &str =
     "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-beta.json";
@@ -20,6 +20,7 @@ const BETA_ASSET_HOST: &str = "orangealpha0d8d5893e69a3.blob.core.windows.net";
 const MAX_INSTALLER_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdateInfo {
@@ -61,6 +62,117 @@ impl UpdateStatus {
             Self::Available(_) => Some("Update now"),
             Self::Failed { .. } => Some("Check again"),
             Self::Disabled | Self::Checking | Self::Current | Self::Downloading(_) => None,
+        }
+    }
+}
+
+pub(crate) struct UpdateController {
+    status: UpdateStatus,
+    receiver: Option<Receiver<UpdateEvent>>,
+    next_update_check: Instant,
+}
+
+impl UpdateController {
+    pub(crate) fn new() -> Self {
+        let receiver = start_check();
+        let status = if receiver.is_some() {
+            UpdateStatus::Checking
+        } else {
+            UpdateStatus::Disabled
+        };
+        Self {
+            status,
+            receiver,
+            next_update_check: Instant::now() + UPDATE_CHECK_INTERVAL,
+        }
+    }
+
+    pub(crate) fn status(&self) -> &UpdateStatus {
+        &self.status
+    }
+
+    pub(crate) fn poll_event(&mut self) -> Option<(UpdateInfo, PathBuf)> {
+        let event = self
+            .receiver
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(event) => Some(Ok(event)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+        match event {
+            Some(Ok(UpdateEvent::Checked(Ok(Some(info))))) => {
+                self.status = UpdateStatus::Available(info);
+                self.receiver = None;
+            }
+            Some(Ok(UpdateEvent::Checked(Ok(None)))) => {
+                self.status = UpdateStatus::Current;
+                self.receiver = None;
+            }
+            Some(Ok(UpdateEvent::Checked(Err(_)))) | Some(Err(())) => {
+                let message = if matches!(self.status, UpdateStatus::Downloading(_)) {
+                    "Update download failed"
+                } else {
+                    "Could not check for updates"
+                };
+                self.status = UpdateStatus::Failed {
+                    message: message.into(),
+                };
+                self.receiver = None;
+            }
+            Some(Ok(UpdateEvent::Downloaded { info, result })) => {
+                self.receiver = None;
+                match result {
+                    Ok(installer) => return Some((info, installer)),
+                    Err(_) => {
+                        self.status = UpdateStatus::Failed {
+                            message: "Update download failed".into(),
+                        };
+                    }
+                }
+            }
+            None => {}
+        }
+        None
+    }
+
+    pub(crate) fn updater_launch_failed(&mut self) {
+        self.status = UpdateStatus::Failed {
+            message: "Could not start the updater".into(),
+        };
+    }
+
+    pub(crate) fn schedule_periodic(&mut self, now: Instant) {
+        self.schedule_periodic_enabled(now, enabled());
+    }
+
+    fn schedule_periodic_enabled(&mut self, now: Instant, updates_enabled: bool) {
+        if updates_enabled
+            && self.receiver.is_none()
+            && now >= self.next_update_check
+            && matches!(
+                self.status,
+                UpdateStatus::Current | UpdateStatus::Available(_) | UpdateStatus::Failed { .. }
+            )
+        {
+            self.status = UpdateStatus::Checking;
+            self.receiver = start_check();
+            self.next_update_check = now + UPDATE_CHECK_INTERVAL;
+        }
+    }
+
+    pub(crate) fn request_update(&mut self) {
+        match &self.status {
+            UpdateStatus::Available(info) => {
+                let info = info.clone();
+                self.receiver = Some(start_download(info.clone()));
+                self.status = UpdateStatus::Downloading(info);
+            }
+            UpdateStatus::Failed { .. } => {
+                self.status = UpdateStatus::Checking;
+                self.receiver = start_check();
+            }
+            _ => {}
         }
     }
 }
@@ -369,6 +481,257 @@ pub(crate) fn launch_updater(info: &UpdateInfo, installer: &Path) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    const SIX_HOURS: Duration = Duration::from_secs(6 * 60 * 60);
+
+    fn update_info(version: &str) -> UpdateInfo {
+        UpdateInfo {
+            version: Version::parse(version).unwrap(),
+            build: "1".repeat(40),
+            installer_url: Url::parse(&format!(
+                "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-{version}.exe"
+            ))
+            .unwrap(),
+            sha256: "A".repeat(64),
+            notes: "Faster joining".into(),
+        }
+    }
+
+    fn controller_with_receiver(
+        status: UpdateStatus,
+        receiver: Receiver<UpdateEvent>,
+        next_update_check: Instant,
+    ) -> UpdateController {
+        UpdateController {
+            status,
+            receiver: Some(receiver),
+            next_update_check,
+        }
+    }
+
+    fn controller_with_event(status: UpdateStatus, event: UpdateEvent) -> UpdateController {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(event).unwrap();
+        controller_with_receiver(status, receiver, Instant::now() + SIX_HOURS)
+    }
+
+    #[test]
+    fn controller_checked_events_become_available_current_or_failed() {
+        let available = update_info("9.0.0");
+        let mut controller = controller_with_event(
+            UpdateStatus::Checking,
+            UpdateEvent::Checked(Ok(Some(available.clone()))),
+        );
+        assert!(controller.poll_event().is_none());
+        assert!(matches!(
+            controller.status(),
+            UpdateStatus::Available(info) if info == &available
+        ));
+
+        let mut controller =
+            controller_with_event(UpdateStatus::Checking, UpdateEvent::Checked(Ok(None)));
+        assert!(controller.poll_event().is_none());
+        assert!(matches!(controller.status(), UpdateStatus::Current));
+
+        let mut controller = controller_with_event(
+            UpdateStatus::Checking,
+            UpdateEvent::Checked(Err("offline".into())),
+        );
+        assert!(controller.poll_event().is_none());
+        assert!(matches!(
+            controller.status(),
+            UpdateStatus::Failed { message } if message == "Could not check for updates"
+        ));
+    }
+
+    #[test]
+    fn controller_processes_at_most_one_event_per_tick() {
+        let first = update_info("9.0.0");
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(UpdateEvent::Checked(Ok(Some(first.clone()))))
+            .unwrap();
+        sender.send(UpdateEvent::Checked(Ok(None))).unwrap();
+        let mut controller =
+            controller_with_receiver(UpdateStatus::Checking, receiver, Instant::now() + SIX_HOURS);
+
+        assert!(controller.poll_event().is_none());
+        assert!(controller.poll_event().is_none());
+        assert!(matches!(
+            controller.status(),
+            UpdateStatus::Available(info) if info == &first
+        ));
+    }
+
+    #[test]
+    fn controller_disconnection_message_depends_on_active_worker() {
+        let (_, check_receiver) = mpsc::channel::<UpdateEvent>();
+        let mut check = controller_with_receiver(
+            UpdateStatus::Checking,
+            check_receiver,
+            Instant::now() + SIX_HOURS,
+        );
+        check.poll_event();
+        assert!(matches!(
+            check.status(),
+            UpdateStatus::Failed { message } if message == "Could not check for updates"
+        ));
+
+        let (_, download_receiver) = mpsc::channel::<UpdateEvent>();
+        let mut download = controller_with_receiver(
+            UpdateStatus::Downloading(update_info("9.0.0")),
+            download_receiver,
+            Instant::now() + SIX_HOURS,
+        );
+        download.poll_event();
+        assert!(matches!(
+            download.status(),
+            UpdateStatus::Failed { message } if message == "Update download failed"
+        ));
+    }
+
+    #[test]
+    fn controller_exposes_downloaded_installer_and_handles_download_error() {
+        let info = update_info("9.0.0");
+        let installer = PathBuf::from(r"C:\cached\orange-setup-9.0.0.exe");
+        let mut success = controller_with_event(
+            UpdateStatus::Downloading(info.clone()),
+            UpdateEvent::Downloaded {
+                info: info.clone(),
+                result: Ok(installer.clone()),
+            },
+        );
+        assert_eq!(success.poll_event(), Some((info, installer)));
+
+        let mut failed = controller_with_event(
+            UpdateStatus::Downloading(update_info("9.0.1")),
+            UpdateEvent::Downloaded {
+                info: update_info("9.0.1"),
+                result: Err("offline".into()),
+            },
+        );
+        assert!(failed.poll_event().is_none());
+        assert!(matches!(
+            failed.status(),
+            UpdateStatus::Failed { message } if message == "Update download failed"
+        ));
+    }
+
+    #[test]
+    fn controller_requests_available_failed_and_ignores_other_statuses() {
+        let version = format!("9999.0.0-controller-test.{}", std::process::id());
+        let mut info = update_info(&version);
+        let directory = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("orange")
+            .join("updates");
+        std::fs::create_dir_all(&directory).unwrap();
+        let installer = directory.join(format!("orange-setup-{version}.exe"));
+        std::fs::write(&installer, b"cached controller test installer").unwrap();
+        info.sha256 = sha256_file(&installer).unwrap();
+        let mut available = UpdateController {
+            status: UpdateStatus::Available(info.clone()),
+            receiver: None,
+            next_update_check: Instant::now() + SIX_HOURS,
+        };
+
+        available.request_update();
+        assert!(matches!(
+            available.status(),
+            UpdateStatus::Downloading(requested) if requested == &info
+        ));
+        let started = Instant::now();
+        while available.poll_event().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::yield_now();
+        }
+        std::fs::remove_file(installer).unwrap();
+
+        let mut failed = UpdateController {
+            status: UpdateStatus::Failed {
+                message: "offline".into(),
+            },
+            receiver: None,
+            next_update_check: Instant::now() + SIX_HOURS,
+        };
+        failed.request_update();
+        assert!(matches!(failed.status(), UpdateStatus::Checking));
+
+        let mut current = UpdateController {
+            status: UpdateStatus::Current,
+            receiver: None,
+            next_update_check: Instant::now() + SIX_HOURS,
+        };
+        current.request_update();
+        assert!(matches!(current.status(), UpdateStatus::Current));
+    }
+
+    #[test]
+    fn controller_periodic_check_requires_eligible_idle_due_state() {
+        let now = Instant::now();
+        let mut early = UpdateController {
+            status: UpdateStatus::Current,
+            receiver: None,
+            next_update_check: now + Duration::from_secs(1),
+        };
+        early.schedule_periodic_enabled(now, true);
+        assert!(matches!(early.status(), UpdateStatus::Current));
+        assert_eq!(early.next_update_check, now + Duration::from_secs(1));
+
+        let mut due = UpdateController {
+            status: UpdateStatus::Failed {
+                message: "offline".into(),
+            },
+            receiver: None,
+            next_update_check: now,
+        };
+        due.schedule_periodic_enabled(now, true);
+        assert!(matches!(due.status(), UpdateStatus::Checking));
+        assert_eq!(due.next_update_check, now + SIX_HOURS);
+
+        let mut disabled = UpdateController {
+            status: UpdateStatus::Available(update_info("9.0.0")),
+            receiver: None,
+            next_update_check: now,
+        };
+        disabled.schedule_periodic_enabled(now, false);
+        assert!(matches!(disabled.status(), UpdateStatus::Available(_)));
+        assert_eq!(disabled.next_update_check, now);
+
+        let (_, busy_receiver) = mpsc::channel();
+        let mut busy = controller_with_receiver(UpdateStatus::Current, busy_receiver, now);
+        busy.schedule_periodic_enabled(now, true);
+        assert!(matches!(busy.status(), UpdateStatus::Current));
+        assert_eq!(busy.next_update_check, now);
+
+        let mut downloading = UpdateController {
+            status: UpdateStatus::Downloading(update_info("9.0.0")),
+            receiver: None,
+            next_update_check: now,
+        };
+        downloading.schedule_periodic_enabled(now, true);
+        assert!(matches!(downloading.status(), UpdateStatus::Downloading(_)));
+        assert_eq!(downloading.next_update_check, now);
+    }
+
+    #[test]
+    fn controller_launch_failure_is_available_to_periodic_scheduling() {
+        let now = Instant::now();
+        let mut controller = UpdateController {
+            status: UpdateStatus::Downloading(update_info("9.0.0")),
+            receiver: None,
+            next_update_check: now,
+        };
+
+        controller.updater_launch_failed();
+        assert!(matches!(
+            controller.status(),
+            UpdateStatus::Failed { message } if message == "Could not start the updater"
+        ));
+        controller.schedule_periodic_enabled(now, true);
+        assert!(matches!(controller.status(), UpdateStatus::Checking));
+        assert_eq!(controller.next_update_check, now + SIX_HOURS);
+    }
 
     fn manifest(version: &str, hash: &str, url: &str) -> String {
         format!(
