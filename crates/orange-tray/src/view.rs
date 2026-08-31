@@ -1,5 +1,8 @@
 use super::{tray, update, Orange, Screen};
-use crate::{supervisor::QUALITIES, ui::*};
+use crate::{
+    supervisor::{WindowTarget, QUALITIES},
+    ui::*,
+};
 use gpui::{
     div, prelude::*, px, rgb, size, Animation, AnimationExt, Context, FontWeight, Pixels,
     SharedString, Size, Window,
@@ -522,148 +525,9 @@ impl Orange {
                     })
                     .children(
                         self.windows
-                            .iter()
-                            .cloned()
-                            .map(|target| {
-                                let is_screen = target.hwnd == 0;
-                                let title = if target.title.is_empty() {
-                                    target.app_name()
-                                } else {
-                                    target.title.clone()
-                                };
-                                let meta = if is_screen {
-                                    "Full display · includes all system audio".to_string()
-                                } else {
-                                    format!(
-                                        "{} · {}×{}",
-                                        target.app_name(),
-                                        target.width,
-                                        target.height
-                                    )
-                                };
-                                let thumb = self.thumbnails.get(&target.hwnd).cloned();
-                                let hwnd = target.hwnd;
-                                let group = SharedString::from(format!("card-{hwnd}"));
-
-                                div()
-                                    .id(SharedString::from(format!("w{hwnd}")))
-                                    .group(group.clone())
-                                    .relative()
-                                    .flex()
-                                    .flex_col()
-                                    .flex_shrink_0()
-                                    .w(px(252.0))
-                                    .h(px(PICKER_CARD_HEIGHT))
-                                    .rounded_md()
-                                    .overflow_hidden()
-                                    .bg(rgb(SURFACE))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE)))
-                                    .active(|s| s.bg(rgb(BG)).border_color(rgb(ORANGE_DIM)))
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .top_0()
-                                            .left_0()
-                                            .w_full()
-                                            .h(px(2.0))
-                                            .bg(rgb(ORANGE))
-                                            .opacity(0.0)
-                                            .group_hover(group.clone(), |s| s.opacity(1.0)),
-                                    )
-                                    .child(
-                                        // 16:9 preview. flex_shrink_0 is
-                                        // load-bearing: as a flex item this
-                                        // would otherwise be compressed to
-                                        // nothing inside a scrolling parent.
-                                        div()
-                                            .flex_shrink_0()
-                                            .h(px(PICKER_PREVIEW_HEIGHT))
-                                            .w_full()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .bg(rgb(0x08070a))
-                                            .overflow_hidden()
-                                            .child(match (thumb, capturing) {
-                                                (Some(image), _) => gpui::img(image)
-                                                    .h(px(PICKER_PREVIEW_HEIGHT))
-                                                    .with_animation(
-                                                        SharedString::from(format!("fade{hwnd}")),
-                                                        Animation::new(Duration::from_millis(260)),
-                                                        |el, delta| el.opacity(delta),
-                                                    )
-                                                    .into_any_element(),
-                                                (None, true) => label("capturing…", FAINT)
-                                                    .text_xs()
-                                                    .into_any_element(),
-                                                (None, false) => label(
-                                                    "preview unavailable · click to share",
-                                                    FAINT,
-                                                )
-                                                .text_xs()
-                                                .into_any_element(),
-                                            }),
-                                    )
-                                    .child(
-                                        // Fixed height keeps the grid even; a
-                                        // two-line title would make rows ragged.
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .justify_center()
-                                            .gap_0p5()
-                                            .flex_shrink_0()
-                                            .h(px(PICKER_DETAILS_HEIGHT))
-                                            .px_3()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .w_full()
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .text_xs()
-                                                    .text_color(rgb(TEXT))
-                                                    .group_hover(group.clone(), |s| {
-                                                        s.text_color(rgb(ORANGE))
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .child(title),
-                                                    )
-                                                    .child(
-                                                        micro("→", ORANGE)
-                                                            .opacity(0.0)
-                                                            .group_hover(group.clone(), |s| {
-                                                                s.opacity(1.0)
-                                                            }),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w_full()
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .text_xs()
-                                                    .text_color(rgb(FAINT))
-                                                    .child(meta),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.start_stream(target.clone());
-                                        cx.notify();
-                                    }))
-                            })
+                            .clone()
+                            .into_iter()
+                            .map(|target| self.window_card(target, capturing, cx))
                             .collect::<Vec<_>>(),
                     ),
             )
@@ -738,6 +602,142 @@ impl Orange {
                         })),
                     ),
             )
+    }
+
+    /// One card in the picker grid.
+    ///
+    /// Split out of render_pick so the grid and the card can be changed
+    /// independently. The card is the part that gets iterated on.
+    fn window_card(
+        &self,
+        target: WindowTarget,
+        capturing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_screen = target.hwnd == 0;
+        let title = if target.title.is_empty() {
+            target.app_name()
+        } else {
+            target.title.clone()
+        };
+        let meta = if is_screen {
+            "Full display · includes all system audio".to_string()
+        } else {
+            format!("{} · {}×{}", target.app_name(), target.width, target.height)
+        };
+        let thumb = self.thumbnails.get(&target.hwnd).cloned();
+        let hwnd = target.hwnd;
+        let group = SharedString::from(format!("card-{hwnd}"));
+
+        div()
+            .id(SharedString::from(format!("w{hwnd}")))
+            .group(group.clone())
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(252.0))
+            .h(px(PICKER_CARD_HEIGHT))
+            .rounded_md()
+            .overflow_hidden()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE)))
+            .active(|s| s.bg(rgb(BG)).border_color(rgb(ORANGE_DIM)))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(2.0))
+                    .bg(rgb(ORANGE))
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |s| s.opacity(1.0)),
+            )
+            .child(
+                // 16:9 preview. flex_shrink_0 is
+                // load-bearing: as a flex item this
+                // would otherwise be compressed to
+                // nothing inside a scrolling parent.
+                div()
+                    .flex_shrink_0()
+                    .h(px(PICKER_PREVIEW_HEIGHT))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x08070a))
+                    .overflow_hidden()
+                    .child(match (thumb, capturing) {
+                        (Some(image), _) => gpui::img(image)
+                            .h(px(PICKER_PREVIEW_HEIGHT))
+                            .with_animation(
+                                SharedString::from(format!("fade{hwnd}")),
+                                Animation::new(Duration::from_millis(260)),
+                                |el, delta| el.opacity(delta),
+                            )
+                            .into_any_element(),
+                        (None, true) => label("capturing…", FAINT).text_xs().into_any_element(),
+                        (None, false) => label("preview unavailable · click to share", FAINT)
+                            .text_xs()
+                            .into_any_element(),
+                    }),
+            )
+            .child(
+                // Fixed height keeps the grid even; a
+                // two-line title would make rows ragged.
+                div()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap_0p5()
+                    .flex_shrink_0()
+                    .h(px(PICKER_DETAILS_HEIGHT))
+                    .px_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(rgb(TEXT))
+                            .group_hover(group.clone(), |s| s.text_color(rgb(ORANGE)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(title),
+                            )
+                            .child(
+                                micro("→", ORANGE)
+                                    .opacity(0.0)
+                                    .group_hover(group.clone(), |s| s.opacity(1.0)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(rgb(FAINT))
+                            .child(meta),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.start_stream(target.clone());
+                cx.notify();
+            }))
     }
 
     fn render_streaming(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
