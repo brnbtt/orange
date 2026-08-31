@@ -173,6 +173,10 @@ impl Tx {
         }
         result
     }
+
+    fn try_send_to_host(&self, message: Message) -> Result<(), mpsc::error::TrySendError<Message>> {
+        self.messages.try_send(message)
+    }
 }
 
 #[derive(Default)]
@@ -181,12 +185,6 @@ pub struct Room {
     host_name: Option<String>,
     diagnostic_session: String,
     viewers: HashMap<String, Tx>,
-}
-
-impl Room {
-    fn can_accept_viewer(&self) -> bool {
-        self.host.is_some() && self.viewers.len() < ROOM_VIEWER_CAPACITY
-    }
 }
 
 pub type Rooms = Arc<Mutex<HashMap<String, Room>>>;
@@ -300,15 +298,31 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                         bail!("peer attempted to change signalling role");
                     }
                     let code = code.trim().to_ascii_uppercase();
-                    let peer = generate_peer_id();
                     let mut rooms = rooms.lock().await;
                     match rooms.get_mut(&code) {
-                        Some(room) if room.can_accept_viewer() => {
+                        Some(room)
+                            if room.host.is_some() && room.viewers.len() < ROOM_VIEWER_CAPACITY =>
+                        {
+                            let peer = loop {
+                                let peer = generate_peer_id();
+                                if !room.viewers.contains_key(&peer) {
+                                    break peer;
+                                }
+                            };
                             room.viewers.insert(peer.clone(), tx.clone());
                             let host_name = room.host_name.clone();
                             let diagnostic_session = room.diagnostic_session.clone();
                             joined = Some((code.clone(), Role::Viewer(peer.clone())));
 
+                            if let Some(host) = &room.host {
+                                host.try_send_to_host(Message::Text(
+                                    Signal::ViewerJoined {
+                                        peer,
+                                        name: identity.as_ref().map(|i| i.name.clone()),
+                                    }
+                                    .to_json(),
+                                ))?;
+                            }
                             let _ = tx.try_send(Message::Text(
                                 Signal::StreamInfo {
                                     host_name,
@@ -316,15 +330,6 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                                 }
                                 .to_json(),
                             ));
-                            if let Some(host) = &room.host {
-                                let _ = host.try_send(Message::Text(
-                                    Signal::ViewerJoined {
-                                        peer,
-                                        name: identity.as_ref().map(|i| i.name.clone()),
-                                    }
-                                    .to_json(),
-                                ));
-                            }
                         }
                         Some(room) if room.host.is_some() => {
                             tx.try_send(Message::Text(
@@ -363,8 +368,9 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
                         }
                         Role::Viewer(peer) => {
                             if let Some(host) = &room.host {
-                                let _ =
-                                    host.try_send(Message::Text(other.with_peer(peer).to_json()));
+                                host.try_send_to_host(Message::Text(
+                                    other.with_peer(peer).to_json(),
+                                ))?;
                             }
                         }
                     }
@@ -395,7 +401,8 @@ pub async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Auth) -> R
             if let Some(room) = rooms.get_mut(&code) {
                 room.viewers.remove(&peer);
                 if let Some(host) = &room.host {
-                    let _ = host.try_send(Message::Text(Signal::ViewerLeft { peer }.to_json()));
+                    let _ =
+                        host.try_send_to_host(Message::Text(Signal::ViewerLeft { peer }.to_json()));
                 }
             }
         }
@@ -559,28 +566,34 @@ mod tests {
     }
 
     #[test]
-    fn room_accepts_fewer_than_16_viewers_only_while_hosted() {
+    fn host_forwarding_queue_errors_do_not_disconnect_host() {
         let (messages, _rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-        let (disconnect, _disconnect_rx) = tokio::sync::watch::channel(false);
+        for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+            messages.try_send(Message::Text("signal".into())).unwrap();
+        }
+        let (disconnect, disconnect_rx) = tokio::sync::watch::channel(false);
         let tx = Tx {
             messages,
             disconnect,
         };
-        let mut room = Room {
-            host: Some(tx.clone()),
-            ..Room::default()
+        assert!(matches!(
+            tx.try_send_to_host(Message::Text("overflow".into())),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert!(!*disconnect_rx.borrow());
+
+        let (messages, rx) = mpsc::channel(1);
+        drop(rx);
+        let (disconnect, disconnect_rx) = tokio::sync::watch::channel(false);
+        let tx = Tx {
+            messages,
+            disconnect,
         };
-
-        for peer in 0..15 {
-            room.viewers.insert(peer.to_string(), tx.clone());
-        }
-        assert!(room.can_accept_viewer());
-        room.viewers.insert("last".into(), tx);
-        assert!(!room.can_accept_viewer());
-
-        room.host = None;
-        room.viewers.clear();
-        assert!(!room.can_accept_viewer());
+        assert!(matches!(
+            tx.try_send_to_host(Message::Text("closed".into())),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(!*disconnect_rx.borrow());
     }
 
     #[tokio::test]
@@ -643,15 +656,198 @@ mod tests {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> Signal {
-        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
-            .await
-            .expect("timed out waiting for relay")
-            .expect("relay closed unexpectedly")
-            .expect("websocket read failed");
-        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
-            panic!("expected text signal");
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("timed out waiting for relay")
+                .expect("relay closed unexpectedly")
+                .expect("websocket read failed");
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                return serde_json::from_str(&text).expect("relay sent malformed signal");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn viewer_rate_limit_counts_only_text_and_cleans_up_its_role() {
+        let rooms = Rooms::default();
+        let app = server::router(server::AppState {
+            rooms: rooms.clone(),
+            auth: auth::Auth::new(None),
+            diagnostics: server::DiagnosticsStorage::Disabled,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+
+        let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Host.to_json(),
+        ))
+        .await
+        .unwrap();
+        let Signal::Hosting { code, .. } = receive_signal(&mut host).await else {
+            panic!("host did not receive a room code");
         };
-        serde_json::from_str(&text).expect("relay sent malformed signal")
+
+        let (mut viewer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                Signal::Join { code: code.clone() }.to_json(),
+            ))
+            .await
+            .unwrap();
+        let _ = receive_signal(&mut viewer).await;
+        let Signal::ViewerJoined { peer, .. } = receive_signal(&mut host).await else {
+            panic!("host did not receive viewer join");
+        };
+
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
+            .await
+            .unwrap();
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Binary(vec![0]))
+            .await
+            .unwrap();
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text("{".into()))
+            .await
+            .unwrap();
+        let Signal::Error { message } = receive_signal(&mut viewer).await else {
+            panic!("malformed text did not return an error");
+        };
+        assert!(message.starts_with("bad message:"));
+
+        let invalid_auth = Signal::Authenticate {
+            session: "invalid".into(),
+        }
+        .to_json();
+        for _ in 0..254 {
+            viewer
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    invalid_auth.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text(invalid_auth))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match viewer.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                    | Some(Err(_))
+                    | None => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("rate-limited viewer stayed connected");
+
+        let Signal::ViewerLeft { peer: departed } = receive_signal(&mut host).await else {
+            panic!("host did not receive rate-limited viewer departure");
+        };
+        assert_eq!(departed, peer);
+        let rooms = rooms.lock().await;
+        assert_eq!(rooms.len(), 1);
+        assert!(rooms.get(&code).unwrap().viewers.is_empty());
+
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn viewer_can_retry_after_a_full_room_on_the_same_socket() {
+        let rooms = Rooms::default();
+        let (full_host_messages, _full_host_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let (full_host_disconnect, _full_host_disconnect_rx) = tokio::sync::watch::channel(false);
+        let full_host = Tx {
+            messages: full_host_messages,
+            disconnect: full_host_disconnect,
+        };
+        let (open_host_messages, _open_host_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let (open_host_disconnect, _open_host_disconnect_rx) = tokio::sync::watch::channel(false);
+        let open_host = Tx {
+            messages: open_host_messages,
+            disconnect: open_host_disconnect,
+        };
+        let (dummy_viewer_messages, _dummy_viewer_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let (dummy_viewer_disconnect, _dummy_viewer_disconnect_rx) =
+            tokio::sync::watch::channel(false);
+        let dummy_viewer = Tx {
+            messages: dummy_viewer_messages,
+            disconnect: dummy_viewer_disconnect,
+        };
+        rooms.lock().await.extend([
+            (
+                "FULL".into(),
+                Room {
+                    host: Some(full_host),
+                    diagnostic_session: "full-session".into(),
+                    viewers: (0..16)
+                        .map(|peer| (peer.to_string(), dummy_viewer.clone()))
+                        .collect(),
+                    ..Room::default()
+                },
+            ),
+            (
+                "OPEN".into(),
+                Room {
+                    host: Some(open_host),
+                    diagnostic_session: "open-session".into(),
+                    ..Room::default()
+                },
+            ),
+        ]);
+        let app = server::router(server::AppState {
+            rooms: rooms.clone(),
+            auth: auth::Auth::new(None),
+            diagnostics: server::DiagnosticsStorage::Disabled,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/ws");
+        let (mut viewer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                Signal::Join {
+                    code: "FULL".into(),
+                }
+                .to_json(),
+            ))
+            .await
+            .unwrap();
+        let Signal::Error { message } = receive_signal(&mut viewer).await else {
+            panic!("full room did not return an error");
+        };
+        assert_eq!(message, "stream is full");
+
+        viewer
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                Signal::Join {
+                    code: "OPEN".into(),
+                }
+                .to_json(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            receive_signal(&mut viewer).await,
+            Signal::StreamInfo { .. }
+        ));
+
+        let rooms = rooms.lock().await;
+        assert_eq!(rooms.get("FULL").unwrap().viewers.len(), 16);
+        assert_eq!(rooms.get("OPEN").unwrap().viewers.len(), 1);
+
+        relay.abort();
     }
 
     #[tokio::test]
