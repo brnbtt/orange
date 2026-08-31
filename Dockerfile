@@ -1,13 +1,13 @@
 # Build only the relay. The `orange` crate needs GStreamer and never runs in a
 # container, so `-p orange-relay` keeps this image small and dependency-free.
 
-FROM rust:1-slim-bookworm AS build
+FROM rust:1.98-slim-bookworm AS build
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p orange-relay
+RUN cargo build --locked --release -p orange-relay
 
 FROM debian:bookworm-slim
 # WebSockets over TLS terminate at the platform ingress, but outbound checks

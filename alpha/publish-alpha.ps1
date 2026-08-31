@@ -42,7 +42,7 @@ function Test-AlphaPublishManifest {
     . $launcher
     $json = $Manifest | ConvertTo-Json -Depth 8
     $validated = ConvertTo-AlphaManifest -Json $json
-    if ($validated.asset_url -cnotmatch "^https://[a-z0-9]{3,24}\.blob\.core\.windows\.net/releases/orange-alpha-[0-9a-f]{7}\.zip$") {
+    if ($validated.asset_url -cnotmatch "^https://[a-z0-9]{3,24}\.blob\.core\.windows\.net/releases/orange-alpha-[0-9a-f]{40}\.zip$") {
         throw "Invalid published asset URL"
     }
     return $validated
@@ -96,6 +96,98 @@ function Test-NativeCommandSucceeds {
     }
 }
 
+function Get-OptionalNativeJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $Command @Arguments 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return ($output | Out-String | ConvertFrom-Json)
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Ensure-GitHubAlphaArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$Archive,
+        [Parameter(Mandatory = $true)][string]$AssetName
+    )
+
+    $release = Get-OptionalNativeJson -Command "gh" -Arguments @(
+        "release", "view", $script:ReleaseTag, "--repo", $script:Repository, "--json", "assets"
+    )
+    if ($null -eq $release) { throw "Could not inspect the GitHub alpha release" }
+    $remote = @($release.assets | Where-Object { $_.name -ceq $AssetName })
+    if ($remote.Count -eq 0) {
+        Invoke-CheckedCommand -Command "gh" -Arguments @(
+            "release", "upload", $script:ReleaseTag, $Archive, "--repo", $script:Repository
+        )
+    } elseif ($remote.Count -ne 1 -or [int64]$remote[0].size -ne (Get-Item -LiteralPath $Archive).Length) {
+        throw "Existing GitHub alpha archive does not match this immutable build"
+    }
+
+    $check = Join-Path $env:TEMP ("orange-alpha-github-check-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $check | Out-Null
+    try {
+        Invoke-CheckedCommand -Command "gh" -Arguments @(
+            "release", "download", $script:ReleaseTag, "--repo", $script:Repository,
+            "--pattern", $AssetName, "--dir", $check
+        )
+        if ((Get-FileHash -LiteralPath (Join-Path $check $AssetName) -Algorithm SHA256).Hash -cne
+            (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash) {
+            throw "GitHub alpha archive failed remote SHA-256 verification"
+        }
+    } finally {
+        Remove-Item -LiteralPath $check -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Ensure-AzureAlphaArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$Archive,
+        [Parameter(Mandatory = $true)][string]$AssetName,
+        [Parameter(Mandatory = $true)][string]$Build,
+        [Parameter(Mandatory = $true)][string]$Sha256
+    )
+
+    $existing = Get-OptionalNativeJson -Command "az" -Arguments @(
+        "storage", "blob", "show", "--account-name", $AlphaStorageAccount,
+        "--container-name", "releases", "--name", $AssetName,
+        "--auth-mode", "key", "--output", "json", "--only-show-errors"
+    )
+    if ($null -eq $existing) {
+        Invoke-CheckedCommand -Command "az" -Arguments @(
+            "storage", "blob", "upload", "--account-name", $AlphaStorageAccount,
+            "--container-name", "releases", "--file", $Archive, "--name", $AssetName,
+            "--auth-mode", "key", "--overwrite", "false",
+            "--metadata", "sha256=$Sha256", "build=$Build", "--only-show-errors"
+        )
+    } elseif ([int64]$existing.properties.contentLength -ne (Get-Item -LiteralPath $Archive).Length -or
+        $existing.metadata.sha256 -cne $Sha256 -or $existing.metadata.build -cne $Build) {
+        throw "Existing Azure alpha archive does not match this immutable build"
+    }
+
+    $check = Join-Path $env:TEMP ("orange-alpha-azure-check-" + [guid]::NewGuid().ToString("N") + ".zip")
+    try {
+        Invoke-CheckedCommand -Command "az" -Arguments @(
+            "storage", "blob", "download", "--account-name", $AlphaStorageAccount,
+            "--container-name", "releases", "--name", $AssetName, "--file", $check,
+            "--auth-mode", "key", "--overwrite", "true", "--only-show-errors"
+        )
+        if ((Get-FileHash -LiteralPath $check -Algorithm SHA256).Hash -cne $Sha256) {
+            throw "Azure alpha archive failed remote SHA-256 verification"
+        }
+    } finally {
+        Remove-Item -LiteralPath $check -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-AlphaPublish {
     $root = Split-Path $PSScriptRoot -Parent
     Push-Location $root
@@ -146,7 +238,7 @@ archive checksum, records diagnostics, and uploads them after Orange exits.
 This portable build requires the GStreamer MSVC x64 runtime.
 "@ | Set-Content -LiteralPath (Join-Path $stage "README.txt") -Encoding UTF8
 
-        $assetName = "orange-alpha-$short.zip"
+        $assetName = "orange-alpha-$build.zip"
         $archive = Join-Path $output $assetName
         Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
         Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal
@@ -189,12 +281,12 @@ This portable build requires the GStreamer MSVC x64 runtime.
                     "--prerelease", "--latest=false"
                 )
             }
-            Invoke-CheckedCommand -Command "gh" -Arguments @("release", "upload", $script:ReleaseTag, $archive, "--repo", $script:Repository, "--clobber")
+            Ensure-GitHubAlphaArchive -Archive $archive -AssetName $assetName
             Invoke-CheckedCommand -Command "gh" -Arguments @("release", "upload", $script:ReleaseTag, $manifestPath, "--repo", $script:Repository, "--clobber")
             Invoke-CheckedCommand -Command "gh" -Arguments @("release", "upload", $script:ReleaseTag, $launcherArchive, "--repo", $script:Repository, "--clobber")
 
+            Ensure-AzureAlphaArchive -Archive $archive -AssetName $assetName -Build $build -Sha256 $hash
             foreach ($upload in @(
-                @{ Path = $archive; Name = $assetName },
                 @{ Path = $launcherArchive; Name = "orange-alpha-launcher.zip" },
                 @{ Path = $manifestPath; Name = "orange-alpha.json" }
             )) {

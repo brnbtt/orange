@@ -2,6 +2,7 @@
 name = "orange-tray"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Host-side tray UI for orange"
 

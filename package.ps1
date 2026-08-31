@@ -32,25 +32,19 @@ try {
         throw "Another Orange packaging process is already running."
     }
     . .\dev.ps1
+    . .\packaging\windows\package-provenance.ps1
     if (-not $env:GSTREAMER_1_0_ROOT_MSVC_X86_64) {
         throw "The GStreamer development environment is unavailable."
     }
 
+    $BuildId = Assert-PackageProvenance -Root $root -BuildId $BuildId
     if (-not $SkipTests) {
-        cargo test --workspace
+        cargo test --locked --workspace
         if ($LASTEXITCODE -ne 0) {
             throw "Workspace tests failed."
         }
     }
 
-    $headBuild = (git rev-parse HEAD).Trim()
-    if ($BuildId) {
-        if ($BuildId -cnotmatch '^[0-9a-f]{40}$' -or $BuildId -cne $headBuild) {
-            throw "BuildId must match the current committed HEAD."
-        }
-    } else {
-        $BuildId = $headBuild
-    }
     $env:ORANGE_BUILD_ID = $BuildId
     $env:ORANGE_UPDATE_CHANNEL = "beta"
     Remove-Item Env:ORANGE_UPDATE_MANIFEST_URL -ErrorAction SilentlyContinue
@@ -80,6 +74,7 @@ try {
 
     $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
     $version = ($metadata.packages | Where-Object name -eq "orange-tray").version
+    Assert-PackageProvenance -Root $root -BuildId $BuildId | Out-Null
     & $iscc "/DAppVersion=$version" ".\packaging\windows\orange.iss"
     if ($LASTEXITCODE -ne 0) {
         throw "Installer build failed."
