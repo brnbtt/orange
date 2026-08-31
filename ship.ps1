@@ -25,6 +25,11 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Push-Location $root
 try {
+    # Capture before dot-sourcing: publish-beta.ps1's param() block executes in
+    # this scope and would otherwise overwrite $Notes and $Version with its own
+    # defaults.
+    $shipNotes = $Notes
+    $shipVersion = $Version
     . (Join-Path $root "publish-beta.ps1") -LibraryOnly
 
     function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -52,19 +57,19 @@ try {
     }
 
     $current = Get-WorkspaceVersion
-    if (-not $Version) {
+    if (-not $shipVersion) {
         if ($current -cnotmatch '^(?<series>[0-9]+\.[0-9]+\.[0-9]+-beta\.)(?<n>[0-9]+)$') {
             throw "Cannot auto-bump '$current'. Pass an explicit -Version."
         }
-        $Version = "{0}{1}" -f $Matches.series, ([int]$Matches.n + 1)
+        $shipVersion = "{0}{1}" -f $Matches.series, ([int]$Matches.n + 1)
     }
 
     Invoke-Git fetch origin main
     $build = (& git rev-parse HEAD).Trim()
-    Assert-Publishable -Version $Version -Build $build -Notes $Notes
+    Assert-Publishable -Version $shipVersion -Build $build -Notes $shipNotes
 
-    Step "Shipping $current -> $Version"
-    if (-not $PSCmdlet.ShouldProcess("$Version", "bump, commit, push and publish")) {
+    Step "Shipping $current -> $shipVersion"
+    if (-not $PSCmdlet.ShouldProcess("$shipVersion", "bump, commit, push and publish")) {
         return
     }
 
@@ -82,7 +87,7 @@ try {
     Step "Bumping the workspace version"
     $manifestPath = Join-Path $root "Cargo.toml"
     $manifest = Get-Content -LiteralPath $manifestPath -Raw
-    $bumped = $manifest -creplace "(?m)^version = ""$([regex]::Escape($current))""$", "version = ""$Version"""
+    $bumped = $manifest -creplace "(?m)^version = ""$([regex]::Escape($current))""$", "version = ""$shipVersion"""
     if ($bumped -ceq $manifest) { throw "Could not find version = ""$current"" in Cargo.toml" }
     [IO.File]::WriteAllText($manifestPath, $bumped, (New-Object Text.UTF8Encoding($false)))
 
@@ -91,16 +96,16 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Could not update Cargo.lock" }
 
     Invoke-Git add Cargo.toml Cargo.lock
-    Invoke-Git commit -m "Bump version to $Version"
+    Invoke-Git commit -m "Bump version to $shipVersion"
     Step "Pushing to origin/main"
     Invoke-Git push origin main
 
     # --- publish --------------------------------------------------------------
-    & (Join-Path $root "publish-beta.ps1") -Publish -SkipTests -Notes $Notes
+    & (Join-Path $root "publish-beta.ps1") -Publish -SkipTests -Notes $shipNotes
     if ($LASTEXITCODE -ne 0) { throw "Publish failed" }
 
     Write-Host ""
-    Write-Host "Shipped $Version." -ForegroundColor Green
+    Write-Host "Shipped $shipVersion." -ForegroundColor Green
     Write-Host "Clients pick it up at next launch, or within 6 hours if already running." -ForegroundColor DarkGray
 }
 finally { Pop-Location }
