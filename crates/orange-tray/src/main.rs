@@ -20,6 +20,8 @@ use gpui::{
     prelude::*, px, size, App, Application, Bounds, Context, Timer, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
@@ -534,6 +536,19 @@ fn request_avatar(url: Option<String>) -> Option<std::sync::mpsc::Receiver<captu
     Some(rx)
 }
 
+type TrayOwner = Rc<RefCell<Option<tray::Tray>>>;
+
+fn shutdown_owned_tray(owner: &TrayOwner) -> anyhow::Result<()> {
+    let Some(mut tray) = owner.borrow_mut().take() else {
+        return Ok(());
+    };
+    if let Err(error) = tray.shutdown() {
+        owner.borrow_mut().replace(tray);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn main() {
     // Diagnostic: capture every window and report, since a windowsgui binary
     // has no console to print to.
@@ -563,10 +578,23 @@ fn main() {
 
     // Installed before the UI so a failure here is visible as a missing icon
     // rather than a half-started app.
-    let tray = tray::Tray::install().ok();
-    let tray_available = tray.is_some();
+    let tray_owner = Rc::new(RefCell::new(tray::Tray::install().ok()));
+    let tray_available = tray_owner.borrow().is_some();
 
     Application::new().run(move |cx: &mut App| {
+        let quit_owner = Rc::clone(&tray_owner);
+        cx.on_app_quit(move |_| {
+            let quit_owner = Rc::clone(&quit_owner);
+            async move {
+                if let Err(error) = shutdown_owned_tray(&quit_owner) {
+                    eprintln!("[tray] app-quit shutdown failed: {error:#}");
+                }
+            }
+        })
+        // GPUI subscriptions cancel on Drop; detaching retains this observer
+        // until the App emitter itself is dropped.
+        .detach();
+
         let bounds = Bounds::centered(None, size(px(400.0), px(540.0)), cx);
         let window = cx
             .open_window(
@@ -604,14 +632,16 @@ fn main() {
 
         // The tray runs its own Win32 message loop on another thread, so its
         // events arrive over a channel and are drained on a timer here.
-        if let Some(mut tray) = tray {
+        if tray_available {
+            let event_owner = Rc::clone(&tray_owner);
             cx.spawn(async move |cx| loop {
                 Timer::after(Duration::from_millis(200)).await;
                 loop {
-                    let event = match tray.try_recv() {
-                        Ok(event) => event,
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    let event = match event_owner.borrow().as_ref().map(tray::Tray::try_recv) {
+                        None => return,
+                        Some(Ok(event)) => event,
+                        Some(Err(std::sync::mpsc::TryRecvError::Empty)) => break,
+                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => return,
                     };
                     match event {
                         tray::TrayEvent::Show => {
@@ -627,7 +657,9 @@ fn main() {
                             });
                         }
                         tray::TrayEvent::Quit => {
-                            tray.shutdown();
+                            if let Err(error) = shutdown_owned_tray(&event_owner) {
+                                eprintln!("[tray] tray-quit shutdown failed: {error:#}");
+                            }
                             let _ = cx.update(|cx| cx.quit());
                             return;
                         }

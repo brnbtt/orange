@@ -9,11 +9,13 @@
 //! directly, so the GPUI side stays in charge of its own state.
 
 use anyhow::{Context, Result};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::OnceLock;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
@@ -30,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const WM_TRAY: u32 = WM_APP + 1;
 /// Private message requesting cleanup on the native creator thread.
 const WM_SHUTDOWN: u32 = WM_APP + 2;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 const ID_SHOW: usize = 1;
 const ID_QUIT: usize = 2;
@@ -48,10 +51,35 @@ enum ClassError {
 
 type ClassResult = std::result::Result<(), ClassError>;
 static TRAY_CLASS_RESULT: OnceLock<ClassResult> = OnceLock::new();
+static NEXT_TRAY_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 struct TrayContext {
-    events: Sender<TrayEvent>,
+    events: RefCell<Option<Sender<TrayEvent>>>,
     icon_added: Cell<bool>,
+    cleaned: Cell<bool>,
+    token: usize,
+}
+
+impl TrayContext {
+    fn disconnect_events(&self) {
+        self.events.borrow_mut().take();
+    }
+
+    unsafe fn cleanup(&self, hwnd: HWND) {
+        if self.cleaned.replace(true) {
+            return;
+        }
+        self.disconnect_events();
+        if self.icon_added.replace(false) {
+            let data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                ..Default::default()
+            };
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        }
+    }
 }
 
 struct OwnedIcon(Option<HICON>);
@@ -69,13 +97,19 @@ impl Drop for OwnedIcon {
 struct Ready {
     hwnd: isize,
     thread_id: u32,
+    token: usize,
 }
+
+type WorkerResult = std::result::Result<(), String>;
 
 /// Owns one tray window, its events, and its native message-loop thread.
 pub struct Tray {
     hwnd: isize,
     thread_id: u32,
+    token: usize,
     events: Receiver<TrayEvent>,
+    completion_rx: Receiver<WorkerResult>,
+    completion: Option<WorkerResult>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -88,39 +122,28 @@ impl Tray {
     fn install_inner(add_icon: bool) -> Result<Self> {
         let (event_tx, events) = channel();
         let (ready_tx, ready_rx) = channel::<Result<Ready>>();
-        let worker = std::thread::spawn(move || unsafe {
-            match create(event_tx, add_icon) {
-                Ok((hwnd, owned_icon)) => {
-                    let ready = Ready {
-                        hwnd: hwnd.0 as isize,
-                        thread_id: GetCurrentThreadId(),
-                    };
-                    if ready_tx.send(Ok(ready)).is_err() {
-                        let _ = DestroyWindow(hwnd);
-                        return;
-                    }
-                    run_message_loop(hwnd);
-                    drop(owned_icon);
-                }
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                }
-            }
+        let (completion_tx, completion_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            let result = unsafe { tray_worker(event_tx, ready_tx, add_icon) };
+            let _ = completion_tx.send(result);
         });
 
         match ready_rx.recv() {
             Ok(Ok(ready)) => Ok(Self {
                 hwnd: ready.hwnd,
                 thread_id: ready.thread_id,
+                token: ready.token,
                 events,
+                completion_rx,
+                completion: None,
                 worker: Some(worker),
             }),
             Ok(Err(error)) => {
-                join_setup_worker(worker)?;
+                join_setup_worker(worker, completion_rx)?;
                 Err(error)
             }
             Err(error) => {
-                join_setup_worker(worker)?;
+                join_setup_worker(worker, completion_rx)?;
                 Err(error).context("tray thread died before it was ready")
             }
         }
@@ -132,48 +155,122 @@ impl Tray {
     }
 
     /// Remove the icon and window on their creator thread, then join it.
-    pub fn shutdown(&mut self) {
-        let Some(worker) = self.worker.take() else {
-            return;
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without consuming the worker handle if shutdown does
+    /// not complete before the deadline. A later call may retry.
+    pub fn shutdown(&mut self) -> Result<()> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Ok(());
         };
-        let hwnd = std::mem::take(&mut self.hwnd);
 
         if worker.thread().id() == std::thread::current().id() {
-            // Joining the current thread would deadlock. This is unreachable
-            // through the public API, but keep Drop safe if ownership changes.
-            unsafe {
-                if IsWindow(Some(HWND(hwnd as *mut _))).as_bool() {
-                    let _ = DestroyWindow(HWND(hwnd as *mut _));
-                }
-            }
-            return;
+            anyhow::bail!("cannot join tray worker from itself");
         }
 
-        let posted = worker.is_finished()
-            || unsafe {
-                PostThreadMessageW(self.thread_id, WM_SHUTDOWN, WPARAM(0), LPARAM(0)).is_ok()
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let post_error = if worker.is_finished() {
+            None
+        } else {
+            unsafe {
+                match PostMessageW(
+                    Some(HWND(self.hwnd as *mut _)),
+                    WM_SHUTDOWN,
+                    WPARAM(self.token),
+                    LPARAM(0),
+                ) {
+                    Ok(()) => None,
+                    Err(window_error) => match PostThreadMessageW(
+                        self.thread_id,
+                        WM_SHUTDOWN,
+                        WPARAM(self.token),
+                        LPARAM(0),
+                    ) {
+                        Ok(()) => Some(format!(
+                            "window shutdown post failed ({window_error}); thread fallback posted"
+                        )),
+                        Err(thread_error) => Some(format!(
+                            "window shutdown post failed ({window_error}); thread fallback failed ({thread_error})"
+                        )),
+                    },
+                }
+            }
+        };
+
+        if self.completion.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            self.completion = match self.completion_rx.recv_timeout(remaining) {
+                Ok(result) => Some(result),
+                Err(RecvTimeoutError::Disconnected) => {
+                    Some(Err("tray worker completion channel disconnected".into()))
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    anyhow::bail!(
+                        "tray worker did not complete within {:?}{}",
+                        SHUTDOWN_TIMEOUT,
+                        post_error
+                            .as_deref()
+                            .map(|error| format!("; {error}"))
+                            .unwrap_or_default()
+                    );
+                }
             };
-        if !posted && !worker.is_finished() {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "[tray] failed to wake tray thread for shutdown (HWND {hwnd:#x})"
-            );
-            // Do not risk an unbounded join when Windows refused the wakeup.
-            return;
         }
-        if worker.join().is_err() {
-            let _ = writeln!(std::io::stderr().lock(), "[tray] tray thread panicked");
+
+        while !worker.is_finished() {
+            if Instant::now() >= deadline {
+                anyhow::bail!("tray worker signaled completion but did not finish before deadline");
+            }
+            std::thread::yield_now();
         }
+
+        let worker = self
+            .worker
+            .take()
+            .expect("worker remains present until bounded completion");
+        let join_result = worker.join();
+        let completion = self
+            .completion
+            .take()
+            .expect("completion is recorded before joining");
+        self.hwnd = 0;
+        self.thread_id = 0;
+        self.token = 0;
+
+        join_result.map_err(|_| anyhow::anyhow!("tray worker panicked"))?;
+        completion.map_err(anyhow::Error::msg)
     }
 }
 
 impl Drop for Tray {
     fn drop(&mut self) {
-        self.shutdown();
+        if let Err(error) = self.shutdown() {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[tray] bounded shutdown failed: {error:#}"
+            );
+        }
     }
 }
 
-fn join_setup_worker(worker: JoinHandle<()>) -> Result<()> {
+fn join_setup_worker(worker: JoinHandle<()>, completion_rx: Receiver<WorkerResult>) -> Result<()> {
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    match completion_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+        Ok(result) => result.map_err(anyhow::Error::msg)?,
+        Err(RecvTimeoutError::Disconnected) => {}
+        Err(RecvTimeoutError::Timeout) => {
+            anyhow::bail!("tray setup worker did not complete within {SHUTDOWN_TIMEOUT:?}")
+        }
+    }
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "tray setup worker signaled completion but did not finish before deadline"
+            );
+        }
+        std::thread::yield_now();
+    }
     worker
         .join()
         .map_err(|_| anyhow::anyhow!("tray thread panicked during setup"))
@@ -218,7 +315,55 @@ unsafe fn ensure_tray_class(instance: HINSTANCE) -> Result<()> {
     }
 }
 
-unsafe fn create(events: Sender<TrayEvent>, add_icon: bool) -> Result<(HWND, OwnedIcon)> {
+unsafe fn tray_worker(
+    events: Sender<TrayEvent>,
+    ready_tx: Sender<Result<Ready>>,
+    add_icon: bool,
+) -> WorkerResult {
+    let mut context = Box::new(TrayContext {
+        events: RefCell::new(Some(events)),
+        icon_added: Cell::new(false),
+        cleaned: Cell::new(false),
+        token: 0,
+    });
+    context.token = NEXT_TRAY_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if context.token == 0 {
+        context.token = NEXT_TRAY_TOKEN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let (hwnd, owned_icon) = match create(&context, add_icon) {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return Ok(());
+        }
+    };
+    let ready = Ready {
+        hwnd: hwnd.0 as isize,
+        thread_id: GetCurrentThreadId(),
+        token: context.token,
+    };
+    if ready_tx.send(Ok(ready)).is_ok() {
+        run_message_loop(hwnd, context.token);
+    }
+
+    if IsWindow(Some(hwnd)).as_bool() {
+        let _ = DestroyWindow(hwnd);
+    }
+    if IsWindow(Some(hwnd)).as_bool() {
+        context.disconnect_events();
+        std::mem::forget(owned_icon);
+        Box::leak(context);
+        return Err("tray window remained live after creator-thread destruction".into());
+    }
+
+    context.disconnect_events();
+    drop(owned_icon);
+    drop(context);
+    Ok(())
+}
+
+unsafe fn create(context: &TrayContext, add_icon: bool) -> Result<(HWND, OwnedIcon)> {
     let instance = GetModuleHandleW(None)?;
     let class_name = w!("orange_tray_icon");
     ensure_tray_class(instance.into())?;
@@ -260,26 +405,17 @@ unsafe fn create(events: Sender<TrayEvent>, add_icon: bool) -> Result<(HWND, Own
         },
     };
 
-    let context = Box::into_raw(Box::new(TrayContext {
-        events,
-        icon_added: Cell::new(false),
-    }));
     SetLastError(ERROR_SUCCESS);
-    let previous = SetWindowLongPtrW(hwnd, GWLP_USERDATA, context as isize);
+    let context_ptr = context as *const TrayContext as isize;
+    let previous = SetWindowLongPtrW(hwnd, GWLP_USERDATA, context_ptr);
     if previous == 0 {
         let error = GetLastError();
         if error != ERROR_SUCCESS {
-            // SAFETY: Installation failed, so ownership never transferred to
-            // the HWND and the allocation remains exclusively owned here.
-            drop(Box::from_raw(context));
             let _ = DestroyWindow(hwnd);
             anyhow::bail!("failed to install tray context (Win32 error {})", error.0);
         }
     } else {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        // SAFETY: The fresh allocation was removed again and is exclusively
-        // owned here. The unexpected previous value remains opaque.
-        drop(Box::from_raw(context));
         let _ = DestroyWindow(hwnd);
         let _ = writeln!(
             std::io::stderr().lock(),
@@ -309,7 +445,7 @@ unsafe fn create(events: Sender<TrayEvent>, add_icon: bool) -> Result<(HWND, Own
 
     // Mark first so even synchronous destruction during the shell call takes
     // the matching delete path. Deleting an icon that was not added is safe.
-    let _ = with_context(hwnd, |context| context.icon_added.set(true));
+    context.icon_added.set(true);
     if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
         let _ = DestroyWindow(hwnd);
         anyhow::bail!("Shell_NotifyIcon refused to add the tray icon");
@@ -317,15 +453,12 @@ unsafe fn create(events: Sender<TrayEvent>, add_icon: bool) -> Result<(HWND, Own
     Ok((hwnd, owned_icon))
 }
 
-unsafe fn run_message_loop(hwnd: HWND) {
+unsafe fn run_message_loop(hwnd: HWND, token: usize) {
     let mut msg = MSG::default();
     loop {
         match message_result(GetMessageW(&mut msg, None, 0, 0).0) {
             MessageResult::Error => {
                 let error = GetLastError().0;
-                if IsWindow(Some(hwnd)).as_bool() {
-                    let _ = DestroyWindow(hwnd);
-                }
                 let _ = writeln!(
                     std::io::stderr().lock(),
                     "[tray] GetMessageW failed (Win32 error {error})"
@@ -333,7 +466,9 @@ unsafe fn run_message_loop(hwnd: HWND) {
                 break;
             }
             MessageResult::Quit => break,
-            MessageResult::Dispatch if msg.hwnd.0.is_null() && msg.message == WM_SHUTDOWN => {
+            MessageResult::Dispatch
+                if msg.hwnd.0.is_null() && msg.message == WM_SHUTDOWN && msg.wParam.0 == token =>
+            {
                 if IsWindow(Some(hwnd)).as_bool() {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -363,7 +498,11 @@ unsafe fn with_context<R>(
 }
 
 unsafe fn emit(hwnd: HWND, event: TrayEvent) {
-    let _ = with_context(hwnd, |context| context.events.send(event));
+    let _ = with_context(hwnd, |context| {
+        if let Some(events) = context.events.borrow().as_ref() {
+            let _ = events.send(event);
+        }
+    });
 }
 
 extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -386,10 +525,19 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 LRESULT(0)
             }
+            WM_SHUTDOWN => {
+                let matches =
+                    with_context(hwnd, |context| context.token == wparam.0).unwrap_or(false);
+                if matches {
+                    let _ = DestroyWindow(hwnd);
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
+                let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
                 SetLastError(ERROR_SUCCESS);
-                let context = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut TrayContext;
-                if context.is_null() {
+                let previous = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                if previous == 0 {
                     let error = GetLastError();
                     if error != ERROR_SUCCESS {
                         let _ = writeln!(
@@ -398,23 +546,27 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                             error.0
                         );
                     }
-                } else {
-                    // SAFETY: Clearing GWLP_USERDATA transferred the Box back
-                    // to this creator-thread callback exactly once.
-                    let context = Box::from_raw(context);
-                    if context.icon_added.get() {
-                        let data = NOTIFYICONDATAW {
-                            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                            hWnd: hwnd,
-                            uID: 1,
-                            ..Default::default()
-                        };
-                        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-                    }
-                    drop(context);
+                }
+                // SAFETY: The worker owns this allocation until after
+                // DestroyWindow returns and the HWND is confirmed dead.
+                if let Some(context) = context.as_ref() {
+                    context.cleanup(hwnd);
                 }
                 PostQuitMessage(0);
                 LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                // Retry a failed WM_DESTROY clear while the worker-owned
+                // context is still live. Cleanup itself is idempotent.
+                let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
+                if !context.is_null() {
+                    SetLastError(ERROR_SUCCESS);
+                    let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    if let Some(context) = context.as_ref() {
+                        context.cleanup(hwnd);
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -508,9 +660,16 @@ unsafe fn show_menu(hwnd: HWND) {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_result, MessageResult, Tray};
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use super::{message_result, MessageResult, Tray, WM_SHUTDOWN};
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Command;
+    use windows::Win32::Foundation::{HANDLE, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        PostThreadMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_QUIT,
+    };
+
+    const LIFECYCLE_CHILD: &str = "ORANGE_TRAY_LIFECYCLE_CHILD";
 
     #[test]
     fn message_result_preserves_get_message_tri_state() {
@@ -523,25 +682,112 @@ mod tests {
 
     #[test]
     fn owner_shutdown_joins_promptly_and_allows_reinstall() {
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
-        std::thread::spawn(move || {
-            let mut first = Tray::install_inner(false).expect("first tray should install");
-            assert!(!first.worker.as_ref().unwrap().is_finished());
-            first.shutdown();
-            assert!(first.worker.is_none());
-            assert_eq!(first.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tray::tests::native_lifecycle_child",
+                "--test-threads=1",
+            ])
+            .env(LIFECYCLE_CHILD, "1")
+            .spawn()
+            .expect("lifecycle child should start");
 
-            let mut second = Tray::install_inner(false).expect("second tray should install");
-            assert!(!second.worker.as_ref().unwrap().is_finished());
-            second.shutdown();
-            assert!(second.worker.is_none());
-            assert_eq!(second.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        let wait = unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), 5_000) };
+        if wait == WAIT_TIMEOUT {
+            child.kill().expect("timed-out child should terminate");
+            child.wait().expect("timed-out child should be reaped");
+            panic!("tray lifecycle child exceeded five seconds");
+        }
+        if wait != WAIT_OBJECT_0 {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("waiting for tray lifecycle child failed: {wait:?}");
+        }
+        assert!(child.wait().unwrap().success());
+    }
 
-            done_tx.send(()).unwrap();
-        });
+    #[test]
+    #[ignore = "run in a bounded subprocess by owner_shutdown_joins_promptly_and_allows_reinstall"]
+    fn native_lifecycle_child() {
+        if std::env::var_os(LIFECYCLE_CHILD).is_none() {
+            return;
+        }
 
-        done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("tray shutdown or reinstall did not complete promptly");
+        let mut first = Tray::install_inner(false).expect("first tray should install");
+        assert!(!first.worker.as_ref().unwrap().is_finished());
+        let bad_token = first.token.wrapping_add(1);
+        let delivered = unsafe {
+            SendMessageTimeoutW(
+                windows::Win32::Foundation::HWND(first.hwnd as *mut _),
+                WM_SHUTDOWN,
+                WPARAM(bad_token),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                1_000,
+                None,
+            )
+        };
+        assert_ne!(delivered.0, 0, "wrong-token message should be dispatched");
+        assert!(!first.worker.as_ref().unwrap().is_finished());
+        first.shutdown().expect("first tray should shut down");
+        assert!(first.worker.is_none());
+        assert_eq!(
+            first.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+        first
+            .shutdown()
+            .expect("repeated shutdown should be harmless");
+
+        let mut second = Tray::install_inner(false).expect("second tray should install");
+        unsafe {
+            PostThreadMessageW(second.thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                .expect("WM_QUIT should post");
+        }
+        second
+            .shutdown()
+            .expect("WM_QUIT cleanup should complete and join");
+        assert!(second.worker.is_none());
+        assert_eq!(
+            second.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+
+        let owner = std::rc::Rc::new(std::cell::RefCell::new(Some(
+            Tray::install_inner(false).expect("app-owned tray should install"),
+        )));
+        crate::shutdown_owned_tray(&owner).expect("app-owned tray should shut down");
+        assert!(owner.borrow().is_none());
+
+        let mut timed_out = Tray::install_inner(false).expect("timeout tray should install");
+        let hwnd = timed_out.hwnd;
+        let thread_id = timed_out.thread_id;
+        let token = timed_out.token;
+        timed_out.token = token.wrapping_add(1);
+        let error = timed_out
+            .shutdown()
+            .expect_err("accepted wrong-token post must not count as completion");
+        assert!(error.to_string().contains("did not complete"));
+        assert_eq!(timed_out.hwnd, hwnd);
+        assert_eq!(timed_out.thread_id, thread_id);
+        assert!(timed_out.worker.is_some());
+        assert!(timed_out.completion.is_none());
+        timed_out.token = token;
+        timed_out
+            .shutdown()
+            .expect("owner should remain usable after timeout");
+
+        let mut fallback = Tray::install_inner(false).expect("fallback tray should install");
+        fallback.hwnd = 1;
+        fallback
+            .shutdown()
+            .expect("thread-message fallback should complete shutdown");
+
+        drop(Tray::install_inner(false).expect("drop-owned tray should install"));
+        let mut after_drop = Tray::install_inner(false).expect("install after Drop should succeed");
+        after_drop
+            .shutdown()
+            .expect("post-Drop tray should shut down");
     }
 }
