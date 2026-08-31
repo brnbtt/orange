@@ -1089,13 +1089,27 @@ mod tests {
         let volume = gst::ElementFactory::make("volume").build().unwrap();
         let mut worker = AudioControlWorker::spawn(volume, &overlay, 0.3, "test").unwrap();
         std::thread::sleep(Duration::from_millis(75));
-
-        let stopped_at = Instant::now();
-        worker.shutdown();
-        let elapsed = stopped_at.elapsed();
+        let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            let stopped_at = Instant::now();
+            worker.shutdown();
+            let _ = finished.send(stopped_at.elapsed());
+        });
+        let prompt = wait_for_finish.recv_timeout(Duration::from_millis(100));
+        let prompt_completion = prompt.is_ok();
         drop(guard);
+        let elapsed = prompt
+            .or_else(|_| wait_for_finish.recv_timeout(Duration::from_secs(1)))
+            .ok();
+        let joined = if elapsed.is_some() {
+            shutdown.join().is_ok()
+        } else {
+            false
+        };
 
-        assert!(elapsed < Duration::from_millis(100));
+        assert!(prompt_completion);
+        assert!(elapsed.is_some_and(|elapsed| elapsed < Duration::from_millis(100)));
+        assert!(joined);
     }
 
     #[test]
@@ -1105,13 +1119,27 @@ mod tests {
         let guard = overlay.lock().unwrap();
         let pad = gst::Pad::builder(gst::PadDirection::Src).build();
         let mut worker = watch_incoming_bitrate(&pad, overlay.clone()).unwrap();
-
-        let stopped_at = Instant::now();
-        worker.shutdown();
-        let elapsed = stopped_at.elapsed();
+        let (finished, wait_for_finish) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            let stopped_at = Instant::now();
+            worker.shutdown();
+            let _ = finished.send(stopped_at.elapsed());
+        });
+        let prompt = wait_for_finish.recv_timeout(Duration::from_millis(100));
+        let prompt_completion = prompt.is_ok();
         drop(guard);
+        let elapsed = prompt
+            .or_else(|_| wait_for_finish.recv_timeout(Duration::from_secs(1)))
+            .ok();
+        let joined = if elapsed.is_some() {
+            shutdown.join().is_ok()
+        } else {
+            false
+        };
 
-        assert!(elapsed < Duration::from_millis(100));
+        assert!(prompt_completion);
+        assert!(elapsed.is_some_and(|elapsed| elapsed < Duration::from_millis(100)));
+        assert!(joined);
     }
 
     #[test]
