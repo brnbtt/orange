@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::time::Instant;
 
-use super::writer::{diagnostic_sink, emit_diagnostic_to};
+use super::writer::diagnostic_sink;
 
 pub(crate) trait OperationOutcome {
     fn succeeded(&self) -> bool;
@@ -93,7 +93,7 @@ pub(crate) fn measure_operation<R: OperationOutcome>(
         return action();
     };
     measure_operation_with(operation, action, |event, payload| {
-        emit_diagnostic_to(&sink, event, role, payload);
+        let _ = sink.emit(event, role, payload);
     })
 }
 

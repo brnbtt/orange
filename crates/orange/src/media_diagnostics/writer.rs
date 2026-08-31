@@ -92,11 +92,20 @@ pub(crate) struct DiagnosticWriter {
 
 impl DiagnosticWriter {
     pub(crate) fn new() -> Self {
+        Self::new_with_destination(
+            std::env::var("ORANGE_MEDIA_DIAGNOSTICS")
+                .ok()
+                .map(PathBuf::from),
+        )
+    }
+
+    fn new_with_destination(destination: Option<PathBuf>) -> Self {
+        let Some(directory) = destination else {
+            return Self::disabled();
+        };
         let mut worker = None;
         let sink = DIAGNOSTIC_SINK
             .get_or_init(|| {
-                let destination = std::env::var("ORANGE_MEDIA_DIAGNOSTICS").ok()?;
-                let directory = PathBuf::from(destination);
                 if let Err(error) = std::fs::create_dir_all(&directory) {
                     eprintln!("[media-diagnostics] could not create log directory: {error}");
                     return None;
@@ -167,7 +176,6 @@ impl DiagnosticWriter {
         (sink, worker)
     }
 
-    #[cfg(test)]
     const fn disabled() -> Self {
         Self {
             sink: None,
@@ -196,7 +204,7 @@ impl Drop for DiagnosticWriter {
 }
 
 impl DiagnosticSink {
-    fn emit(&self, event: &str, role: &str, payload: impl Serialize) -> bool {
+    pub(super) fn emit(&self, event: &str, role: &str, payload: impl Serialize) -> bool {
         let sender = self
             .sender
             .lock()
@@ -279,7 +287,7 @@ pub(crate) fn emit_diagnostic(event: &str, role: &str, payload: impl Serialize) 
     let Some(sink) = diagnostic_sink() else {
         return;
     };
-    emit_diagnostic_to(&sink, event, role, payload);
+    let _ = sink.emit(event, role, payload);
 }
 
 #[cfg(test)]
@@ -317,15 +325,6 @@ pub(crate) fn capture_diagnostics(action: impl FnOnce()) -> Vec<serde_json::Valu
     })
 }
 
-pub(super) fn emit_diagnostic_to(
-    sink: &DiagnosticSink,
-    event: &str,
-    role: &str,
-    payload: impl Serialize,
-) {
-    let _ = sink.emit(event, role, payload);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +333,76 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    struct ReleaseGuard(Arc<Mutex<Option<SyncSender<()>>>>);
+
+    impl ReleaseGuard {
+        fn new(sender: SyncSender<()>) -> Self {
+            Self(Arc::new(Mutex::new(Some(sender))))
+        }
+
+        fn release(&self) {
+            let sender = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct WriterReleaseGuard {
+        // Field order releases a blocked writer before its owner joins on unwind.
+        _release: ReleaseGuard,
+        writer: DiagnosticWriter,
+    }
+
+    impl WriterReleaseGuard {
+        fn shutdown(mut self) {
+            self.writer.shutdown();
+        }
+    }
+
+    fn wait_for_sender_close(sink: &DiagnosticSink) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if sink
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait_for_worker_finish(writer: &DiagnosticWriter) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if writer.worker.as_ref().is_none_or(JoinHandle::is_finished) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
 
     #[derive(Clone)]
     struct SharedWriter {
@@ -369,6 +437,42 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum IoFailure {
+        Write,
+        Flush,
+    }
+
+    struct FailingWriter {
+        failure: IoFailure,
+        failed: SyncSender<()>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if matches!(self.failure, IoFailure::Write) {
+                let _ = self.failed.try_send(());
+                return Err(io::Error::other("write failed"));
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if matches!(self.failure, IoFailure::Flush) {
+                let _ = self.failed.try_send(());
+                return Err(io::Error::other("flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for FailingWriter {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -469,6 +573,39 @@ mod tests {
         (writer, output, dropped)
     }
 
+    fn assert_io_failure_disconnects_sink(failure: IoFailure) {
+        let (failed, failure_observed) = sync_channel(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let writer = DiagnosticWriter::start(
+            FailingWriter {
+                failure,
+                failed,
+                dropped: dropped.clone(),
+            },
+            1024,
+        );
+        let sink = writer.sink.as_ref().unwrap().clone();
+        assert!(sink.emit("accepted", "test", serde_json::json!({})));
+        failure_observed
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(wait_for_worker_finish(&writer));
+        assert!(!sink.emit("after-failure", "test", serde_json::json!({})));
+
+        let (finished, shutdown_finished) = sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            let mut writer = writer;
+            writer.shutdown();
+            writer.shutdown();
+            let _ = finished.send(());
+        });
+        shutdown_finished
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        shutdown.join().unwrap();
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+    }
+
     #[test]
     fn diagnostic_writer_shutdown_drains_accepted_lines_and_joins_once() {
         let (mut writer, output, dropped) = local_writer();
@@ -516,6 +653,8 @@ mod tests {
             },
             1024 * 1024,
         );
+        // Drop before `writer` on any assertion panic so its join cannot strand.
+        let release = ReleaseGuard::new(release);
         let sink = writer.sink.as_ref().unwrap().clone();
         assert!(sink.emit("first", "test", serde_json::json!({})));
         blocked.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -524,16 +663,20 @@ mod tests {
         }
         assert!(!sink.emit("dropped", "test", serde_json::json!({})));
 
-        let shutdown = std::thread::spawn(move || {
-            let mut writer = writer;
-            writer.shutdown();
-        });
-        release.send(()).unwrap();
+        let shutdown_owner = WriterReleaseGuard {
+            _release: release.clone(),
+            writer,
+        };
+        let shutdown = std::thread::spawn(move || shutdown_owner.shutdown());
+        assert!(wait_for_sender_close(&sink));
+        assert!(!sink.emit("after-close", "test", serde_json::json!({})));
+        release.release();
         shutdown.join().unwrap();
 
         let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert_eq!(output.lines().count(), 129);
         assert!(!output.contains("\"event\":\"dropped\""));
+        assert!(!output.contains("\"event\":\"after-close\""));
     }
 
     #[test]
@@ -542,6 +685,7 @@ mod tests {
         let sink = writer.sink.as_ref().unwrap().clone();
         let (entered, serializing) = sync_channel(1);
         let (release, released) = sync_channel(1);
+        let release = ReleaseGuard::new(release);
         let sink_for_emit = sink.clone();
         let emitting = std::thread::spawn(move || {
             sink_for_emit.emit(
@@ -555,20 +699,14 @@ mod tests {
         });
         serializing.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let shutdown = std::thread::spawn(move || {
-            let mut writer = writer;
-            writer.shutdown();
-        });
-        while sink
-            .sender
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
-        {
-            std::thread::yield_now();
-        }
+        let shutdown_owner = WriterReleaseGuard {
+            _release: release.clone(),
+            writer,
+        };
+        let shutdown = std::thread::spawn(move || shutdown_owner.shutdown());
+        assert!(wait_for_sender_close(&sink));
         assert!(!sink.emit("too-late", "test", serde_json::json!({})));
-        release.send(()).unwrap();
+        release.release();
 
         assert!(emitting.join().unwrap());
         shutdown.join().unwrap();
@@ -616,14 +754,26 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_writer_shutdown_is_a_disabled_idempotent_no_op() {
-        let mut writer = DiagnosticWriter::disabled();
+    fn diagnostic_writer_without_destination_is_disabled_and_shutdown_is_idempotent() {
+        assert!(DIAGNOSTIC_SINK.get().is_none());
+        let mut writer = DiagnosticWriter::new_with_destination(None);
 
         writer.shutdown();
         writer.shutdown();
 
         assert!(writer.sink.is_none());
         assert!(writer.worker.is_none());
+        assert!(DIAGNOSTIC_SINK.get().is_none());
+    }
+
+    #[test]
+    fn diagnostic_writer_write_failure_disconnects_and_shuts_down() {
+        assert_io_failure_disconnects_sink(IoFailure::Write);
+    }
+
+    #[test]
+    fn diagnostic_writer_flush_failure_disconnects_and_shuts_down() {
+        assert_io_failure_disconnects_sink(IoFailure::Flush);
     }
 
     #[test]
