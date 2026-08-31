@@ -1114,9 +1114,17 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "child test failed: {test}");
-                return true;
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "child test failed: {test}");
+                    return true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("could not wait for child test {test}: {error}");
+                }
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
