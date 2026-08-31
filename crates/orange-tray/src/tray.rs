@@ -45,13 +45,7 @@ pub enum TrayEvent {
     Quit,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ClassError {
-    Windows(u32),
-}
-
-type ClassResult = std::result::Result<(), ClassError>;
-static TRAY_CLASS_RESULT: OnceLock<ClassResult> = OnceLock::new();
+static TRAY_CLASS_RESULT: OnceLock<std::result::Result<(), u32>> = OnceLock::new();
 static TRAY_MESSAGE_RESULT: OnceLock<std::result::Result<u32, u32>> = OnceLock::new();
 
 struct TrayContext {
@@ -99,8 +93,9 @@ impl Drop for OwnedIcon {
 pub struct Tray {
     hwnd: isize,
     events: Receiver<TrayEvent>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<std::result::Result<(), String>>>,
     shutdown_event: Option<OwnedHandle>,
+    cleanup_error: Option<String>,
 }
 
 impl Tray {
@@ -122,7 +117,7 @@ impl Tray {
         let worker = std::thread::spawn(move || {
             // SAFETY: The owner keeps shutdown_handle open until this worker
             // terminates, and tray_worker owns all native window operations.
-            unsafe { tray_worker(event_tx, ready_tx, add_icon, shutdown_handle) };
+            unsafe { tray_worker(event_tx, ready_tx, add_icon, shutdown_handle) }
         });
 
         match ready_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
@@ -131,6 +126,7 @@ impl Tray {
                 events,
                 worker: Some(worker),
                 shutdown_event: Some(shutdown_event),
+                cleanup_error: None,
             }),
             Ok(Err(error)) => {
                 finish_setup_worker(worker, &shutdown_event, FINAL_SHUTDOWN_TIMEOUT);
@@ -171,7 +167,10 @@ impl Tray {
 
     fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<()> {
         let Some(worker) = self.worker.as_ref() else {
-            return Ok(());
+            return match &self.cleanup_error {
+                Some(error) => Err(anyhow::anyhow!(error.clone())),
+                None => Ok(()),
+            };
         };
         if worker.thread().id() == std::thread::current().id() {
             anyhow::bail!("cannot join tray worker from itself");
@@ -212,10 +211,22 @@ impl Tray {
             .take()
             .expect("worker remains owned until its native handle is signaled");
         debug_assert!(worker.is_finished());
-        let result = worker.join();
-        self.hwnd = 0;
-        self.shutdown_event.take();
-        result.map_err(|_| anyhow::anyhow!("tray worker panicked"))
+        match worker.join() {
+            Ok(Ok(())) => {
+                self.hwnd = 0;
+                self.shutdown_event.take();
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.cleanup_error = Some(error.clone());
+                Err(anyhow::anyhow!(error))
+            }
+            Err(_) => {
+                let error = "tray worker panicked before proving native cleanup".to_string();
+                self.cleanup_error = Some(error.clone());
+                Err(anyhow::anyhow!(error))
+            }
+        }
     }
 }
 
@@ -237,7 +248,7 @@ fn signal_event(event: &OwnedHandle) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_thread(worker: &JoinHandle<()>, timeout: Duration) -> Result<bool> {
+fn wait_for_thread<T>(worker: &JoinHandle<T>, timeout: Duration) -> Result<bool> {
     let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
     // SAFETY: AsRawHandle borrows the native thread handle. `worker` remains
     // alive and unmoved for the complete wait, so Windows cannot observe a
@@ -259,47 +270,39 @@ fn wait_for_thread(worker: &JoinHandle<()>, timeout: Duration) -> Result<bool> {
     }
 }
 
-fn finish_setup_worker(worker: JoinHandle<()>, event: &OwnedHandle, timeout: Duration) {
+fn finish_setup_worker(
+    worker: JoinHandle<std::result::Result<(), String>>,
+    event: &OwnedHandle,
+    timeout: Duration,
+) {
     let deadline = Instant::now() + timeout;
     signal_event(event).unwrap_or_else(|error| fail_fast("could not stop tray setup", &error));
     match wait_for_thread(&worker, deadline.saturating_duration_since(Instant::now())) {
-        Ok(signaled) if setup_cleanup_decision(signaled) == CleanupDecision::Complete => {}
-        Ok(_) => fail_fast(
+        Ok(true) => {}
+        Ok(false) => fail_fast(
             "tray setup did not terminate before the final deadline",
             &anyhow::anyhow!("timeout after {timeout:?}"),
         ),
         Err(error) => fail_fast("could not wait for tray setup", &error),
     }
-    if worker.join().is_err() {
-        fail_fast(
+    match worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => fail_fast("tray setup cleanup failed", &anyhow::anyhow!(error)),
+        Err(_) => fail_fast(
             "tray setup worker panicked",
             &anyhow::anyhow!("native tray ownership may be incomplete"),
-        );
+        ),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CleanupDecision {
-    Complete,
-    Retry,
-    Abort,
-}
-
-fn cleanup_decision(window_alive: bool, attempts: u32, before_deadline: bool) -> CleanupDecision {
-    if !window_alive {
-        CleanupDecision::Complete
-    } else if attempts < DESTROY_ATTEMPTS && before_deadline {
-        CleanupDecision::Retry
-    } else {
-        CleanupDecision::Abort
-    }
-}
-
-fn setup_cleanup_decision(worker_signaled: bool) -> CleanupDecision {
-    if worker_signaled {
-        CleanupDecision::Complete
-    } else {
-        CleanupDecision::Abort
+fn retry_error_if_owned<E>(
+    result: std::result::Result<(), E>,
+    owns: impl FnOnce() -> bool,
+) -> Option<E> {
+    match result {
+        Ok(()) => None,
+        Err(error) if owns() => Some(error),
+        Err(_) => None,
     }
 }
 
@@ -319,12 +322,12 @@ unsafe fn ensure_tray_class(instance: HINSTANCE) -> Result<()> {
         if RegisterClassW(&class) != 0 {
             Ok(())
         } else {
-            Err(ClassError::Windows(GetLastError().0))
+            Err(GetLastError().0)
         }
     });
     match result {
         Ok(()) => Ok(()),
-        Err(ClassError::Windows(error)) => {
+        Err(error) => {
             anyhow::bail!("failed to register tray window class (Win32 error {error})")
         }
     }
@@ -359,7 +362,7 @@ unsafe fn tray_worker(
     ready_tx: Sender<Result<isize>>,
     add_icon: bool,
     shutdown_handle: isize,
-) {
+) -> std::result::Result<(), String> {
     let context = Box::new(TrayContext {
         events: RefCell::new(Some(events)),
         icon_added: Cell::new(false),
@@ -383,11 +386,17 @@ unsafe fn tray_worker(
     }
 
     if let Some(hwnd) = hwnd {
-        destroy_window(hwnd);
+        if let Err(error) = destroy_window(hwnd, &context) {
+            context.disconnect_events();
+            std::mem::forget(owned_icon);
+            Box::leak(context);
+            return Err(error.to_string());
+        }
     }
     context.disconnect_events();
     drop(owned_icon);
     drop(context);
+    Ok(())
 }
 
 unsafe fn create(
@@ -535,63 +544,63 @@ unsafe fn run_message_loop(shutdown_event: HANDLE) -> std::result::Result<(), St
     }
 }
 
-unsafe fn destroy_window(hwnd: HWND) {
-    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-    let mut attempts = 0u32;
-    let mut destroy_error = None;
-    loop {
-        match cleanup_decision(
-            IsWindow(Some(hwnd)).as_bool(),
-            attempts,
-            Instant::now() < deadline,
-        ) {
-            CleanupDecision::Complete => return,
-            CleanupDecision::Abort => fail_fast(
-                "creator thread could not destroy tray HWND",
-                &destroy_error.unwrap_or_else(|| {
-                    anyhow::anyhow!(
-                        "HWND remained live after {attempts} attempts within {SHUTDOWN_TIMEOUT:?}"
-                    )
-                }),
-            ),
-            CleanupDecision::Retry => {}
+unsafe fn context_still_owned(hwnd: HWND, expected: *const TrayContext) -> bool {
+    SetLastError(ERROR_SUCCESS);
+    let actual = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
+    if actual.is_null() {
+        let error = GetLastError();
+        if error != ERROR_SUCCESS {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[tray] could not verify failed-destroy HWND ownership (Win32 error {})",
+                error.0
+            );
+        }
+        return false;
+    }
+    actual == expected
+}
+
+unsafe fn destroy_window(hwnd: HWND, context: &TrayContext) -> Result<()> {
+    let expected = context as *const TrayContext;
+    let mut last_error = None;
+    for attempt in 1..=DESTROY_ATTEMPTS {
+        let result = DestroyWindow(hwnd);
+        let Some(error) = retry_error_if_owned(result, || context_still_owned(hwnd, expected))
+        else {
+            return Ok(());
+        };
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[tray] owned HWND DestroyWindow attempt {attempt} failed: {error}"
+        );
+        last_error = Some(error);
+        if attempt == DESTROY_ATTEMPTS {
+            break;
         }
 
-        attempts += 1;
-        destroy_error = DestroyWindow(hwnd).err().map(anyhow::Error::from);
-        if IsWindow(Some(hwnd)).as_bool() {
-            if attempts == 1 || attempts.is_multiple_of(20) {
-                let _ = writeln!(
-                    std::io::stderr().lock(),
-                    "[tray] HWND remained live after DestroyWindow attempt {attempts}: {}",
-                    destroy_error
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .as_deref()
-                        .unwrap_or("no Win32 error reported")
-                );
-            }
-            let wait_ms = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .min(100) as u32;
-            let wait = MsgWaitForMultipleObjectsEx(None, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-            if wait == WAIT_FAILED {
-                let _ = writeln!(
-                    std::io::stderr().lock(),
-                    "[tray] cleanup message wait failed (Win32 error {})",
-                    GetLastError().0
-                );
-            }
-            let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                if msg.message != WM_QUIT {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
+        let wait = MsgWaitForMultipleObjectsEx(None, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if wait == WAIT_FAILED {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[tray] cleanup message wait failed (Win32 error {})",
+                GetLastError().0
+            );
+        }
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message != WM_QUIT {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
         }
+        if !context_still_owned(hwnd, expected) {
+            return Ok(());
+        }
     }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("failed to destroy owned tray HWND")))
 }
 
 /// Runs `action` synchronously with the context installed for this HWND.
@@ -623,22 +632,26 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         match msg {
             message if is_tray_message(message) => {
                 let shutdown = with_context(hwnd, |context| {
-                    WaitForSingleObject(HANDLE(context.shutdown_event as *mut _), 0)
+                    let status = WaitForSingleObject(HANDLE(context.shutdown_event as *mut _), 0);
+                    let error = (status == WAIT_FAILED).then(|| GetLastError().0);
+                    (status, error)
                 });
                 match shutdown {
-                    Some(status) if status == WAIT_OBJECT_0 => {
+                    Some((status, _)) if status == WAIT_OBJECT_0 => {
                         let _ = DestroyWindow(hwnd);
                         return LRESULT(0);
                     }
-                    Some(status) if status == WAIT_TIMEOUT => {}
-                    Some(status) if status == WAIT_FAILED => fail_fast(
-                        "tray callback could not inspect shutdown event",
-                        &anyhow::anyhow!("Win32 error {}", GetLastError().0),
-                    ),
-                    Some(status) => fail_fast(
-                        "tray callback received unexpected event wait status",
-                        &anyhow::anyhow!("status {status:?}"),
-                    ),
+                    Some((status, _)) if status == WAIT_TIMEOUT => {}
+                    Some((status, error)) => {
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "[tray] callback event wait returned {status:?}{}",
+                            error
+                                .map(|error| format!(" (Win32 error {error})"))
+                                .unwrap_or_default()
+                        );
+                        return LRESULT(0);
+                    }
                     None => return DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
                 // The mouse message arrives in the low word of lparam.
@@ -784,7 +797,8 @@ unsafe fn show_menu(hwnd: HWND) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_decision, setup_cleanup_decision, tray_message, CleanupDecision, Tray};
+    use super::{retry_error_if_owned, tray_message, Tray};
+    use std::cell::Cell;
     use std::os::windows::io::AsRawHandle;
     use std::process::Command;
     use windows::Win32::Foundation::{HANDLE, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
@@ -797,16 +811,20 @@ mod tests {
     const LIFECYCLE_CHILD: &str = "ORANGE_TRAY_LIFECYCLE_CHILD";
 
     #[test]
-    fn cleanup_deadlines_choose_retry_or_fail_fast() {
-        assert_eq!(cleanup_decision(false, 0, true), CleanupDecision::Complete);
-        assert_eq!(cleanup_decision(true, 0, true), CleanupDecision::Retry);
+    fn destroy_retry_checks_identity_only_after_failure() {
+        let identity_checks = Cell::new(0);
         assert_eq!(
-            cleanup_decision(true, super::DESTROY_ATTEMPTS, true),
-            CleanupDecision::Abort
+            retry_error_if_owned(Ok::<(), &str>(()), || {
+                identity_checks.set(identity_checks.get() + 1);
+                true
+            }),
+            None
         );
-        assert_eq!(cleanup_decision(true, 0, false), CleanupDecision::Abort);
-        assert_eq!(setup_cleanup_decision(true), CleanupDecision::Complete);
-        assert_eq!(setup_cleanup_decision(false), CleanupDecision::Abort);
+        assert_eq!(identity_checks.get(), 0);
+
+        assert_eq!(retry_error_if_owned(Err("owned"), || true), Some("owned"));
+        assert_eq!(retry_error_if_owned(Err("reused"), || false), None);
+        assert!(super::SHUTDOWN_TIMEOUT < super::FINAL_SHUTDOWN_TIMEOUT);
     }
 
     #[test]
