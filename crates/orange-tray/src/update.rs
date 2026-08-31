@@ -1203,15 +1203,36 @@ mod tests {
     }
 
     #[test]
-    fn newer_beta_is_offered_but_current_and_downgrade_are_not() {
+    fn only_a_semantically_newer_version_is_offered() {
         let hash = "A".repeat(64);
-        let url = "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe";
-        let update = parse_update_manifest(&manifest("0.2.0-beta.2", &hash, url), "0.2.0-beta.1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(update.version.to_string(), "0.2.0-beta.2");
-        assert!(parse_update_manifest(&manifest("0.2.0-beta.1", &hash, "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.1.exe"), "0.2.0-beta.1").unwrap().is_none());
-        assert!(parse_update_manifest(&manifest("0.1.9", &hash, "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.1.9.exe"), "0.2.0-beta.1").unwrap().is_none());
+        let offered = |version: &str, current: &str| {
+            let url = format!(
+                "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-{version}.exe"
+            );
+            parse_update_manifest(&manifest(version, &hash, &url), current)
+                .unwrap()
+                .map(|info| info.version.to_string())
+        };
+
+        assert_eq!(offered("0.3.1", "0.3.0"), Some("0.3.1".into()));
+        assert_eq!(offered("0.4.0", "0.3.9"), Some("0.4.0".into()));
+        assert_eq!(offered("1.0.0", "0.9.9"), Some("1.0.0".into()));
+        // The one-time move off the old -beta.N scheme. Every client already in
+        // the wild has to see a plain 0.3.0 as newer than its pre-release, or it
+        // is stranded on a version that will never be published again.
+        assert_eq!(offered("0.3.0", "0.2.0-beta.11"), Some("0.3.0".into()));
+        // Pre-release identifiers compare numerically, not as text: this is why
+        // beta.10 ever superseded beta.9.
+        assert_eq!(
+            offered("0.2.0-beta.10", "0.2.0-beta.9"),
+            Some("0.2.0-beta.10".into())
+        );
+
+        assert_eq!(offered("0.3.0", "0.3.0"), None);
+        assert_eq!(offered("0.2.9", "0.3.0"), None);
+        assert_eq!(offered("0.9.9", "1.0.0"), None);
+        // A pre-release sorts below its own release, so it is not an upgrade.
+        assert_eq!(offered("1.0.0-beta.1", "1.0.0"), None);
     }
 
     #[test]

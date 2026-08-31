@@ -43,7 +43,7 @@ function Test-BetaManifest {
         throw "Invalid beta manifest fields"
     }
     if ($Manifest.schema -ne 1 -or $Manifest.channel -cne "beta") { throw "Invalid beta manifest channel" }
-    if ($Manifest.version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') { throw "Invalid beta version" }
+    if ($Manifest.version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "Invalid release version" }
     if ($Manifest.build -cnotmatch '^[0-9a-f]{40}$') { throw "Invalid beta build" }
     if ($Manifest.sha256 -cnotmatch '^[0-9A-F]{64}$') { throw "Invalid installer hash" }
     if ($Manifest.notes -isnot [string] -or [Text.Encoding]::UTF8.GetByteCount($Manifest.notes) -gt 500 -or
@@ -104,8 +104,8 @@ function Assert-Publishable {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Notes
     )
 
-    if ($Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') {
-        throw "Workspace version '$Version' is not a beta version. Set it in Cargo.toml."
+    if ($Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "Workspace version '$Version' is not MAJOR.MINOR.PATCH. Set it in Cargo.toml."
     }
     if ([string]::IsNullOrWhiteSpace($Notes)) {
         throw "Publishing requires -Notes. Users see this text in the update banner."
@@ -267,8 +267,8 @@ function Invoke-BetaPublish {
         $version = Get-WorkspaceVersion
         if ($Publish) {
             Assert-Publishable -Version $version -Build $build -Notes $Notes
-        } elseif ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') {
-            throw "Workspace version '$version' is not a beta version. Set it in Cargo.toml."
+        } elseif ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Workspace version '$version' is not MAJOR.MINOR.PATCH. Set it in Cargo.toml."
         }
         Write-Host "==> Publishing $version from $($build.Substring(0, 12))" -ForegroundColor Cyan
 

@@ -8,16 +8,29 @@ if (-not (Test-Path -LiteralPath $publisher -PathType Leaf)) {
 $root = Join-Path $env:TEMP ("orange-beta-publish-test-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
-    $installer = Join-Path $root "orange-setup-0.2.0-beta.1.exe"
+    $installer = Join-Path $root "orange-setup-0.3.0.exe"
     [IO.File]::WriteAllBytes($installer, [Text.Encoding]::UTF8.GetBytes("installer"))
     $manifest = New-BetaManifest `
-        -Version "0.2.0-beta.1" `
+        -Version "0.3.0" `
         -Build "0123456789abcdef0123456789abcdef01234567" `
         -InstallerPath $installer `
-        -Notes "First beta"
+        -Notes "First release"
     Test-BetaManifest -Manifest $manifest -InstallerPath $installer | Out-Null
-    if ($manifest.installer_url -cne "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.1.exe") {
+    if ($manifest.installer_url -cne "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.3.0.exe") {
         throw "wrong installer URL"
+    }
+
+    # Versions are plain MAJOR.MINOR.PATCH. A pre-release suffix would publish
+    # an installer the filename check then disagrees with.
+    foreach ($rejected in @("0.3.0-beta.1", "0.3", "v0.3.0", "0.3.0+1")) {
+        $badVersion = $manifest | ConvertTo-Json | ConvertFrom-Json
+        $badVersion.version = $rejected
+        try {
+            Test-BetaManifest -Manifest $badVersion -InstallerPath $installer | Out-Null
+            throw "version '$rejected' was accepted"
+        } catch {
+            if ($_.Exception.Message -eq "version '$rejected' was accepted") { throw }
+        }
     }
 
     $bad = $manifest | ConvertTo-Json | ConvertFrom-Json
@@ -46,7 +59,7 @@ try {
         if ($_.Exception.Message -eq "UTF-8 oversized notes were accepted") { throw }
     }
 
-    $oversized = Join-Path $root "orange-setup-0.2.0-beta.1-oversized.exe"
+    $oversized = Join-Path $root "orange-setup-0.3.0-oversized.exe"
     $stream = [IO.File]::Create($oversized)
     try { $stream.SetLength((250MB) + 1) } finally { $stream.Dispose() }
     Copy-Item -LiteralPath $oversized -Destination $installer -Force

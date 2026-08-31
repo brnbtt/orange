@@ -167,16 +167,24 @@ Windows 10/11.
 
 ### Releasing
 
-Ship a new beta with one command. It bumps the version, runs the full test
+Ship a new release with one command. It bumps the version, runs the full test
 suite, commits, pushes, builds the installer, and publishes:
 
 ```powershell
 .\ship.ps1 -Notes "Fixes audio dropping out when the game loses focus."
+.\ship.ps1 -Minor -Notes "Adds a settings screen."
 ```
 
 Everything that can fail cheaply runs first, so a failure never leaves you with
 a committed-and-pushed version bump to unwind. `-Notes` is required: users see
 that text in the update banner.
+
+Versions are plain `MAJOR.MINOR.PATCH`. There is no `-beta` suffix, because the
+leading `0` already means "unstable" in semver and the update manifest carries
+`"channel": "beta"` separately. `.\ship.ps1` bumps the patch by default, since
+most releases are fixes; `-Minor` is for a release that adds something, and
+`-Major` is how `1.0.0` arrives once Orange is production ready. `-Version` sets
+the number outright for anything those cannot express.
 
 If the publish itself fails partway, do **not** re-run `ship.ps1` — it would
 bump the version again. Re-run the publisher directly instead; it is idempotent

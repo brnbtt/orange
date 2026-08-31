@@ -1,5 +1,5 @@
 #ifndef AppVersion
-#define AppVersion "0.1.0"
+#error AppVersion was not defined. Build through package.ps1, which passes /DAppVersion from the workspace version.
 #endif
 
 #define GStreamerVersion "1.28.6"

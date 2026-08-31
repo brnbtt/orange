@@ -1,6 +1,12 @@
-# Ships a new beta: bump, test, commit, push, publish.
+# Ships a new release: bump, test, commit, push, publish.
 #
 #   .\ship.ps1 -Notes "Fixes audio dropping out when the game loses focus."
+#   .\ship.ps1 -Minor -Notes "Adds a settings screen."
+#
+# Versions are plain MAJOR.MINOR.PATCH. The leading 0 already says "not
+# production ready" in semver, so there is no -beta suffix duplicating it; the
+# update manifest carries the channel instead. 1.0.0 is where this arrives, not
+# a change of scheme.
 #
 # Order matters. Everything that can fail cheaply runs before anything mutates
 # the repo, so a failure never leaves you with a committed-and-pushed version
@@ -15,8 +21,10 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "High")]
 param(
     [Parameter(Mandatory = $true)][string]$Notes,
-    # Defaults to bumping the trailing beta number. Pass this to start a new
-    # series, e.g. -Version "0.3.0-beta.1".
+    # Bumps the patch number by default, because most releases are fixes.
+    [switch]$Minor,
+    [switch]$Major,
+    # Sets the version outright, for anything the switches cannot express.
     [string]$Version,
     [switch]$SkipTests
 )
@@ -30,6 +38,8 @@ try {
     # defaults.
     $shipNotes = $Notes
     $shipVersion = $Version
+    $shipMinor = [bool]$Minor
+    $shipMajor = [bool]$Major
     . (Join-Path $root "publish-beta.ps1") -LibraryOnly
 
     function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -57,11 +67,23 @@ try {
     }
 
     $current = Get-WorkspaceVersion
+    if ($shipMinor -and $shipMajor) { throw "Pass -Minor or -Major, not both." }
+    if ($shipVersion -and ($shipMinor -or $shipMajor)) {
+        throw "Pass -Version or a bump switch, not both."
+    }
     if (-not $shipVersion) {
-        if ($current -cnotmatch '^(?<series>[0-9]+\.[0-9]+\.[0-9]+-beta\.)(?<n>[0-9]+)$') {
+        if ($current -cnotmatch '^(?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)$') {
+            # Anything with a pre-release or build suffix is deliberately not
+            # auto-bumped: what "next" means is a judgement call.
             throw "Cannot auto-bump '$current'. Pass an explicit -Version."
         }
-        $shipVersion = "{0}{1}" -f $Matches.series, ([int]$Matches.n + 1)
+        $shipVersion = if ($shipMajor) {
+            "{0}.0.0" -f ([int]$Matches.major + 1)
+        } elseif ($shipMinor) {
+            "{0}.{1}.0" -f $Matches.major, ([int]$Matches.minor + 1)
+        } else {
+            "{0}.{1}.{2}" -f $Matches.major, $Matches.minor, ([int]$Matches.patch + 1)
+        }
     }
 
     Invoke-Git fetch origin main

@@ -598,6 +598,13 @@ fn main() {
         return;
     }
 
+    // A second launch should surface the window that already exists rather than
+    // start a rival process. Checked before the tray so the loser exits without
+    // ever adding a second icon.
+    if tray::defer_to_running_instance() {
+        return;
+    }
+
     // Installed before the UI so a failure here is visible as a missing icon
     // rather than a half-started app.
     let tray_owner = Rc::new(RefCell::new(tray::Tray::install().ok()));

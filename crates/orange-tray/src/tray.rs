@@ -18,12 +18,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, SetLastError, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
-    RECT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+    GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND,
+    LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcessId, SetEvent, WaitForSingleObject,
+    CreateEventW, CreateMutexW, GetCurrentProcessId, SetEvent, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -710,6 +710,76 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     }
 }
 
+/// Holds this process's claim to being *the* running instance. A mutex lives
+/// only as long as a handle to it is open, so the claim has to outlive `main`;
+/// releasing it would let the next launch start a second copy.
+static INSTANCE_CLAIM: OnceLock<OwnedHandle> = OnceLock::new();
+
+/// True when another copy is already running, in which case it has been asked
+/// to show its window and this process should exit without opening anything.
+///
+/// Clicking a pinned taskbar icon launches a fresh process whenever the app has
+/// no taskbar button - which is exactly the state the close button leaves it in,
+/// since it hides the window rather than quitting. Without this guard every such
+/// click started a rival process with its own tray icon, all of them writing the
+/// same preferences file.
+pub fn defer_to_running_instance() -> bool {
+    // `Local\` scopes the claim to the logon session, so two users on one
+    // machine still get an instance each.
+    defer_to_named(
+        w!("Local\\orange-instance-88dd87b7-0a96-42aa-babd-fc9841a93f71"),
+        &INSTANCE_CLAIM,
+    )
+}
+
+fn defer_to_named(name: PCWSTR, claim: &OnceLock<OwnedHandle>) -> bool {
+    // SAFETY: CreateMutexW returns a new owning handle, which moves into
+    // OwnedHandle exactly once. GetLastError is read immediately afterwards,
+    // before any other call can overwrite it.
+    unsafe {
+        let Ok(handle) = CreateMutexW(None, false, name) else {
+            // The claim could not be made at all. Running a second copy is a
+            // smaller failure than refusing to start.
+            return false;
+        };
+        let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
+        let handle = OwnedHandle::from_raw_handle(handle.0);
+        if already_running {
+            wake_running_instance();
+            return true;
+        }
+        let _ = claim.set(handle);
+        false
+    }
+}
+
+/// Ask the instance holding the claim to bring its window up.
+///
+/// Its tray window is message-only, so it is invisible to `FindWindowW` and has
+/// to be looked up under `HWND_MESSAGE`. `ID_SHOW` is the same command the tray
+/// menu posts, so this reuses the whole existing show path rather than adding a
+/// second one.
+unsafe fn wake_running_instance() {
+    let Ok(hwnd) = FindWindowExW(
+        Some(HWND_MESSAGE),
+        None,
+        w!("orange_tray_icon"),
+        PCWSTR::null(),
+    ) else {
+        // No tray window means the running copy failed to install its icon, so
+        // its window is still on the taskbar and Windows will restore it.
+        return;
+    };
+    // A background process cannot take the foreground on its own. This one was
+    // just launched by the user, so it can hand that right over.
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid != 0 {
+        let _ = AllowSetForegroundWindow(pid);
+    }
+    let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(ID_SHOW), LPARAM(0));
+}
+
 /// Hide the main window entirely, leaving the app alive in the tray.
 ///
 /// GPUI exposes `minimize` but no per-window hide, so this goes through Win32.
@@ -809,6 +879,26 @@ mod tests {
     };
 
     const LIFECYCLE_CHILD: &str = "ORANGE_TRAY_LIFECYCLE_CHILD";
+
+    #[test]
+    fn the_second_claim_on_a_name_defers_to_the_first() {
+        // A distinct name, so this never contends with a real running orange.
+        let name = windows::core::w!("Local\\orange-instance-test-3f9a1c04");
+        let winner = std::sync::OnceLock::new();
+        let loser = std::sync::OnceLock::new();
+
+        assert!(!super::defer_to_named(name, &winner), "first claim wins");
+        assert!(
+            winner.get().is_some(),
+            "the winner holds the mutex open, or the next launch starts a second copy"
+        );
+
+        assert!(
+            super::defer_to_named(name, &loser),
+            "second claim defers to the first"
+        );
+        assert!(loser.get().is_none(), "the loser claims nothing");
+    }
 
     #[test]
     fn destroy_retry_checks_identity_only_after_failure() {
