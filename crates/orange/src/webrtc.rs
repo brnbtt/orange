@@ -160,6 +160,8 @@ pub(crate) enum ReceiveOutput {
 /// transport -> depayload -> decode path is sound and only signalling stands
 /// between us and streaming to another machine.
 pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) -> Result<()> {
+    // Keep the unique owner outside every callback and declare it before the
+    // pipeline so the sink reaches Null before owner-driven HWND destruction.
     let (playback_owner, output) = match output {
         Output::Window(owner) => {
             let handle = owner.handle();
@@ -564,8 +566,9 @@ pub fn build_receive_branch(
                 .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
                 .context("d3d11videosink does not implement GstVideoOverlay")?;
             let hwnd = playback.hwnd().context("playback window is unavailable")?;
-            // SAFETY: the handle belongs to this playback component and
-            // its unique owner outlives the receiver pipeline.
+            // SAFETY: Window ReceiveOutput values are created only by
+            // run_loopback/run_watch, where the unique owner is declared
+            // before and outlives the receiver pipeline and its callbacks.
             unsafe { overlay_iface.set_window_handle(hwnd as usize) };
 
             vec![queue, composition, sink]

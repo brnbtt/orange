@@ -1323,6 +1323,8 @@ fn create_offer(
 
 /// Viewer: join a stream by code.
 pub async fn run_watch(code: &str, url: &str, output: Output) -> Result<()> {
+    // Keep the unique owner outside every callback and declare it before the
+    // pipeline so explicit Null teardown precedes HWND destruction.
     let (playback_owner, output) = match output {
         Output::Window(owner) => {
             let handle = owner.handle();

@@ -303,6 +303,8 @@ fn run(cli: Cli) -> Result<()> {
                 anyhow::bail!("fps must be greater than zero");
             }
 
+            // Declared before the pipeline so its Drop runs only after the
+            // sink and callbacks are stopped and released.
             let playback_owner =
                 window::PlaybackWindow::spawn_preview("orange - preview", ww as i32, wh as i32)?;
             let playback = playback_owner.handle();
@@ -377,7 +379,9 @@ fn build_preview_pipeline(
         .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
         .context("d3d11videosink does not implement GstVideoOverlay")?;
     let hwnd = playback.hwnd().context("playback window is unavailable")?;
-    // SAFETY: `hwnd` is our own window, alive for as long as this runs.
+    // SAFETY: this helper is called only with the preview session's passive
+    // handle. Its unique owner is declared before the returned pipeline, and
+    // run_until_closed sets that pipeline to Null before the owner can drop.
     unsafe { overlay_iface.set_window_handle(hwnd as usize) };
 
     pipeline.add_many([source.upcast_ref(), &composition, &sink])?;
@@ -547,7 +551,12 @@ fn report_file(path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::timed_pipeline_should_continue;
+    use super::{gst, run_pipeline_while, timed_pipeline_should_continue};
+    use gst::prelude::*;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_CLOSE,
+    };
 
     #[test]
     fn timed_pipeline_runs_only_before_deadline_and_while_playback_is_open() {
@@ -556,5 +565,44 @@ mod tests {
         assert!(!timed_pipeline_should_continue(true, Some(false)));
         assert!(!timed_pipeline_should_continue(false, None));
         assert!(!timed_pipeline_should_continue(false, Some(true)));
+    }
+
+    #[test]
+    fn closed_playback_pipeline_reaches_null_before_owner_drop() {
+        gst::init().unwrap();
+        let owner = crate::window::PlaybackWindow::spawn(
+            "orange pipeline cleanup test",
+            crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
+        )
+        .unwrap();
+        let playback = owner.handle();
+        let hwnd = playback.hwnd().unwrap();
+        // SAFETY: the owner remains in this scope, and WM_CLOSE only hides the
+        // window while reserving the HWND for pipeline teardown.
+        let _ = unsafe {
+            SendMessageTimeoutW(
+                HWND(hwnd as *mut _),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                1_000,
+                None,
+            )
+        };
+        assert!(!playback.is_alive());
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("fakesrc")
+            .property("num-buffers", 1i32)
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        pipeline.add_many([&source, &sink]).unwrap();
+        source.link(&sink).unwrap();
+
+        run_pipeline_while(&pipeline, 30, Some(&playback)).unwrap();
+
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        drop(owner);
     }
 }

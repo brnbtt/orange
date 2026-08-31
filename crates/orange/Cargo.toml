@@ -42,4 +42,5 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    "Win32_Security",
 ]
