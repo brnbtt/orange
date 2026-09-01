@@ -141,9 +141,18 @@ or a cross-vendor performance guarantee.
 
 The beta uses a one-click per-user installer. Open
 `orange-setup-<version>.exe`; it installs Orange under
-`%LOCALAPPDATA%\Programs\orange`, creates a Start menu shortcut, installs the
-pinned GStreamer runtime per-user when missing, and opens the app. Rust, Visual
-Studio, and the source tree are not required on the receiving machine.
+`%LOCALAPPDATA%\Programs\orange`, creates a Start menu shortcut, and opens the
+app. Rust, Visual Studio, and the source tree are not required on the receiving
+machine.
+
+Setup never reaches the network. Earlier builds downloaded the official
+GStreamer runtime during install, which is a 504 MB file from a host with no CDN
+behind it, so a first install could take several minutes or fail outright.
+Orange loads about 38 MB of that runtime, and `package.ps1` now stages exactly
+that slice into the installer: it asks GStreamer which plugin provides each
+element the pipelines need, walks the import tables to collect their dependent
+DLLs, and refuses to build unless every element resolves from the staged tree
+alone. The result installs offline from a single 17 MB file.
 
 Installed beta builds check the public update channel at startup and every six
 hours. `Update now` downloads from the fixed release host, enforces size and
@@ -307,4 +316,11 @@ not evidence for or against the source or deployment design.
 
 ## License
 
-MIT. GStreamer is LGPL-2.1 and dynamically linked; GPUI is Apache-2.0.
+MIT. GPUI is Apache-2.0.
+
+The installer redistributes part of the GStreamer runtime, dynamically linked
+and unmodified: LGPL-2.1-or-later for GStreamer itself and most plugins,
+MPL-2.0 for the AV1 RTP payloader from `gst-plugins-rs`, BSD-2-Clause for
+`dav1d`, Apache-2.0 for OpenSSL. Upstream's licence texts ship alongside the
+binaries in `gstreamer\share\licenses`, and sources are at
+<https://gitlab.freedesktop.org/gstreamer/gstreamer>.

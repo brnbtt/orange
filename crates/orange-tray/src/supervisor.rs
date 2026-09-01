@@ -64,7 +64,22 @@ fn orange_exe() -> Result<std::path::PathBuf> {
 /// tray itself has no GStreamer dependency, which is why it starts fine and
 /// only the child fails.
 fn gstreamer_bin() -> Option<std::path::PathBuf> {
-    // An explicit root wins, since that is what the dev shell sets.
+    // The copy installed beside us wins over everything else. It is the exact
+    // tree this build was packaged and verified against, whereas a machine-wide
+    // GStreamer is whatever version that machine happens to have - possibly
+    // older than the plugins we need, possibly newer and differently named.
+    // Preferring ours means a developer's system install cannot mask a gap in
+    // the bundle either.
+    if let Some(bundled) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(r"gstreamer\bin")))
+        .filter(|bin| bin.is_dir())
+    {
+        return Some(bundled);
+    }
+
+    // Then an explicit root, since that is what the dev shell sets and dev
+    // builds have no bundle beside them.
     if let Ok(root) = std::env::var("GSTREAMER_1_0_ROOT_MSVC_X86_64") {
         let bin = std::path::PathBuf::from(root).join("bin");
         if bin.is_dir() {
@@ -177,6 +192,12 @@ fn prune_diagnostics(directory: &std::path::Path) {
 pub fn gstreamer_available() -> bool {
     gstreamer_bin().is_some()
 }
+
+/// Shown when the media runtime cannot be found. It ships inside the installer,
+/// so on a released build its absence means the installation is damaged rather
+/// than that anything is missing from the machine.
+pub const MEDIA_RUNTIME_MISSING: &str =
+    "The media runtime that ships with orange is missing. Reinstalling orange will restore it.";
 
 pub fn list_windows() -> Result<Vec<WindowTarget>> {
     let output = orange_command()?
@@ -744,6 +765,31 @@ mod tests {
         // Only a pathological size falls back on the floor, where the tiers do
         // collapse. That is the floor working, not the tiers failing.
         assert_eq!(BITRATES[0].kbps(160, 120), 500);
+    }
+
+    #[test]
+    fn the_bundled_media_runtime_wins_over_one_installed_on_the_machine() {
+        // The bundle is the exact tree this build was packaged and verified
+        // against. A machine-wide GStreamer is whatever version that computer
+        // happens to have, so letting it win turns a working install into a
+        // failure that only reproduces on someone else's machine - and hides
+        // a gap in the bundle from every developer who has GStreamer locally.
+        let exe_directory = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let bundled = exe_directory.join("gstreamer").join("bin");
+        std::fs::create_dir_all(&bundled).unwrap();
+
+        let machine_wide = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(machine_wide.path().join("bin")).unwrap();
+        std::env::set_var("GSTREAMER_1_0_ROOT_MSVC_X86_64", machine_wide.path());
+        let chosen = gstreamer_bin();
+        std::env::remove_var("GSTREAMER_1_0_ROOT_MSVC_X86_64");
+        std::fs::remove_dir_all(exe_directory.join("gstreamer")).ok();
+
+        assert_eq!(chosen.as_deref(), Some(bundled.as_path()));
     }
 
     #[test]

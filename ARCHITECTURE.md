@@ -58,7 +58,7 @@ Compile dependencies point `orange -> orange-signal <- orange-relay`; tray/updat
 | `crates/orange-tray/src/ui.rs` | Visual tokens and reusable GPUI controls, logo, buttons, cards, pills, titlebar controls, animations |
 | `crates/orange-tray/src/background.rs` | Cancelled-and-joined thumbnail and avatar jobs, bounded avatar download and decode |
 | `crates/orange-tray/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
-| `crates/orange-tray/src/supervisor.rs` | Finds GStreamer, launches `orange.exe`, parses child stdout/stderr, quality tiers, diagnostic retention |
+| `crates/orange-tray/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, parses child stdout/stderr, quality tiers, diagnostic retention |
 | `crates/orange-tray/src/session.rs` | Reads CLI session JSON; atomically reads/writes tray preferences |
 | `crates/orange-tray/src/tray.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-tray/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
@@ -208,6 +208,7 @@ webrtcbin OPUS pad
 | Local media diagnostic records | `crates/orange/src/media_diagnostics/writer.rs` |
 | Update manifest/client handoff | `publish-beta.ps1`, `crates/orange-tray/src/update.rs`, `crates/orange-updater/src/main.rs` |
 | Installer contents/prerequisites | `package.ps1`, `packaging/windows/orange.iss` |
+| Which GStreamer elements ship in the installer | `packaging/windows/stage-gstreamer.ps1` |
 | Release procedure (bump, test, commit, push, publish) | `ship.ps1` |
 | Pre-push gate | `packaging/hooks/pre-push.ps1` |
 | Azure single-replica deployment | `deploy/azure.ps1` |

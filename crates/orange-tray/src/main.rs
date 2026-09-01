@@ -443,10 +443,7 @@ impl Orange {
     fn start_stream(&mut self, target: WindowTarget) {
         stop_thumbnail_job(&mut self.thumbnail_job);
         if !supervisor::gstreamer_available() {
-            self.show_error(
-                "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
-                    .to_string(),
-            );
+            self.show_error(supervisor::MEDIA_RUNTIME_MISSING.to_string());
             return;
         }
         let preview = self.thumbnails.get(&target.hwnd).cloned();
@@ -485,10 +482,7 @@ impl Orange {
             return;
         }
         if !supervisor::gstreamer_available() {
-            self.show_error(
-                "GStreamer was not found. Install it with: winget install gstreamerproject.gstreamer"
-                    .to_string(),
-            );
+            self.show_error(supervisor::MEDIA_RUNTIME_MISSING.to_string());
             return;
         }
         match Supervisor::watch(&code, &self.server, self.watches.len()) {

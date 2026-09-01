@@ -2,11 +2,6 @@
 #error AppVersion was not defined. Build through package.ps1, which passes /DAppVersion from the workspace version.
 #endif
 
-#define GStreamerVersion "1.28.6"
-#define GStreamerFile "gstreamer-1.0-msvc-x86_64-" + GStreamerVersion + ".exe"
-#define GStreamerUrl "https://gstreamer.freedesktop.org/data/pkg/windows/" + GStreamerVersion + "/msvc/" + GStreamerFile
-#define GStreamerSha256 "059251444d1267b486eba390b18d25fed87e10315e72f757ec6c7e912fa746b5"
-
 [Setup]
 AppId={{3F4D13A1-E6A0-49BA-97D6-67DAF8938677}
 AppName=orange
@@ -42,6 +37,10 @@ Source: "..\..\target\release\orange.exe"; DestDir: "{app}"; Flags: ignoreversio
 Source: "..\..\target\release\orange-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\orange-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\package\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
+; The media runtime travels with us. package.ps1 stages the slice orange loads
+; and proves every element resolves from it. GStreamer locates its own plugins
+; relative to bin\gstreamer-1.0-0.dll, so this layout needs no environment.
+Source: "..\..\target\package\gstreamer\*"; DestDir: "{app}\gstreamer"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\orange"; Filename: "{app}\orange-tray.exe"
@@ -56,36 +55,6 @@ const
   CN_BASE = $BC00;
   CN_COMMAND = CN_BASE + WM_COMMAND;
 
-var
-  DownloadPage: TDownloadWizardPage;
-
-function HasGStreamerAt(const Root: String): Boolean;
-begin
-  Result :=
-    FileExists(AddBackslash(Root) + 'bin\gstreamer-1.0-0.dll') and
-    FileExists(AddBackslash(Root) + 'lib\gstreamer-1.0\gstd3d11.dll') and
-    FileExists(AddBackslash(Root) + 'lib\gstreamer-1.0\gstwebrtc.dll') and
-    FileExists(AddBackslash(Root) + 'lib\gstreamer-1.0\gstnvcodec.dll');
-end;
-
-function GStreamerReady: Boolean;
-begin
-  Result :=
-    HasGStreamerAt(GetEnv('GSTREAMER_1_0_ROOT_MSVC_X86_64')) or
-    HasGStreamerAt(ExpandConstant('{localappdata}\Programs\gstreamer\1.0\msvc_x86_64')) or
-    HasGStreamerAt(ExpandConstant('{pf}\gstreamer\1.0\msvc_x86_64')) or
-    HasGStreamerAt('C:\gstreamer\1.0\msvc_x86_64');
-end;
-
-procedure InitializeWizard;
-begin
-  DownloadPage := CreateDownloadPage(
-    'Preparing the media runtime',
-    'orange needs the official GStreamer runtime for video and audio.',
-    nil);
-  DownloadPage.ShowBaseNameInsteadOfUrl := True;
-end;
-
 procedure CurPageChanged(CurPageID: Integer);
 var
   ClickNotification: Longint;
@@ -95,45 +64,4 @@ begin
     ClickNotification := BN_CLICKED shl 16;
     PostMessage(WizardForm.NextButton.Handle, CN_COMMAND, ClickNotification, 0);
   end;
-end;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  ResultCode: Integer;
-begin
-  Result := '';
-  if GStreamerReady then
-    exit;
-
-  DownloadPage.Clear;
-  DownloadPage.Add('{#GStreamerUrl}', '{#GStreamerFile}', '{#GStreamerSha256}');
-  DownloadPage.Show;
-  try
-    try
-      DownloadPage.Download;
-    except
-      Result := 'Could not download the GStreamer runtime: ' + GetExceptionMessage;
-      exit;
-    end;
-  finally
-    DownloadPage.Hide;
-  end;
-
-  if not Exec(
-    ExpandConstant('{tmp}\{#GStreamerFile}'),
-    '/TYPE=runtime /CURRENTUSER /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
-    '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
-  begin
-    Result := 'Could not start the GStreamer runtime installer.';
-    exit;
-  end;
-
-  if ResultCode <> 0 then
-  begin
-    Result := Format('The GStreamer runtime installer failed with code %d.', [ResultCode]);
-    exit;
-  end;
-
-  if not GStreamerReady then
-    Result := 'GStreamer finished installing, but orange could not find the required media plugins.';
 end;

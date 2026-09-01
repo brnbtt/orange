@@ -13,6 +13,8 @@ $checks = [ordered]@{
     "app-local VC runtime" = 'Source: "\.\.\\\.\.\\target\\package\\vcruntime140\.dll"; DestDir: "\{app\}"'
     "interactive launch" = 'Filename: "\{app\}\\orange-tray\.exe";[^\r\n]*nowait[^\r\n]*skipifsilent'
     "no task page" = '(?m)^\[Tasks\]\s*$'
+    "bundled media runtime" = 'Source: "\.\.\\\.\.\\target\\package\\gstreamer\\\*"; DestDir: "\{app\}\\gstreamer"[^\r\n]*recursesubdirs'
+    "media runtime staged before Inno" = 'Copy-GStreamerRuntime[\s\S]*& \$iscc'
     "updater release build" = 'cargo build --locked --release -p orange -p orange-tray -p orange-updater'
     "beta build channel" = 'ORANGE_UPDATE_CHANNEL\s*=\s*"beta"'
     "automatic install click" = 'CurPageID\s*=\s*wpReady[\s\S]*PostMessage\(WizardForm\.NextButton\.Handle,\s*CN_COMMAND'
@@ -22,7 +24,7 @@ $failures = New-Object System.Collections.Generic.List[string]
 foreach ($check in $checks.GetEnumerator()) {
     $matched = if ($check.Key -eq "no task page") {
         $iss -notmatch $check.Value
-    } elseif ($check.Key -in @("updater release build", "beta build channel")) {
+    } elseif ($check.Key -in @("updater release build", "beta build channel", "media runtime staged before Inno")) {
         $package -match $check.Value
     } else {
         $iss -match $check.Value
@@ -34,6 +36,12 @@ if ($iss -match 'Tasks:\s*(desktopicon|startup)') {
 }
 if ($iss -match 'vc_redist|Microsoft Visual C\+\+ runtime installer') {
     $failures.Add("machine-wide VC runtime installer remains")
+}
+# Setup must not reach the network. A 504 MB download from a host with no CDN
+# was the whole reason a first install could take minutes or fail; the runtime
+# is carried in [Files] now, and nothing should quietly reintroduce a fetch.
+if ($iss -match 'CreateDownloadPage|TDownloadWizardPage|DownloadTemporaryFile|https?://[^\r\n]*\.exe') {
+    $failures.Add("installer downloads a prerequisite at setup time")
 }
 $provenanceCalls = [regex]::Matches($package, 'Assert-PackageProvenance -Root \$root -BuildId \$BuildId')
 $tests = $package.IndexOf('if (-not $SkipTests)')

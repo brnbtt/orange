@@ -33,6 +33,7 @@ try {
     }
     . .\dev.ps1
     . .\packaging\windows\package-provenance.ps1
+    . .\packaging\windows\stage-gstreamer.ps1
     if (-not $env:GSTREAMER_1_0_ROOT_MSVC_X86_64) {
         throw "The GStreamer development environment is unavailable."
     }
@@ -73,6 +74,17 @@ try {
     if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notlike "*Microsoft Corporation*") {
         throw "The Microsoft Visual C++ runtime DLL signature is invalid."
     }
+
+    # Carry the media runtime rather than downloading it during setup. This also
+    # verifies the staged tree resolves every element on its own, which is the
+    # only check that runs before the installer reaches somebody else's machine:
+    # a dev build uses the system GStreamer and would never notice a gap here.
+    $staged = Copy-GStreamerRuntime `
+        -GStreamerRoot $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 `
+        -Destination (Join-Path $runtimeDirectory "gstreamer") `
+        -Seed @(Join-Path $root "target\release\orange.exe")
+    Write-Host ("GStreamer: {0} plugins, {1} files, {2:N1} MB, {3} elements verified" -f
+        $staged.Plugins, $staged.Files, ($staged.Bytes / 1MB), $staged.Elements) -ForegroundColor DarkGray
 
     $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
     $version = ($metadata.packages | Where-Object name -eq "orange-tray").version
