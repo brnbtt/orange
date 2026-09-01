@@ -6,6 +6,9 @@
 *.mkv
 *.mp4
 *.png
+# sound.rs renders cues to WAV when auditioning them, and those land wherever
+# the tool that asked for them was pointed. Three of them reached the repo root.
+*.wav
 
 # Source assets are checked in explicitly: the logo is compiled into the tray
 # binary with include_bytes!, so a clone without it does not build.
