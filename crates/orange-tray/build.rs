@@ -3,5 +3,9 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=ORANGE_BUILD_ID");
     println!("cargo:rerun-if-env-changed=ORANGE_UPDATE_CHANNEL");
-    let _ = embed_resource::compile("app.rc", embed_resource::NONE);
+    println!("cargo:rerun-if-changed=app.rc");
+    println!("cargo:rerun-if-changed=icon.ico");
+    embed_resource::compile("app.rc", embed_resource::NONE)
+        .manifest_required()
+        .expect("the Windows application resources must compile");
 }

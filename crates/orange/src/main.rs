@@ -216,6 +216,10 @@ fn main() {
 }
 
 fn entry() -> Result<()> {
+    // Set before GStreamer or our native window code can present any UI.
+    if let Err(error) = window::set_taskbar_identity() {
+        eprintln!("[window] could not set taskbar identity: {error}");
+    }
     let cli = Cli::parse();
     let _diagnostics = media_diagnostics::DiagnosticWriter::new();
     run(cli)

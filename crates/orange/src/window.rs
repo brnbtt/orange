@@ -34,11 +34,21 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_APP, WM_NULL,
 };
 
 mod native;
+
+const APP_USER_MODEL_ID: &str = "brnbtt.orange";
+
+pub fn set_taskbar_identity() -> windows::core::Result<()> {
+    let app_id = windows::core::HSTRING::from(APP_USER_MODEL_ID);
+    // SAFETY: HSTRING provides a valid NUL-terminated buffer that remains alive
+    // for the duration of this call.
+    unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr())) }
+}
 
 /// Opt out of DPI virtualisation, before any window exists.
 ///
@@ -540,8 +550,9 @@ fn duration_to_wait_millis(duration: Duration) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_window_startup, join_after_worker_completion, shutdown_policy, CleanupFailure,
-        CleanupResult, PlaybackProfile, PlaybackWindow, ShutdownPolicy, WorkerFinish,
+        finish_window_startup, join_after_worker_completion, set_taskbar_identity, shutdown_policy,
+        CleanupFailure, CleanupResult, PlaybackProfile, PlaybackWindow, ShutdownPolicy,
+        WorkerFinish, APP_USER_MODEL_ID,
     };
     use anyhow::anyhow;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -561,6 +572,12 @@ mod tests {
             owner.try_shutdown_worker(Duration::from_secs(5)),
             WorkerFinish::Joined(Ok(()))
         );
+    }
+
+    #[test]
+    fn taskbar_identity_matches_tray_process() {
+        assert_eq!(APP_USER_MODEL_ID, "brnbtt.orange");
+        set_taskbar_identity().expect("taskbar identity should be accepted by Windows");
     }
 
     #[test]

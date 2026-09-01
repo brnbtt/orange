@@ -448,6 +448,7 @@ impl Orange {
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let animate = self.animate;
         let hosting = self.host.is_some();
+        let watching = !self.watches.is_empty();
         let defaults = format!(
             "{} · {}",
             self.quality().label.to_ascii_uppercase(),
@@ -542,12 +543,25 @@ impl Orange {
             .child(
                 action_card(
                     "join",
-                    people_mark(20.0, MUTED),
-                    "JOIN A STREAM",
-                    "Open a friend's code from your clipboard.",
+                    people_mark(20.0, if watching { SUCCESS } else { MUTED }),
+                    if watching {
+                        "VIEW ACTIVE STREAMS"
+                    } else {
+                        "JOIN A STREAM"
+                    },
+                    if watching {
+                        "Manage your open viewer windows."
+                    } else {
+                        "Open a friend's code from your clipboard."
+                    },
                     false,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if watching {
+                        this.screen = Screen::Watching;
+                        cx.notify();
+                        return;
+                    }
                     // A proper text field is deferred; the code is always
                     // copied from Discord anyway, so paste is the flow.
                     let code = cx
@@ -1141,6 +1155,12 @@ impl Orange {
                         cx.notify();
                     },
                 )),
+            )
+            .child(
+                secondary("back-watching", "Back").on_click(cx.listener(|this, _, _, cx| {
+                    this.screen = Screen::Home;
+                    cx.notify();
+                })),
             )
             .child(
                 secondary("leave-all", "Close all viewer windows")

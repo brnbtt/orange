@@ -43,7 +43,9 @@ Source: "..\..\target\package\vcruntime140.dll"; DestDir: "{app}"; Flags: ignore
 Source: "..\..\target\package\gstreamer\*"; DestDir: "{app}\gstreamer"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\orange"; Filename: "{app}\orange-tray.exe"
+Name: "{group}\orange"; Filename: "{app}\orange-tray.exe"; AppUserModelID: "brnbtt.orange"
+; Upgrade the pin only when the user already chose to create one.
+Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\orange"; Filename: "{app}\orange-tray.exe"; AppUserModelID: "brnbtt.orange"; Check: IsOrangeTaskbarPin
 
 [Run]
 Filename: "{app}\orange-tray.exe"; Description: "Open orange"; Flags: nowait skipifsilent
@@ -54,6 +56,26 @@ const
   WM_COMMAND = $0111;
   CN_BASE = $BC00;
   CN_COMMAND = CN_BASE + WM_COMMAND;
+
+function IsOrangeTaskbarPin: Boolean;
+var
+  PinPath, TargetPath: String;
+  WshShell, Shortcut: Variant;
+begin
+  Result := False;
+  PinPath := ExpandConstant('{userappdata}\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\orange.lnk');
+  if not FileExists(PinPath) then
+    Exit;
+
+  try
+    WshShell := CreateOleObject('WScript.Shell');
+    Shortcut := WshShell.CreateShortcut(PinPath);
+    TargetPath := Shortcut.TargetPath;
+    Result := CompareText(TargetPath, ExpandConstant('{app}\orange-tray.exe')) = 0;
+  except
+    Log('Could not inspect existing Orange taskbar pin: ' + GetExceptionMessage);
+  end;
+end;
 
 procedure CurPageChanged(CurPageID: Integer);
 var

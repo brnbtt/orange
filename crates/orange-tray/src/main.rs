@@ -34,6 +34,18 @@ use supervisor::{Bitrate, LoginAttempt, Quality, Supervisor, WindowTarget, BITRA
 
 const DEFAULT_SERVER: &str =
     "wss://orange-relay.redmushroom-80c79f12.brazilsouth.azurecontainerapps.io/ws";
+const APP_USER_MODEL_ID: &str = "brnbtt.orange";
+
+fn set_taskbar_identity() -> windows::core::Result<()> {
+    let app_id = windows::core::HSTRING::from(APP_USER_MODEL_ID);
+    // SAFETY: HSTRING provides a valid NUL-terminated buffer that remains alive
+    // for the duration of this call.
+    unsafe {
+        windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::PCWSTR(
+            app_id.as_ptr(),
+        ))
+    }
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
@@ -726,6 +738,12 @@ fn shutdown_owned_tray_with(
 }
 
 fn main() {
+    // Must precede every window so the tray and viewer processes share one
+    // taskbar group despite being different executables.
+    if let Err(error) = set_taskbar_identity() {
+        eprintln!("[tray] could not set taskbar identity: {error}");
+    }
+
     // Diagnostic: capture every window and report, since a windowsgui binary
     // has no console to print to.
     if std::env::args().any(|a| a == "--test-capture") {
@@ -866,11 +884,101 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn icon_frame(size: u16) -> image::RgbaImage {
+        let source = include_bytes!("../icon.ico");
+        let count = u16::from_le_bytes([source[4], source[5]]) as usize;
+        for index in 0..count {
+            let start = 6 + index * 16;
+            let width = if source[start] == 0 {
+                256
+            } else {
+                u16::from(source[start])
+            };
+            let height = if source[start + 1] == 0 {
+                256
+            } else {
+                u16::from(source[start + 1])
+            };
+            if (width, height) != (size, size) {
+                continue;
+            }
+
+            let length = u32::from_le_bytes(
+                source[start + 8..start + 12]
+                    .try_into()
+                    .expect("ICO entry length"),
+            ) as usize;
+            let offset = u32::from_le_bytes(
+                source[start + 12..start + 16]
+                    .try_into()
+                    .expect("ICO entry offset"),
+            ) as usize;
+            let mut single = Vec::with_capacity(22 + length);
+            single.extend_from_slice(&source[..4]);
+            single.extend_from_slice(&1u16.to_le_bytes());
+            single.extend_from_slice(&source[start..start + 12]);
+            single.extend_from_slice(&22u32.to_le_bytes());
+            single.extend_from_slice(&source[offset..offset + length]);
+            return image::load_from_memory_with_format(&single, image::ImageFormat::Ico)
+                .expect("valid icon frame")
+                .into_rgba8();
+        }
+        panic!("icon has no {size}px frame");
+    }
+
+    fn most_scanline_runs(image: &image::RgbaImage) -> usize {
+        (0..image.width())
+            .map(|x| {
+                let mut previous = false;
+                let mut runs = 0;
+                for y in 0..image.height() {
+                    let [r, g, b, a] = image.get_pixel(x, y).0;
+                    let orange = r >= 200 && (45..=150).contains(&g) && b <= 80 && a >= 128;
+                    if orange && !previous {
+                        runs += 1;
+                    }
+                    previous = orange;
+                }
+                runs
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
     fn login_session() -> session::Session {
         session::Session {
             name: "Orange User".into(),
             id: "123".into(),
             avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn taskbar_identity_matches_viewer_process() {
+        assert_eq!(APP_USER_MODEL_ID, "brnbtt.orange");
+        set_taskbar_identity().expect("taskbar identity should be accepted by Windows");
+    }
+
+    #[test]
+    fn app_icon_contains_optically_tuned_windows_frames() {
+        let frames = [
+            (16, 3, 7),
+            (20, 4, 8),
+            (24, 5, 9),
+            (32, 5, 10),
+            (48, 6, 11),
+            (64, 7, 12),
+            (128, 10, 17),
+            (256, 12, 18),
+        ];
+        for (size, minimum, maximum) in frames {
+            let frame = icon_frame(size);
+            assert_eq!(frame.dimensions(), (u32::from(size), u32::from(size)));
+            let runs = most_scanline_runs(&frame);
+            assert!(
+                (minimum..=maximum).contains(&runs),
+                "{size}px mark has {runs} scanlines"
+            );
         }
     }
 
