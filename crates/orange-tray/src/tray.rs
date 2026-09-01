@@ -18,12 +18,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND,
-    LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+    CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+    HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, GetCurrentProcessId, SetEvent, WaitForSingleObject,
+    CreateEventW, CreateMutexW, GetCurrentProcessId, OpenEventW, SetEvent, WaitForSingleObject,
+    EVENT_MODIFY_STATE,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -374,10 +376,19 @@ unsafe fn tray_worker(
     match create(&context, add_icon, &mut hwnd, &mut owned_icon) {
         Ok(()) => {
             let window = hwnd.expect("successful tray setup has an HWND");
+            // Auto-reset and initially unset: every signal wakes the loop
+            // exactly once. Created after the window exists, so a signal can
+            // never arrive before there is something to show.
+            let show_event = CreateEventW(None, false, false, show_event_name()).ok();
             if ready_tx.send(Ok(window.0 as isize)).is_ok() {
-                if let Err(error) = run_message_loop(HANDLE(shutdown_handle as *mut _)) {
+                if let Err(error) =
+                    run_message_loop(window, HANDLE(shutdown_handle as *mut _), show_event)
+                {
                     let _ = writeln!(std::io::stderr().lock(), "[tray] {error}");
                 }
+            }
+            if let Some(event) = show_event {
+                let _ = CloseHandle(event);
             }
         }
         Err(error) => {
@@ -492,8 +503,17 @@ unsafe fn create(
     Ok(())
 }
 
-unsafe fn run_message_loop(shutdown_event: HANDLE) -> std::result::Result<(), String> {
-    let handles = [shutdown_event];
+unsafe fn run_message_loop(
+    hwnd: HWND,
+    shutdown_event: HANDLE,
+    show_event: Option<HANDLE>,
+) -> std::result::Result<(), String> {
+    // Shutdown is always index 0. The show event is optional: without it the
+    // tray still works, a second launch just cannot raise this window.
+    let handles: Vec<HANDLE> = match show_event {
+        Some(show) => vec![shutdown_event, show],
+        None => vec![shutdown_event],
+    };
     loop {
         let wait = MsgWaitForMultipleObjectsEx(
             Some(&handles),
@@ -503,6 +523,13 @@ unsafe fn run_message_loop(shutdown_event: HANDLE) -> std::result::Result<(), St
         );
         if wait == WAIT_OBJECT_0 {
             return Ok(());
+        }
+        if show_event.is_some() && wait.0 == WAIT_OBJECT_0.0 + 1 {
+            // A second launch asked us to surface. The event auto-resets, so
+            // there is nothing to clear. Emitting Show lands this on the same
+            // path as the tray menu's Open rather than a second one.
+            emit(hwnd, TrayEvent::Show);
+            continue;
         }
         if wait.0 == WAIT_OBJECT_0.0 + handles.len() as u32 {
             let mut msg = MSG::default();
@@ -753,31 +780,39 @@ fn defer_to_named(name: PCWSTR, claim: &OnceLock<OwnedHandle>) -> bool {
     }
 }
 
+/// Name of the event the running instance waits on to be told to surface.
+fn show_event_name() -> PCWSTR {
+    w!("Local\\orange-show-88dd87b7-0a96-42aa-babd-fc9841a93f71")
+}
+
 /// Ask the instance holding the claim to bring its window up.
 ///
-/// Its tray window is message-only, so it is invisible to `FindWindowW` and has
-/// to be looked up under `HWND_MESSAGE`. `ID_SHOW` is the same command the tray
-/// menu posts, so this reuses the whole existing show path rather than adding a
-/// second one.
+/// This signals a named event rather than posting to the running instance's
+/// window. Its tray window is message-only, and `FindWindowEx` cannot resolve
+/// that class name from another process - measured, not assumed: the window is
+/// there and enumerable as a child of the message-only parent, but every name
+/// lookup returns null, including one handed that parent explicitly. A named
+/// event has no such ambiguity, and `OpenMutexW` already proves named kernel
+/// objects cross the process boundary here.
 unsafe fn wake_running_instance() {
-    let Ok(hwnd) = FindWindowExW(
-        Some(HWND_MESSAGE),
-        None,
-        w!("orange_tray_icon"),
-        PCWSTR::null(),
-    ) else {
-        // No tray window means the running copy failed to install its icon, so
-        // its window is still on the taskbar and Windows will restore it.
-        return;
-    };
     // A background process cannot take the foreground on its own. This one was
-    // just launched by the user, so it can hand that right over.
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid != 0 {
-        let _ = AllowSetForegroundWindow(pid);
+    // just launched by the user and can hand that right over; without a window
+    // its pid is unknown, so the permission is granted broadly.
+    let _ = AllowSetForegroundWindow(ASFW_ANY);
+    signal_show_event(show_event_name());
+}
+
+/// Signal the named show event. False when nothing is listening on it.
+fn signal_show_event(name: PCWSTR) -> bool {
+    // SAFETY: OpenEventW returns a new owning handle, moved into OwnedHandle
+    // exactly once, which closes it on the way out.
+    unsafe {
+        let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, name) else {
+            return false;
+        };
+        let event = OwnedHandle::from_raw_handle(event.0);
+        SetEvent(HANDLE(event.as_raw_handle())).is_ok()
     }
-    let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(ID_SHOW), LPARAM(0));
 }
 
 /// Hide the main window entirely, leaving the app alive in the tray.
@@ -879,6 +914,54 @@ mod tests {
     };
 
     const LIFECYCLE_CHILD: &str = "ORANGE_TRAY_LIFECYCLE_CHILD";
+
+    #[test]
+    fn a_show_signal_crosses_the_process_boundary_by_name() {
+        // The regression this guards: the first version of this looked the
+        // running instance up with FindWindowEx by class name, which returns
+        // null for a message-only window created by another process even when
+        // handed the correct parent. Nothing failed loudly - a second launch
+        // just silently did nothing. Named kernel objects resolve where window
+        // names do not, and this pins that.
+        //
+        // A unique name, so it never contends with a real running orange.
+        let name = windows::core::w!("Local\\orange-show-test-7d21e4b8");
+
+        // The running instance's side of the handshake.
+        let listener = unsafe {
+            windows::Win32::System::Threading::CreateEventW(None, false, false, name).unwrap()
+        };
+
+        // Nothing has signalled yet.
+        assert_eq!(
+            unsafe { WaitForSingleObject(listener, 0) },
+            WAIT_TIMEOUT,
+            "the event starts unsignalled"
+        );
+
+        // The second instance's side: open by name and signal.
+        assert!(super::signal_show_event(name), "signalling should succeed");
+        assert_eq!(
+            unsafe { WaitForSingleObject(listener, 500) },
+            WAIT_OBJECT_0,
+            "the running instance must observe the signal"
+        );
+
+        // Auto-reset: one signal wakes the loop exactly once, so a stale set
+        // state cannot make it spin.
+        assert_eq!(
+            unsafe { WaitForSingleObject(listener, 0) },
+            WAIT_TIMEOUT,
+            "the event resets itself after one wake"
+        );
+
+        unsafe { windows::Win32::Foundation::CloseHandle(listener).unwrap() };
+
+        // Nobody listening is a clean false, not a panic.
+        assert!(!super::signal_show_event(windows::core::w!(
+            "Local\\orange-show-test-nobody-home"
+        )));
+    }
 
     #[test]
     fn the_second_claim_on_a_name_defers_to_the_first() {
