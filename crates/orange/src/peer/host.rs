@@ -350,13 +350,22 @@ pub(crate) async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()
     )
 }
 
+/// The tray's process id, when the tray started us.
+///
+/// Set by `orange-tray` so whole-screen capture can leave the tray's own cues
+/// out of the stream. Absent when `orange host` is run straight from a shell,
+/// where there is no tray making noise to exclude.
+fn ui_process_id() -> Option<u32> {
+    std::env::var("ORANGE_UI_PID").ok()?.parse().ok()
+}
+
 /// Attach a new viewer branch to the running pipeline and start negotiating.
 /// Build the audio capture chain and return its tee, so each viewer can take
 /// a branch from it.
 fn build_audio_tee(pipeline: &gst::Pipeline, pid: u32) -> Result<gst::Element> {
     check_audio_elements()?;
 
-    let chain = gst::parse::bin_from_description(&build_audio_chain(pid), true)
+    let chain = gst::parse::bin_from_description(&build_audio_chain(pid, ui_process_id()), true)
         .context("failed to build audio chain")?;
     let caps_filter = gst::ElementFactory::make("capsfilter")
         .property("caps", audio_rtp_caps())

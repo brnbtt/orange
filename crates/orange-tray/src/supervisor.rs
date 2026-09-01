@@ -109,6 +109,10 @@ fn orange_command() -> Result<Command> {
         let existing = std::env::var("PATH").unwrap_or_default();
         command.env("PATH", format!("{};{}", bin.display(), existing));
     }
+    // Whole-screen sharing captures every sound the machine makes. Ours are
+    // meant for the person hosting, so the child is told which process tree to
+    // leave out.
+    command.env("ORANGE_UI_PID", std::process::id().to_string());
     if std::env::var_os("ORANGE_MEDIA_DIAGNOSTICS").is_none() {
         if let Some(directory) = diagnostics_directory() {
             prune_diagnostics(&directory);
@@ -315,6 +319,9 @@ pub struct StreamStatus {
     pub code: Option<String>,
     pub viewers: Vec<String>,
     pub error: Option<String>,
+    /// Set when a watched stream finished because the host stopped, as opposed
+    /// to the viewer closing their own window. Both exit zero.
+    pub ended: bool,
     viewer_labels: Vec<(String, String)>,
 }
 
@@ -446,6 +453,12 @@ impl Drop for Supervisor {
     }
 }
 
+/// Printed by `orange watch` when the host stopped, mirroring the constant in
+/// `crates/orange/src/peer/watch.rs`. A watch child exits zero both when the
+/// stream ends and when the viewer closes their own window, so the exit code
+/// cannot tell them apart and this line has to.
+const WATCH_ENDED: &str = "[watch-status] ended";
+
 /// Extract the few facts the UI cares about from the child's log lines.
 fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
     let Ok(mut status) = status.lock() else {
@@ -454,6 +467,8 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
 
     if let Some(rest) = line.split("Share this code:").nth(1) {
         status.code = Some(rest.trim().to_string());
+    } else if line == WATCH_ENDED {
+        status.ended = true;
     } else if let Some(record) = line.strip_prefix("[host-status] ") {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
             return;
@@ -815,6 +830,21 @@ mod tests {
             MAX_DIAGNOSTIC_FILES
         );
         assert!(directory.path().join("keep.txt").is_file());
+    }
+
+    #[test]
+    fn a_stream_ending_is_reported_separately_from_a_stream_breaking() {
+        // Both exit zero, so without this marker the tray cannot tell the host
+        // stopping from the viewer closing their own window - and it used to
+        // guess, by grepping stderr for the substring "error".
+        let status = Arc::new(Mutex::new(StreamStatus::default()));
+        parse_line("[watch] joining ABC-123...", &status);
+        assert!(!status.lock().unwrap().ended);
+
+        parse_line(WATCH_ENDED, &status);
+        let status = status.lock().unwrap();
+        assert!(status.ended);
+        assert!(status.error.is_none(), "an ending is not a failure");
     }
 
     #[test]

@@ -170,15 +170,19 @@ impl Default for CaptureSettings {
 /// stream. Capturing the whole output device would pick all of that up.
 ///
 /// A pid of zero means whole-screen sharing, where capturing everything the
-/// machine plays is the expected behaviour.
+/// machine plays is the expected behaviour - with one exception. The tray plays
+/// short cues when a viewer arrives or leaves, and those are meant for the
+/// person hosting, not for the people watching them. `exclude_pid` carries the
+/// tray's own process id so that one tree can be left out while everything else
+/// is still captured.
 ///
 /// Opus at 128 kbps stereo is transparent enough for games and is a rounding
 /// error next to the video bitrate.
-pub fn build_audio_chain(pid: u32) -> String {
-    let scope = if pid == 0 {
-        String::new()
-    } else {
-        format!("loopback-mode=include-process-tree loopback-target-pid={pid} ")
+pub fn build_audio_chain(pid: u32, exclude_pid: Option<u32>) -> String {
+    let scope = match (pid, exclude_pid) {
+        (0, Some(ui)) => format!("loopback-mode=exclude-process-tree loopback-target-pid={ui} "),
+        (0, None) => String::new(),
+        (pid, _) => format!("loopback-mode=include-process-tree loopback-target-pid={pid} "),
     };
     format!(
         "wasapi2src loopback=true {scope}\
@@ -514,7 +518,7 @@ mod tests {
 
     #[test]
     fn audio_payload_is_forced_to_the_advertised_stereo_format() {
-        let chain = build_audio_chain(42);
+        let chain = build_audio_chain(42, None);
 
         assert!(chain.contains("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"));
         assert!(!chain.contains("inband-fec=true"));
@@ -522,8 +526,34 @@ mod tests {
     }
 
     #[test]
+    fn sharing_one_window_captures_only_that_window() {
+        // Scoping to the shared app is what keeps voice chat and music out of
+        // the stream, and it has to win even when a tray pid is offered: there
+        // is nothing to exclude from a capture that is already this narrow.
+        let chain = build_audio_chain(42, Some(7));
+        assert!(chain.contains("loopback-mode=include-process-tree loopback-target-pid=42"));
+        assert!(!chain.contains("exclude"));
+    }
+
+    #[test]
+    fn sharing_the_whole_screen_captures_everything_except_our_own_cues() {
+        // Whole-screen sharing is meant to pick up everything the machine
+        // plays. The tray's cues are the exception: a chime that says "someone
+        // joined" is for the person hosting, and broadcasting it to everyone
+        // already watching is the opposite of feedback.
+        let chain = build_audio_chain(0, Some(7));
+        assert!(chain.contains("loopback-mode=exclude-process-tree loopback-target-pid=7"));
+
+        // Run without a tray - `orange host` from a shell - and there is no
+        // process making cues, so nothing is excluded.
+        let unattended = build_audio_chain(0, None);
+        assert!(!unattended.contains("loopback-mode"));
+        assert!(unattended.contains("wasapi2src loopback=true"));
+    }
+
+    #[test]
     fn audio_preflight_covers_every_chain_element() {
-        let chain = build_audio_chain(42);
+        let chain = build_audio_chain(42, None);
         for element in [
             "wasapi2src",
             "audioconvert",

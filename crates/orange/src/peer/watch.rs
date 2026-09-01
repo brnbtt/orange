@@ -20,6 +20,18 @@ use super::{
     parse_sdp, watch_bus, watch_connection, ConnectionFailure, PipelineError,
 };
 
+/// Printed when a stream we were watching finishes normally.
+///
+/// The tray reads this off stdout. Without it, a host stopping and a viewer
+/// closing their own window are the same thing from the outside: a child that
+/// exited zero. They are not the same thing to the person watching, so the
+/// difference has to be said out loud rather than inferred from an exit code
+/// that only has two values.
+///
+/// The mirror of this string lives in `orange-tray`'s supervisor, which is the
+/// same arrangement as `[host-status]` and `Share this code:`.
+const WATCH_ENDED: &str = "[watch-status] ended";
+
 fn enable_incoming_video_nack(bin: &gst::Element) {
     bin.connect("on-new-transceiver", false, move |values| {
         let Ok(transceiver) = values[1].get::<gst_webrtc::WebRTCRTPTransceiver>() else {
@@ -248,6 +260,13 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
     );
 
     let session_result: Result<()> = async {
+        // Whether the relay has put us in a room yet. It reports a room closing
+        // the same way it reports a bad code - a plain Error with prose in it -
+        // so the only thing separating the two is when they arrive. Before
+        // StreamInfo we are still trying to join, and an Error means we failed.
+        // After it, we are in the room, and the only thing the relay has left to
+        // tell us is that the host is gone.
+        let mut joined = false;
         loop {
             let signal = if let Some(playback) = &viewer_playback {
                 tokio::select! {
@@ -301,6 +320,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                     bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
                 }
                 Signal::StreamInfo { host_name, .. } => {
+                    joined = true;
                     if let Some(overlay) = &viewer_overlay {
                         if let Ok(mut state) = overlay.lock() {
                             state.host = host_name.clone();
@@ -314,6 +334,14 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                 Signal::Authenticated { name } => println!("[watch] signed in as {name}"),
 
                 Signal::Error { message } => {
+                    if joined {
+                        // A stream you were watching finishing is the ordinary
+                        // end of a session, not a failure of one. Saying so on
+                        // stdout lets the tray tell it apart from the viewer
+                        // closing their own window, which also exits cleanly.
+                        println!("{WATCH_ENDED}");
+                        break;
+                    }
                     anyhow::bail!("{message}");
                 }
                 _ => {}

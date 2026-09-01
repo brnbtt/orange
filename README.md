@@ -125,9 +125,28 @@ wasapi2src loopback=true loopback-mode=include-process-tree \
   loopback-target-pid=<game> -> opusenc -> rtpopuspay
 ```
 
-Whole-screen sharing includes system output audio. Pass `--no-audio` to disable
-audio. Failure while constructing optional audio disables it and leaves video
-running; a later audio error in the shared host pipeline can end the session.
+Whole-screen sharing includes system output audio, except orange's own process
+tree: the tray plays short cues when a viewer arrives or leaves, and those are
+for the person hosting rather than for the people watching them. Pass
+`--no-audio` to disable audio. Failure while constructing optional audio
+disables it and leaves video running; a later audio error in the shared host
+pipeline can end the session.
+
+### Sound
+
+Streaming happens while you are looking at the game, so a viewer arriving, or
+the stream you are watching ending, is invisible unless the tray is in front of
+you. Five cues cover that, synthesised in `crates/orange-tray/src/sound.rs`
+rather than shipped as audio files.
+
+How many times a cue speaks is the part of the vocabulary that carries: your own
+session starting or ending runs the whole D minor chord, somebody else arriving
+or leaving is a single step, and a failure is a minor ninth sounded as a chord,
+which is the one sound in the set that does not belong to the family. Cues fire
+only for things that complete on their own or happen while you are elsewhere,
+never for something you just clicked and are already watching happen.
+
+There is no mute control, which is what all of the above is in service of.
 
 ### Historical diagnostic measurement
 

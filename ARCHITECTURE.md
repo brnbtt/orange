@@ -56,6 +56,7 @@ Compile dependencies point `orange -> orange-signal <- orange-relay`; tray/updat
 | `crates/orange-tray/src/main.rs` | Application state machine, GPUI startup, polling, child lifecycle, picker actions, update handoff, top-level tray ownership |
 | `crates/orange-tray/src/view.rs` | All screen rendering and UI event wiring: signed out, home, picker, streaming, watching, settings, update banner |
 | `crates/orange-tray/src/ui.rs` | Visual tokens and reusable GPUI controls, logo, buttons, cards, pills, titlebar controls, animations |
+| `crates/orange-tray/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
 | `crates/orange-tray/src/background.rs` | Cancelled-and-joined thumbnail and avatar jobs, bounded avatar download and decode |
 | `crates/orange-tray/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
 | `crates/orange-tray/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, parses child stdout/stderr, quality tiers, diagnostic retention |
@@ -179,6 +180,8 @@ webrtcbin OPUS pad
 | Tray window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --bitrate --scale [--fps]`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
 | Host stdout markers `Share this code:` and `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
+| Watch stdout marker `[watch-status] ended` | producer: `crates/orange/src/peer/watch.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
+| `ORANGE_UI_PID`, so whole-screen capture can exclude the tray's own cues | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/peer/host.rs` |
 | Session file `%APPDATA%\orange\session.json` | writer: `crates/orange/src/auth.rs`; reader: `crates/orange-tray/src/session.rs` |
 | Preferences `%APPDATA%\orange\preferences.json` | `crates/orange-tray/src/session.rs` |
 | Beta manifest schema/host/name/hash | producer: `publish-beta.ps1`; consumer: `crates/orange-tray/src/update.rs` |
@@ -200,6 +203,7 @@ webrtcbin OPUS pad
 | Overlay behavior/layout | `crates/orange/src/overlay.rs`, `crates/orange/src/overlay/raster.rs`, `crates/orange/src/overlay/gst.rs` |
 | Tray screens | `crates/orange-tray/src/view.rs` |
 | Tray colors/components | `crates/orange-tray/src/ui.rs` |
+| Tray sound cues | `crates/orange-tray/src/sound.rs` |
 | Tray quality tiers and child log parsing | `crates/orange-tray/src/supervisor.rs` |
 | Session/preferences persistence | `crates/orange/src/auth.rs`, `crates/orange-tray/src/session.rs` |
 | Signal wire format | `crates/orange-signal/src/protocol.rs` |

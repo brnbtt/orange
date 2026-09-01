@@ -1,7 +1,9 @@
 use super::{tray, update, Orange, Screen};
 use crate::{
+    sound,
     supervisor::{WindowTarget, BITRATES, FRAME_RATES, QUALITIES},
     ui::*,
+    NoticeKind,
 };
 
 /// Indices into `Orange::settings_open`.
@@ -145,6 +147,16 @@ impl Orange {
 
     fn render_error_toast(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let notice = self.notice.as_ref()?;
+        // A failure is tinted red; an ordinary fact borrows the same shape in
+        // the app's own colours. The shape is shared because the position and
+        // the dismiss control are what make it recognisable as a notice - the
+        // colour is the only thing carrying "and this one is bad".
+        let failed = notice.kind == NoticeKind::Failure;
+        let (background, border, text) = if failed {
+            (0x241514, 0x3d211f, DANGER)
+        } else {
+            (SURFACE, BORDER, MUTED)
+        };
         Some(
             appear(
                 "error",
@@ -156,15 +168,15 @@ impl Orange {
                     .gap_3()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x241514))
+                    .bg(rgb(background))
                     .border_1()
-                    .border_color(rgb(0x3d211f))
+                    .border_color(rgb(border))
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
                             .text_xs()
-                            .text_color(rgb(DANGER))
+                            .text_color(rgb(text))
                             .child(notice.text.clone()),
                     )
                     .child(
@@ -994,6 +1006,10 @@ impl Orange {
                     .text_color(rgb(DANGER))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.stop_host();
+                        // The cue lives here rather than inside stop_host,
+                        // which is also how an update tears the session down on
+                        // its way out. Quitting should not chime.
+                        sound::play(sound::Cue::Ended);
                         cx.notify();
                     })),
             )

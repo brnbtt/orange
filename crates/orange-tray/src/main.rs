@@ -11,6 +11,7 @@
 mod background;
 mod capture;
 mod session;
+mod sound;
 mod supervisor;
 mod tray;
 mod ui;
@@ -51,7 +52,19 @@ struct WatchSession {
 
 struct Notice {
     text: String,
+    kind: NoticeKind,
     expires_at: Instant,
+}
+
+/// Whether a notice is reporting a failure or just saying what happened.
+///
+/// Everything used to be a failure, which is how a host ending their stream -
+/// the most ordinary thing that can happen to a viewer - came to be announced
+/// in red as `Error: The stream ended`.
+#[derive(PartialEq, Clone, Copy)]
+enum NoticeKind {
+    Ordinary,
+    Failure,
 }
 
 fn poll_login(
@@ -105,6 +118,9 @@ struct Orange {
     copied_at: Option<Instant>,
     copied_code: Option<String>,
     own_codes: Vec<String>,
+    /// Viewer count at the last tick, so arrivals and departures can be told
+    /// apart. Reset to zero whenever no stream is running.
+    viewers_seen: usize,
     logo_epoch: u64,
     updates: update::UpdateController,
 }
@@ -168,6 +184,7 @@ impl Orange {
             logging_in: None,
             notice: startup_error.map(|text| Notice {
                 text,
+                kind: NoticeKind::Failure,
                 expires_at: Instant::now() + Duration::from_secs(4),
             }),
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
@@ -177,6 +194,7 @@ impl Orange {
             copied_at: None,
             copied_code: None,
             own_codes: preferences.own_codes,
+            viewers_seen: 0,
             logo_epoch: 0,
             updates,
         }
@@ -244,25 +262,47 @@ impl Orange {
         }
 
         let mut watch_error = None;
+        let mut watch_ended = false;
         self.watches.retain_mut(|watch| {
             if watch.supervisor.running() {
                 true
             } else {
-                watch_error = watch
-                    .supervisor
-                    .status
-                    .lock()
-                    .ok()
-                    .and_then(|status| status.error.clone())
-                    .or(watch_error.take());
+                if let Ok(status) = watch.supervisor.status.lock() {
+                    watch_error = status.error.clone().or(watch_error.take());
+                    watch_ended |= status.ended;
+                }
                 false
             }
         });
         if let Some(error) = watch_error {
             self.show_error(error);
+        } else if watch_ended {
+            // The host stopping is the ordinary way to stop watching. Said
+            // plainly, in the same voice as everything else, because there is
+            // nothing here for anyone to fix.
+            sound::play(sound::Cue::Ended);
+            self.show_notice(NoticeKind::Ordinary, "Stream ended");
         }
         if self.screen == Screen::Watching && self.watches.is_empty() {
             self.screen = Screen::Home;
+        }
+
+        // Viewers arriving and leaving is the one thing that happens entirely
+        // while the user is looking at their game, so it is the moment sound
+        // was added for. Counting is enough: two people swapping within the
+        // same half-second is not worth a peer-id diff. This only runs while a
+        // host is alive, or a stream ending would fire a departure cue for
+        // everyone who was still watching.
+        if self.host.is_some() {
+            let viewers = self.viewers().len();
+            match viewers.cmp(&self.viewers_seen) {
+                std::cmp::Ordering::Greater => sound::play(sound::Cue::Joined),
+                std::cmp::Ordering::Less => sound::play(sound::Cue::Left),
+                std::cmp::Ordering::Equal => {}
+            }
+            self.viewers_seen = viewers;
+        } else {
+            self.viewers_seen = 0;
         }
         // A newly-issued room code is immediately ready to paste into chat.
         if let Some(code) = self.code() {
@@ -274,6 +314,10 @@ impl Orange {
                 }
                 self.copied_code = Some(code);
                 self.copied_at = Some(Instant::now());
+                // Going live is not instant - the child has to reach the relay
+                // and be given a code - so by the time it happens the user has
+                // usually looked away. Same reason the code is auto-copied here.
+                sound::play(sound::Cue::Live);
             }
         }
         if self
@@ -308,9 +352,19 @@ impl Orange {
         BITRATES[self.bitrate.min(BITRATES.len() - 1)]
     }
 
+    /// Every failure the user is told about goes through here, which makes it
+    /// the one place the alert cue is due.
     fn show_error(&mut self, message: impl Into<String>) {
+        sound::play(sound::Cue::Alert);
+        self.show_notice(NoticeKind::Failure, message);
+    }
+
+    /// State a fact without claiming anything went wrong. Silent by default:
+    /// the caller knows which cue, if any, belongs to the thing it is reporting.
+    fn show_notice(&mut self, kind: NoticeKind, message: impl Into<String>) {
         self.notice = Some(Notice {
             text: message.into(),
+            kind,
             expires_at: Instant::now() + Duration::from_secs(4),
         });
     }
@@ -495,6 +549,10 @@ impl Orange {
                     self.screen = Screen::Watching;
                 }
                 self.clear_error();
+                // The viewer window takes a moment to negotiate and appear, so
+                // this says the code was accepted before there is anything to
+                // look at.
+                sound::play(sound::Cue::Live);
             }
             Err(err) => self.show_error(err.to_string()),
         }
