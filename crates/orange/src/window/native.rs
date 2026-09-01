@@ -26,8 +26,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Cosmetic only: the frame behind the video, visible for an instant before
-/// the first frame arrives and in the letterbox bars.
-const BACKGROUND: COLORREF = COLORREF(0x000b0b0b); // BGR
+/// the first frame arrives and in the letterbox bars. The board's black, which
+/// is the floor of the palette and so the right colour for "nothing here yet".
+const BACKGROUND: COLORREF = COLORREF(0x00080707); // BGR of #070708
 #[derive(Clone, Copy)]
 enum ClassError {
     BrushAllocation,

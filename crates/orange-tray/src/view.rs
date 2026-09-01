@@ -13,7 +13,7 @@ const SECTION_APPLICATION: usize = 2;
 use gpui::{
     div, prelude::*, px, rgb, size, Context, FontWeight, Pixels, SharedString, Size, Window,
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Per-screen view metadata.
 ///
@@ -28,9 +28,11 @@ impl Screen {
         match self {
             Screen::PickWindow => size(px(576.0), px(660.0)),
             Screen::Streaming => size(px(480.0), px(640.0)),
-            Screen::SignedOut | Screen::Home | Screen::Watching | Screen::Settings => {
-                size(px(400.0), px(540.0))
-            }
+            // Home carries the hero, two route cards and the footer. At 540 the
+            // hero was squeezed to a third of its height and the footer fell
+            // off the bottom edge.
+            Screen::Home => size(px(400.0), px(660.0)),
+            Screen::SignedOut | Screen::Watching | Screen::Settings => size(px(400.0), px(540.0)),
         }
     }
 
@@ -66,6 +68,11 @@ impl Render for Orange {
             self.sized_for = Some(self.screen);
             window.resize(self.screen.size());
         }
+        // Decoration runs only while this window is the one you are looking
+        // at. GPUI refreshes the window when activation changes, so reading it
+        // here is enough to start and stop the ambient layer.
+        self.animate = window.is_window_active();
+        let animate = self.animate;
 
         let key = self.screen.animation_key();
 
@@ -100,8 +107,14 @@ impl Render for Orange {
                     .pt_4()
                     .pb_4()
                     .gap_4()
+                    // Behind everything, and first, so it never takes a hit
+                    // test. One instance for the whole app rather than one per
+                    // screen: it is the room, and the room does not restart
+                    // its drift because you opened settings.
+                    .child(grid(animate))
                     .child(
                         div()
+                            .relative()
                             .flex()
                             .flex_col()
                             .flex_1()
@@ -153,7 +166,7 @@ impl Orange {
         // colour is the only thing carrying "and this one is bad".
         let failed = notice.kind == NoticeKind::Failure;
         let (background, border, text) = if failed {
-            (0x241514, 0x3d211f, DANGER)
+            (DANGER_WASH, DANGER_EDGE, DANGER)
         } else {
             (SURFACE, BORDER, MUTED)
         };
@@ -228,7 +241,7 @@ impl Orange {
                 .gap_3()
                 .p_3()
                 .rounded_md()
-                .bg(rgb(0x24190f))
+                .bg(rgb(ORANGE_WASH))
                 .border_1()
                 .border_color(rgb(ORANGE_DIM))
                 .child(
@@ -288,9 +301,9 @@ impl Orange {
                     .items_center()
                     .gap_2()
                     .window_control_area(gpui::WindowControlArea::Drag)
-                    .child(logo(18.0, 0))
+                    .child(logo(MARK_TITLEBAR, LogoState::Idle, 0, false))
                     .child(
-                        label("O R A N G E", TEXT)
+                        label(WORDMARK, TEXT)
                             .font_family("Bahnschrift")
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD),
@@ -336,7 +349,7 @@ impl Orange {
                     // while the app keeps running in the tray. Minimise is a
                     // normal minimise; the two should not do the same thing.
                     .child(
-                        titlebar_button("close", "×", 0x8c2b28).on_click(cx.listener(
+                        titlebar_button("close", "×", DANGER_HOVER).on_click(cx.listener(
                             |this, _, _, cx| {
                                 if this.screen == Screen::PickWindow {
                                     this.leave_picker(Screen::Home);
@@ -355,6 +368,7 @@ impl Orange {
 
 impl Orange {
     fn render_signed_out(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let animate = self.animate;
         div()
             .flex()
             .flex_col()
@@ -363,7 +377,18 @@ impl Orange {
             .justify_center()
             .items_center()
             .px_2()
-            .child(logo(56.0, self.logo_epoch))
+            // The mark reports the wait, so "Waiting for Discord…" on the
+            // button is not the only thing saying anything is happening.
+            .child(logo(
+                MARK_BRAND,
+                if self.logging_in.is_some() {
+                    LogoState::Loading
+                } else {
+                    LogoState::Idle
+                },
+                self.logo_epoch,
+                animate,
+            ))
             .child(wordmark(20.0))
             .child(
                 div()
@@ -371,12 +396,7 @@ impl Orange {
                     .flex_col()
                     .gap_1p5()
                     .items_center()
-                    .child(
-                        label("Share games directly with friends", TEXT)
-                            .font_family("Bahnschrift")
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD),
-                    )
+                    .child(heading("Share games directly with friends", 20.0))
                     .child(
                         div()
                             .max_w(px(260.0))
@@ -390,7 +410,7 @@ impl Orange {
                     ),
             )
             .child(
-                div().w_full().max_w(px(260.0)).child(
+                div().w_full().max_w(px(280.0)).child(
                     primary(
                         "signin",
                         if self.logging_in.is_some() {
@@ -398,6 +418,7 @@ impl Orange {
                         } else {
                             "Sign in with Discord"
                         },
+                        false,
                     )
                     .when(self.logging_in.is_some(), |d| d.bg(rgb(ORANGE_DIM)))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -425,6 +446,7 @@ impl Orange {
     }
 
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let animate = self.animate;
         let hosting = self.host.is_some();
         let defaults = format!(
             "{} · {}",
@@ -450,35 +472,62 @@ impl Orange {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(micro("READY TO STREAM", GREEN))
+                    .flex_shrink_0()
+                    .child(dot(ORANGE))
+                    .child(micro("READY TO STREAM", ORANGE))
                     .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
                     .child(micro(defaults, MUTED)),
             )
             .child(
+                // The hero. Framed rather than floating: the brackets and the
+                // edge marks are what stop a centred logo on a dark field
+                // reading as an empty screen that has not loaded yet.
                 div()
+                    .relative()
                     .flex()
-                    .flex_col()
                     .flex_1()
+                    .min_h(px(0.0))
                     .items_center()
                     .justify_center()
-                    .gap_3()
-                    .child(logo(112.0, self.logo_epoch))
-                    .child(wordmark(23.0))
-                    .child(accent_rule(28.0))
+                    .child(corner_brackets(14.0, FRAME))
+                    .child(div().absolute().left(px(0.0)).child(crosshair(9.0, FRAME)))
+                    .child(div().absolute().right(px(0.0)).child(crosshair(9.0, FRAME)))
                     .child(
-                        label("Pick a window, share the code, keep playing.", MUTED)
-                            .font_family("Cascadia Mono")
-                            .text_size(px(10.0)),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .child(logo(
+                                MARK_HERO,
+                                if hosting {
+                                    LogoState::Live
+                                } else {
+                                    LogoState::Idle
+                                },
+                                self.logo_epoch,
+                                animate,
+                            ))
+                            .child(wordmark(23.0))
+                            .child(accent_rule(28.0))
+                            .child(micro("STREAM.  SHARE.  CONNECT.", MUTED)),
                     ),
             )
             .child(
-                primary(
+                action_card(
                     "start",
+                    broadcast_mark(20.0, ORANGE),
                     if hosting {
-                        "View active stream"
+                        "VIEW ACTIVE STREAM"
                     } else {
-                        "Start streaming"
+                        "START STREAMING"
                     },
+                    if hosting {
+                        "Your stream is running now."
+                    } else {
+                        "Go live and share your game, desktop or app."
+                    },
+                    true,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if hosting {
@@ -491,7 +540,14 @@ impl Orange {
                 })),
             )
             .child(
-                secondary("join", "Join a stream").on_click(cx.listener(|this, _, _, cx| {
+                action_card(
+                    "join",
+                    people_mark(20.0, MUTED),
+                    "JOIN A STREAM",
+                    "Open a friend's code from your clipboard.",
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
                     // A proper text field is deferred; the code is always
                     // copied from Discord anyway, so paste is the flow.
                     let code = cx
@@ -502,32 +558,19 @@ impl Orange {
                     cx.notify();
                 })),
             )
-            .child(label("Paste a code first — it joins from your clipboard.", FAINT).text_xs())
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap_3()
+                    .flex_shrink_0()
                     .pt_3()
                     .border_t_1()
                     .border_color(rgb(BORDER))
+                    .child(identity(avatar_image, user_name, "SIGNED IN AS"))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(avatar(avatar_image, &user_name, 26.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .child(micro("SIGNED IN AS", FAINT))
-                                    .child(label(user_name, TEXT).text_xs()),
-                            ),
-                    )
-                    .child(
-                        quiet("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
+                        ghost("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
                             this.sign_out(Some(Screen::SignedOut));
                             cx.notify();
                         })),
@@ -562,18 +605,14 @@ impl Orange {
                             .flex_col()
                             .gap_0p5()
                             .child(micro(format!("{} SOURCES AVAILABLE", count), ORANGE))
-                            .child(
-                                label("Choose what to share", TEXT)
-                                    .font_family("Bahnschrift")
-                                    .font_weight(FontWeight::SEMIBOLD),
-                            )
+                            .child(heading("Choose what to share", 14.0))
                             .child(
                                 label("Click a preview to start streaming immediately.", FAINT)
                                     .text_xs(),
                             ),
                     )
                     .child(
-                        quiet("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| {
+                        ghost("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| {
                             this.refresh_windows();
                             cx.notify();
                         })),
@@ -658,7 +697,7 @@ impl Orange {
                             ),
                     )
                     .child(
-                        quiet("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
+                        ghost("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
                             this.leave_picker(Screen::Home);
                             cx.notify();
                         })),
@@ -725,13 +764,14 @@ impl Orange {
                 // would otherwise be compressed to
                 // nothing inside a scrolling parent.
                 div()
+                    .relative()
                     .flex_shrink_0()
                     .h(px(PICKER_PREVIEW_HEIGHT))
                     .w_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgb(0x08070a))
+                    .bg(rgb(INK))
                     .overflow_hidden()
                     .child(match (thumb, capturing) {
                         (Some(image), _) => appear(
@@ -744,7 +784,19 @@ impl Orange {
                         (None, false) => label("preview unavailable · click to share", FAINT)
                             .text_xs()
                             .into_any_element(),
-                    }),
+                    })
+                    // Over the preview rather than beside the title, where an
+                    // arrow the size of the caption was easy to miss on the
+                    // one card the cursor was actually on.
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom(px(8.0))
+                            .right(px(8.0))
+                            .opacity(0.0)
+                            .group_hover(group.clone(), |s| s.opacity(1.0))
+                            .child(go_badge()),
+                    ),
             )
             .child(
                 // Fixed height keeps the grid even; a
@@ -776,11 +828,6 @@ impl Orange {
                                     .whitespace_nowrap()
                                     .text_ellipsis()
                                     .child(title),
-                            )
-                            .child(
-                                micro("→", ORANGE)
-                                    .opacity(0.0)
-                                    .group_hover(group.clone(), |s| s.opacity(1.0)),
                             ),
                     )
                     .child(
@@ -825,7 +872,7 @@ impl Orange {
         let preview = self.active_preview.clone();
         let just_copied = self
             .copied_at
-            .map(|t| t.elapsed() < Duration::from_secs(2))
+            .map(|t| t.elapsed() < crate::COPIED_FOR)
             .unwrap_or(false);
 
         div()
@@ -939,7 +986,7 @@ impl Orange {
                                     } else {
                                         "Click to copy again"
                                     },
-                                    if just_copied { GREEN } else { FAINT },
+                                    if just_copied { SUCCESS } else { FAINT },
                                 )
                                 .text_xs(),
                             ),
@@ -1062,7 +1109,7 @@ impl Orange {
                     count,
                     if count == 1 { "" } else { "S" }
                 ),
-                GREEN,
+                SUCCESS,
             ))
             .child(
                 div()
@@ -1144,13 +1191,13 @@ impl Orange {
             .gap_3()
             .child(identity)
             .child(match signed_in {
-                Some(_) => quiet("so", "Sign out")
+                Some(_) => ghost("so", "Sign out")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sign_out(None);
                         cx.notify();
                     }))
                     .into_any_element(),
-                None => quiet("si", "Sign in")
+                None => ghost("si", "Sign in")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.screen = Screen::SignedOut;
                         cx.notify();
@@ -1282,7 +1329,7 @@ impl Orange {
             // the opposite of reserving its space.
             button
                 .text_color(rgb(FAINT))
-                .border_color(rgb(0x1f1f1f))
+                .border_color(rgb(BORDER_DIM))
                 .cursor_default()
                 .into_any_element()
         };
@@ -1402,10 +1449,14 @@ impl Orange {
                 FAINT,
             ))
             .child(
-                secondary("back-settings", "Done").on_click(cx.listener(|this, _, _, cx| {
-                    this.screen = Screen::Home;
-                    cx.notify();
-                })),
+                ghost("back-settings", "Done")
+                    .w_full()
+                    .h(px(44.0))
+                    .text_size(px(13.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.screen = Screen::Home;
+                        cx.notify();
+                    })),
             )
     }
 }

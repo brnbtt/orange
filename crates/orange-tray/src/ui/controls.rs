@@ -1,70 +1,13 @@
+//! Reusable controls: buttons, pills, cards, rows, chrome.
+//!
+//! Nothing here knows what screen it is on. If a control needs to know, it
+//! belongs in `view.rs` instead.
+
+use super::theme::*;
 use gpui::{div, prelude::*, px, rgb, Animation, AnimationExt, FontWeight, SharedString};
-use std::time::Duration;
-
-// Palette from the logo exploration.
-pub(super) const BG: u32 = 0x0b0b0b;
-pub(super) const SURFACE: u32 = 0x161616;
-pub(super) const SURFACE_HOVER: u32 = 0x202020;
-pub(super) const BORDER: u32 = 0x2a2a2a;
-pub(super) const TEXT: u32 = 0xe6e0d1;
-pub(super) const MUTED: u32 = 0x99948a;
-pub(super) const FAINT: u32 = 0x66625b;
-pub(super) const ORANGE: u32 = 0xff5a1f;
-pub(super) const ORANGE_DIM: u32 = 0x8a3110;
-pub(super) const INK: u32 = 0x0b0b0b;
-pub(super) const DANGER: u32 = 0xe0645f;
-pub(super) const GREEN: u32 = 0x4ec97a;
-pub(super) const PICKER_PREVIEW_HEIGHT: f32 = 142.0;
-pub(super) const PICKER_DETAILS_HEIGHT: f32 = 52.0;
-pub(super) const PICKER_CARD_HEIGHT: f32 = PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT;
-/// Height of the custom titlebar. The toast layer hangs directly below it, so
-/// the two have to agree.
-pub(super) const TITLEBAR_HEIGHT: f32 = 44.0;
-
-/// The app's motion vocabulary.
-///
-/// Two durations, not five. Every animation here used to name its own number -
-/// 160, 180, 200, 260, 1600 - with no reason for any of them being different,
-/// which is how the app ended up feeling assembled rather than designed.
-///
-/// Everything that appears shares one decelerating curve. Note that eased is
-/// not slower: `ease_out_quint` front-loads the change, so 220ms eased reads
-/// faster than the 200ms linear fades it replaces.
-pub(super) mod motion {
-    use std::time::Duration;
-
-    /// A detail changing in place: a line of text, a value.
-    pub const QUICK: Duration = Duration::from_millis(140);
-    /// Anything arriving: a card, a toast, a thumbnail, a whole screen.
-    pub const ENTER: Duration = Duration::from_millis(220);
-    /// How much longer each successive item in a group takes. Same start,
-    /// staggered finish, because GPUI has no delay primitive.
-    pub const STAGGER: Duration = Duration::from_millis(60);
-    /// One breath of the live indicator.
-    pub const BREATH: Duration = Duration::from_millis(1_600);
-}
-
-/// Fade an element in on the shared entrance curve.
-///
-/// Every arrival in the app goes through here, so how the app feels is one
-/// edit rather than seven, and no call site can quietly invent its own timing.
-pub(super) fn appear<E>(
-    id: impl Into<SharedString>,
-    duration: Duration,
-    element: E,
-) -> gpui::AnimationElement<E>
-where
-    E: IntoElement + Styled + 'static,
-{
-    element.with_animation(
-        id.into(),
-        Animation::new(duration).with_easing(gpui::ease_out_quint()),
-        |element, delta| element.opacity(delta),
-    )
-}
 
 /// Small square affordance on a toast: collapse, expand, or dismiss.
-pub(super) fn toast_toggle(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn toast_toggle(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -81,11 +24,7 @@ pub(super) fn toast_toggle(id: &'static str, glyph: &'static str) -> gpui::State
         .child(glyph)
 }
 
-pub(super) fn label(text: impl Into<SharedString>, color: u32) -> gpui::Div {
-    div().text_color(rgb(color)).child(text.into())
-}
-
-pub(super) fn avatar(
+pub(crate) fn avatar(
     image: Option<std::sync::Arc<gpui::RenderImage>>,
     name: &str,
     size: f32,
@@ -128,29 +67,9 @@ pub(super) fn avatar(
         .child(content)
 }
 
-/// Technical microcopy from the identity board: compact, monospaced and used
-/// only for orientation/status so body text remains easy to scan.
-pub(super) fn micro(text: impl Into<SharedString>, color: u32) -> gpui::Div {
-    label(text, color)
-        .font_family("Cascadia Mono")
-        .text_size(px(10.0))
-        .font_weight(FontWeight::MEDIUM)
-}
-
-pub(super) fn wordmark(size: f32) -> gpui::Div {
-    label("O R A N G E", ORANGE)
-        .font_family("Bahnschrift")
-        .text_size(px(size))
-        .font_weight(FontWeight::SEMIBOLD)
-}
-
-pub(super) fn accent_rule(width: f32) -> gpui::Div {
-    div().w(px(width)).h(px(2.0)).bg(rgb(ORANGE))
-}
-
 /// A raised surface with a hairline border. The border does most of the work:
 /// on a dark UI, background alone reads as mush.
-pub(super) fn card() -> gpui::Div {
+pub(crate) fn card() -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -162,18 +81,24 @@ pub(super) fn card() -> gpui::Div {
         .border_color(rgb(BORDER))
 }
 
-pub(super) fn primary(
+/// The one action a screen exists for.
+///
+/// `arrow` puts a trailing chevron on the far edge and pushes the label to the
+/// leading one, which is how the boards draw a button that moves you forward.
+/// Actions that merely acknowledge something - waiting on a browser, signing
+/// in - stay centred and arrowless, so the arrow keeps meaning "next".
+pub(crate) fn primary(
     id: &'static str,
     text: impl Into<SharedString>,
+    arrow: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
         .items_center()
-        .justify_center()
         .w_full()
+        .h(px(44.0))
         .px_4()
-        .py_2()
         .rounded_md()
         .bg(rgb(ORANGE))
         .text_color(rgb(INK))
@@ -181,14 +106,23 @@ pub(super) fn primary(
         .text_size(px(13.0))
         .font_weight(FontWeight::SEMIBOLD)
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0xff6f38)))
+        .hover(|s| s.bg(rgb(ORANGE_HOT)))
         // Press feedback: without it, a click feels like nothing happened
         // until the screen changes.
         .active(|s| s.bg(rgb(ORANGE_DIM)))
-        .child(text.into())
+        .map(|element| {
+            if arrow {
+                element
+                    .justify_between()
+                    .child(text.into())
+                    .child(div().text_size(px(14.0)).child("\u{2192}"))
+            } else {
+                element.justify_center().child(text.into())
+            }
+        })
 }
 
-pub(super) fn secondary(
+pub(crate) fn secondary(
     id: &'static str,
     text: impl Into<SharedString>,
 ) -> gpui::Stateful<gpui::Div> {
@@ -198,8 +132,8 @@ pub(super) fn secondary(
         .items_center()
         .justify_center()
         .w_full()
+        .h(px(44.0))
         .px_4()
-        .py_2()
         .rounded_md()
         .bg(rgb(SURFACE))
         .border_1()
@@ -208,18 +142,48 @@ pub(super) fn secondary(
         .font_family("Bahnschrift")
         .text_size(px(13.0))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(0x3a3a3a)))
+        .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(BORDER_HOVER)))
         .active(|s| s.bg(rgb(BG)))
         .child(text.into())
 }
 
-/// A secondary action: Sign out, Check now, Open folder, Back.
+/// A named exit: Sign out, Refresh, Back, Done.
+///
+/// Orange on nothing. These are the moves the boards draw in the accent
+/// because they change where you are rather than what you have configured,
+/// and there is at most one of them visible per screen - which is the only
+/// reason spending the accent on them does not dilute it.
+pub(crate) fn ghost(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .h(px(30.0))
+        .px_3()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(ORANGE_DIM))
+        .text_xs()
+        .text_color(rgb(ORANGE))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(ORANGE_WASH)).border_color(rgb(ORANGE)))
+        .active(|s| s.bg(rgb(BG)))
+        .child(text.into())
+}
+
+/// A secondary action inside a settings row: Check now, Open folder.
 ///
 /// Bordered rather than bare text. As plain FAINT text it was styled
 /// identically to the caption beside it, so on the Diagnostics row "Logs from
 /// your recent sessions" and "Open folder" were indistinguishable until hover -
 /// one inert, one the only control in the row.
-pub(super) fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+///
+/// Neutral rather than orange, unlike `ghost`: several of these can be on
+/// screen at once, and the board's own first rule is that orange is an accent
+/// and not the dominant colour.
+pub(crate) fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         // Without this a long description in the same row squeezes the action
@@ -247,7 +211,7 @@ pub(super) fn quiet(id: &'static str, text: impl Into<SharedString>) -> gpui::St
 /// Shared rather than hand-assembled per row, because hand-assembling is how
 /// the Updates and Diagnostics rows drifted apart: one had `min_w(0)` on its
 /// text column and the other did not, so only one of them clipped.
-pub(super) fn setting_row(
+pub(crate) fn setting_row(
     title: impl Into<SharedString>,
     detail: impl Into<SharedString>,
     action: gpui::AnyElement,
@@ -266,7 +230,7 @@ pub(super) fn setting_row(
                 // Lets the column shrink below its content, so the description
                 // wraps instead of pushing the action off the card.
                 .min_w(px(0.0))
-                .child(label(title, TEXT))
+                .child(heading(title, 12.0))
                 .child(label(detail, MUTED).text_xs()),
         )
         .child(action)
@@ -284,7 +248,7 @@ pub(super) fn setting_row(
 /// whole. A single line covering every option has to be written vaguely enough
 /// to fit them all, which is how "Auto follows the refresh rate" ended up
 /// reading as a claim about the whole setting instead of about Auto.
-pub(super) fn setting_choice(
+pub(crate) fn setting_choice(
     title: impl Into<SharedString>,
     readout: Option<SharedString>,
     pills: Vec<gpui::AnyElement>,
@@ -302,14 +266,14 @@ pub(super) fn setting_choice(
             .flex()
             .items_center()
             .gap_2()
-            .child(label(title.clone(), TEXT))
+            .child(heading(title.clone(), 12.0))
             .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
             .child(appear(
                 SharedString::from(format!("{title}={readout}")),
                 motion::QUICK,
                 micro(readout, MUTED),
             )),
-        None => div().flex().child(label(title, TEXT)),
+        None => div().flex().child(heading(title, 12.0)),
     };
 
     card()
@@ -333,7 +297,7 @@ pub(super) fn setting_choice(
 /// primitive, which GPUI does not have. Movement is deliberately not animated:
 /// every offset GPUI can express is a margin or padding, so a slide would
 /// reflow the scroll container on every frame.
-pub(super) fn section_body(id: &str, children: Vec<gpui::AnyElement>) -> impl IntoElement {
+pub(crate) fn section_body(id: &str, children: Vec<gpui::AnyElement>) -> impl IntoElement {
     let animated: Vec<gpui::AnyElement> = children
         .into_iter()
         .enumerate()
@@ -368,7 +332,7 @@ pub(super) fn section_body(id: &str, children: Vec<gpui::AnyElement>) -> impl In
 /// Typography sits on the row itself rather than on each child, so the whole
 /// heading brightens as one on hover; `micro` would pin each child's colour and
 /// defeat that.
-pub(super) fn section_header(
+pub(crate) fn section_header(
     id: &'static str,
     title: &'static str,
     readout: Option<&'static str>,
@@ -390,7 +354,7 @@ pub(super) fn section_header(
         // the screen, not chrome; ORANGE_DIM on this background is 2.4:1, which
         // made the top of the hierarchy the second-dimmest thing on it.
         .text_color(rgb(ORANGE))
-        .hover(|style| style.text_color(rgb(0xff6f38)))
+        .hover(|style| style.text_color(rgb(ORANGE_HOT)))
         .child(accent_rule(12.0))
         .child(div().child(title))
         // The same rule the streaming header uses between its label and its
@@ -407,7 +371,7 @@ pub(super) fn section_header(
         )
 }
 
-pub(super) fn update_action(
+pub(crate) fn update_action(
     id: &'static str,
     text: impl Into<SharedString>,
 ) -> gpui::Stateful<gpui::Div> {
@@ -426,12 +390,12 @@ pub(super) fn update_action(
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0xff6f38)))
+        .hover(|style| style.bg(rgb(ORANGE_HOT)))
         .active(|style| style.bg(rgb(ORANGE_DIM)))
         .child(text.into())
 }
 
-pub(super) fn option_pill(
+pub(crate) fn option_pill(
     id: SharedString,
     text: impl Into<SharedString>,
     active: bool,
@@ -459,115 +423,232 @@ pub(super) fn option_pill(
         .child(text.into())
 }
 
-/// The mark: a scanline eclipse crescent, from the logo exploration.
+/// A concentric broadcast mark: a lit centre with two rings around it.
 ///
-/// Embedded as a PNG rather than drawn, because the scanline texture cannot be
-/// expressed with GPUI primitives without hundreds of elements. Hero-sized
-/// instances receive a periodic transmit sweep that pushes their scanlines
-/// outward as rays; titlebar-sized instances stay static because animation at
-/// 18px would only read as flicker.
-fn logo_element_id(animated: bool, epoch: u64) -> SharedString {
-    if animated {
-        SharedString::from(format!("logo-animated-{epoch}"))
-    } else {
-        SharedString::from("logo-static")
-    }
+/// Built from three divs rather than set as a glyph. The titlebar can lean on
+/// Segoe UI Symbol because its three glyphs are ancient and universal; a
+/// broadcast icon is neither, and a missing one falls back to a tofu box in
+/// the most prominent control on the screen.
+pub(crate) fn broadcast_mark(size: f32, color: u32) -> gpui::Div {
+    let ring = |diameter: f32, alpha_color: u32| {
+        div()
+            .absolute()
+            .w(px(diameter))
+            .h(px(diameter))
+            .left(px((size - diameter) / 2.0))
+            .top(px((size - diameter) / 2.0))
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(alpha_color))
+    };
+    div()
+        .relative()
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        .child(ring(size, color))
+        .child(ring(size * 0.62, color))
+        .child(
+            div()
+                .absolute()
+                .w(px(size * 0.24))
+                .h(px(size * 0.24))
+                .left(px(size * 0.38))
+                .top(px(size * 0.38))
+                .rounded_full()
+                .bg(rgb(color)),
+        )
 }
 
-pub(super) fn logo(px_size: f32, epoch: u64) -> impl IntoElement {
-    static STATIC: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
-        std::sync::OnceLock::new();
-    static ANIMATED: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
-        std::sync::OnceLock::new();
+/// Two figures: somebody else's stream.
+///
+/// A head and a pair of shoulders each, rather than two rings. Two circles
+/// side by side is what a pair of goggles looks like; the shoulders are what
+/// make it a person.
+pub(crate) fn people_mark(size: f32, color: u32) -> gpui::Div {
+    let figure = |x: f32, scale: f32| {
+        let head = size * 0.26 * scale;
+        let shoulders = size * 0.46 * scale;
+        div()
+            .absolute()
+            .left(px(x))
+            .bottom(px(size * 0.18))
+            .w(px(shoulders))
+            .h(px(size * 0.6 * scale))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px((shoulders - head) / 2.0))
+                    .w(px(head))
+                    .h(px(head))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(color)),
+            )
+            .child(
+                // Only the top corners are rounded, so it reads as a torso
+                // continuing past the frame rather than a floating pill.
+                div()
+                    .absolute()
+                    .bottom(px(0.0))
+                    .left(px(0.0))
+                    .w(px(shoulders))
+                    .h(px(size * 0.24 * scale))
+                    .rounded_t(px(shoulders / 2.0))
+                    .border_1()
+                    .border_color(rgb(color)),
+            )
+    };
+    div()
+        .relative()
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        // The smaller figure first, so the nearer one overlaps it.
+        .child(figure(size * 0.42, 0.82))
+        .child(figure(0.0, 1.0))
+}
 
-    let animated = px_size >= 80.0;
-    let image = (if animated { &ANIMATED } else { &STATIC })
-        .get_or_init(|| {
-            let bytes = include_bytes!("../logo.png");
-            let decoded = image::load_from_memory(bytes).ok()?.into_rgba8();
-            let base = if animated {
-                // Reserve real canvas to the left of the mark. Extending rays
-                // inside the original tightly-cropped PNG only clipped them.
-                let scaled = image::imageops::resize(
-                    &decoded,
-                    96,
-                    96,
-                    image::imageops::FilterType::Triangle,
-                );
-                let mut canvas = image::RgbaImage::new(128, 128);
-                image::imageops::overlay(&mut canvas, &scaled, 28, 16);
-                canvas.into_raw()
-            } else {
-                decoded.into_raw()
-            };
-            // A short transmit sweep followed by a hold. Constant motion made
-            // the mark feel like a loading spinner; Routine's interfaces use
-            // sparse, stateful motion that settles back into stillness.
-            let frame_count = if animated { 44 } else { 1 };
-            let mut frames = Vec::with_capacity(frame_count);
-            for frame_index in 0..frame_count {
-                let mut raw = base.clone();
-                if animated && frame_index < 20 {
-                    let sweep_y = frame_index as f32 / 19.0 * 127.0;
-                    for y in 0..128usize {
-                        let strength = (1.0 - (y as f32 - sweep_y).abs() / 15.0).max(0.0);
-                        if strength <= 0.0 {
-                            continue;
-                        }
-                        let first = (0..128usize).find(|x| base[(y * 128 + x) * 4 + 3] > 16);
-                        let Some(first) = first else { continue };
-                        let source = (y * 128 + first) * 4;
-                        let extension = (strength * 42.0).round() as usize;
-                        for distance in 1..=extension.min(first) {
-                            let target = (y * 128 + first - distance) * 4;
-                            let taper = 1.0 - distance as f32 / (extension + 1) as f32;
-                            raw[target] = base[source];
-                            raw[target + 1] = base[source + 1];
-                            raw[target + 2] = base[source + 2];
-                            let ray_alpha = strength.sqrt() * (0.78 + 0.22 * taper);
-                            raw[target + 3] = (base[source + 3] as f32 * ray_alpha).round() as u8;
-                        }
-                    }
-                }
-                // GPUI wants BGRA; the PNG decodes as RGBA.
-                for pixel in raw.as_chunks_mut::<4>().0 {
-                    pixel.swap(0, 2);
-                }
-                let buffer = image::RgbaImage::from_raw(128, 128, raw)?;
-                frames.push(if animated {
-                    image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(45, 1))
-                } else {
-                    image::Frame::new(buffer)
-                });
-            }
-            Some(std::sync::Arc::new(gpui::RenderImage::new(frames)))
-        })
-        .clone();
+/// The rounded well a mark sits in on an action card.
+pub(crate) fn icon_tile(mark: gpui::Div, border: u32) -> gpui::Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .w(px(46.0))
+        .h(px(46.0))
+        .rounded_md()
+        .bg(rgb(SURFACE))
+        .border_1()
+        .border_color(rgb(border))
+        .child(mark)
+}
 
-    match image {
-        Some(image) => gpui::img(image)
-            .id(logo_element_id(animated, epoch))
-            .w(px(px_size))
-            .h(px(px_size))
-            .into_any_element(),
-        // If the asset ever fails to decode, a plain disc beats nothing.
-        None => div()
-            .w(px(px_size))
-            .h(px(px_size))
-            .rounded_full()
-            .bg(rgb(ORANGE))
-            .into_any_element(),
-    }
+/// A whole route as one target: mark, title, what it does, and an arrow.
+///
+/// This replaces a stack of bare buttons whose labels had to carry all the
+/// meaning on their own. The supporting line is the point - "Start streaming"
+/// and "Join a stream" are indistinguishable to somebody opening the app for
+/// the first time, and a caption costs nothing but a row of height.
+///
+/// `accent` marks the one the screen is actually for. Exactly one card per
+/// screen may set it, or the accent stops meaning anything.
+pub(crate) fn action_card(
+    id: &'static str,
+    mark: gpui::Div,
+    title: &'static str,
+    detail: &'static str,
+    accent: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let edge = if accent { ORANGE_DIM } else { BORDER };
+    let group = SharedString::from(format!("action-{id}"));
+    div()
+        .id(id)
+        .group(group.clone())
+        .flex()
+        .items_center()
+        .gap_3()
+        .w_full()
+        .flex_shrink_0()
+        .p_3()
+        .rounded_md()
+        .bg(rgb(if accent { ORANGE_WASH } else { SURFACE }))
+        .border_1()
+        .border_color(rgb(edge))
+        .cursor_pointer()
+        .hover(|style| style.border_color(rgb(if accent { ORANGE } else { BORDER_HOVER })))
+        .active(|style| style.bg(rgb(BG)))
+        .child(icon_tile(mark, edge))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    label(title, if accent { ORANGE } else { TEXT })
+                        .font_family("Bahnschrift")
+                        .text_size(px(14.0))
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(label(detail, MUTED).text_xs()),
+        )
+        .child(
+            // Slides a couple of pixels on hover. The only motion in the card,
+            // so it reads as the card acknowledging the cursor rather than as
+            // decoration.
+            div()
+                .flex_shrink_0()
+                .text_size(px(15.0))
+                .text_color(rgb(if accent { ORANGE } else { FAINT }))
+                .pr_1()
+                .group_hover(group, |style| style.pr_0().text_color(rgb(ORANGE)))
+                .child("\u{2192}"),
+        )
+}
+
+/// Who you are signed in as: portrait, a rule, and the name.
+///
+/// The rule is the boards' idea and a good one - it ties the portrait to the
+/// text as one object, so the footer reads as a single identity rather than as
+/// an image that happens to sit next to a caption.
+pub(crate) fn identity(
+    image: Option<std::sync::Arc<gpui::RenderImage>>,
+    name: impl Into<SharedString>,
+    caption: &'static str,
+) -> gpui::Div {
+    let name = name.into();
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .min_w(px(0.0))
+        .child(
+            // The ring is a second element rather than a border on the
+            // portrait: a border would eat into the image at this size, and
+            // the portrait is already round and clipped.
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .w(px(40.0))
+                .h(px(40.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(ORANGE_DIM))
+                .child(avatar(image, &name, 32.0)),
+        )
+        .child(div().w(px(2.0)).h(px(28.0)).flex_shrink_0().bg(rgb(ORANGE)))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .min_w(px(0.0))
+                .child(micro(caption, FAINT))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(rgb(TEXT))
+                        .child(name),
+                ),
+        )
 }
 
 /// A small coloured dot, for status.
-pub(super) fn dot(color: u32) -> gpui::Div {
+pub(crate) fn dot(color: u32) -> gpui::Div {
     div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(color))
 }
 
 /// A dot that breathes, for "this is live right now".
-pub(super) fn live_dot() -> impl IntoElement {
-    dot(GREEN).with_animation(
+pub(crate) fn live_dot() -> impl IntoElement {
+    dot(SUCCESS).with_animation(
         SharedString::from("live-pulse"),
         // GPUI ships this curve: a sine breath that eases at both ends. The
         // hand-rolled triangle wave it replaces snapped at the turn.
@@ -578,26 +659,32 @@ pub(super) fn live_dot() -> impl IntoElement {
     )
 }
 
-/// Fade content in. Keyed per screen so navigation reads as a transition
-/// rather than an instant swap.
-pub(super) fn fade_in(id: impl Into<SharedString>, element: gpui::AnyElement) -> impl IntoElement {
-    appear(
-        id,
-        motion::ENTER,
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.0))
-            .child(element),
-    )
+/// The badge that appears on a picker preview under the cursor.
+///
+/// The boards draw a tick here. This is an arrow, because a tick means "this
+/// one is selected" and there is no selected state in the picker - clicking a
+/// card starts the stream outright. Same circle, honest verb.
+pub(crate) fn go_badge() -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded_full()
+        .bg(rgb(INK))
+        .border_1()
+        .border_color(rgb(ORANGE))
+        .text_size(px(13.0))
+        .text_color(rgb(ORANGE))
+        .child("\u{2192}")
 }
 
 /// Square, unobtrusive control in the titlebar.
 ///
 /// The hover colour is a parameter rather than something callers add
 /// afterwards: GPUI panics if `.hover()` is applied twice to one element.
-pub(super) fn titlebar_button(
+pub(crate) fn titlebar_button(
     id: &'static str,
     glyph: &'static str,
     hover_bg: u32,
@@ -616,23 +703,4 @@ pub(super) fn titlebar_button(
         .cursor_pointer()
         .hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(TEXT)))
         .child(glyph)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn animated_logo_identity_changes_when_the_window_reopens() {
-        assert_ne!(logo_element_id(true, 0), logo_element_id(true, 1));
-        assert_eq!(logo_element_id(false, 0), logo_element_id(false, 1));
-    }
-
-    #[test]
-    fn picker_cards_use_content_height_instead_of_filling_the_viewport() {
-        assert_eq!(
-            PICKER_CARD_HEIGHT,
-            PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT
-        );
-    }
 }

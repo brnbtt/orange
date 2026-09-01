@@ -178,17 +178,23 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
 }
 
 /// Minimal styled page for the browser leg of the login.
+///
+/// The palette is the app's, so the tab that opens mid-sign-in does not look
+/// like somebody else's site. The faces are the system's: the CSP on this
+/// response is `default-src 'none'`, and widening it to fetch a webfont for
+/// two seconds of copy is not a trade worth making.
 fn page(title: &str, body: &str) -> String {
     let title = escape_html(title);
     let body = escape_html(body);
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>orange</title>
 <style>
- body{{background:#141416;color:#eee;font:16px/1.6 system-ui,sans-serif;
+ body{{background:#070708;color:#e6e0d1;font:15px/1.6 system-ui,sans-serif;
       display:grid;place-items:center;height:100vh;margin:0;text-align:center}}
- h1{{color:#ff7a00;font-size:1.5rem;margin:0 0 .5rem}}
- p{{color:#9a9a9a;margin:0}}
-</style></head><body><div><h1>{title}</h1><p>{body}</p></div></body></html>"#
+ h1{{color:#ff5a1f;font-size:1.35rem;margin:0 0 .75rem}}
+ hr{{width:28px;height:2px;border:0;background:#ff5a1f;margin:0 auto .75rem}}
+ p{{color:#99948a;margin:0}}
+</style></head><body><div><h1>{title}</h1><hr><p>{body}</p></div></body></html>"#
     )
 }
 

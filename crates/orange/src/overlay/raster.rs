@@ -14,15 +14,29 @@ const CHIP: f32 = 34.0;
 const PAD: f32 = 13.0;
 const TRACK: f32 = 110.0;
 const LABEL: f32 = 13.0;
-const CONTROL_RADIUS: f32 = 10.0;
+const CONTROL_RADIUS: f32 = 12.0;
+/// The live dot. Small enough to read as an indicator rather than a button.
+const DOT: f32 = 3.5;
+/// Volume track height and knob radius. The knob is deliberately much bigger
+/// than the track is tall: it is the part you aim at.
+const TRACK_HEIGHT: f32 = 6.0;
+const KNOB: f32 = 9.0;
 
-// The app's palette, matching the tray.
-const SURFACE: (f32, f32, f32) = (0.086, 0.086, 0.086);
-const BORDER: (f32, f32, f32) = (0.165, 0.165, 0.165);
-const CREAM: (f32, f32, f32) = (0.902, 0.878, 0.820);
-const ORANGE: (f32, f32, f32) = (1.0, 0.353, 0.122);
-const DANGER: (f32, f32, f32) = (0.878, 0.392, 0.373);
+// The app's palette, matching the tray. Kept as floats because tiny-skia wants
+// them that way; the hex on the right is the value on the identity board.
+//
+// The panel is darker than the tray's card surface and very nearly opaque. A
+// control panel has to read the same over a dark game and a white browser, and
+// at 0.94 the same fill looked like two different greys depending on the frame
+// behind it.
+const SURFACE: (f32, f32, f32) = (0.078, 0.078, 0.086); // #141416
+const BORDER: (f32, f32, f32) = (0.165, 0.165, 0.180); // #2a2a2e
+const CREAM: (f32, f32, f32) = (0.902, 0.878, 0.820); // #e6e0d1
+const ORANGE: (f32, f32, f32) = (1.0, 0.353, 0.122); // #ff5a1f
+const DANGER: (f32, f32, f32) = (0.937, 0.267, 0.267); // #ef4444
 
+const ICON_SPEAKER_NONE: &str = "M155.51,24.81a8,8,0,0,0-8.42.88L77.25,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V32A8,8,0,0,0,155.51,24.81ZM32,96H72v64H32ZM144,207.64,88,164.09V91.91l56-43.55Z";
+const ICON_SPEAKER_LOW: &str = "M155.51,24.81a8,8,0,0,0-8.42.88L77.25,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V32A8,8,0,0,0,155.51,24.81ZM32,96H72v64H32ZM144,207.64,88,164.09V91.91l56-43.55ZM208,128a39.93,39.93,0,0,1-10,26.46,8,8,0,0,1-12-10.58,24,24,0,0,0,0-31.72,8,8,0,1,1,12-10.58A40,40,0,0,1,208,128Z";
 const ICON_SPEAKER_HIGH: &str = "M155.51,24.81a8,8,0,0,0-8.42.88L77.25,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V32A8,8,0,0,0,155.51,24.81ZM32,96H72v64H32ZM144,207.64,88,164.09V91.91l56-43.55Zm54-106.08a40,40,0,0,1,0,52.88,8,8,0,0,1-12-10.58,24,24,0,0,0,0-31.72,8,8,0,0,1,12-10.58ZM248,128a79.9,79.9,0,0,1-20.37,53.34,8,8,0,0,1-11.92-10.67,64,64,0,0,0,0-85.33,8,8,0,1,1,11.92-10.67A79.83,79.83,0,0,1,248,128Z";
 const ICON_SPEAKER_SLASH: &str = "M53.92,34.62A8,8,0,1,0,42.08,45.38L73.55,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V175.09l42.08,46.29a8,8,0,1,0,11.84-10.76ZM32,96H72v64H32ZM144,207.64,88,164.09V95.89l56,61.6Zm42-63.77a24,24,0,0,0,0-31.72,8,8,0,1,1,12-10.57,40,40,0,0,1,0,52.88,8,8,0,0,1-12-10.59Zm-80.16-76a8,8,0,0,1,1.4-11.23l39.85-31A8,8,0,0,1,160,32v74.83a8,8,0,0,1-16,0V48.36l-26.94,21A8,8,0,0,1,105.84,67.91ZM248,128a79.9,79.9,0,0,1-20.37,53.34,8,8,0,0,1-11.92-10.67,64,64,0,0,0,0-85.33,8,8,0,1,1,11.92-10.67A79.83,79.83,0,0,1,248,128Z";
 const ICON_X: &str = "M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z";
@@ -109,12 +123,13 @@ fn status_max_width(logical_width: f32) -> f32 {
     (logical_width - MARGIN * 2.0 - BUTTON - 8.0).max(0.0)
 }
 
-fn status_leading_width(persistent_live: bool, height: f32) -> f32 {
-    if persistent_live {
-        20.0
-    } else {
-        height
-    }
+/// The live dot's radius inside a status chip.
+///
+/// Proportional to the chip rather than fixed, because the two chips are
+/// different heights - the host's live monitor is shorter than a viewer's -
+/// and one radius looked heavy in one and lost in the other.
+fn dot_radius(chip_height: f32) -> f32 {
+    (chip_height * 0.12).clamp(3.0, DOT + 1.5)
 }
 
 /// The panel every cluster sits on.
@@ -123,7 +138,7 @@ fn status_leading_width(persistent_live: bool, height: f32) -> f32 {
 /// to survive the worst case, not the average one - but small enough that
 /// being nearly opaque hides almost nothing.
 fn panel(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, alpha: f32) {
-    fill_round(pixmap, x, y, w, h, r, rgba(SURFACE, 0.94 * alpha));
+    fill_round(pixmap, x, y, w, h, r, rgba(SURFACE, 0.97 * alpha));
     if let Some(path) = rounded_rect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, r) {
         stroke(pixmap, &path, rgba(BORDER, 0.92 * alpha), 1.0);
     }
@@ -158,27 +173,45 @@ fn draw_svg_icon(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, path: &str, color:
     );
 }
 
-fn speaker(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, muted: bool, color: Color) {
-    draw_svg_icon(
-        pixmap,
-        x,
-        y,
-        s,
-        if muted {
+/// The speaker glyph that matches what you would actually hear.
+///
+/// Four states, not two. A single "on" icon means the only way to tell 10%
+/// from 100% is to read the slider, which is exactly the thing the icon is
+/// there to save you from - and at 20% the difference between "quiet" and
+/// "muted" is the one distinction worth drawing.
+fn speaker_icon(muted: bool, level: f32) -> &'static str {
+    if muted || level <= 0.0 {
+        // Muted and turned-to-zero are different acts, so they get different
+        // glyphs: the slash is something you did, the silent cone is where
+        // the slider is.
+        return if muted {
             ICON_SPEAKER_SLASH
         } else {
-            ICON_SPEAKER_HIGH
-        },
-        color,
-    );
+            ICON_SPEAKER_NONE
+        };
+    }
+    if level < 0.5 {
+        ICON_SPEAKER_LOW
+    } else {
+        ICON_SPEAKER_HIGH
+    }
+}
+
+fn speaker(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, muted: bool, level: f32, color: Color) {
+    draw_svg_icon(pixmap, x, y, s, speaker_icon(muted, level), color);
 }
 
 fn cross(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
     draw_svg_icon(pixmap, x, y, s, ICON_X, color);
 }
 
-fn live_mark(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
-    circle(pixmap, x + s / 2.0, y + s / 2.0, s * 0.24, color);
+/// The live dot.
+///
+/// A filled circle and nothing else. This was briefly a crescent inside
+/// viewfinder brackets, which at twenty pixels read as a small orange smudge
+/// competing with the one word the chip exists to say.
+fn live_mark(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color: Color) {
+    circle(pixmap, cx, cy, radius, color);
 }
 
 fn expand(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, exiting: bool, color: Color) {
@@ -287,6 +320,7 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
     // A compact stream mark at rest; hovering expands into real receive data.
     {
         let expanded = status_expanded(state.hot == Some(Control::Stats));
+        let pulse = state.live_pulse();
         let received = state.quality_label();
         let quality = if persistent_live {
             String::from("LIVE")
@@ -309,10 +343,10 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
         // Logical dimensions first; each is independently converted for the
         // destination rectangle and for the source pixmap.
         let h = if persistent_live { 28.0 } else { CHIP };
-        let leading = status_leading_width(persistent_live, h);
+        let leading = h;
         let has_text = text::available();
         let show_label = (expanded || persistent_live) && has_text;
-        let label_gap = if persistent_live { 0.0 } else { 8.0 };
+        let label_gap = if persistent_live { 4.0 } else { 8.0 };
         let end_pad = if persistent_live { 10.0 } else { PAD };
         let max_w = status_max_width(logical_width).max(h);
         let label_size = LABEL * raster_scale;
@@ -362,27 +396,23 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
                     0.0,
                     raster_w,
                     raster_h,
-                    if persistent_live { 8.0 } else { CONTROL_RADIUS } * raster_scale,
+                    if persistent_live {
+                        10.0
+                    } else {
+                        CONTROL_RADIUS
+                    } * raster_scale,
                     status_alpha,
                 );
-                if persistent_live {
-                    circle(
-                        pixmap,
-                        10.0 * raster_scale,
-                        raster_h / 2.0,
-                        3.0 * raster_scale,
-                        rgba(ORANGE, status_alpha),
-                    );
-                } else {
-                    let icon = ICON * raster_scale;
-                    live_mark(
-                        pixmap,
-                        (raster_h - icon) / 2.0,
-                        (raster_h - icon) / 2.0,
-                        icon,
-                        rgba(ORANGE, status_alpha),
-                    );
-                }
+                // Centred in the leading box, so the label always clears it
+                // whatever height the chip is.
+                let lead = leading * raster_scale;
+                live_mark(
+                    pixmap,
+                    lead / 2.0,
+                    raster_h / 2.0,
+                    dot_radius(h) * raster_scale,
+                    rgba(ORANGE, status_alpha * pulse),
+                );
                 if !show_label {
                     return;
                 }
@@ -530,13 +560,14 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
                     (h - icon) / 2.0,
                     icon,
                     muted,
+                    level,
                     rgba(CREAM, hot_alpha(Control::Mute, 0.85) * alpha),
                 );
                 if !open {
                     return;
                 }
                 let tx = button + gap;
-                let th = 4.0 * raster_scale;
+                let th = TRACK_HEIGHT * raster_scale;
                 let ty = h / 2.0 - th / 2.0;
                 fill_round(
                     pixmap,
@@ -545,7 +576,7 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
                     track,
                     th,
                     th / 2.0,
-                    rgba(CREAM, 0.22 * alpha),
+                    rgba(CREAM, 0.28 * alpha),
                 );
                 if level > 0.0 {
                     fill_round(
@@ -562,7 +593,7 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
                     pixmap,
                     tx + track * level,
                     h / 2.0,
-                    6.0 * raster_scale,
+                    KNOB * raster_scale,
                     rgba(CREAM, alpha),
                 );
             },
@@ -780,9 +811,17 @@ mod tests {
     }
 
     #[test]
-    fn live_status_uses_a_compact_typographic_lead() {
-        assert_eq!(status_leading_width(true, 28.0), 20.0);
-        assert_eq!(status_leading_width(false, 34.0), 34.0);
+    fn the_dot_scales_with_the_chip_it_sits_in() {
+        // Readable in the host's short chip, still an indicator in the
+        // viewer's taller one, and never wider than its leading box.
+        for height in [28.0_f32, 34.0] {
+            let radius = dot_radius(height);
+            assert!(radius >= 3.0, "the dot vanishes in a {height}px chip");
+            assert!(
+                radius * 2.0 < height / 2.0,
+                "the dot reads as a button in a {height}px chip"
+            );
+        }
     }
 
     #[test]

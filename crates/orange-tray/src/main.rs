@@ -82,6 +82,13 @@ fn poll_login(
     })
 }
 
+/// How long the share code shows its "Copied" confirmation.
+///
+/// Shared with `Digest` so the tick that retires the confirmation is the same
+/// tick that repaints it away. Two copies of this number and the label would
+/// linger until something else happened to trigger a render.
+const COPIED_FOR: Duration = Duration::from_secs(2);
+
 struct Orange {
     tray_available: bool,
     screen: Screen,
@@ -122,7 +129,77 @@ struct Orange {
     /// apart. Reset to zero whenever no stream is running.
     viewers_seen: usize,
     logo_epoch: u64,
+    /// Whether ambient animation should run: true only while this window is
+    /// the active one.
+    ///
+    /// Any running animation forces a full repaint at 60fps, measured at about
+    /// 12% of a CPU core on this window. That is a fair price while somebody
+    /// is looking at the app and pure waste the moment they alt-tab away, so
+    /// the decoration stops when the window loses focus and picks up again
+    /// when it comes back. Read from the window during `render`, because GPUI
+    /// refreshes on activation change and has no public observer for it.
+    animate: bool,
     updates: update::UpdateController,
+}
+
+/// The parts of the app the view can actually see.
+///
+/// `tick` runs twice a second whether or not anything happened, and used to
+/// end in an unconditional `cx.notify()`. That re-rendered every element in
+/// the app twice a second forever, including while the window was hidden in
+/// the tray and there was nobody to show it to.
+///
+/// Comparing two of these costs a few dozen bytes and a handful of integer
+/// compares, and turns a permanent background repaint into one that happens
+/// when something moved. It is deliberately built from what `view.rs` reads
+/// rather than from every field on `Orange`: a value the screens never render
+/// cannot change what is on screen, and including it would only reintroduce
+/// the wakeups this exists to remove.
+#[derive(PartialEq)]
+struct Digest {
+    screen: Screen,
+    notice: Option<(NoticeKind, String)>,
+    logging_in: bool,
+    signed_in_as: Option<String>,
+    has_avatar: bool,
+    hosting: bool,
+    code: Option<String>,
+    viewers: usize,
+    watches: usize,
+    windows: usize,
+    thumbnails: usize,
+    capturing: bool,
+    has_preview: bool,
+    /// The share code's "Copied" confirmation expires on a timer rather than
+    /// on an event, so the tick that retires it has to be the one that
+    /// repaints.
+    recently_copied: bool,
+    update_status: String,
+}
+
+impl Orange {
+    fn digest(&self) -> Digest {
+        Digest {
+            screen: self.screen,
+            notice: self
+                .notice
+                .as_ref()
+                .map(|notice| (notice.kind, notice.text.clone())),
+            logging_in: self.logging_in.is_some(),
+            signed_in_as: self.session.as_ref().map(|session| session.name.clone()),
+            has_avatar: self.avatar.is_some(),
+            hosting: self.host.is_some(),
+            code: self.code(),
+            viewers: self.viewers().len(),
+            watches: self.watches.len(),
+            windows: self.windows.len(),
+            thumbnails: self.thumbnails.len(),
+            capturing: self.thumbnail_job.is_some(),
+            has_preview: self.active_preview.is_some(),
+            recently_copied: self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FOR),
+            update_status: self.updates.settings_detail(),
+        }
+    }
 }
 
 impl Orange {
@@ -196,11 +273,14 @@ impl Orange {
             own_codes: preferences.own_codes,
             viewers_seen: 0,
             logo_epoch: 0,
+            // Corrected on the first render, before anything is painted.
+            animate: false,
             updates,
         }
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
+        let before = self.digest();
         self.drain_thumbnails();
         self.poll_updates(cx);
         let avatar_result = self.avatar_job.as_ref().and_then(|job| {
@@ -327,7 +407,11 @@ impl Orange {
         {
             self.notice = None;
         }
-        cx.notify();
+        // Only when something the screens can see actually moved. A poll that
+        // finds nothing is not a reason to redraw the app.
+        if self.digest() != before {
+            cx.notify();
+        }
     }
 
     fn poll_updates(&mut self, cx: &mut Context<Self>) {

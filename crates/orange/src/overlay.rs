@@ -34,6 +34,9 @@ pub(crate) use gst::attach;
 /// How long the controls stay up after the last mouse movement.
 const HIDE_AFTER: Duration = Duration::from_millis(1_000);
 const FADE: Duration = Duration::from_millis(200);
+/// One breath of the live dot. The tray's status dot uses the same period, so
+/// a host with both windows open sees one rhythm rather than two.
+const BREATH: Duration = Duration::from_millis(1_600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
@@ -81,6 +84,9 @@ pub struct OverlayState {
     pub bitrate_kbps: Option<u32>,
     profile: crate::window::PlaybackProfile,
     shown_at: Instant,
+    /// Fixed for the life of the overlay, so the live dot's breath is
+    /// continuous rather than restarting whenever the controls wake.
+    born: Instant,
     hot: Option<Control>,
     hits: Vec<Hit>,
     /// Cached rasterisation, invalidated when anything visible changes.
@@ -111,6 +117,7 @@ impl OverlayState {
             // Start hidden; pointer activity or the first known source size
             // briefly reveals the controls.
             shown_at: Instant::now() - HIDE_AFTER * 2,
+            born: Instant::now(),
             hot: None,
             hits: Vec::new(),
             cache: None,
@@ -140,6 +147,20 @@ impl OverlayState {
             let t = (elapsed - fade_start).as_secs_f32() / FADE.as_secs_f32();
             (1.0 - t).clamp(0.0, 1.0)
         }
+    }
+
+    /// One breath of the live dot, as an alpha multiplier.
+    ///
+    /// Never reaches zero. A dot that blinks fully off reads as a fault light;
+    /// this is a slow swell that says the picture is arriving now rather than
+    /// being a label that happens to be red.
+    ///
+    /// Driven from a fixed birth instant rather than `shown_at`, which resets
+    /// on every mouse move and would restart the breath mid-swell.
+    pub(super) fn live_pulse(&self) -> f32 {
+        let phase = self.born.elapsed().as_secs_f32() / BREATH.as_secs_f32();
+        let wave = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+        0.45 + 0.55 * wave
     }
 
     /// Video pixels per unit of design.
@@ -327,6 +348,12 @@ impl OverlayState {
         self.hot.map(|c| c as u8).hash(&mut hasher);
         self.quality_label().hash(&mut hasher);
         self.detail_label().hash(&mut hasher);
+        // Only while the dot is actually on screen. Hashing the breath
+        // unconditionally would re-rasterise the whole overlay a dozen times a
+        // second behind a hidden control set, which is what the cache is for.
+        if self.visible() || self.profile.persistent_live_status() {
+            ((self.live_pulse() * 20.0) as u32).hash(&mut hasher);
+        }
         hasher.finish()
     }
 }

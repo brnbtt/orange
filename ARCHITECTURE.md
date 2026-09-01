@@ -55,7 +55,10 @@ Compile dependencies point `orange -> orange-signal <- orange-relay`; tray/updat
 | --- | --- |
 | `crates/orange-tray/src/main.rs` | Application state machine, GPUI startup, polling, child lifecycle, picker actions, update handoff, top-level tray ownership |
 | `crates/orange-tray/src/view.rs` | All screen rendering and UI event wiring: signed out, home, picker, streaming, watching, settings, update banner |
-| `crates/orange-tray/src/ui.rs` | Visual tokens and reusable GPUI controls, logo, buttons, cards, pills, titlebar controls, animations |
+| `crates/orange-tray/src/ui/theme.rs` | Design tokens: colour, type, metrics, motion. No elements |
+| `crates/orange-tray/src/ui/controls.rs` | Reusable GPUI controls: buttons, pills, cards, rows, titlebar |
+| `crates/orange-tray/src/ui/mark.rs` | The logo, its states, and the glow behind it |
+| `crates/orange-tray/src/ui/decor.rs` | Ambient layer: drifting grid, viewfinder brackets, registration marks |
 | `crates/orange-tray/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
 | `crates/orange-tray/src/background.rs` | Cancelled-and-joined thumbnail and avatar jobs, bounded avatar download and decode |
 | `crates/orange-tray/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
@@ -202,7 +205,8 @@ webrtcbin OPUS pad
 | Native viewer behavior and HWND lifetime | `crates/orange/src/window.rs`, `crates/orange/src/window/native.rs` |
 | Overlay behavior/layout | `crates/orange/src/overlay.rs`, `crates/orange/src/overlay/raster.rs`, `crates/orange/src/overlay/gst.rs` |
 | Tray screens | `crates/orange-tray/src/view.rs` |
-| Tray colors/components | `crates/orange-tray/src/ui.rs` |
+| Tray colors/components | `crates/orange-tray/src/ui/theme.rs`, `crates/orange-tray/src/ui/controls.rs` |
+| Logo, glow, ambient grid | `crates/orange-tray/src/ui/mark.rs`, `crates/orange-tray/src/ui/decor.rs` |
 | Tray sound cues | `crates/orange-tray/src/sound.rs` |
 | Tray quality tiers and child log parsing | `crates/orange-tray/src/supervisor.rs` |
 | Session/preferences persistence | `crates/orange/src/auth.rs`, `crates/orange-tray/src/session.rs` |
