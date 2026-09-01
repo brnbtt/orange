@@ -1,11 +1,15 @@
 use super::{tray, update, Orange, Screen};
 use crate::{
-    supervisor::{WindowTarget, QUALITIES},
+    supervisor::{WindowTarget, BITRATES, FRAME_RATES, QUALITIES},
     ui::*,
 };
+
+/// Indices into `Orange::settings_open`.
+const SECTION_ACCOUNT: usize = 0;
+const SECTION_STREAMING: usize = 1;
+const SECTION_APPLICATION: usize = 2;
 use gpui::{
-    div, prelude::*, px, rgb, size, Animation, AnimationExt, Context, FontWeight, Pixels,
-    SharedString, Size, Window,
+    div, prelude::*, px, rgb, size, Context, FontWeight, Pixels, SharedString, Size, Window,
 };
 use std::time::{Duration, Instant};
 
@@ -142,38 +146,37 @@ impl Orange {
     fn render_error_toast(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let notice = self.notice.as_ref()?;
         Some(
-            div()
-                .flex()
-                .items_start()
-                .justify_between()
-                .gap_3()
-                .p_3()
-                .rounded_md()
-                .bg(rgb(0x241514))
-                .border_1()
-                .border_color(rgb(0x3d211f))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_xs()
-                        .text_color(rgb(DANGER))
-                        .child(notice.text.clone()),
-                )
-                .child(
-                    toast_toggle("dismiss-error", "\u{2715}").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.clear_error();
-                            cx.notify();
-                        },
-                    )),
-                )
-                .with_animation(
-                    SharedString::from("error"),
-                    Animation::new(Duration::from_millis(160)),
-                    |element, delta| element.opacity(delta),
-                )
-                .into_any_element(),
+            appear(
+                "error",
+                motion::ENTER,
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x241514))
+                    .border_1()
+                    .border_color(rgb(0x3d211f))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(rgb(DANGER))
+                            .child(notice.text.clone()),
+                    )
+                    .child(
+                        toast_toggle("dismiss-error", "\u{2715}").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.clear_error();
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .into_any_element(),
         )
     }
 
@@ -522,6 +525,7 @@ impl Orange {
 
     fn render_pick(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let quality = self.quality();
+        let bitrate = self.bitrate();
         let selected = self.quality;
         let count = self.windows.len();
         // Distinguishes "still capturing" from "this window refuses to draw",
@@ -614,44 +618,31 @@ impl Orange {
                                         .iter()
                                         .enumerate()
                                         .map(|(index, q)| {
-                                            let active = index == selected;
-                                            div()
-                                                .id(SharedString::from(format!("q{index}")))
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .border_1()
-                                                .border_color(rgb(if active {
-                                                    ORANGE
-                                                } else {
-                                                    BORDER
-                                                }))
-                                                .bg(rgb(if active { ORANGE } else { SURFACE }))
-                                                .text_color(rgb(if active { INK } else { MUTED }))
-                                                .when(active, |d| {
-                                                    d.font_weight(FontWeight::SEMIBOLD)
-                                                })
-                                                .when(!active, |d| {
-                                                    d.hover(|s| {
-                                                        s.bg(rgb(SURFACE_HOVER))
-                                                            .text_color(rgb(TEXT))
-                                                    })
-                                                })
-                                                .child(q.label)
-                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                            option_pill(
+                                                SharedString::from(format!("q{index}")),
+                                                q.label,
+                                                index == selected,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
                                                     this.quality = index;
                                                     this.save_preferences();
                                                     cx.notify();
-                                                }))
+                                                }),
+                                            )
                                         })
                                         .collect::<Vec<_>>(),
                                 ),
                             )
                             .child(
-                                label(format!("~{} Mbps per viewer", quality.mbps), FAINT)
-                                    .text_xs(),
+                                label(
+                                    format!(
+                                        "Up to ~{} Mbps per viewer",
+                                        bitrate.mbps(quality.max_width, quality.max_height)
+                                    ),
+                                    FAINT,
+                                )
+                                .text_xs(),
                             ),
                     )
                     .child(
@@ -731,14 +722,12 @@ impl Orange {
                     .bg(rgb(0x08070a))
                     .overflow_hidden()
                     .child(match (thumb, capturing) {
-                        (Some(image), _) => gpui::img(image)
-                            .h(px(PICKER_PREVIEW_HEIGHT))
-                            .with_animation(
-                                SharedString::from(format!("fade{hwnd}")),
-                                Animation::new(Duration::from_millis(260)),
-                                |el, delta| el.opacity(delta),
-                            )
-                            .into_any_element(),
+                        (Some(image), _) => appear(
+                            format!("fade{hwnd}"),
+                            motion::ENTER,
+                            gpui::img(image).h(px(PICKER_PREVIEW_HEIGHT)),
+                        )
+                        .into_any_element(),
                         (None, true) => label("capturing…", FAINT).text_xs().into_any_element(),
                         (None, false) => label("preview unavailable · click to share", FAINT)
                             .text_xs()
@@ -1100,33 +1089,271 @@ impl Orange {
             )
     }
 
-    fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn settings_account_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let signed_in = self.session.as_ref().map(|s| s.name.clone());
-        let selected_quality = self.quality;
-        let selected_fps = self.fps;
+        // The person is the content and the provider is the qualifier; the other
+        // way round read like a list of connected services when there is one.
         let identity = match &signed_in {
             Some(name) => div()
                 .flex()
                 .items_center()
                 .gap_2()
+                .min_w(px(0.0))
                 .child(avatar(self.avatar.clone(), name, 32.0))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_0p5()
-                        .child(label("Discord", TEXT))
-                        .child(label(name.clone(), FAINT).text_xs()),
+                        .min_w(px(0.0))
+                        .child(label(name.clone(), TEXT))
+                        .child(label("Discord", MUTED).text_xs()),
                 )
                 .into_any_element(),
             None => div()
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(label("Discord", TEXT))
-                .child(label("Not signed in", FAINT).text_xs())
+                .min_w(px(0.0))
+                .child(label("Not signed in", TEXT))
+                .child(label("Sign in with Discord to share", MUTED).text_xs())
                 .into_any_element(),
         };
+
+        card()
+            .flex_shrink_0()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(identity)
+            .child(match signed_in {
+                Some(_) => quiet("so", "Sign out")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sign_out(None);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                None => quiet("si", "Sign in")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.screen = Screen::SignedOut;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            })
+            .into_any_element()
+    }
+
+    fn settings_resolution_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.quality;
+        let chosen = self.quality();
+        let pills = QUALITIES
+            .iter()
+            .enumerate()
+            .map(|(index, quality)| {
+                option_pill(
+                    SharedString::from(format!("settings-quality-{index}")),
+                    quality.label,
+                    index == selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.quality = index;
+                    this.save_preferences();
+                    cx.notify();
+                }))
+                .into_any_element()
+            })
+            .collect();
+
+        setting_choice(
+            "Resolution",
+            Some(SharedString::from(format!(
+                "{} \u{d7} {}",
+                chosen.max_width, chosen.max_height
+            ))),
+            pills,
+            chosen.detail,
+        )
+        .into_any_element()
+    }
+
+    fn settings_frame_rate_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.fps;
+        let pills = FRAME_RATES
+            .iter()
+            .map(|rate| {
+                let fps = rate.fps;
+                option_pill(
+                    SharedString::from(format!("settings-fps-{}", fps.unwrap_or(0))),
+                    rate.label,
+                    fps == selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.fps = fps;
+                    this.save_preferences();
+                    cx.notify();
+                }))
+                .into_any_element()
+            })
+            .collect();
+
+        let detail = FRAME_RATES
+            .iter()
+            .find(|rate| rate.fps == selected)
+            .unwrap_or(&FRAME_RATES[0])
+            .detail;
+
+        // No readout: a readout shows what an abstract label resolves to. "60"
+        // is not abstract, and "Auto" has nothing true to resolve to until the
+        // stream starts and the display is known.
+        setting_choice("Frame rate", None, pills, detail).into_any_element()
+    }
+
+    fn settings_bitrate_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.bitrate;
+        let chosen = self.bitrate();
+        let quality = self.quality();
+        let pills = BITRATES
+            .iter()
+            .enumerate()
+            .map(|(index, bitrate)| {
+                option_pill(
+                    SharedString::from(format!("settings-bitrate-{index}")),
+                    bitrate.label,
+                    index == selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.bitrate = index;
+                    this.save_preferences();
+                    cx.notify();
+                }))
+                .into_any_element()
+            })
+            .collect();
+
+        // Titled by what it buys rather than by its unit. The kbps figure stays
+        // in the readout, so the technical number is still visible without the
+        // control claiming to be about bitrate for its own sake.
+        setting_choice(
+            "Image quality",
+            Some(SharedString::from(format!(
+                "{} KBPS \u{b7} {}",
+                chosen.kbps(quality.max_width, quality.max_height),
+                quality.label.to_uppercase()
+            ))),
+            pills,
+            chosen.detail,
+        )
+        .into_any_element()
+    }
+
+    fn settings_updates_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The action is always rendered so the row does not reflow while a
+        // check runs; dimmed and inert when nothing applies. The label follows
+        // the state: an available update installs, anything else checks.
+        let action = self.updates.settings_action();
+        let button = quiet("check-updates", action.unwrap_or("Check now"));
+        let action = if action.is_some() {
+            button
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.updates.activate_settings_action();
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else {
+            // Dimmed by colour, not opacity. Opacity 0.35 over already-dim text
+            // landed near 1.6:1, so the row read as having no action at all -
+            // the opposite of reserving its space.
+            button
+                .text_color(rgb(FAINT))
+                .border_color(rgb(0x1f1f1f))
+                .cursor_default()
+                .into_any_element()
+        };
+        setting_row("Updates", self.updates.settings_detail(), action).into_any_element()
+    }
+
+    fn settings_diagnostics_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        setting_row(
+            "Diagnostics",
+            "Logs from your recent sessions",
+            quiet("open-diagnostics", "Open folder")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_diagnostics();
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+        .into_any_element()
+    }
+
+    /// A heading plus its cards, folded away when the heading is clicked.
+    fn settings_section(
+        &mut self,
+        index: usize,
+        id: &'static str,
+        title: &'static str,
+        readout: Option<&'static str>,
+        cards: Vec<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let open = self.settings_open[index];
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap_3()
+            .child(
+                section_header(id, title, readout, open).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.settings_open[index] = !this.settings_open[index];
+                        cx.notify();
+                    },
+                )),
+            )
+            // Keyed on the open state so re-expanding replays the fade rather
+            // than reusing an animation that already finished.
+            .children(open.then(|| section_body(id, cards)))
+            .into_any_element()
+    }
+
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let account = self.settings_account_card(cx);
+        let resolution = self.settings_resolution_card(cx);
+        let frame_rate = self.settings_frame_rate_card(cx);
+        let bitrate = self.settings_bitrate_card(cx);
+        let updates = self.settings_updates_card(cx);
+        let diagnostics = self.settings_diagnostics_card(cx);
+
+        let account = self.settings_section(
+            SECTION_ACCOUNT,
+            "section-account",
+            "ACCOUNT",
+            None,
+            vec![account],
+            cx,
+        );
+        // VIDEO, not STREAMING: the titlebar already uses "/ STREAMING" to mean
+        // a stream is live right now, and this section configures none of that.
+        // DEFAULTS, because resolution can still be changed in the picker at
+        // share time - without saying so, someone who sets 1080p here and sees
+        // something else there concludes the setting is broken.
+        let video = self.settings_section(
+            SECTION_STREAMING,
+            "section-video",
+            "VIDEO",
+            Some("DEFAULTS"),
+            vec![resolution, frame_rate, bitrate],
+            cx,
+        );
+        let system = self.settings_section(
+            SECTION_APPLICATION,
+            "section-system",
+            "SYSTEM",
+            None,
+            vec![updates, diagnostics],
+            cx,
+        );
 
         div()
             .flex()
@@ -1135,165 +1362,20 @@ impl Orange {
             .flex_1()
             .min_h(px(0.0))
             .child(
-                // The settings list outgrew the window once Updates and
-                // Diagnostics were added. Scroll the list and pin the footer so
-                // Done is always reachable without scrolling to find it.
+                // The list outgrew the window once Updates and Diagnostics were
+                // added. Scroll the list and pin the footer so Done is always
+                // reachable without scrolling to find it.
                 div()
                     .id("settings-scroll")
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_4()
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-            .child(micro("ACCOUNT AND RELAY", ORANGE).flex_shrink_0())
-            .child(
-                card()
-                    .flex_shrink_0()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(identity)
-                    .child(match signed_in {
-                        Some(_) => quiet("so", "Sign out")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sign_out(None);
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                        None => quiet("si", "Sign in")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.screen = Screen::SignedOut;
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    }),
-            )
-            .child(
-                card()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .child(label("Default quality", TEXT))
-                    .child(
-                        div().flex().gap_1p5().children(
-                            QUALITIES
-                                .iter()
-                                .enumerate()
-                                .map(|(index, quality)| {
-                                    option_pill(
-                                        SharedString::from(format!("settings-quality-{index}")),
-                                        quality.label,
-                                        index == selected_quality,
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.quality = index;
-                                        this.save_preferences();
-                                        cx.notify();
-                                    }))
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                    )
-                    .child(
-                        label("Used when a new stream starts. You can still change it before sharing.", FAINT)
-                            .text_xs(),
-                    ),
-            )
-            .child(
-                card()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .child(label("Frame rate", TEXT))
-                    .child(
-                        div().flex().gap_1p5().children(
-                            [
-                                (None, "Auto"),
-                                (Some(60), "60"),
-                                (Some(120), "120"),
-                                (Some(240), "240"),
-                            ]
-                            .into_iter()
-                            .map(|(fps, text)| {
-                                option_pill(
-                                    SharedString::from(format!(
-                                        "settings-fps-{}",
-                                        fps.unwrap_or(0)
-                                    )),
-                                    text,
-                                    fps == selected_fps,
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.fps = fps;
-                                    this.save_preferences();
-                                    cx.notify();
-                                }))
-                            })
-                            .collect::<Vec<_>>(),
-                        ),
-                    )
-                    .child(
-                        label("Auto follows the refresh rate of the display being captured.", FAINT)
-                            .text_xs(),
-                    ),
-            )
-            .child(
-                card()
-                    .flex_shrink_0()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .min_w(px(0.0))
-                            .child(label("Updates", TEXT))
-                            .child(label(self.updates.settings_detail(), FAINT).text_xs()),
-                    )
-                    .child({
-                        // Always rendered so the row does not reflow while a
-                        // check runs; dimmed and inert when nothing applies.
-                        // The label follows the state: an available update
-                        // installs, anything else checks.
-                        let action = self.updates.settings_action();
-                        let button = quiet("check-updates", action.unwrap_or("Check now"));
-                        if action.is_some() {
-                            button
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.updates.activate_settings_action();
-                                    cx.notify();
-                                }))
-                                .into_any_element()
-                        } else {
-                            button.opacity(0.35).cursor_default().into_any_element()
-                        }
-                    }),
-            )
-            .child(
-                card()
-                    .flex_shrink_0()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(label("Diagnostics", TEXT))
-                            .child(
-                                label("Session logs. Attach these when reporting a problem.", FAINT)
-                                    .text_xs(),
-                            ),
-                    )
-                    .child(quiet("open-diagnostics", "Open folder").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.open_diagnostics();
-                            cx.notify();
-                        },
-                    ))),
-            ),
+                    .child(account)
+                    .child(video)
+                    .child(system),
             )
             .child(micro(
                 format!(

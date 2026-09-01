@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
+use supervisor::{Bitrate, LoginAttempt, Quality, Supervisor, WindowTarget, BITRATES, QUALITIES};
 
 const DEFAULT_SERVER: &str =
     "wss://orange-relay.redmushroom-80c79f12.brazilsouth.azurecontainerapps.io/ws";
@@ -83,6 +83,7 @@ struct Orange {
     avatar_job: Option<AvatarJob>,
     quality: usize,
     fps: Option<u32>,
+    bitrate: usize,
     active_target: Option<WindowTarget>,
     active_preview: Option<std::sync::Arc<gpui::RenderImage>>,
     host: Option<Supervisor>,
@@ -96,6 +97,10 @@ struct Orange {
     /// Whether the update toast is collapsed to its heading. The toast cannot
     /// be dismissed, only folded away: an available update stays actionable.
     update_collapsed: bool,
+    /// Which settings sections are expanded. Not persisted: opening settings
+    /// with everything visible is the better default, and it keeps a transient
+    /// view detail out of the preferences file.
+    settings_open: [bool; 3],
     /// Drives the transient "Copied" confirmation on the share code.
     copied_at: Option<Instant>,
     copied_code: Option<String>,
@@ -154,7 +159,8 @@ impl Orange {
             avatar: None,
             avatar_job,
             quality: preferences.quality.min(QUALITIES.len() - 1),
-            fps: preferences.fps,
+            fps: supervisor::supported_frame_rate(preferences.fps),
+            bitrate: preferences.bitrate.min(BITRATES.len() - 1),
             active_target: None,
             active_preview: None,
             host: None,
@@ -167,6 +173,7 @@ impl Orange {
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
             sized_for: None,
             update_collapsed: false,
+            settings_open: [true; 3],
             copied_at: None,
             copied_code: None,
             own_codes: preferences.own_codes,
@@ -297,6 +304,10 @@ impl Orange {
         QUALITIES[self.quality.min(QUALITIES.len() - 1)]
     }
 
+    fn bitrate(&self) -> Bitrate {
+        BITRATES[self.bitrate.min(BITRATES.len() - 1)]
+    }
+
     fn show_error(&mut self, message: impl Into<String>) {
         self.notice = Some(Notice {
             text: message.into(),
@@ -324,6 +335,7 @@ impl Orange {
         let preferences = session::Preferences {
             quality: self.quality,
             fps: self.fps,
+            bitrate: self.bitrate,
             own_codes: self.own_codes.clone(),
         };
         if let Err(error) = session::save_preferences(&preferences) {
@@ -438,7 +450,13 @@ impl Orange {
             return;
         }
         let preview = self.thumbnails.get(&target.hwnd).cloned();
-        match Supervisor::host(&target, &self.quality(), self.fps, &self.server) {
+        match Supervisor::host(
+            &target,
+            &self.quality(),
+            &self.bitrate(),
+            self.fps,
+            &self.server,
+        ) {
             Ok(stream) => {
                 self.active_target = Some(target);
                 self.active_preview = preview;

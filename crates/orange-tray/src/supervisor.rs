@@ -308,18 +308,20 @@ impl Supervisor {
     pub fn host(
         target: &WindowTarget,
         quality: &Quality,
+        bitrate: &Bitrate,
         fps: Option<u32>,
         server: &str,
     ) -> Result<Self> {
-        let scale = quality.scale_for(target);
+        let (width, height) = quality.fit(target);
         let mut command = orange_command()?;
         command
             .arg("host")
             .args(["--hwnd", &target.hwnd.to_string()])
             .args(["--server", server])
-            .args(["--codec", quality.codec])
-            .args(["--bitrate", &quality.bitrate.to_string()])
-            .args(["--scale", &scale]);
+            // Every tier lets the child pick the best encoder its GPU offers.
+            .args(["--codec", "auto"])
+            .args(["--bitrate", &bitrate.kbps(width, height).to_string()])
+            .args(["--scale", &format!("{width}x{height}")]);
         if let Some(fps) = fps {
             command.args(["--fps", &fps.to_string()]);
         }
@@ -466,51 +468,157 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quality {
     pub label: &'static str,
+    pub detail: &'static str,
     pub max_width: u32,
     pub max_height: u32,
-    pub bitrate: u32,
-    pub codec: &'static str,
-    /// Rough upload cost per viewer, shown so the tradeoff is visible.
-    pub mbps: u32,
 }
 
 impl Quality {
-    /// Fit the source inside this quality tier without changing its ratio.
-    fn scale_for(&self, target: &WindowTarget) -> String {
+    /// Fit the source inside this tier without changing its ratio.
+    ///
+    /// The factor is clamped at 1.0, so a tier is a ceiling and never an
+    /// upscale. Choosing 4K on a 1080p window encodes 1080p, because upscaling
+    /// invents no detail and only costs bits.
+    pub fn fit(&self, target: &WindowTarget) -> (u32, u32) {
         let source_w = target.width.max(2) as f32;
         let source_h = target.height.max(2) as f32;
         let factor = (self.max_width as f32 / source_w)
             .min(self.max_height as f32 / source_h)
             .min(1.0);
         let even = |value: f32| ((value.round() as u32).max(2) / 2) * 2;
-        format!("{}x{}", even(source_w * factor), even(source_h * factor))
+        (even(source_w * factor), even(source_h * factor))
     }
 }
 
 pub const QUALITIES: &[Quality] = &[
     Quality {
         label: "720p",
+        detail: "Soft on a large screen. Lightest to send",
         max_width: 1280,
         max_height: 720,
-        bitrate: 4_000,
-        codec: "auto",
-        mbps: 4,
     },
     Quality {
         label: "1080p",
+        detail: "Crisp on most screens",
         max_width: 1920,
         max_height: 1080,
-        bitrate: 8_000,
-        codec: "auto",
-        mbps: 8,
     },
     Quality {
         label: "1440p",
+        detail: "Crisp on large or high-DPI screens",
         max_width: 2560,
         max_height: 1440,
-        bitrate: 18_000,
-        codec: "auto",
-        mbps: 18,
+    },
+    Quality {
+        // The ceiling only needs saying on the tier people are afraid to pick.
+        label: "2160p",
+        detail: "Most detail. Never upscales a smaller window",
+        max_width: 3840,
+        max_height: 2160,
+    },
+];
+
+/// How many bits to spend on each pixel of the encoded output.
+///
+/// Labelled by the image quality it buys, not by the tradeoff it makes. The
+/// previous labels - Smooth, Balanced, Sharp - pointed the wrong way: "Smooth"
+/// reads as a desirable motion property, so someone optimising for smooth
+/// gameplay would pick it and get the softest picture on the list. Bitrate does
+/// not affect smoothness at all.
+///
+/// This used to be a flat kilobit figure per resolution tier, which cannot be
+/// right for more than one output size: the 1080p tier spent its full 8 Mbps
+/// whether it encoded 1920x1080 or the 1920x804 an ultrawide window scales down
+/// to. Expressing it per pixel makes every tier mean the same thing at every
+/// resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bitrate {
+    pub label: &'static str,
+    pub detail: &'static str,
+    pub kbps_per_megapixel: u32,
+}
+
+impl Bitrate {
+    /// Kilobits per second for an output of this size.
+    ///
+    /// Frame rate is deliberately not a factor. Bitrate need scales almost
+    /// linearly with pixel count but only weakly with frame rate, because
+    /// consecutive frames of screen content are highly redundant and predict
+    /// well: doubling the rate does not come close to doubling the bits.
+    pub fn kbps(&self, width: u32, height: u32) -> u32 {
+        let pixels = u64::from(width) * u64::from(height);
+        let kbps = pixels * u64::from(self.kbps_per_megapixel) / 1_000_000;
+        // The floor is deliberately low. It exists only to keep a pathologically
+        // small window from asking for an unusable rate; set any higher and it
+        // collapses the tiers into each other at ordinary window sizes, which
+        // would make choosing Low over Standard do nothing.
+        //
+        // The ceiling is an absolute sanity bound, not a policy. It has to sit
+        // above High at 2160p (91 Mbps unclamped), or High and Standard both
+        // clamp to it there and the top two tiers become the same setting.
+        kbps.clamp(500, 80_000) as u32
+    }
+
+    /// The same figure rounded up for display.
+    pub fn mbps(&self, width: u32, height: u32) -> u32 {
+        self.kbps(width, height).div_ceil(1_000)
+    }
+}
+
+/// Frame-rate choices. `None` follows the captured display's refresh rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRate {
+    pub fps: Option<u32>,
+    pub label: &'static str,
+    pub detail: &'static str,
+}
+
+pub const FRAME_RATES: &[FrameRate] = &[
+    FrameRate {
+        fps: None,
+        label: "Auto",
+        detail: "Matches the captured display's refresh rate",
+    },
+    FrameRate {
+        fps: Some(60),
+        label: "60",
+        detail: "Works on every display",
+    },
+    FrameRate {
+        fps: Some(120),
+        label: "120",
+        detail: "Needs a 120 Hz display. Heavier to encode",
+    },
+];
+
+/// Fall back to Auto for a rate that is no longer offered.
+///
+/// 240 was offered once. Without this, a preferences file written by that build
+/// leaves the picker with nothing selected and no description to show.
+pub fn supported_frame_rate(fps: Option<u32>) -> Option<u32> {
+    fps.filter(|value| FRAME_RATES.iter().any(|rate| rate.fps == Some(*value)))
+}
+
+/// Roughly 0.067, 0.117 and 0.183 bits per pixel per frame at 60 fps. The
+/// original tiers sat at 0.043/0.070/0.113, which was calibrated to match the
+/// flat per-resolution figures this replaced rather than to look good; every
+/// tier moves up by about one step, so today's Standard is close to yesterday's
+/// High.
+pub const BITRATES: &[Bitrate] = &[
+    Bitrate {
+        label: "Low",
+        detail: "Softer in fast motion. Lightest upload",
+        kbps_per_megapixel: 4_000,
+    },
+    Bitrate {
+        label: "Standard",
+        detail: "Clean for games and video",
+        kbps_per_megapixel: 7_000,
+    },
+    Bitrate {
+        label: "High",
+        detail: "Sharp text and fine detail. Needs fast upload",
+        kbps_per_megapixel: 11_000,
     },
 ];
 
@@ -529,15 +637,113 @@ mod tests {
     }
 
     #[test]
-    fn quality_bounds_preserve_source_shape() {
-        assert_eq!(QUALITIES[1].scale_for(&target(2002, 1804)), "1198x1080");
-        assert_eq!(QUALITIES[1].scale_for(&target(3440, 1440)), "1920x804");
-        assert_eq!(QUALITIES[1].scale_for(&target(1280, 720)), "1280x720");
+    fn every_caption_fits_one_line_and_reads_as_a_caption() {
+        // A card's inner width is ~296px, and 12px Segoe UI runs about 5.8px
+        // per character, so anything past this wraps to a second line. That is
+        // not cosmetic: a wrapped caption changes the card's height, which
+        // shoves every card below it while a fade is still running.
+        const BUDGET: usize = 48;
+        let captions = QUALITIES
+            .iter()
+            .map(|q| ("resolution", q.label, q.detail))
+            .chain(
+                FRAME_RATES
+                    .iter()
+                    .map(|r| ("frame rate", r.label, r.detail)),
+            )
+            .chain(
+                BITRATES
+                    .iter()
+                    .map(|b| ("image quality", b.label, b.detail)),
+            );
+
+        for (card, label, detail) in captions {
+            assert!(
+                detail.len() <= BUDGET,
+                "{card}/{label}: {} chars, over the {BUDGET} budget: {detail:?}",
+                detail.len()
+            );
+            assert!(
+                !detail.ends_with('.'),
+                "{card}/{label}: captions do not take a terminal period: {detail:?}"
+            );
+            assert!(!detail.is_empty(), "{card}/{label} has no caption");
+        }
     }
 
     #[test]
-    fn tray_quality_tiers_request_compatible_encoder_selection() {
-        assert!(QUALITIES.iter().all(|quality| quality.codec == "auto"));
+    fn image_quality_labels_name_the_picture_not_the_tradeoff() {
+        // "Smooth" pointed the wrong way: it reads as a desirable motion
+        // property, so anyone optimising for smooth gameplay picked the softest
+        // picture on the list. Bitrate does not affect smoothness.
+        assert_eq!(
+            BITRATES.iter().map(|b| b.label).collect::<Vec<_>>(),
+            ["Low", "Standard", "High"]
+        );
+        // The labels must climb in the same direction as the bits behind them.
+        assert!(BITRATES
+            .windows(2)
+            .all(|pair| pair[0].kbps_per_megapixel < pair[1].kbps_per_megapixel));
+    }
+
+    #[test]
+    fn a_frame_rate_that_is_no_longer_offered_falls_back_to_auto() {
+        // 240 shipped in an earlier build, so preferences files contain it.
+        assert_eq!(supported_frame_rate(Some(240)), None);
+        assert_eq!(supported_frame_rate(Some(60)), Some(60));
+        assert_eq!(supported_frame_rate(Some(120)), Some(120));
+        assert_eq!(supported_frame_rate(None), None);
+        // Every offered rate survives the filter, so adding one cannot silently
+        // become unselectable.
+        for rate in FRAME_RATES {
+            assert_eq!(supported_frame_rate(rate.fps), rate.fps, "{}", rate.label);
+        }
+    }
+
+    #[test]
+    fn quality_bounds_preserve_source_shape() {
+        assert_eq!(QUALITIES[1].fit(&target(2002, 1804)), (1198, 1080));
+        assert_eq!(QUALITIES[1].fit(&target(3440, 1440)), (1920, 804));
+        assert_eq!(QUALITIES[1].fit(&target(1280, 720)), (1280, 720));
+    }
+
+    #[test]
+    fn a_tier_is_a_ceiling_and_never_upscales() {
+        // A 1080p source under the 4K tier encodes 1080p. Choosing a tier above
+        // your display costs nothing, because upscaling invents no detail.
+        let source = target(1920, 1080);
+        assert_eq!(QUALITIES[3].fit(&source), (1920, 1080));
+        assert_eq!(QUALITIES[1].fit(&source), (1920, 1080));
+        // And it costs no extra bits either, because bitrate follows the output.
+        let balanced = BITRATES[1];
+        let (width, height) = QUALITIES[3].fit(&source);
+        assert_eq!(balanced.kbps(width, height), balanced.kbps(1920, 1080));
+    }
+
+    #[test]
+    fn bitrate_follows_the_pixels_actually_encoded() {
+        let standard = BITRATES[1];
+        assert_eq!(standard.kbps(1280, 720), 6_451);
+        assert_eq!(standard.kbps(1920, 1080), 14_515);
+        // An ultrawide on the 1080p tier encodes 1920x804 and pays for
+        // 1920x804 rather than for a full 1920x1080 it never sends.
+        let (width, height) = QUALITIES[1].fit(&target(3440, 1440));
+        assert!(standard.kbps(width, height) < standard.kbps(1920, 1080));
+
+        // Tiers stay distinct at every window size anyone actually shares, and
+        // at 2160p in particular: that is where the ceiling can swallow the top
+        // two tiers and quietly make them the same setting.
+        for (width, height) in [(640u32, 360u32), (1280, 720), (1920, 1080), (3840, 2160)] {
+            let tiers: Vec<u32> = BITRATES.iter().map(|b| b.kbps(width, height)).collect();
+            assert!(
+                tiers.windows(2).all(|pair| pair[0] < pair[1]),
+                "tiers collapsed at {width}x{height}: {tiers:?}"
+            );
+            assert!(tiers.iter().all(|kbps| (500..=80_000).contains(kbps)));
+        }
+        // Only a pathological size falls back on the floor, where the tiers do
+        // collapse. That is the floor working, not the tiers failing.
+        assert_eq!(BITRATES[0].kbps(160, 120), 500);
     }
 
     #[test]

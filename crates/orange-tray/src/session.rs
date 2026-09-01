@@ -25,6 +25,8 @@ pub struct Preferences {
     pub quality: usize,
     /// `None` follows the captured window's display refresh rate.
     pub fps: Option<u32>,
+    /// Index into `BITRATES`: how many bits to spend per pixel.
+    pub bitrate: usize,
     pub own_codes: Vec<String>,
 }
 
@@ -33,6 +35,7 @@ impl Default for Preferences {
         Self {
             quality: 1,
             fps: None,
+            bitrate: 1,
             own_codes: Vec::new(),
         }
     }
@@ -193,6 +196,23 @@ mod tests {
     }
 
     #[test]
+    fn preferences_written_before_a_field_existed_still_load() {
+        // Every installed client has a preferences.json with no `bitrate` key.
+        // It has to load with the default rather than failing to parse, or the
+        // update strands people on a startup error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, r#"{"quality":2,"fps":120,"own_codes":["ORANGE"]}"#).unwrap();
+
+        let loaded = load_preferences_from(&path).unwrap();
+
+        assert_eq!(loaded.bitrate, Preferences::default().bitrate);
+        assert_eq!(loaded.quality, 2);
+        assert_eq!(loaded.fps, Some(120));
+        assert_eq!(loaded.own_codes, vec!["ORANGE".to_string()]);
+    }
+
+    #[test]
     fn atomic_save_replaces_existing_json_without_leaving_a_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preferences.json");
@@ -200,6 +220,7 @@ mod tests {
         let preferences = Preferences {
             quality: 2,
             fps: Some(120),
+            bitrate: 2,
             own_codes: vec!["ORANGE".into()],
         };
 

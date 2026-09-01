@@ -286,16 +286,21 @@ impl UpdateController {
     }
 
     /// One line describing update state for the settings screen.
+    ///
+    /// No terminal periods: these are captions, not sentences, and at 12px a
+    /// trailing dot is visual lint. "installed builds only" is gone too - that
+    /// was our mental model leaking, and a friend handed a build has no idea
+    /// which kind they have.
     pub(crate) fn settings_detail(&self) -> String {
         match &self.status {
-            UpdateStatus::Disabled => "Automatic updates apply to installed builds only.".into(),
-            UpdateStatus::Checking => "Checking\u{2026}".into(),
-            UpdateStatus::Downloading(info) => format!("Downloading {}\u{2026}", info.version),
-            UpdateStatus::Available(info) => format!("Version {} is available.", info.version),
+            UpdateStatus::Disabled => "Automatic updates are off in this build".into(),
+            UpdateStatus::Checking => "Checking for updates".into(),
+            UpdateStatus::Downloading(info) => format!("Downloading {}", info.version),
+            UpdateStatus::Available(info) => format!("{} is available", info.version),
             UpdateStatus::Failed { message } => message.clone(),
             UpdateStatus::Current => match checked_ago(self.last_checked.map(|at| at.elapsed())) {
-                Some(ago) => format!("Up to date \u{b7} checked {ago}"),
-                None => "Up to date.".into(),
+                Some(ago) => format!("Up to date \u{b7} last checked {ago}"),
+                None => "Up to date".into(),
             },
         }
     }
@@ -1096,8 +1101,8 @@ mod tests {
     #[test]
     fn settings_detail_describes_every_status() {
         let cases = [
-            (UpdateStatus::Disabled, "installed builds only"),
-            (UpdateStatus::Checking, "Checking"),
+            (UpdateStatus::Disabled, "off in this build"),
+            (UpdateStatus::Checking, "Checking for updates"),
             (UpdateStatus::Current, "Up to date"),
             (UpdateStatus::Available(update_info()), "is available"),
             (UpdateStatus::Downloading(update_info()), "Downloading"),
@@ -1112,6 +1117,12 @@ mod tests {
             let detail = controller(status, None).settings_detail();
             assert!(detail.contains(expected), "{detail:?} lacks {expected:?}");
             assert!(!detail.is_empty());
+            // These are captions, not sentences. A trailing period at 12px in a
+            // dim colour is visual lint, and the screen mixed both styles.
+            assert!(
+                !detail.ends_with('.'),
+                "{detail:?} should not end in a period"
+            );
         }
     }
 
@@ -1119,12 +1130,12 @@ mod tests {
     fn settings_detail_reports_when_the_last_check_happened() {
         let mut controller = controller(UpdateStatus::Current, None);
         // Before any check completes there is nothing truthful to report.
-        assert_eq!(controller.settings_detail(), "Up to date.");
+        assert_eq!(controller.settings_detail(), "Up to date");
 
         controller.last_checked = Instant::now().checked_sub(Duration::from_secs(120));
         assert_eq!(
             controller.settings_detail(),
-            "Up to date \u{b7} checked 2 minutes ago"
+            "Up to date \u{b7} last checked 2 minutes ago"
         );
     }
 
