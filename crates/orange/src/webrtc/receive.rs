@@ -218,6 +218,7 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
         || {
             gst::ElementFactory::make("wasapi2sink")
                 .property("async", false)
+                .property("sync", false)
                 .property("buffer-time", 40_000i64)
                 .property("latency-time", 10_000i64)
                 .build()
@@ -232,6 +233,7 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
         Err(_) => build_receive_element(diagnostic_role, "audio-sink", "wasapisink", || {
             gst::ElementFactory::make("wasapisink")
                 .property("async", false)
+                .property("sync", false)
                 .property("buffer-time", 40_000i64)
                 .property("latency-time", 10_000i64)
                 .build()
@@ -612,6 +614,7 @@ mod tests {
         assert!(!video.element.property::<bool>("async"));
         assert!(!video.element.property::<bool>("sync"));
         assert!(!audio.element.property::<bool>("async"));
+        assert!(!audio.element.property::<bool>("sync"));
         assert_eq!(audio.element.property::<i64>("buffer-time"), 40_000);
         assert_eq!(audio.element.property::<i64>("latency-time"), 10_000);
     }
