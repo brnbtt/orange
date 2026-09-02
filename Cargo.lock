@@ -4046,7 +4046,7 @@ dependencies = [
 
 [[package]]
 name = "orange"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -4069,7 +4069,7 @@ dependencies = [
 
 [[package]]
 name = "orange-relay"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "orange-signal",
@@ -4078,7 +4078,7 @@ dependencies = [
 
 [[package]]
 name = "orange-signal"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -4095,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "orange-tray"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -4112,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "orange-updater"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "sha2 0.10.9",
