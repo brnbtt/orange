@@ -273,7 +273,8 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         };
         match accept_receive_pad(&workers_for_pad, pad) {
             Some(AcceptedReceivePad::Audio(claim)) => {
-                match build_audio_branch(&pipeline, pad, overlay_for_pad.clone(), "loopback") {
+                match build_audio_branch(&pipeline, pad, overlay_for_pad.clone(), None, "loopback")
+                {
                     Ok(worker) => claim.complete_audio(worker),
                     Err(error) => eprintln!("[webrtc] could not build audio branch: {error}"),
                 }

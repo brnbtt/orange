@@ -248,7 +248,7 @@ fn link_tee_branch(
     tee: &gst::Element,
     bin: &gst::Element,
     max_buffers: u32,
-    retransmit: bool,
+    is_video: bool,
     progress: Option<Arc<MediaProgress>>,
     mut payload: Vec<gst::Element>,
 ) -> Result<TeeBranch> {
@@ -269,9 +269,11 @@ fn link_tee_branch(
     let sink_pad = bin
         .request_pad_simple("sink_%u")
         .context("webrtcbin refused a sink pad")?;
-    if retransmit {
-        let transceiver = sink_pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+    let transceiver = sink_pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+    if is_video {
         enable_nack(&transceiver);
+    } else if let Some(sender) = transceiver.sender() {
+        sender.set_priority(gst_webrtc::WebRTCPriorityType::High);
     }
     let Some(tee_pad) = tee.request_pad_simple("src_%u") else {
         bin.release_request_pad(&sink_pad);
@@ -874,6 +876,34 @@ mod tests {
 
         assert!(shutdown);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn audio_sender_uses_high_network_priority() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let tee = gst::ElementFactory::make("tee").build().unwrap();
+        let bin = super::make_webrtcbin("audio-priority-test").unwrap();
+        pipeline.add_many([&tee, &bin]).unwrap();
+        let branch = super::link_tee_branch(
+            &pipeline,
+            &tee,
+            &bin,
+            AUDIO_BRANCH_MAX_PACKETS,
+            false,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let transceiver = branch
+            .bin_pad
+            .property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+
+        assert_eq!(
+            transceiver.sender().unwrap().priority(),
+            gst_webrtc::WebRTCPriorityType::High
+        );
+        super::remove_tee_branch(&pipeline, &bin, branch);
     }
 
     #[test]

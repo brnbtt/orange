@@ -11,6 +11,10 @@ pub(crate) enum MediaStage {
     Depay,
     Parsed,
     Decoded,
+    AudioRtp,
+    AudioDepay,
+    AudioDecoded,
+    AudioSinkInput,
 }
 
 #[derive(Default)]
@@ -26,6 +30,10 @@ pub(crate) struct MediaProgress {
     depay: StageCounter,
     parsed: StageCounter,
     decoded: StageCounter,
+    audio_rtp: StageCounter,
+    audio_depay: StageCounter,
+    audio_decoded: StageCounter,
+    audio_sink_input: StageCounter,
     keyframes: AtomicU64,
     queue_overruns: AtomicU64,
 }
@@ -43,6 +51,10 @@ pub(crate) struct MediaSnapshot {
     depay: StageSnapshot,
     parsed: StageSnapshot,
     decoded: StageSnapshot,
+    audio_rtp: StageSnapshot,
+    audio_depay: StageSnapshot,
+    audio_decoded: StageSnapshot,
+    audio_sink_input: StageSnapshot,
     keyframes: u64,
     queue_overruns: u64,
 }
@@ -55,6 +67,10 @@ impl MediaProgress {
             depay: StageCounter::default(),
             parsed: StageCounter::default(),
             decoded: StageCounter::default(),
+            audio_rtp: StageCounter::default(),
+            audio_depay: StageCounter::default(),
+            audio_decoded: StageCounter::default(),
+            audio_sink_input: StageCounter::default(),
             keyframes: AtomicU64::new(0),
             queue_overruns: AtomicU64::new(0),
         }
@@ -75,6 +91,10 @@ impl MediaProgress {
             MediaStage::Depay => &self.depay,
             MediaStage::Parsed => &self.parsed,
             MediaStage::Decoded => &self.decoded,
+            MediaStage::AudioRtp => &self.audio_rtp,
+            MediaStage::AudioDepay => &self.audio_depay,
+            MediaStage::AudioDecoded => &self.audio_decoded,
+            MediaStage::AudioSinkInput => &self.audio_sink_input,
         };
         counter.buffers.fetch_add(1, Ordering::Relaxed);
         counter.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -101,6 +121,10 @@ impl MediaProgress {
             depay: snapshot_stage(&self.depay, now_ms),
             parsed: snapshot_stage(&self.parsed, now_ms),
             decoded: snapshot_stage(&self.decoded, now_ms),
+            audio_rtp: snapshot_stage(&self.audio_rtp, now_ms),
+            audio_depay: snapshot_stage(&self.audio_depay, now_ms),
+            audio_decoded: snapshot_stage(&self.audio_decoded, now_ms),
+            audio_sink_input: snapshot_stage(&self.audio_sink_input, now_ms),
             keyframes: self.keyframes.load(Ordering::Relaxed),
             queue_overruns: self.queue_overruns.load(Ordering::Relaxed),
         }
@@ -142,6 +166,10 @@ mod tests {
         progress.record_at(MediaStage::Depay, 1_000, 900, false);
         progress.record_at(MediaStage::Parsed, 1_000, 800, true);
         progress.record_at(MediaStage::Decoded, 1_000, 700, false);
+        progress.record_at(MediaStage::AudioRtp, 160, 1_450, false);
+        progress.record_at(MediaStage::AudioDepay, 120, 1_440, false);
+        progress.record_at(MediaStage::AudioDecoded, 1_920, 1_430, false);
+        progress.record_at(MediaStage::AudioSinkInput, 1_920, 1_420, false);
 
         let snapshot = progress.snapshot_at(1_500);
 
@@ -151,7 +179,18 @@ mod tests {
         assert_eq!(snapshot.depay.silent_ms, Some(600));
         assert_eq!(snapshot.parsed.silent_ms, Some(700));
         assert_eq!(snapshot.decoded.silent_ms, Some(800));
+        assert_eq!(snapshot.audio_rtp.silent_ms, Some(50));
+        assert_eq!(snapshot.audio_depay.silent_ms, Some(60));
+        assert_eq!(snapshot.audio_decoded.silent_ms, Some(70));
+        assert_eq!(snapshot.audio_sink_input.silent_ms, Some(80));
         assert_eq!(snapshot.keyframes, 1);
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["audio_rtp"]["buffers"], 1);
+        assert_eq!(json["audio_depay"]["buffers"], 1);
+        assert_eq!(json["audio_decoded"]["buffers"], 1);
+        assert_eq!(json["audio_sink_input"]["buffers"], 1);
+        assert!(json.get("audio_output").is_none());
     }
 
     #[test]

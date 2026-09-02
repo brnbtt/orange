@@ -404,6 +404,7 @@ pub(crate) fn build_audio_branch(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
     overlay: Option<crate::overlay::SharedOverlay>,
+    progress: Option<Arc<MediaProgress>>,
     diagnostic_role: &str,
 ) -> Result<Option<AudioControlWorker>> {
     let initial_volume = overlay
@@ -431,6 +432,32 @@ pub(crate) fn build_audio_branch(
             .build()?)
     })?;
     let sink = build_audio_sink(diagnostic_role)?;
+
+    if let Some(progress) = progress {
+        track_pad(
+            &depay
+                .element
+                .static_pad("src")
+                .context("audio depayloader has no src pad")?,
+            MediaStage::AudioDepay,
+            progress.clone(),
+        );
+        track_pad(
+            &dec.element
+                .static_pad("src")
+                .context("audio decoder has no src pad")?,
+            MediaStage::AudioDecoded,
+            progress.clone(),
+        );
+        track_pad(
+            &sink
+                .element
+                .static_pad("sink")
+                .context("audio sink has no sink pad")?,
+            MediaStage::AudioSinkInput,
+            progress,
+        );
+    }
 
     let all = [depay, dec, convert, resample, volume, sink];
     attach_receive_elements(

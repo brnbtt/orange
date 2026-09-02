@@ -177,12 +177,20 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
         );
         let result: Result<bool> = match accept_receive_pad(&workers_for_pad, pad) {
             Some(AcceptedReceivePad::Audio(claim)) => {
-                build_audio_branch(&pipeline, pad, overlay_for_audio.clone(), "watch").map(
-                    |worker| {
-                        claim.complete_audio(worker);
-                        true
-                    },
+                if let Some(progress) = &media_progress_for_pad {
+                    track_pad(pad, MediaStage::AudioRtp, progress.clone());
+                }
+                build_audio_branch(
+                    &pipeline,
+                    pad,
+                    overlay_for_audio.clone(),
+                    media_progress_for_pad.clone(),
+                    "watch",
                 )
+                .map(|worker| {
+                    claim.complete_audio(worker);
+                    true
+                })
             }
             Some(AcceptedReceivePad::Video(claim)) => {
                 match output

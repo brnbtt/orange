@@ -19,6 +19,7 @@ const AUTO_ENCODERS: [(Codec, &str); 4] = [
     (Codec::H264, "mfh264enc"),
     (Codec::H264, "nvd3d11h264enc"),
 ];
+const MIN_FORCE_KEY_UNIT_INTERVAL_NS: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -306,6 +307,11 @@ fn set_from_str_if_supported(element: &gst::Element, property: &str, value: &str
 
 pub fn configure_encoder(element: &gst::Element, encoder: &str, codec: Codec, fps: u32) {
     set_encoder_gop(element, gop_size(fps) as u32);
+    set_if_supported(
+        element,
+        "min-force-key-unit-interval",
+        MIN_FORCE_KEY_UNIT_INTERVAL_NS,
+    );
     if encoder.starts_with("nvd3d11") {
         set_from_str_if_supported(element, "preset", "p5");
         set_from_str_if_supported(element, "tune", "low-latency");
@@ -470,6 +476,10 @@ mod tests {
         configure_encoder(&encoder, "nvd3d11av1enc", Codec::Av1, 60);
 
         assert_eq!(encoder.property::<i32>("gop-size"), 120);
+        assert_eq!(
+            encoder.property::<u64>("min-force-key-unit-interval"),
+            1_000_000_000
+        );
         assert!(encoder.property::<bool>("spatial-aq"));
     }
 
