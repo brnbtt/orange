@@ -4,6 +4,7 @@ use gstreamer as gst;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::Arc;
 
+use crate::connection::{ConnectionEvent, ConnectionFailure};
 use crate::media_diagnostics::{
     diagnostics_enabled, emit_diagnostic, start_webrtc_diagnostics, track_pad, DiagnosticsHandle,
     MediaProgress, MediaStage,
@@ -17,7 +18,7 @@ use orange_signal::{connect, Signal};
 
 use super::{
     check_promise_reply, combine_session_and_cleanup, enable_nack, forward_ice, make_webrtcbin,
-    parse_sdp, watch_bus, watch_connection, ConnectionFailure, PipelineError,
+    parse_sdp, watch_bus, watch_connection, ConnectionFailureHandler, PipelineError,
 };
 
 /// Printed when a stream we were watching finishes normally.
@@ -75,6 +76,21 @@ async fn cleanup_watch_start_failure(
     combine_session_and_cleanup(Err(start_error), cleanup.await)
 }
 
+async fn wait_for_playback_close(playback: crate::window::PlaybackWindowHandle) {
+    while playback.is_alive() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+fn connection_failed(
+    playback: Option<&crate::window::PlaybackWindowHandle>,
+    failure: ConnectionFailure,
+) {
+    if let Some(playback) = playback {
+        playback.connection_event(ConnectionEvent::Failed(failure));
+    }
+}
+
 /// Viewer: join a stream by code.
 async fn stop_watch_receive_pipeline(
     bin: &gst::Element,
@@ -115,25 +131,66 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
         ),
     };
     let viewer_playback = playback_owner.as_ref().map(|owner| owner.handle());
-    let mut client = connect(url).await?;
-    if let Some(session) = crate::auth::load_session()? {
-        client.outgoing.send(Signal::Authenticate {
-            session: session.token,
-        })?;
+    if let Some(playback) = &viewer_playback {
+        playback.begin_connection();
+        playback.reveal();
     }
-    client.outgoing.send(Signal::Join {
-        code: code.to_string(),
+    let connect_result = if let Some(playback) = &viewer_playback {
+        tokio::select! {
+            result = connect(url) => Some(result),
+            () = wait_for_playback_close(playback.clone()) => None,
+        }
+    } else {
+        Some(connect(url).await)
+    };
+    let Some(connect_result) = connect_result else {
+        return Ok(());
+    };
+    let mut client = connect_result.inspect_err(|_| {
+        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Signaling);
     })?;
-    println!("[watch] joining {code}...");
+    let session = crate::auth::load_session().inspect_err(|_| {
+        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Signaling);
+    })?;
+    if let Some(session) = session {
+        client
+            .outgoing
+            .send(Signal::Authenticate {
+                session: session.token,
+            })
+            .inspect_err(|_| {
+                connection_failed(viewer_playback.as_ref(), ConnectionFailure::Signaling);
+            })?;
+    }
+    client
+        .outgoing
+        .send(Signal::Join {
+            code: code.to_string(),
+        })
+        .inspect_err(|_| {
+            connection_failed(viewer_playback.as_ref(), ConnectionFailure::Signaling);
+        })?;
+    println!("[watch] joining...");
 
     let pipeline = gst::Pipeline::new();
-    let bin = make_webrtcbin("viewer")?;
-    configure_receive_transport(&bin, matches!(&output, ReceiveOutput::Window(_)))?;
-    pipeline.add(&bin)?;
-    let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch", viewer_playback.clone())?;
+    let bin = make_webrtcbin("viewer").inspect_err(|_| {
+        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Playback);
+    })?;
+    configure_receive_transport(&bin, matches!(&output, ReceiveOutput::Window(_))).inspect_err(
+        |_| {
+            connection_failed(viewer_playback.as_ref(), ConnectionFailure::Playback);
+        },
+    )?;
+    pipeline.add(&bin).inspect_err(|_| {
+        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Playback);
+    })?;
+    let (session_errors, mut bus_errors) = watch_bus(&pipeline, "watch", viewer_playback.clone())
+        .inspect_err(|_| {
+        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Playback);
+    })?;
 
     let connection_errors = session_errors.clone();
-    let on_connection_failure: ConnectionFailure = Arc::new(move |error| {
+    let on_connection_failure: ConnectionFailureHandler = Arc::new(move |error| {
         let _ = connection_errors.send(PipelineError {
             source: String::new(),
             message: error,
@@ -145,6 +202,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
         "watch".to_string(),
         None,
         Some(on_connection_failure),
+        viewer_playback.clone(),
     );
     enable_incoming_video_nack(&bin);
     forward_ice(&bin, client.outgoing.clone(), String::new());
@@ -165,11 +223,15 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
     let branch_errors = session_errors.clone();
     let receive_workers = ReceiveWorkerRegistry::new();
     let workers_for_pad = receive_workers.clone();
+    let playback_for_pad = viewer_playback.clone();
     let pad_added = bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
         let kind = encoding_name(pad).unwrap_or_default();
+        if let Some(playback) = &playback_for_pad {
+            playback.connection_event(ConnectionEvent::PadAdded);
+        }
         emit_diagnostic(
             "pad-added",
             "watch",
@@ -239,21 +301,28 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
         match result {
             Err(error) => {
                 eprintln!("[watch] could not build {kind} branch: {error}");
+                connection_failed(playback_for_pad.as_ref(), ConnectionFailure::Playback);
                 let _ = branch_errors.send(PipelineError {
                     source: String::new(),
                     message: format!("could not build {kind} receive branch: {error}"),
                 });
             }
-            Ok(true) => emit_diagnostic(
-                "receive-branch-ready",
-                "watch",
-                serde_json::json!({ "encoding": &kind }),
-            ),
+            Ok(true) => {
+                if let Some(playback) = &playback_for_pad {
+                    playback.connection_event(ConnectionEvent::ReceiveBranchReady);
+                }
+                emit_diagnostic(
+                    "receive-branch-ready",
+                    "watch",
+                    serde_json::json!({ "encoding": &kind }),
+                );
+            }
             Ok(false) => {}
         }
     });
 
     if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Playback);
         return cleanup_watch_start_failure(
             error.into(),
             stop_watch_receive_pipeline(&bin, pad_added, receive_workers, None, &pipeline),
@@ -299,20 +368,46 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                     signal = client.incoming.recv() => signal,
                 }
             };
-            let Some(signal) = signal else { break };
+            let Some(signal) = signal else {
+                if viewer_playback
+                    .as_ref()
+                    .is_some_and(crate::window::PlaybackWindowHandle::is_alive)
+                {
+                    connection_failed(viewer_playback.as_ref(), ConnectionFailure::Signaling);
+                }
+                break;
+            };
             handle_watch_diagnostic_signal(&signal);
             match signal {
                 Signal::Sdp { kind, sdp, .. } if kind == "offer" => {
-                    let desc = parse_sdp(&kind, &sdp)?;
+                    if let Some(playback) = &viewer_playback {
+                        playback.connection_event(ConnectionEvent::SdpOfferReceived);
+                    }
+                    let desc = parse_sdp(&kind, &sdp).inspect_err(|_| {
+                        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Negotiation);
+                    })?;
                     let bin_for_answer = bin.clone();
                     let outgoing = client.outgoing.clone();
                     let session_errors = session_errors.clone();
+                    let playback_for_offer = viewer_playback.clone();
                     let installed = gst::Promise::with_change_func(move |reply| {
                         match check_promise_reply(reply, "installing remote offer") {
                             Ok(_) => {
-                                create_answer(&bin_for_answer, outgoing, session_errors.clone())
+                                if let Some(playback) = &playback_for_offer {
+                                    playback.connection_event(ConnectionEvent::SdpOfferInstalled);
+                                }
+                                create_answer(
+                                    &bin_for_answer,
+                                    outgoing,
+                                    session_errors.clone(),
+                                    playback_for_offer.clone(),
+                                )
                             }
                             Err(error) => {
+                                connection_failed(
+                                    playback_for_offer.as_ref(),
+                                    ConnectionFailure::Negotiation,
+                                );
                                 let _ = session_errors.send(PipelineError {
                                     source: String::new(),
                                     message: format!("could not install host offer: {error}"),
@@ -329,6 +424,9 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                 }
                 Signal::StreamInfo { host_name, .. } => {
                     joined = true;
+                    if let Some(playback) = &viewer_playback {
+                        playback.connection_event(ConnectionEvent::StreamInfo);
+                    }
                     if let Some(overlay) = &viewer_overlay {
                         if let Ok(mut state) = overlay.lock() {
                             state.host = host_name.clone();
@@ -350,6 +448,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                         println!("{WATCH_ENDED}");
                         break;
                     }
+                    connection_failed(viewer_playback.as_ref(), ConnectionFailure::Room);
                     anyhow::bail!("{message}");
                 }
                 _ => {}
@@ -358,6 +457,9 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
         Ok(())
     }
     .await;
+    if session_result.is_err() {
+        connection_failed(viewer_playback.as_ref(), ConnectionFailure::Signaling);
+    }
 
     let stop_result =
         stop_watch_receive_pipeline(&bin, pad_added, receive_workers, diagnostics, &pipeline).await;
@@ -369,12 +471,14 @@ fn create_answer(
     bin: &gst::Element,
     out: tokio::sync::mpsc::UnboundedSender<Signal>,
     errors: tokio::sync::mpsc::UnboundedSender<PipelineError>,
+    playback: Option<crate::window::PlaybackWindowHandle>,
 ) {
     let bin_clone = bin.clone();
     let promise = gst::Promise::with_change_func(move |reply| {
         let reply = match check_promise_reply(reply, "creating answer") {
             Ok(Some(reply)) => reply,
             Ok(None) => {
+                connection_failed(playback.as_ref(), ConnectionFailure::Negotiation);
                 let _ = errors.send(PipelineError {
                     source: String::new(),
                     message: "creating answer returned no description".into(),
@@ -382,6 +486,7 @@ fn create_answer(
                 return;
             }
             Err(error) => {
+                connection_failed(playback.as_ref(), ConnectionFailure::Negotiation);
                 let _ = errors.send(PipelineError {
                     source: String::new(),
                     message: error.to_string(),
@@ -390,6 +495,7 @@ fn create_answer(
             }
         };
         let Ok(answer_value) = reply.value("answer") else {
+            connection_failed(playback.as_ref(), ConnectionFailure::Negotiation);
             let _ = errors.send(PipelineError {
                 source: String::new(),
                 message: "creating answer returned no description".into(),
@@ -397,6 +503,7 @@ fn create_answer(
             return;
         };
         let Ok(answer) = answer_value.get::<gst_webrtc::WebRTCSessionDescription>() else {
+            connection_failed(playback.as_ref(), ConnectionFailure::Negotiation);
             let _ = errors.send(PipelineError {
                 source: String::new(),
                 message: "creating answer returned an invalid description".into(),
@@ -404,16 +511,36 @@ fn create_answer(
             return;
         };
         let sdp = answer.sdp().as_text().unwrap_or_default();
+        let playback_for_install = playback.clone();
         let installed = gst::Promise::with_change_func(move |reply| {
             match check_promise_reply(reply, "installing local answer") {
                 Ok(_) => {
-                    let _ = out.send(Signal::Sdp {
-                        peer: String::new(),
-                        kind: "answer".into(),
-                        sdp,
-                    });
+                    if let Some(playback) = &playback_for_install {
+                        playback.connection_event(ConnectionEvent::SdpAnswerInstalled);
+                    }
+                    if out
+                        .send(Signal::Sdp {
+                            peer: String::new(),
+                            kind: "answer".into(),
+                            sdp,
+                        })
+                        .is_err()
+                    {
+                        connection_failed(
+                            playback_for_install.as_ref(),
+                            ConnectionFailure::Signaling,
+                        );
+                        let _ = errors.send(PipelineError {
+                            source: String::new(),
+                            message: "could not send viewer answer".into(),
+                        });
+                    }
                 }
                 Err(error) => {
+                    connection_failed(
+                        playback_for_install.as_ref(),
+                        ConnectionFailure::Negotiation,
+                    );
                     let _ = errors.send(PipelineError {
                         source: String::new(),
                         message: error.to_string(),
@@ -430,6 +557,10 @@ fn create_answer(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_CLOSE,
+    };
 
     #[tokio::test]
     async fn peer_worker_review_playing_failure_runs_cleanup_and_reports_both_errors() {
@@ -472,5 +603,40 @@ mod tests {
                 "payload": { "id": "watch-session" },
             })]
         );
+    }
+
+    #[tokio::test]
+    async fn closing_while_signaling_is_open_cancels_the_join_wait_promptly() {
+        let owner = crate::window::PlaybackWindow::spawn(
+            "orange joining cancellation test",
+            crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
+        )
+        .unwrap();
+        let playback = owner.handle();
+        playback.begin_connection();
+        let hwnd = playback.hwnd().expect("window did not publish its HWND");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            unsafe {
+                SendMessageTimeoutW(
+                    HWND(hwnd as *mut _),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                    SMTO_ABORTIFHUNG,
+                    1_000,
+                    None,
+                )
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            wait_for_playback_close(playback),
+        )
+        .await
+        .expect("window close was not observed promptly");
+        closer.join().unwrap();
+        drop(owner);
     }
 }

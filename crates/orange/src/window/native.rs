@@ -1,7 +1,7 @@
 use super::{
-    fail_fast_native_cleanup, finish_window_startup, CleanupFailure, CleanupResult,
-    NativeWindowState, PlaybackProfile, ShutdownEvent, WorkerFinish, ASPECT_MESSAGE,
-    REVEAL_MESSAGE,
+    connection_surface, fail_fast_native_cleanup, finish_window_startup, CleanupFailure,
+    CleanupResult, NativeWindowState, PlaybackProfile, ShutdownEvent, WorkerFinish, ASPECT_MESSAGE,
+    CONNECTION_MESSAGE, REVEAL_MESSAGE,
 };
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -17,8 +17,10 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_DONOTROUND, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, GetMonitorInfoW, MonitorFromWindow, ScreenToClient, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW, InvalidateRect,
+    MonitorFromWindow, ScreenToClient, SetDIBitsToDevice, UpdateWindow, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
@@ -83,6 +85,7 @@ pub(super) fn spawn_window(
     envelope: (i32, i32),
     profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
+    connection: Arc<crate::connection::ConnectionTracker>,
     native: Arc<NativeWindowState>,
 ) -> Result<SpawnedWindow> {
     let (tx, rx) = mpsc::sync_channel::<Result<isize>>(1);
@@ -95,7 +98,14 @@ pub(super) fn spawn_window(
         .name("orange-playback-window".to_string())
         .spawn(move || unsafe {
             let mut completion = CompletionAck::new(completion);
-            let cleanup = match create_window(&title, envelope, profile, overlay, native.clone()) {
+            let cleanup = match create_window(
+                &title,
+                envelope,
+                profile,
+                overlay,
+                connection,
+                native.clone(),
+            ) {
                 Ok(hwnd) => {
                     native.install(hwnd.0 as isize);
                     if tx.send(Ok(hwnd.0 as isize)).is_err() {
@@ -125,6 +135,7 @@ pub(super) fn spawn_window(
 /// Per-window state reachable from the window procedure.
 struct WindowContext {
     overlay: crate::overlay::SharedOverlay,
+    connection: Arc<crate::connection::ConnectionTracker>,
     native: Arc<NativeWindowState>,
     revealed: std::cell::Cell<bool>,
     profile: PlaybackProfile,
@@ -541,6 +552,7 @@ unsafe fn create_window(
     envelope: (i32, i32),
     profile: PlaybackProfile,
     overlay: crate::overlay::SharedOverlay,
+    connection: Arc<crate::connection::ConnectionTracker>,
     native: Arc<NativeWindowState>,
 ) -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
@@ -600,6 +612,7 @@ unsafe fn create_window(
     let native_for_creation_cleanup = native.clone();
     let ctx = Box::into_raw(Box::new(WindowContext {
         overlay,
+        connection,
         native,
         revealed: std::cell::Cell::new(false),
         profile,
@@ -634,6 +647,57 @@ unsafe fn create_window(
     Ok(hwnd)
 }
 
+unsafe fn paint_connection_surface(hwnd: HWND, stage: crate::connection::ConnectionStage) {
+    let mut paint = PAINTSTRUCT::default();
+    let dc = BeginPaint(hwnd, &mut paint);
+    let mut bounds = RECT::default();
+    if GetClientRect(hwnd, &mut bounds).is_ok() {
+        let width = (bounds.right - bounds.left).max(0) as u32;
+        let height = (bounds.bottom - bounds.top).max(0) as u32;
+        let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        if let Some(pixmap) = connection_surface::render(width, height, dpi, stage) {
+            let mut pixels = pixmap.take();
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            SetLastError(ERROR_SUCCESS);
+            let lines = SetDIBitsToDevice(
+                dc,
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                0,
+                height,
+                pixels.as_ptr().cast(),
+                &info,
+                DIB_RGB_COLORS,
+            );
+            if lines == 0 {
+                eprintln!(
+                    "[window] connection surface blit failed (Win32 error {})",
+                    GetLastError().0
+                );
+            }
+        }
+    }
+    let _ = EndPaint(hwnd, &paint);
+}
+
 /// Whether the pointer is inside this window's client area.
 ///
 /// Checked before hiding it, so a timer tick never blanks the cursor while it
@@ -657,10 +721,33 @@ unsafe fn cursor_inside(hwnd: HWND) -> bool {
 
 /// Whether the controls are currently on screen. The cursor follows them.
 unsafe fn controls_visible(hwnd: HWND) -> bool {
+    if with_context(hwnd, |ctx| ctx.connection.snapshot())
+        .flatten()
+        .is_some_and(|stage| !stage.is_connected())
+    {
+        return true;
+    }
     let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) else {
         return true;
     };
     overlay.lock().ok().map(|o| o.visible()).unwrap_or(true)
+}
+
+unsafe fn connection_close_hit_test(hwnd: HWND, x: f32, y: f32) -> bool {
+    let connecting = with_context(hwnd, |ctx| ctx.connection.snapshot())
+        .flatten()
+        .is_some_and(|stage| !stage.is_connected());
+    if !connecting {
+        return false;
+    }
+    let mut rect = RECT::default();
+    if GetClientRect(hwnd, &mut rect).is_err() {
+        return false;
+    }
+    let width = (rect.right - rect.left).max(0) as u32;
+    let height = (rect.bottom - rect.top).max(0) as u32;
+    let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    connection_surface::close_hit_test(x, y, width, height, dpi)
 }
 
 #[cfg(test)]
@@ -881,6 +968,27 @@ fn message_result(result: i32) -> MessageResult {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            CONNECTION_MESSAGE => {
+                let connecting = with_context(hwnd, |ctx| ctx.connection.snapshot())
+                    .flatten()
+                    .is_some_and(|stage| !stage.is_connected());
+                if connecting {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    let _ = UpdateWindow(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_PAINT => {
+                let stage = with_context(hwnd, |ctx| ctx.connection.snapshot())
+                    .flatten()
+                    .filter(|stage| !stage.is_connected());
+                if let Some(stage) = stage {
+                    paint_connection_surface(hwnd, stage);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
             ASPECT_MESSAGE => {
                 resize_to_video_aspect(hwnd, wparam.0 as u32, lparam.0 as u32);
                 LRESULT(0)
@@ -894,6 +1002,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 })
                 .flatten();
                 if let Some(activate) = activate {
+                    let connecting = with_context(hwnd, |ctx| ctx.connection.snapshot())
+                        .flatten()
+                        .is_some_and(|stage| !stage.is_connected());
+                    if connecting {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        let _ = UpdateWindow(hwnd);
+                    }
                     let flags = if activate {
                         AW_BLEND | AW_ACTIVATE
                     } else {
@@ -902,6 +1017,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     if AnimateWindow(hwnd, REVEAL_MS, flags).is_err() {
                         let _ =
                             ShowWindow(hwnd, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
+                    }
+                    if connecting {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        let _ = UpdateWindow(hwnd);
                     }
                 }
                 LRESULT(0)
@@ -952,6 +1071,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     y: screen_y,
                 };
                 let _ = ScreenToClient(hwnd, &mut point);
+                if connection_close_hit_test(hwnd, point.x as f32, point.y as f32) {
+                    return LRESULT(HTCLIENT as isize);
+                }
 
                 let over_control = with_context(hwnd, |ctx| ctx.overlay.clone())
                     .and_then(|overlay| {
@@ -978,6 +1100,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                if connection_close_hit_test(hwnd, x, y) {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    return LRESULT(0);
+                }
                 let mut close = false;
                 let mut fullscreen = false;
                 let mut volume_dragging = false;
@@ -1047,6 +1173,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     if let Ok(mut overlay) = overlay.lock() {
                         overlay.client = (width, height);
                     }
+                }
+                let connecting = with_context(hwnd, |ctx| ctx.connection.snapshot())
+                    .flatten()
+                    .is_some_and(|stage| !stage.is_connected());
+                if connecting {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }

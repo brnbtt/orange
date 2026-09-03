@@ -17,6 +17,19 @@ pub fn encoding_name(pad: &gst::Pad) -> Option<String> {
     structure.get::<String>("encoding-name").ok()
 }
 
+fn notify_on_first_buffer(pad: &gst::Pad, notify: impl Fn() + Send + Sync + 'static) -> Result<()> {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if matches!(info.data, Some(gst::PadProbeData::Buffer(_))) {
+            notify();
+            gst::PadProbeReturn::Remove
+        } else {
+            gst::PadProbeReturn::Ok
+        }
+    })
+    .context("could not watch for the first decoded video frame")?;
+    Ok(())
+}
+
 /// Add and link a dynamic receive branch as one transaction. GStreamer does
 /// not roll back partially added elements or pad links when a later operation
 /// fails, so the caller must do it explicitly before keeping the session alive.
@@ -211,6 +224,21 @@ fn build_video_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
     })
 }
 
+fn attach_video_sink_to_playback(
+    sink: &ReceiveElement,
+    playback: &crate::window::PlaybackWindowHandle,
+) -> Result<()> {
+    let overlay_iface = sink
+        .element
+        .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
+        .context("d3d11videosink does not implement GstVideoOverlay")?;
+    let hwnd = playback.hwnd().context("playback window is unavailable")?;
+    // SAFETY: run_loopback/run_watch and the lifecycle test retain the unique
+    // window owner until after the sink is stopped and released.
+    unsafe { overlay_iface.set_window_handle(hwnd as usize) };
+    Ok(())
+}
+
 fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
     let primary = measure_operation(
         diagnostic_role,
@@ -265,7 +293,7 @@ pub fn build_receive_branch(
     progress: Option<Arc<MediaProgress>>,
     diagnostic_role: &str,
 ) -> Result<()> {
-    let reveal_playback = match &output {
+    let window_playback = match &output {
         ReceiveOutput::Window(playback) => Some(playback.clone()),
         ReceiveOutput::File { .. } => None,
     };
@@ -289,6 +317,10 @@ pub fn build_receive_branch(
         .current_caps()
         .as_ref()
         .and_then(|caps| frame_rate_from_rtp_caps(caps));
+    let decoded_pad = dec
+        .element
+        .static_pad("src")
+        .context("decoder has no src pad")?;
     if let Some(progress) = progress {
         track_pad(
             &depay
@@ -306,13 +338,12 @@ pub fn build_receive_branch(
             MediaStage::Parsed,
             progress.clone(),
         );
-        track_pad(
-            &dec.element
-                .static_pad("src")
-                .context("decoder has no src pad")?,
-            MediaStage::Decoded,
-            progress,
-        );
+        track_pad(&decoded_pad, MediaStage::Decoded, progress);
+    }
+    if let Some(playback) = window_playback {
+        notify_on_first_buffer(&decoded_pad, move || {
+            playback.connection_event(crate::connection::ConnectionEvent::FirstVideoFrame);
+        })?;
     }
 
     let tail: Vec<ReceiveElement> = match output {
@@ -338,15 +369,7 @@ pub fn build_receive_branch(
             let queue = build_live_video_queue(diagnostic_role)?;
 
             let sink = build_video_sink(diagnostic_role)?;
-            let overlay_iface = sink
-                .element
-                .dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
-                .context("d3d11videosink does not implement GstVideoOverlay")?;
-            let hwnd = playback.hwnd().context("playback window is unavailable")?;
-            // SAFETY: Window ReceiveOutput values are created only by
-            // run_loopback/run_watch, where the unique owner is declared
-            // before and outlives the receiver pipeline and its callbacks.
-            unsafe { overlay_iface.set_window_handle(hwnd as usize) };
+            attach_video_sink_to_playback(&sink, &playback)?;
 
             vec![queue, composition, sink]
         }
@@ -390,9 +413,6 @@ pub fn build_receive_branch(
         "link-incoming-video-rtp-pad",
         "remove-incoming-video-block-probe",
     )?;
-    if let Some(playback) = reveal_playback {
-        playback.reveal();
-    }
     println!("[webrtc] receiving video");
     Ok(())
 }
@@ -494,6 +514,7 @@ pub(crate) fn build_audio_branch(
 mod tests {
     use super::super::{build_video_payloader, rtp_caps};
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn rtp_caps_advertise_the_configured_frame_rate() {
@@ -617,5 +638,65 @@ mod tests {
         assert!(!audio.element.property::<bool>("sync"));
         assert_eq!(audio.element.property::<i64>("buffer-time"), 40_000);
         assert_eq!(audio.element.property::<i64>("latency-time"), 10_000);
+    }
+
+    #[test]
+    fn first_buffer_notification_is_one_shot_and_does_not_consume_media() {
+        gst::init().unwrap();
+        let src = gst::Pad::builder(gst::PadDirection::Src)
+            .name("src")
+            .build();
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_in_sink = received.clone();
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .name("sink")
+            .chain_function(move |_, _, _| {
+                received_in_sink.fetch_add(1, Ordering::SeqCst);
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build();
+        src.link(&sink).unwrap();
+        sink.set_active(true).unwrap();
+        src.set_active(true).unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notifications_in_probe = notifications.clone();
+        notify_on_first_buffer(&src, move || {
+            notifications_in_probe.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        assert!(src.push_event(gst::event::StreamStart::new("first-frame-test")));
+        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        assert!(src.push_event(gst::event::Segment::new(segment.as_ref())));
+        src.push(gst::Buffer::new()).unwrap();
+        src.push(gst::Buffer::new()).unwrap();
+
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn attaching_d3d11_sink_and_finishing_connection_reuses_the_hwnd() {
+        gst::init().unwrap();
+        let owner = crate::window::PlaybackWindow::spawn(
+            "orange sink attachment test",
+            crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
+        )
+        .unwrap();
+        let playback = owner.handle();
+        playback.begin_connection();
+        let original = playback.hwnd().expect("window did not publish its HWND");
+        let sink = build_video_sink("test").unwrap();
+
+        attach_video_sink_to_playback(&sink, &playback).unwrap();
+        playback.connection_event(crate::connection::ConnectionEvent::FirstVideoFrame);
+
+        assert_eq!(playback.hwnd(), Some(original));
+        assert_eq!(
+            playback.connection_stage(),
+            Some(crate::connection::ConnectionStage::Connected)
+        );
+        drop(sink);
+        drop(owner);
     }
 }

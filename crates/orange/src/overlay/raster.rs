@@ -765,7 +765,9 @@ fn to_composition(panels: Vec<Panel>) -> Option<gst_video::VideoOverlayCompositi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::{ConnectionEvent, ConnectionTracker};
     use crate::overlay::HIDE_AFTER;
+    use std::sync::Arc;
     use std::time::Instant;
 
     #[test]
@@ -875,5 +877,28 @@ mod tests {
                 .iter()
                 .any(|pixel| pixel[3] > 0));
         }
+    }
+
+    #[test]
+    fn native_surface_and_video_overlay_derive_connection_copy_from_one_tracker() {
+        let connection = Arc::new(ConnectionTracker::default());
+        let mut state = OverlayState::with_connection(
+            crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
+            connection.clone(),
+        );
+        state.video = (1920, 1080);
+        state.fps = Some(60.0);
+        assert_eq!(state.quality_label(), "1080p60");
+
+        connection.begin();
+        connection.advance(ConnectionEvent::IceChecking);
+        assert_eq!(state.quality_label(), "Finding a direct route");
+        assert_eq!(
+            state.detail_label().as_deref(),
+            Some("ICE is checking available network paths")
+        );
+
+        connection.advance(ConnectionEvent::FirstVideoFrame);
+        assert_eq!(state.quality_label(), "1080p60");
     }
 }

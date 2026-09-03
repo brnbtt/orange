@@ -267,6 +267,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
     let workers = ReceiveWorkerRegistry::new();
     let workers_for_pad = workers.clone();
     let overlay_for_pad = overlay.clone();
+    let playback_for_pad = playback.clone();
     let pad_added = recv_bin.connect_pad_added(move |_, pad| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
@@ -289,6 +290,9 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
                 };
                 match build_receive_branch(&pipeline, pad, output, None, "loopback") {
                     Ok(()) => {
+                        if let Some(playback) = &playback_for_pad {
+                            playback.reveal();
+                        }
                         let bitrate =
                             overlay_for_pad.clone().and_then(
                                 |overlay| match watch_incoming_bitrate(pad, overlay) {

@@ -19,7 +19,7 @@ use orange_signal::Signal;
 
 use super::{
     check_promise_reply, enable_nack, forward_ice, make_webrtcbin, watch_connection,
-    ConnectionFailure, ConnectionReady,
+    ConnectionFailureHandler, ConnectionReadyHandler,
 };
 
 const AUDIO_BRANCH_MAX_PACKETS: u32 = 10;
@@ -403,10 +403,10 @@ pub(super) fn add_viewer(
     );
     let failed_peer = peer.to_string();
     let connection_failures = failures.clone();
-    let on_connection_failure: ConnectionFailure = Arc::new(move |error| {
+    let on_connection_failure: ConnectionFailureHandler = Arc::new(move |error| {
         let _ = connection_failures.send((failed_peer.clone(), error));
     });
-    let on_connected: ConnectionReady = Arc::new(move || {
+    let on_connected: ConnectionReadyHandler = Arc::new(move || {
         startup_trigger.request();
     });
     watch_connection(
@@ -415,6 +415,7 @@ pub(super) fn add_viewer(
         diagnostic_label.clone(),
         Some(on_connected),
         Some(on_connection_failure),
+        None,
     );
     branch.diagnostics = start_webrtc_diagnostics(&branch.bin, diagnostic_label, progress, None);
     forward_ice(&branch.bin, out.clone(), peer.to_string());

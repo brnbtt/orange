@@ -1,6 +1,7 @@
 //! orange - low-overhead window streaming for friends.
 
 mod auth;
+mod connection;
 mod encoder_characterization;
 mod media_diagnostics;
 mod overlay;
@@ -23,6 +24,10 @@ use gstreamer_video::prelude::VideoOverlayExtManual;
 use pipeline::{CaptureSettings, Codec};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
+
+const fn watch_window_title() -> &'static str {
+    "orange - viewer"
+}
 
 #[derive(Parser)]
 #[command(name = "orange", about = "Low-overhead window streaming for friends")]
@@ -358,10 +363,8 @@ fn run(cli: Cli) -> Result<()> {
                         PlaybackKind::Friend => window::PlaybackProfile::FriendViewer { cascade },
                         PlaybackKind::Monitor => window::PlaybackProfile::LiveMonitor,
                     };
-                    let playback = window::PlaybackWindow::spawn(
-                        &format!("orange - {code}"),
-                        playback_profile,
-                    )?;
+                    let playback =
+                        window::PlaybackWindow::spawn(watch_window_title(), playback_profile)?;
                     webrtc::Output::Window(playback)
                 }
             };
@@ -686,7 +689,7 @@ mod tests {
     use super::{
         format_error_chain, gst, run_pipeline_while, run_pipeline_while_with_shutdown,
         run_pipeline_while_with_shutdown_and_state, start_pipeline_with, stop_pipeline_with,
-        timed_pipeline_should_continue, Cli, Command, QualityArgs,
+        timed_pipeline_should_continue, watch_window_title, Cli, Command, QualityArgs,
     };
     use clap::Parser;
     use gst::prelude::*;
@@ -710,6 +713,15 @@ mod tests {
 
         assert_eq!(automatic.bitrate, None);
         assert_eq!(overridden.bitrate, Some(100_001));
+    }
+
+    #[test]
+    fn viewer_window_title_never_contains_the_room_code() {
+        let code = "SENSITIVE-ROOM-CODE";
+        let title = watch_window_title();
+
+        assert_eq!(title, "orange - viewer");
+        assert!(!title.contains(code));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use gstreamer_webrtc as gst_webrtc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::connection::{ConnectionEvent, ConnectionFailure as ViewerConnectionFailure};
 use crate::media_diagnostics::emit_diagnostic;
 use orange_signal::Signal;
 
@@ -89,6 +90,11 @@ fn watch_bus(
                     err.debug().unwrap_or_default()
                 );
                 eprintln!("[{label}] ERROR: {error}");
+                if let Some(playback) = &playback {
+                    playback.connection_event(ConnectionEvent::Failed(
+                        ViewerConnectionFailure::Playback,
+                    ));
+                }
                 let _ = bus_errors.send(PipelineError {
                     source: source.to_string(),
                     message: error,
@@ -133,8 +139,8 @@ fn watch_bus(
 /// `pad-added` fires when the transceiver is created, which happens whether or
 /// not any media ever arrives. The states below are the difference between
 /// "negotiated" and "actually connected".
-type ConnectionFailure = Arc<dyn Fn(String) + Send + Sync>;
-type ConnectionReady = Arc<dyn Fn() + Send + Sync>;
+type ConnectionFailureHandler = Arc<dyn Fn(String) + Send + Sync>;
+type ConnectionReadyHandler = Arc<dyn Fn() + Send + Sync>;
 
 fn is_terminal_connection_state(state: gst_webrtc::WebRTCPeerConnectionState) -> bool {
     matches!(
@@ -144,27 +150,69 @@ fn is_terminal_connection_state(state: gst_webrtc::WebRTCPeerConnectionState) ->
     )
 }
 
+fn ice_gathering_event(state: gst_webrtc::WebRTCICEGatheringState) -> Option<ConnectionEvent> {
+    match state {
+        gst_webrtc::WebRTCICEGatheringState::Gathering
+        | gst_webrtc::WebRTCICEGatheringState::Complete => Some(ConnectionEvent::IceGathering),
+        _ => None,
+    }
+}
+
+fn ice_connection_event(state: gst_webrtc::WebRTCICEConnectionState) -> Option<ConnectionEvent> {
+    match state {
+        gst_webrtc::WebRTCICEConnectionState::Checking => Some(ConnectionEvent::IceChecking),
+        gst_webrtc::WebRTCICEConnectionState::Connected
+        | gst_webrtc::WebRTCICEConnectionState::Completed => Some(ConnectionEvent::IceConnected),
+        gst_webrtc::WebRTCICEConnectionState::Failed
+        | gst_webrtc::WebRTCICEConnectionState::Closed => {
+            Some(ConnectionEvent::Failed(ViewerConnectionFailure::Network))
+        }
+        _ => None,
+    }
+}
+
+fn peer_connection_event(state: gst_webrtc::WebRTCPeerConnectionState) -> Option<ConnectionEvent> {
+    match state {
+        gst_webrtc::WebRTCPeerConnectionState::Connected => Some(ConnectionEvent::PeerConnected),
+        gst_webrtc::WebRTCPeerConnectionState::Failed
+        | gst_webrtc::WebRTCPeerConnectionState::Closed => {
+            Some(ConnectionEvent::Failed(ViewerConnectionFailure::Network))
+        }
+        _ => None,
+    }
+}
+
 fn watch_connection(
     bin: &gst::Element,
     label: String,
     diagnostic_role: String,
-    on_connected: Option<ConnectionReady>,
-    on_failure: Option<ConnectionFailure>,
+    on_connected: Option<ConnectionReadyHandler>,
+    on_failure: Option<ConnectionFailureHandler>,
+    playback: Option<crate::window::PlaybackWindowHandle>,
 ) {
     let l = label.clone();
     let role = diagnostic_role.clone();
+    let playback_for_ice = playback.clone();
     bin.connect_notify(Some("ice-connection-state"), move |bin, _| {
         let state = bin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
         println!("[{l}] ice: {state:?}");
         emit_diagnostic("ice-state", &role, format!("{state:?}"));
+        if let (Some(playback), Some(event)) = (&playback_for_ice, ice_connection_event(state)) {
+            playback.connection_event(event);
+        }
     });
 
     let l = label.clone();
     let role = diagnostic_role.clone();
+    let playback_for_gathering = playback.clone();
     bin.connect_notify(Some("ice-gathering-state"), move |bin, _| {
         let state = bin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
         println!("[{l}] gathering: {state:?}");
         emit_diagnostic("ice-gathering-state", &role, format!("{state:?}"));
+        if let (Some(playback), Some(event)) = (&playback_for_gathering, ice_gathering_event(state))
+        {
+            playback.connection_event(event);
+        }
     });
 
     bin.connect_notify(Some("connection-state"), move |bin, _| {
@@ -175,6 +223,9 @@ fn watch_connection(
             &diagnostic_role,
             format!("{state:?}"),
         );
+        if let (Some(playback), Some(event)) = (&playback, peer_connection_event(state)) {
+            playback.connection_event(event);
+        }
         if state == gst_webrtc::WebRTCPeerConnectionState::Connected {
             if let Some(on_connected) = &on_connected {
                 on_connected();
@@ -235,6 +286,7 @@ fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescripti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::{ConnectionEvent, ConnectionFailure as ViewerConnectionFailure};
 
     #[test]
     fn peer_worker_review_normal_teardown_failure_is_never_masked() {
@@ -293,5 +345,52 @@ mod tests {
         assert!(!super::is_terminal_connection_state(
             gst_webrtc::WebRTCPeerConnectionState::Connected
         ));
+    }
+
+    #[test]
+    fn gstreamer_states_map_to_truthful_viewer_connection_events() {
+        assert_eq!(
+            ice_gathering_event(gst_webrtc::WebRTCICEGatheringState::Gathering),
+            Some(ConnectionEvent::IceGathering)
+        );
+        assert_eq!(
+            ice_gathering_event(gst_webrtc::WebRTCICEGatheringState::Complete),
+            Some(ConnectionEvent::IceGathering)
+        );
+        assert_eq!(
+            ice_gathering_event(gst_webrtc::WebRTCICEGatheringState::New),
+            None
+        );
+
+        assert_eq!(
+            ice_connection_event(gst_webrtc::WebRTCICEConnectionState::Checking),
+            Some(ConnectionEvent::IceChecking)
+        );
+        for connected in [
+            gst_webrtc::WebRTCICEConnectionState::Connected,
+            gst_webrtc::WebRTCICEConnectionState::Completed,
+        ] {
+            assert_eq!(
+                ice_connection_event(connected),
+                Some(ConnectionEvent::IceConnected)
+            );
+        }
+        assert_eq!(
+            ice_connection_event(gst_webrtc::WebRTCICEConnectionState::Failed),
+            Some(ConnectionEvent::Failed(ViewerConnectionFailure::Network))
+        );
+
+        assert_eq!(
+            peer_connection_event(gst_webrtc::WebRTCPeerConnectionState::Connected),
+            Some(ConnectionEvent::PeerConnected)
+        );
+        assert_eq!(
+            peer_connection_event(gst_webrtc::WebRTCPeerConnectionState::Failed),
+            Some(ConnectionEvent::Failed(ViewerConnectionFailure::Network))
+        );
+        assert_eq!(
+            peer_connection_event(gst_webrtc::WebRTCPeerConnectionState::Connecting),
+            None
+        );
     }
 }

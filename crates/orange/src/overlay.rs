@@ -82,6 +82,7 @@ pub struct OverlayState {
     pub host: Option<String>,
     pub fps: Option<f64>,
     pub bitrate_kbps: Option<u32>,
+    connection: Arc<crate::connection::ConnectionTracker>,
     profile: crate::window::PlaybackProfile,
     shown_at: Instant,
     /// Fixed for the life of the overlay, so the live dot's breath is
@@ -100,7 +101,18 @@ pub struct OverlayState {
 }
 
 impl OverlayState {
+    #[cfg(test)]
     pub fn new(profile: crate::window::PlaybackProfile) -> Self {
+        Self::with_connection(
+            profile,
+            Arc::new(crate::connection::ConnectionTracker::default()),
+        )
+    }
+
+    pub(crate) fn with_connection(
+        profile: crate::window::PlaybackProfile,
+        connection: Arc<crate::connection::ConnectionTracker>,
+    ) -> Self {
         Self {
             video: (0, 0),
             client: (0, 0),
@@ -113,6 +125,7 @@ impl OverlayState {
             host: None,
             fps: None,
             bitrate_kbps: None,
+            connection,
             profile,
             // Start hidden; pointer activity or the first known source size
             // briefly reveals the controls.
@@ -297,6 +310,13 @@ impl OverlayState {
     /// A short description of what is being received: the product's whole
     /// claim, and until now invisible to the person watching.
     fn quality_label(&self) -> String {
+        if let Some(stage) = self
+            .connection
+            .snapshot()
+            .filter(|stage| !stage.is_connected())
+        {
+            return stage.copy().title.to_string();
+        }
         let (w, h) = self.video;
         if w == 0 || h == 0 {
             return String::from("connecting");
@@ -315,6 +335,13 @@ impl OverlayState {
     }
 
     fn detail_label(&self) -> Option<String> {
+        if let Some(stage) = self
+            .connection
+            .snapshot()
+            .filter(|stage| !stage.is_connected())
+        {
+            return Some(stage.copy().detail.to_string());
+        }
         let mut parts = Vec::new();
         if let Some(kbps) = self.bitrate_kbps {
             parts.push(format!("{:.0} Mbps", kbps as f32 / 1000.0));
