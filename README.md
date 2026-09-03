@@ -267,15 +267,15 @@ Run the complete validation matrix from [ARCHITECTURE.md#validation](ARCHITECTUR
 orange list
 orange list --json
 
-# Capture and encode only; H.265 is the default.
-orange record --hwnd 395876 --bitrate 18000 --scale 2560x1440 --seconds 8 --out test.mkv
+# Capture and encode only; H.265 and bitrate selection are automatic.
+orange record --hwnd 395876 --scale 2560x1440 --seconds 8 --out test.mkv
 
 # Capture, WebRTC transport, decode, and local render.
-orange loopback --hwnd 395876 --scale 1280x720 --bitrate 8000 --show
+orange loopback --hwnd 395876 --scale 1280x720 --show
 
 # Local relay and two peer processes.
 orange serve
-orange host --hwnd 395876 --scale 1920x1080 --bitrate 8000
+orange host --hwnd 395876 --scale 1920x1080
 # Share this code: BC2-VH3
 orange watch --code BC2-VH3
 ```
@@ -284,8 +284,11 @@ Point host and watch at another relay with `--server ws://host:9000/ws` or set
 `ORANGE_SERVER`. `record` isolates capture/encode; `loopback` adds the media
 transport without the network relay.
 
-The CLI defaults to H.265 at 25 Mbps and can choose another bitrate. The tray
-offers fixed H.265 tiers: 4 Mbps at 720p, 8 Mbps at 1080p, and 18 Mbps at 1440p.
+The CLI defaults to H.265 and derives a measured video bitrate ceiling from the
+encoded resolution and frame rate. The anchor is 18 Mbps at 1080p60; pixel
+growth is sublinear, frame-rate growth is linear, values are rounded to 500
+kbps, and the automatic ceiling is capped at 80 Mbps. `--bitrate` remains
+available as an advanced override.
 
 ## Relay Limits And Deployment
 
@@ -298,11 +301,11 @@ message is capped at 64 KiB.
 Host upload remains the practical media limit because every viewer receives a
 separate peer-to-peer stream:
 
-| Tray tier | 2 viewers | 4 viewers | 8 viewers |
-| --- | --- | --- | --- |
-| 18 Mbps | 36 Mbps | 72 Mbps | 144 Mbps |
-| 8 Mbps | 16 Mbps | 32 Mbps | 64 Mbps |
-| 4 Mbps | 8 Mbps | 16 Mbps | 32 Mbps |
+| 1080p rate | Per viewer | 2 viewers | 4 viewers | 8 viewers |
+| --- | ---: | ---: | ---: | ---: |
+| 30 fps | 9 Mbps | 18 Mbps | 36 Mbps | 72 Mbps |
+| 60 fps | 18 Mbps | 36 Mbps | 72 Mbps | 144 Mbps |
+| 120 fps | 36 Mbps | 72 Mbps | 144 Mbps | 288 Mbps |
 
 Rooms and auth sessions are process-local memory. `deploy/azure.ps1` therefore
 pins `min-replicas = max-replicas = 1`. Deploying or restarting that one replica

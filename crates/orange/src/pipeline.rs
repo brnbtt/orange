@@ -20,6 +20,24 @@ const AUTO_ENCODERS: [(Codec, &str); 4] = [
     (Codec::H264, "nvd3d11h264enc"),
 ];
 const MIN_FORCE_KEY_UNIT_INTERVAL_NS: u64 = 1_000_000_000;
+const REFERENCE_VIDEO_PIXELS: f64 = 1920.0 * 1080.0;
+const REFERENCE_VIDEO_KBPS: f64 = 18_000.0;
+const VIDEO_BITRATE_STEP_KBPS: f64 = 500.0;
+const MAX_RECOMMENDED_VIDEO_KBPS: u32 = 80_000;
+
+/// A measured good-quality ceiling for Orange's low-latency H.265 path.
+pub(crate) fn recommended_video_bitrate(width: u32, height: u32, fps: u32) -> (u32, bool) {
+    let pixels = f64::from(width) * f64::from(height);
+    let target = REFERENCE_VIDEO_KBPS
+        * (pixels / REFERENCE_VIDEO_PIXELS).powf(0.8)
+        * (f64::from(fps) / 60.0);
+    let rounded = (target / VIDEO_BITRATE_STEP_KBPS).round() * VIDEO_BITRATE_STEP_KBPS;
+    let constrained = rounded > f64::from(MAX_RECOMMENDED_VIDEO_KBPS);
+    (
+        (rounded as u32).clamp(500, MAX_RECOMMENDED_VIDEO_KBPS),
+        constrained,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -457,6 +475,32 @@ mod tests {
         };
 
         assert_eq!(gop_size(settings.fps), 120);
+    }
+
+    #[test]
+    fn recommended_bitrate_tracks_output_pixels_and_frame_rate() {
+        for (width, height, fps, expected_kbps) in [
+            (1280, 720, 60, 9_500),
+            (1920, 1080, 30, 9_000),
+            (1920, 1080, 60, 18_000),
+            (1920, 1080, 120, 36_000),
+            (2560, 1440, 60, 28_500),
+            (3840, 2160, 60, 54_500),
+            (1920, 804, 60, 14_000),
+        ] {
+            assert_eq!(
+                recommended_video_bitrate(width, height, fps),
+                (expected_kbps, false),
+                "{width}x{height} at {fps} fps"
+            );
+        }
+    }
+
+    #[test]
+    fn recommended_bitrate_reports_the_extreme_quality_cap() {
+        assert_eq!(recommended_video_bitrate(3840, 2160, 120), (80_000, true));
+        assert_eq!(recommended_video_bitrate(3840, 2160, 88), (80_000, false));
+        assert_eq!(recommended_video_bitrate(3840, 2160, 89), (80_000, true));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::{tray, update, Orange, Screen};
 use crate::{
     sound,
-    supervisor::{WindowTarget, BITRATES, FRAME_RATES, QUALITIES},
+    supervisor::{WindowTarget, FRAME_RATES, QUALITIES},
     ui::*,
     NoticeKind,
 };
@@ -593,8 +593,6 @@ impl Orange {
     }
 
     fn render_pick(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let quality = self.quality();
-        let bitrate = self.bitrate();
         let selected = self.quality;
         let count = self.windows.len();
         // Distinguishes "still capturing" from "this window refuses to draw",
@@ -700,14 +698,7 @@ impl Orange {
                                 ),
                             )
                             .child(
-                                label(
-                                    format!(
-                                        "Up to ~{} Mbps per viewer",
-                                        bitrate.mbps(quality.max_width, quality.max_height)
-                                    ),
-                                    FAINT,
-                                )
-                                .text_xs(),
+                                label("Streaming quality adjusts automatically", FAINT).text_xs(),
                             ),
                     )
                     .child(
@@ -1292,44 +1283,6 @@ impl Orange {
         setting_choice("Frame rate", None, pills, detail).into_any_element()
     }
 
-    fn settings_bitrate_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let selected = self.bitrate;
-        let chosen = self.bitrate();
-        let quality = self.quality();
-        let pills = BITRATES
-            .iter()
-            .enumerate()
-            .map(|(index, bitrate)| {
-                option_pill(
-                    SharedString::from(format!("settings-bitrate-{index}")),
-                    bitrate.label,
-                    index == selected,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.bitrate = index;
-                    this.save_preferences();
-                    cx.notify();
-                }))
-                .into_any_element()
-            })
-            .collect();
-
-        // Titled by what it buys rather than by its unit. The kbps figure stays
-        // in the readout, so the technical number is still visible without the
-        // control claiming to be about bitrate for its own sake.
-        setting_choice(
-            "Image quality",
-            Some(SharedString::from(format!(
-                "{} KBPS \u{b7} {}",
-                chosen.kbps(quality.max_width, quality.max_height),
-                quality.label.to_uppercase()
-            ))),
-            pills,
-            chosen.detail,
-        )
-        .into_any_element()
-    }
-
     fn settings_updates_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The action is always rendered so the row does not reflow while a
         // check runs; dimmed and inert when nothing applies. The label follows
@@ -1404,7 +1357,6 @@ impl Orange {
         let account = self.settings_account_card(cx);
         let resolution = self.settings_resolution_card(cx);
         let frame_rate = self.settings_frame_rate_card(cx);
-        let bitrate = self.settings_bitrate_card(cx);
         let updates = self.settings_updates_card(cx);
         let diagnostics = self.settings_diagnostics_card(cx);
 
@@ -1426,7 +1378,7 @@ impl Orange {
             "section-video",
             "VIDEO",
             Some("DEFAULTS"),
-            vec![resolution, frame_rate, bitrate],
+            vec![resolution, frame_rate],
             cx,
         );
         let system = self.settings_section(

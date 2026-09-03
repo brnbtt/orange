@@ -25,8 +25,6 @@ pub struct Preferences {
     pub quality: usize,
     /// `None` follows the captured window's display refresh rate.
     pub fps: Option<u32>,
-    /// Index into `BITRATES`: how many bits to spend per pixel.
-    pub bitrate: usize,
     pub own_codes: Vec<String>,
 }
 
@@ -35,7 +33,6 @@ impl Default for Preferences {
         Self {
             quality: 1,
             fps: None,
-            bitrate: 1,
             own_codes: Vec::new(),
         }
     }
@@ -196,20 +193,24 @@ mod tests {
     }
 
     #[test]
-    fn preferences_written_before_a_field_existed_still_load() {
-        // Every installed client has a preferences.json with no `bitrate` key.
-        // It has to load with the default rather than failing to parse, or the
-        // update strands people on a startup error.
+    fn preferences_with_the_retired_bitrate_field_still_load_and_clean_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preferences.json");
-        std::fs::write(&path, r#"{"quality":2,"fps":120,"own_codes":["ORANGE"]}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"quality":2,"fps":120,"bitrate":2,"own_codes":["ORANGE"]}"#,
+        )
+        .unwrap();
 
         let loaded = load_preferences_from(&path).unwrap();
 
-        assert_eq!(loaded.bitrate, Preferences::default().bitrate);
         assert_eq!(loaded.quality, 2);
         assert_eq!(loaded.fps, Some(120));
         assert_eq!(loaded.own_codes, vec!["ORANGE".to_string()]);
+        save_preferences_to(&path, &loaded).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(saved.get("bitrate").is_none());
     }
 
     #[test]
@@ -220,7 +221,6 @@ mod tests {
         let preferences = Preferences {
             quality: 2,
             fps: Some(120),
-            bitrate: 2,
             own_codes: vec!["ORANGE".into()],
         };
 
@@ -231,6 +231,7 @@ mod tests {
         assert_eq!(json["quality"], 2);
         assert_eq!(json["fps"], 120);
         assert_eq!(json["own_codes"], serde_json::json!(["ORANGE"]));
+        assert!(json.get("bitrate").is_none());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 

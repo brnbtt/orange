@@ -319,6 +319,7 @@ pub struct StreamStatus {
     pub code: Option<String>,
     pub viewers: Vec<String>,
     pub error: Option<String>,
+    pub notice: Option<String>,
     /// Set when a watched stream finished because the host stopped, as opposed
     /// to the viewer closing their own window. Both exit zero.
     pub ended: bool,
@@ -336,7 +337,6 @@ impl Supervisor {
     pub fn host(
         target: &WindowTarget,
         quality: &Quality,
-        bitrate: &Bitrate,
         fps: Option<u32>,
         server: &str,
     ) -> Result<Self> {
@@ -348,7 +348,6 @@ impl Supervisor {
             .args(["--server", server])
             // Every tier lets the child pick the best encoder its GPU offers.
             .args(["--codec", "auto"])
-            .args(["--bitrate", &bitrate.kbps(width, height).to_string()])
             .args(["--scale", &format!("{width}x{height}")]);
         if let Some(fps) = fps {
             command.args(["--fps", &fps.to_string()]);
@@ -469,6 +468,18 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
         status.code = Some(rest.trim().to_string());
     } else if line == WATCH_ENDED {
         status.ended = true;
+    } else if let Some(record) = line.strip_prefix("[quality-status] ") {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
+            return;
+        };
+        if record.get("event").and_then(|value| value.as_str())
+            == Some("automatic-bitrate-constrained")
+        {
+            status.notice = record
+                .get("message")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+        }
     } else if let Some(record) = line.strip_prefix("[host-status] ") {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
             return;
@@ -554,53 +565,6 @@ pub const QUALITIES: &[Quality] = &[
     },
 ];
 
-/// How many bits to spend on each pixel of the encoded output.
-///
-/// Labelled by the image quality it buys, not by the tradeoff it makes. The
-/// previous labels - Smooth, Balanced, Sharp - pointed the wrong way: "Smooth"
-/// reads as a desirable motion property, so someone optimising for smooth
-/// gameplay would pick it and get the softest picture on the list. Bitrate does
-/// not affect smoothness at all.
-///
-/// This used to be a flat kilobit figure per resolution tier, which cannot be
-/// right for more than one output size: the 1080p tier spent its full 8 Mbps
-/// whether it encoded 1920x1080 or the 1920x804 an ultrawide window scales down
-/// to. Expressing it per pixel makes every tier mean the same thing at every
-/// resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bitrate {
-    pub label: &'static str,
-    pub detail: &'static str,
-    pub kbps_per_megapixel: u32,
-}
-
-impl Bitrate {
-    /// Kilobits per second for an output of this size.
-    ///
-    /// Frame rate is deliberately not a factor. Bitrate need scales almost
-    /// linearly with pixel count but only weakly with frame rate, because
-    /// consecutive frames of screen content are highly redundant and predict
-    /// well: doubling the rate does not come close to doubling the bits.
-    pub fn kbps(&self, width: u32, height: u32) -> u32 {
-        let pixels = u64::from(width) * u64::from(height);
-        let kbps = pixels * u64::from(self.kbps_per_megapixel) / 1_000_000;
-        // The floor is deliberately low. It exists only to keep a pathologically
-        // small window from asking for an unusable rate; set any higher and it
-        // collapses the tiers into each other at ordinary window sizes, which
-        // would make choosing Low over Standard do nothing.
-        //
-        // The ceiling is an absolute sanity bound, not a policy. It has to sit
-        // above High at 2160p (91 Mbps unclamped), or High and Standard both
-        // clamp to it there and the top two tiers become the same setting.
-        kbps.clamp(500, 80_000) as u32
-    }
-
-    /// The same figure rounded up for display.
-    pub fn mbps(&self, width: u32, height: u32) -> u32 {
-        self.kbps(width, height).div_ceil(1_000)
-    }
-}
-
 /// Frame-rate choices. `None` follows the captured display's refresh rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameRate {
@@ -635,29 +599,6 @@ pub fn supported_frame_rate(fps: Option<u32>) -> Option<u32> {
     fps.filter(|value| FRAME_RATES.iter().any(|rate| rate.fps == Some(*value)))
 }
 
-/// Roughly 0.067, 0.117 and 0.183 bits per pixel per frame at 60 fps. The
-/// original tiers sat at 0.043/0.070/0.113, which was calibrated to match the
-/// flat per-resolution figures this replaced rather than to look good; every
-/// tier moves up by about one step, so today's Standard is close to yesterday's
-/// High.
-pub const BITRATES: &[Bitrate] = &[
-    Bitrate {
-        label: "Low",
-        detail: "Softer in fast motion. Lightest upload",
-        kbps_per_megapixel: 4_000,
-    },
-    Bitrate {
-        label: "Standard",
-        detail: "Clean for games and video",
-        kbps_per_megapixel: 7_000,
-    },
-    Bitrate {
-        label: "High",
-        detail: "Sharp text and fine detail. Needs fast upload",
-        kbps_per_megapixel: 11_000,
-    },
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,11 +627,6 @@ mod tests {
                 FRAME_RATES
                     .iter()
                     .map(|r| ("frame rate", r.label, r.detail)),
-            )
-            .chain(
-                BITRATES
-                    .iter()
-                    .map(|b| ("image quality", b.label, b.detail)),
             );
 
         for (card, label, detail) in captions {
@@ -705,21 +641,6 @@ mod tests {
             );
             assert!(!detail.is_empty(), "{card}/{label} has no caption");
         }
-    }
-
-    #[test]
-    fn image_quality_labels_name_the_picture_not_the_tradeoff() {
-        // "Smooth" pointed the wrong way: it reads as a desirable motion
-        // property, so anyone optimising for smooth gameplay picked the softest
-        // picture on the list. Bitrate does not affect smoothness.
-        assert_eq!(
-            BITRATES.iter().map(|b| b.label).collect::<Vec<_>>(),
-            ["Low", "Standard", "High"]
-        );
-        // The labels must climb in the same direction as the bits behind them.
-        assert!(BITRATES
-            .windows(2)
-            .all(|pair| pair[0].kbps_per_megapixel < pair[1].kbps_per_megapixel));
     }
 
     #[test]
@@ -750,36 +671,6 @@ mod tests {
         let source = target(1920, 1080);
         assert_eq!(QUALITIES[3].fit(&source), (1920, 1080));
         assert_eq!(QUALITIES[1].fit(&source), (1920, 1080));
-        // And it costs no extra bits either, because bitrate follows the output.
-        let balanced = BITRATES[1];
-        let (width, height) = QUALITIES[3].fit(&source);
-        assert_eq!(balanced.kbps(width, height), balanced.kbps(1920, 1080));
-    }
-
-    #[test]
-    fn bitrate_follows_the_pixels_actually_encoded() {
-        let standard = BITRATES[1];
-        assert_eq!(standard.kbps(1280, 720), 6_451);
-        assert_eq!(standard.kbps(1920, 1080), 14_515);
-        // An ultrawide on the 1080p tier encodes 1920x804 and pays for
-        // 1920x804 rather than for a full 1920x1080 it never sends.
-        let (width, height) = QUALITIES[1].fit(&target(3440, 1440));
-        assert!(standard.kbps(width, height) < standard.kbps(1920, 1080));
-
-        // Tiers stay distinct at every window size anyone actually shares, and
-        // at 2160p in particular: that is where the ceiling can swallow the top
-        // two tiers and quietly make them the same setting.
-        for (width, height) in [(640u32, 360u32), (1280, 720), (1920, 1080), (3840, 2160)] {
-            let tiers: Vec<u32> = BITRATES.iter().map(|b| b.kbps(width, height)).collect();
-            assert!(
-                tiers.windows(2).all(|pair| pair[0] < pair[1]),
-                "tiers collapsed at {width}x{height}: {tiers:?}"
-            );
-            assert!(tiers.iter().all(|kbps| (500..=80_000).contains(kbps)));
-        }
-        // Only a pathological size falls back on the floor, where the tiers do
-        // collapse. That is the floor working, not the tiers failing.
-        assert_eq!(BITRATES[0].kbps(160, 120), 500);
     }
 
     #[test]
@@ -879,5 +770,20 @@ mod tests {
         );
 
         assert_eq!(status.lock().unwrap().viewers, ["orange"]);
+    }
+
+    #[test]
+    fn automatic_quality_constraint_is_retained_for_the_live_tray_notice() {
+        let status = Arc::new(Mutex::new(StreamStatus::default()));
+
+        parse_line(
+            r#"[quality-status] {"event":"automatic-bitrate-constrained","message":"Automatic quality is limited"}"#,
+            &status,
+        );
+
+        assert_eq!(
+            status.lock().unwrap().notice.as_deref(),
+            Some("Automatic quality is limited")
+        );
     }
 }

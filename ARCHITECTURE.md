@@ -62,12 +62,12 @@ Compile dependencies point `orange -> orange-signal <- orange-relay`; tray/updat
 | `crates/orange-tray/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
 | `crates/orange-tray/src/background.rs` | Cancelled-and-joined thumbnail and avatar jobs, bounded avatar download and decode |
 | `crates/orange-tray/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
-| `crates/orange-tray/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, parses child stdout/stderr, quality tiers, diagnostic retention |
+| `crates/orange-tray/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
 | `crates/orange-tray/src/session.rs` | Reads CLI session JSON; atomically reads/writes tray preferences |
 | `crates/orange-tray/src/tray.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-tray/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
 
-The tray quality table in `crates/orange-tray/src/supervisor.rs` requests automatic zero-copy encoder selection at 4/8/18 Mbps for 720p/1080p/1440p. Selection prefers H.265 (Media Foundation, then NVIDIA) and falls back to H.264 (Media Foundation, then NVIDIA). The CLI defaults to explicit Media Foundation H.265 at 25 Mbps unless `--codec auto` is supplied.
+The tray requests automatic zero-copy encoder selection and leaves bitrate selection to the media child after output resolution and frame rate are known. The measured automatic policy anchors at 18 Mbps for 1080p60, scales sublinearly with pixels and linearly with frame rate, and caps at 80 Mbps with a tray-visible quality warning. Selection prefers H.265 (Media Foundation, then NVIDIA) and falls back to H.264 (Media Foundation, then NVIDIA). The CLI defaults to explicit Media Foundation H.265; `--bitrate` remains an advanced override.
 
 ## Media CLI Source Map
 
@@ -181,8 +181,9 @@ webrtcbin OPUS pad
 | --- | --- |
 | Signal JSON tags, fields, defaults, and peer stamping | `crates/orange-signal/src/protocol.rs` |
 | Tray window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
-| Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --bitrate --scale [--fps]`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
+| Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --scale [--fps]`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
 | Host stdout markers `Share this code:` and `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
+| Automatic bitrate cap marker `[quality-status] <json>` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | Watch stdout marker `[watch-status] ended` | producer: `crates/orange/src/peer/watch.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | `ORANGE_UI_PID`, so whole-screen capture can exclude the tray's own cues | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/peer/host.rs` |
 | Session file `%APPDATA%\orange\session.json` | writer: `crates/orange/src/auth.rs`; reader: `crates/orange-tray/src/session.rs` |

@@ -16,9 +16,9 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GA_ROOTOWNER,
-    GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetSystemMetrics, GetWindowLongW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    GA_ROOTOWNER, GWL_EXSTYLE, SM_CXSCREEN, SM_CYSCREEN, WS_EX_TOOLWINDOW,
 };
 
 /// Window classes that are part of the shell or overlays rather than
@@ -50,6 +50,18 @@ impl CaptureTarget {
     fn is_interesting(&self) -> bool {
         self.width >= 320 && self.height >= 240 && !self.title.is_empty()
     }
+}
+
+pub fn capture_dimensions(hwnd: isize) -> Option<(u32, u32)> {
+    let (width, height) = if hwnd == 0 {
+        unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+    } else {
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(HWND(hwnd as *mut _), &mut rect).ok()? };
+        (rect.right - rect.left, rect.bottom - rect.top)
+    };
+    Some((width.try_into().ok()?, height.try_into().ok()?))
+        .filter(|(width, height)| *width > 0 && *height > 0)
 }
 
 unsafe fn window_title(hwnd: HWND) -> String {

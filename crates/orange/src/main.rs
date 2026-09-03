@@ -1,6 +1,7 @@
 //! orange - low-overhead window streaming for friends.
 
 mod auth;
+mod encoder_characterization;
 mod media_diagnostics;
 mod overlay;
 mod peer;
@@ -63,6 +64,17 @@ enum Command {
         quality: QualityArgs,
         #[arg(long, default_value_t = 10)]
         seconds: u64,
+    },
+    /// Characterize H.265 bitrate changes while the encoder is PLAYING.
+    CharacterizeBitrate {
+        /// Test one encoder; omitted tests each available H.265 encoder independently.
+        #[arg(long)]
+        encoder: Option<String>,
+    },
+    #[command(hide = true)]
+    CharacterizeBitrateWorker {
+        #[arg(long)]
+        encoder: String,
     },
     /// Run the signalling relay. Carries handshakes only, never video.
     Serve {
@@ -143,9 +155,9 @@ struct QualityArgs {
     no_audio: bool,
     #[arg(long, default_value = "h265")]
     codec: String,
-    /// Kilobits per second.
-    #[arg(long, default_value_t = 25_000)]
-    bitrate: u32,
+    /// Override the resolution/FPS-derived video bitrate, in kilobits per second.
+    #[arg(long)]
+    bitrate: Option<u32>,
     /// Frames per second. Defaults to the captured window's display refresh.
     #[arg(long)]
     fps: Option<u32>,
@@ -172,13 +184,41 @@ impl QualityArgs {
         if requested.is_none() && encoder != "mfh265enc" {
             println!("Encoder auto-selected {codec:?} via {encoder} zero-copy fallback.");
         }
+        let scale = self.scale.as_deref().map(parse_scale).transpose()?;
+        let (width, height) = scale
+            .or_else(|| targets::capture_dimensions(hwnd))
+            .unwrap_or((1920, 1080));
+        let (recommended_bitrate, constrained) =
+            pipeline::recommended_video_bitrate(width, height, fps);
+        let bitrate = self.bitrate.unwrap_or(recommended_bitrate);
+        if self.bitrate.is_none() {
+            println!(
+                "Video bitrate set automatically to {bitrate} kbps for {width}x{height} at {fps} fps."
+            );
+            if constrained {
+                let message = format!(
+                    "Automatic quality is limited to {} Mbps at {width}x{height} and {fps} fps",
+                    bitrate / 1_000
+                );
+                println!(
+                    "[quality-status] {}",
+                    serde_json::json!({
+                        "event": "automatic-bitrate-constrained",
+                        "message": message,
+                    })
+                );
+                eprintln!(
+                    "[quality] automatic video bitrate capped at {bitrate} kbps; {width}x{height} at {fps} fps is quality-constrained"
+                );
+            }
+        }
         Ok(CaptureSettings {
             hwnd,
             codec,
             encoder,
-            bitrate: self.bitrate,
+            bitrate,
             fps,
-            scale: self.scale.as_deref().map(parse_scale).transpose()?,
+            scale,
             // Scope audio to the captured window's process, so voice chat and
             // music stay out of the stream. Whole-screen sharing captures
             // everything, which is the expected behaviour there.
@@ -274,6 +314,12 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 report_file(&out)
             }
+        }
+        Command::CharacterizeBitrate { encoder } => {
+            encoder_characterization::run(encoder.as_deref())
+        }
+        Command::CharacterizeBitrateWorker { encoder } => {
+            encoder_characterization::run_worker(&encoder)
         }
         Command::Serve { addr } => runtime()?.block_on(signal::serve(&addr)),
         Command::Login { server } => runtime()?.block_on(async {
@@ -640,14 +686,31 @@ mod tests {
     use super::{
         format_error_chain, gst, run_pipeline_while, run_pipeline_while_with_shutdown,
         run_pipeline_while_with_shutdown_and_state, start_pipeline_with, stop_pipeline_with,
-        timed_pipeline_should_continue,
+        timed_pipeline_should_continue, Cli, Command, QualityArgs,
     };
+    use clap::Parser;
     use gst::prelude::*;
     use std::sync::{Arc, Mutex};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_CLOSE,
     };
+
+    fn host_quality(args: &[&str]) -> QualityArgs {
+        match Cli::try_parse_from(args).unwrap().command {
+            Command::Host { quality, .. } => quality,
+            _ => panic!("expected host command"),
+        }
+    }
+
+    #[test]
+    fn video_bitrate_override_is_optional_and_remains_available_to_the_cli() {
+        let automatic = host_quality(&["orange", "host", "--hwnd", "1"]);
+        let overridden = host_quality(&["orange", "host", "--hwnd", "1", "--bitrate", "100001"]);
+
+        assert_eq!(automatic.bitrate, None);
+        assert_eq!(overridden.bitrate, Some(100_001));
+    }
 
     #[test]
     fn formatted_error_includes_outer_and_inner_causes_on_one_line() {

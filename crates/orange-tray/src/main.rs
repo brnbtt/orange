@@ -30,7 +30,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use supervisor::{Bitrate, LoginAttempt, Quality, Supervisor, WindowTarget, BITRATES, QUALITIES};
+use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
 const DEFAULT_SERVER: &str =
     "wss://orange-relay.redmushroom-80c79f12.brazilsouth.azurecontainerapps.io/ws";
@@ -115,7 +115,6 @@ struct Orange {
     avatar_job: Option<AvatarJob>,
     quality: usize,
     fps: Option<u32>,
-    bitrate: usize,
     active_target: Option<WindowTarget>,
     active_preview: Option<std::sync::Arc<gpui::RenderImage>>,
     host: Option<Supervisor>,
@@ -265,7 +264,6 @@ impl Orange {
             avatar_job,
             quality: preferences.quality.min(QUALITIES.len() - 1),
             fps: supervisor::supported_frame_rate(preferences.fps),
-            bitrate: preferences.bitrate.min(BITRATES.len() - 1),
             active_target: None,
             active_preview: None,
             host: None,
@@ -334,6 +332,14 @@ impl Orange {
             }
         }
 
+        let host_notice = self
+            .host
+            .as_ref()
+            .and_then(|host| host.status.lock().ok())
+            .and_then(|mut status| status.notice.take());
+        if let Some(notice) = host_notice {
+            self.show_notice(NoticeKind::Ordinary, notice);
+        }
         if self.host.as_mut().is_some_and(|host| !host.running()) {
             let host_error = self
                 .host
@@ -444,10 +450,6 @@ impl Orange {
         QUALITIES[self.quality.min(QUALITIES.len() - 1)]
     }
 
-    fn bitrate(&self) -> Bitrate {
-        BITRATES[self.bitrate.min(BITRATES.len() - 1)]
-    }
-
     /// Every failure the user is told about goes through here, which makes it
     /// the one place the alert cue is due.
     fn show_error(&mut self, message: impl Into<String>) {
@@ -485,7 +487,6 @@ impl Orange {
         let preferences = session::Preferences {
             quality: self.quality,
             fps: self.fps,
-            bitrate: self.bitrate,
             own_codes: self.own_codes.clone(),
         };
         if let Err(error) = session::save_preferences(&preferences) {
@@ -597,13 +598,7 @@ impl Orange {
             return;
         }
         let preview = self.thumbnails.get(&target.hwnd).cloned();
-        match Supervisor::host(
-            &target,
-            &self.quality(),
-            &self.bitrate(),
-            self.fps,
-            &self.server,
-        ) {
+        match Supervisor::host(&target, &self.quality(), self.fps, &self.server) {
             Ok(stream) => {
                 self.active_target = Some(target);
                 self.active_preview = preview;
