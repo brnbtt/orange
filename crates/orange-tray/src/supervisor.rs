@@ -9,6 +9,7 @@
 //! Communication is one-way and line-based: we read the child's stdout and
 //! look for the handful of things the UI needs to know.
 
+use crate::session::Friend;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
@@ -323,6 +324,10 @@ pub struct StreamStatus {
     /// Set when a watched stream finished because the host stopped, as opposed
     /// to the viewer closing their own window. Both exit zero.
     pub ended: bool,
+    /// Who this session put us in contact with, if they were signed in: the
+    /// host when watching, the newest viewer when hosting. The tray offers to
+    /// keep them; it never adds them on its own.
+    pub met: Option<Friend>,
     viewer_labels: Vec<(String, String)>,
 }
 
@@ -464,6 +469,32 @@ impl Drop for Supervisor {
 /// cannot tell them apart and this line has to.
 const WATCH_ENDED: &str = "[watch-status] ended";
 
+/// The Discord identity of whoever this session put us in contact with: the
+/// host when watching, the newest viewer when hosting.
+///
+/// Anonymous peers produce nothing. Without an id there is no stable way to
+/// recognise the same person again, so there is nothing worth offering to keep;
+/// `peer` is a routing id the relay reassigns every session.
+fn parse_profile(record: &serde_json::Value) -> Option<Friend> {
+    let id = record.get("id")?.as_str()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(Friend {
+        id: id.to_string(),
+        name: record
+            .get("name")
+            .and_then(|value| value.as_str())
+            .or_else(|| record.get("label").and_then(|value| value.as_str()))
+            .unwrap_or(id)
+            .to_string(),
+        avatar_url: record
+            .get("avatar_url")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
+}
+
 /// Extract the few facts the UI cares about from the child's log lines.
 fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
     let Ok(mut status) = status.lock() else {
@@ -486,6 +517,11 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
         }
+    } else if let Some(record) = line.strip_prefix("[watch-host] ") {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
+            return;
+        };
+        status.met = parse_profile(&record).or(status.met.take());
     } else if let Some(record) = line.strip_prefix("[host-status] ") {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
             return;
@@ -501,6 +537,9 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
                 let Some(label) = record.get("label").and_then(|value| value.as_str()) else {
                     return;
                 };
+                // Only an authenticated viewer carries an id, and only an id
+                // is worth offering to keep: `peer` is reassigned per session.
+                status.met = parse_profile(&record).or(status.met.take());
                 if !status.viewer_labels.iter().any(|(id, _)| id == peer) {
                     status
                         .viewer_labels
@@ -802,6 +841,48 @@ mod tests {
         );
 
         assert_eq!(status.lock().unwrap().viewers, ["orange"]);
+    }
+
+    /// A viewer who never signed in has no Discord id, and the routing `peer`
+    /// is reassigned every session. Offering to "keep" that is offering to
+    /// remember a number that will never match anyone again.
+    #[test]
+    fn an_anonymous_peer_produces_no_one_to_add() {
+        let status = Arc::new(Mutex::new(StreamStatus::default()));
+
+        parse_line(
+            r#"[host-status] {"event":"joined","peer":"a","label":"viewer a","id":null}"#,
+            &status,
+        );
+        parse_line(r#"[watch-host] {"name":"Anonymous Host"}"#, &status);
+
+        assert!(status.lock().unwrap().met.is_none());
+    }
+
+    /// Both directions of a code join have to surface an identity, or only one
+    /// side of a new friendship can be formed and the other silently shows
+    /// "Not streaming" forever because they never listed their half.
+    #[test]
+    fn both_a_watched_host_and_a_joining_viewer_can_be_kept() {
+        let host_side = Arc::new(Mutex::new(StreamStatus::default()));
+        parse_line(
+            r#"[host-status] {"event":"joined","peer":"a","label":"Vee","id":"77","avatar_url":"https://cdn/v.png"}"#,
+            &host_side,
+        );
+        let met = host_side.lock().unwrap().met.clone().unwrap();
+        assert_eq!(met.id, "77");
+        assert_eq!(met.name, "Vee");
+        assert_eq!(met.avatar_url.as_deref(), Some("https://cdn/v.png"));
+
+        let watch_side = Arc::new(Mutex::new(StreamStatus::default()));
+        parse_line(
+            r#"[watch-host] {"id":"42","name":"Hoss","avatar_url":"https://cdn/h.png"}"#,
+            &watch_side,
+        );
+        let met = watch_side.lock().unwrap().met.clone().unwrap();
+        assert_eq!(met.id, "42");
+        assert_eq!(met.name, "Hoss");
+        assert_eq!(met.avatar_url.as_deref(), Some("https://cdn/h.png"));
     }
 
     #[test]

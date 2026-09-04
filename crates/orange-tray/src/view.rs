@@ -27,7 +27,6 @@ impl Screen {
             Screen::SignedOut => "signedout",
             Screen::Home => "home",
             Screen::PickWindow => "pick",
-            Screen::Friends => "friends",
             Screen::Streaming => "streaming",
             Screen::Watching => "watching",
             Screen::Settings => "settings",
@@ -37,7 +36,6 @@ impl Screen {
     fn breadcrumb(self) -> Option<&'static str> {
         match self {
             Screen::PickWindow => Some("/ SHARE"),
-            Screen::Friends => Some("/ FRIENDS"),
             Screen::Streaming => Some("/ STREAMING"),
             Screen::Watching => Some("/ WATCHING"),
             Screen::Settings => Some("/ SETTINGS"),
@@ -60,7 +58,6 @@ impl Render for Orange {
             Screen::SignedOut => self.render_signed_out(cx).into_any_element(),
             Screen::Home => self.render_home(cx).into_any_element(),
             Screen::PickWindow => self.render_pick(cx).into_any_element(),
-            Screen::Friends => self.render_friends(cx).into_any_element(),
             Screen::Streaming => self.render_streaming(cx).into_any_element(),
             Screen::Watching => self.render_watching(cx).into_any_element(),
             Screen::Settings => self.render_settings(cx).into_any_element(),
@@ -426,6 +423,116 @@ impl Orange {
             )
     }
 
+    /// One friend row: picture, name, what they are doing, and the action.
+    ///
+    /// Lives outside `render_home` so the list and its states stay one
+    /// description rather than two that drift.
+    fn friend_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let friend = &self.friends[index];
+        let state = self.presence.get(&friend.id).cloned();
+        let polled = self.presence_error.is_none() && !self.presence.is_empty();
+        let (status, status_color) = match (&state, polled) {
+            (Some(Presence::Live { .. }), _) => ("Streaming now", SUCCESS),
+            (Some(Presence::Full), _) => ("Stream is full", MUTED),
+            (Some(Presence::Offline), _) | (None, true) => ("Not streaming", FAINT),
+            (None, false) => ("Checking\u{2026}", FAINT),
+        };
+        let joinable = match &state {
+            Some(Presence::Live { code }) => Some(code.clone()),
+            _ => None,
+        };
+        let already_watching = joinable
+            .as_ref()
+            .is_some_and(|code| self.watches.iter().any(|watch| &watch.code == code));
+        let id = friend.id.clone();
+
+        card()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .min_w(px(0.0))
+                    .child(avatar(
+                        self.friend_avatars.get(&friend.id).cloned(),
+                        &friend.name,
+                        32.0,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .min_w(px(0.0))
+                            .child(
+                                label(friend.name.clone(), TEXT)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_ellipsis(),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(if matches!(state, Some(Presence::Live { .. })) {
+                                        live_dot().into_any_element()
+                                    } else {
+                                        dot(status_color).into_any_element()
+                                    })
+                                    .child(label(status, status_color).text_xs()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(match (joinable, already_watching) {
+                        (Some(_), true) => label("Watching", FAINT).text_xs().into_any_element(),
+                        (Some(code), false) => div()
+                            .id(SharedString::from(format!("join-friend-{index}")))
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .bg(rgb(ORANGE))
+                            .text_color(rgb(INK))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(ORANGE_HOT)))
+                            .child("Join")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.join(code.clone());
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                        (None, _) => div().into_any_element(),
+                    })
+                    .child(
+                        // Removing has to be as easy as adding: a roster you
+                        // cannot prune only ever grows, and every name on it
+                        // can see when you go live.
+                        div()
+                            .id(SharedString::from(format!("remove-friend-{index}")))
+                            .text_xs()
+                            .text_color(rgb(FAINT))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(DANGER)))
+                            .child("Remove")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_friend(&id);
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
     fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let animate = self.animate;
         let hosting = self.host.is_some();
@@ -441,6 +548,93 @@ impl Orange {
             .map(|session| session.name.clone())
             .unwrap_or_else(|| "Anonymous".into());
         let avatar_image = self.avatar.clone();
+        let live = self
+            .friends
+            .iter()
+            .filter(|friend| {
+                matches!(
+                    self.presence.get(&friend.id),
+                    Some(Presence::Live { .. } | Presence::Full)
+                )
+            })
+            .count();
+        let rows: Vec<_> = (0..self.friends.len())
+            .map(|index| self.friend_row(index, cx).into_any_element())
+            .collect();
+        // Offered rather than added: a code gets pasted into group chats, so
+        // silently keeping everyone who clicks it would hand strangers a
+        // permanent view of when this user streams.
+        let offer = self.pending_friend().map(|friend| {
+            let name = friend.name.clone();
+            card()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .flex_shrink_0()
+                .border_color(rgb(ORANGE_DIM))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2p5()
+                        .min_w(px(0.0))
+                        .child(avatar(None, &name, 28.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .min_w(px(0.0))
+                                .child(
+                                    label(name.clone(), TEXT)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_ellipsis(),
+                                )
+                                .child(label("Keep as a friend?", FAINT).text_xs()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .id("keep-friend")
+                                .px_3()
+                                .py_1p5()
+                                .rounded_md()
+                                .bg(rgb(ORANGE))
+                                .text_color(rgb(INK))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(ORANGE_HOT)))
+                                .child("Add")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(friend) = this.pending_friend() {
+                                        this.add_friend(friend);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("dismiss-friend")
+                                .text_xs()
+                                .text_color(rgb(FAINT))
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(rgb(TEXT)))
+                                .child("No")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_pending_friend();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+        });
 
         div()
             .flex()
@@ -458,41 +652,122 @@ impl Orange {
                     .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
                     .child(micro(defaults, MUTED)),
             )
-            .child(
-                // The hero. Framed rather than floating: the brackets and the
-                // edge marks are what stop a centred logo on a dark field
-                // reading as an empty screen that has not loaded yet.
+            .children(offer)
+            .child(if self.friends.is_empty() {
+                // Nothing to list yet, so the space explains how a list comes
+                // to exist rather than showing an empty box. This is the only
+                // moment the app can teach the flow, because once one friend
+                // exists the screen never looks like this again.
                 div()
                     .relative()
                     .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
                     .items_center()
                     .justify_center()
+                    .gap_3()
                     .child(corner_brackets(14.0, FRAME))
                     .child(div().absolute().left(px(0.0)).child(crosshair(9.0, FRAME)))
                     .child(div().absolute().right(px(0.0)).child(crosshair(9.0, FRAME)))
+                    .child(logo(
+                        MARK_HERO,
+                        if hosting {
+                            LogoState::Live
+                        } else {
+                            LogoState::Idle
+                        },
+                        self.logo_epoch,
+                        animate,
+                    ))
+                    .child(wordmark(23.0))
+                    .child(accent_rule(28.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(people_mark(14.0, MUTED))
+                            .child(micro("NO FRIENDS YET", MUTED)),
+                    )
                     .child(
                         div()
                             .flex()
                             .flex_col()
+                            .gap_1()
+                            .items_center()
+                            .max_w(px(300.0))
+                            .child(
+                                label("Paste a friend's code below to watch them.", MUTED)
+                                    .text_xs()
+                                    .text_center(),
+                            )
+                            .child(
+                                label(
+                                    "Afterwards you can keep them, and their \
+                                     streams show up here automatically.",
+                                    FAINT,
+                                )
+                                .text_xs()
+                                .text_center(),
+                            ),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(
+                        div()
+                            .flex()
                             .items_center()
                             .gap_2()
-                            .child(logo(
-                                MARK_HERO,
-                                if hosting {
-                                    LogoState::Live
-                                } else {
-                                    LogoState::Idle
-                                },
-                                self.logo_epoch,
-                                animate,
+                            .flex_shrink_0()
+                            .child(micro(
+                                format!("{live} OF {} STREAMING", self.friends.len()),
+                                if live > 0 { SUCCESS } else { MUTED },
                             ))
-                            .child(wordmark(23.0))
-                            .child(accent_rule(28.0))
-                            .child(micro("STREAM.  SHARE.  CONNECT.", MUTED)),
-                    ),
-            )
+                            .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
+                            .children(watching.then(|| {
+                                div()
+                                    .id("open-watching")
+                                    .cursor_pointer()
+                                    .child(micro(
+                                        format!("{} OPEN \u{2192}", self.watches.len()),
+                                        SUCCESS,
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.screen = Screen::Watching;
+                                        cx.notify();
+                                    }))
+                            })),
+                    )
+                    .children(self.presence_error.clone().map(|error| {
+                        // A failed poll must not read as "nobody is live". The
+                        // likeliest cause is a relay that forgot this session,
+                        // which is the signed-out case wearing a different hat.
+                        card()
+                            .py_2()
+                            .flex_shrink_0()
+                            .child(label("Could not reach the relay", DANGER).text_xs())
+                            .child(label(error, FAINT).text_xs())
+                    }))
+                    .child(
+                        div()
+                            .id("friend-list")
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
+                    .into_any_element()
+            })
             .child(
                 action_card(
                     "start",
@@ -520,29 +795,19 @@ impl Orange {
                 })),
             )
             .child(
-                action_card(
-                    "join",
-                    people_mark(20.0, if watching { SUCCESS } else { MUTED }),
-                    if watching {
-                        "VIEW ACTIVE STREAMS"
-                    } else {
-                        "FRIENDS"
+                secondary("join-code", "Join with a code").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        // Still the only way to reach someone you have never
+                        // watched. It is also how the roster starts, so it is
+                        // a first-class action rather than a fallback.
+                        let code = cx
+                            .read_from_clipboard()
+                            .and_then(|item| item.text())
+                            .unwrap_or_default();
+                        this.join(code);
+                        cx.notify();
                     },
-                    if watching {
-                        "Manage your open viewer windows."
-                    } else {
-                        "See who is streaming and join in one click."
-                    },
-                    false,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.screen = if watching {
-                        Screen::Watching
-                    } else {
-                        Screen::Friends
-                    };
-                    cx.notify();
-                })),
+                )),
             )
             .child(
                 div()
@@ -1150,189 +1415,6 @@ impl Orange {
                         sound::play(sound::Cue::Ended);
                         cx.notify();
                     })),
-            )
-    }
-
-    /// Who is streaming right now, and one click to join them.
-    ///
-    /// The roster is local (`preferences.json`); only presence comes from the
-    /// relay, and only for friends who listed this user when they went live.
-    /// A friend with no answer yet is rendered as unknown rather than offline,
-    /// because "offline" is a claim the tray has not earned until a poll
-    /// succeeds.
-    fn render_friends(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let live = self
-            .friends
-            .iter()
-            .filter(|friend| {
-                matches!(
-                    self.presence.get(&friend.id),
-                    Some(Presence::Live { .. } | Presence::Full)
-                )
-            })
-            .count();
-        let polled = self.presence_error.is_none() && !self.presence.is_empty();
-
-        let rows = self
-            .friends
-            .iter()
-            .enumerate()
-            .map(|(index, friend)| {
-                let state = self.presence.get(&friend.id).cloned();
-                let (status, status_color) = match (&state, polled) {
-                    (Some(Presence::Live { .. }), _) => ("Streaming now", SUCCESS),
-                    (Some(Presence::Full), _) => ("Stream is full", MUTED),
-                    (Some(Presence::Offline), _) => ("Not streaming", FAINT),
-                    (None, true) => ("Not streaming", FAINT),
-                    (None, false) => ("Checking\u{2026}", FAINT),
-                };
-                let joinable = match &state {
-                    Some(Presence::Live { code }) => Some(code.clone()),
-                    _ => None,
-                };
-                let already_watching = joinable
-                    .as_ref()
-                    .is_some_and(|code| self.watches.iter().any(|watch| &watch.code == code));
-
-                card()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2p5()
-                            .min_w(px(0.0))
-                            // Real Discord picture when one has been fetched;
-                            // `avatar` falls back to the initial until then.
-                            .child(avatar(
-                                self.friend_avatars.get(&friend.id).cloned(),
-                                &friend.name,
-                                32.0,
-                            ))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .min_w(px(0.0))
-                                    .child(
-                                        label(friend.name.clone(), TEXT)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_ellipsis(),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .child(
-                                                if matches!(state, Some(Presence::Live { .. })) {
-                                                    live_dot().into_any_element()
-                                                } else {
-                                                    dot(status_color).into_any_element()
-                                                },
-                                            )
-                                            .child(label(status, status_color).text_xs()),
-                                    ),
-                            ),
-                    )
-                    .child(match (joinable, already_watching) {
-                        (Some(_), true) => label("Watching", FAINT).text_xs().into_any_element(),
-                        (Some(code), false) => div()
-                            .id(SharedString::from(format!("join-friend-{index}")))
-                            .flex_shrink_0()
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .bg(rgb(ORANGE))
-                            .text_color(rgb(INK))
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(ORANGE_HOT)))
-                            .child("Join")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.join(code.clone());
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                        (None, _) => div().into_any_element(),
-                    })
-            })
-            .collect::<Vec<_>>();
-
-        let empty = card().py_3().items_center().child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .items_center()
-                .child(label("No friends yet", MUTED).text_xs())
-                .child(label(
-                    "Add ids to \"friends\" in preferences.json for now.",
-                    FAINT,
-                ))
-                .child(label("Then use Join with a code below.", FAINT).text_xs()),
-        );
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .flex_1()
-            .child(micro(
-                if self.friends.is_empty() {
-                    "NO FRIENDS ADDED".to_string()
-                } else {
-                    format!("{live} OF {} STREAMING", self.friends.len())
-                },
-                if live > 0 { SUCCESS } else { MUTED },
-            ))
-            .children(self.presence_error.clone().map(|error| {
-                // A failed poll must not read as "nobody is live". The most
-                // likely cause is a relay that forgot this session, which is
-                // the signed-out case wearing a different hat.
-                card()
-                    .py_2()
-                    .child(label("Could not reach the relay", DANGER).text_xs())
-                    .child(label(error, FAINT).text_xs())
-            }))
-            .child(
-                div()
-                    .id("friend-list")
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .when(self.friends.is_empty(), |list| list.child(empty))
-                    .children(rows),
-            )
-            .child(
-                secondary("join-code", "Join with a code").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        // Kept alongside the friends list: adding a friend
-                        // still starts with a pasted invite, and a relay
-                        // running without Discord configured has no other way
-                        // in at all.
-                        let code = cx
-                            .read_from_clipboard()
-                            .and_then(|item| item.text())
-                            .unwrap_or_default();
-                        this.join(code);
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(
-                ghost("friends-back", "Back").on_click(cx.listener(|this, _, _, cx| {
-                    this.screen = Screen::Home;
-                    cx.notify();
-                })),
             )
     }
 

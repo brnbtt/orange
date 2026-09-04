@@ -36,6 +36,12 @@ pub enum Signal {
     StreamInfo {
         #[serde(default)]
         host_name: Option<String>,
+        /// Discord id and avatar of the host, so a viewer who joined by code
+        /// can offer to keep them. Absent for an anonymous host.
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        host_avatar: Option<String>,
         #[serde(default)]
         diagnostic_session: Option<String>,
     },
@@ -44,6 +50,13 @@ pub enum Signal {
         peer: String,
         #[serde(default)]
         name: Option<String>,
+        /// The mirror of `StreamInfo`'s host fields: enough for the host to
+        /// offer to keep a viewer who arrived with a code. `peer` is a routing
+        /// id the relay reassigns every session and is useless as an identity.
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        avatar_url: Option<String>,
     },
     /// Server -> host: a viewer disconnected, tear its branch down.
     ViewerLeft { peer: String },

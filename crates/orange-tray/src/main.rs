@@ -53,7 +53,6 @@ enum Screen {
     SignedOut,
     Home,
     PickWindow,
-    Friends,
     Streaming,
     Watching,
     Settings,
@@ -217,6 +216,9 @@ struct Digest {
     /// Friend pictures arrive one at a time from a background worker. Without
     /// this the rows would keep their initials until something else moved.
     friend_avatars: usize,
+    /// The "keep this person?" offer appears when a child reports who it met,
+    /// which is a background event with no click behind it.
+    pending_friend: Option<String>,
 }
 
 impl Orange {
@@ -247,6 +249,7 @@ impl Orange {
                 .collect(),
             presence_error: self.presence_error.clone(),
             friend_avatars: self.friend_avatars.len(),
+            pending_friend: self.pending_friend().map(|friend| friend.id),
         }
     }
 
@@ -655,6 +658,83 @@ impl Orange {
         }
     }
 
+    /// Someone this session put us in contact with who is not a friend yet.
+    ///
+    /// Read from every live child, so it covers both directions: the host of a
+    /// stream being watched, and the newest viewer of a stream being hosted.
+    fn pending_friend(&self) -> Option<session::Friend> {
+        let from_host = self
+            .host
+            .as_ref()
+            .and_then(|host| host.status.lock().ok())
+            .and_then(|status| status.met.clone());
+        let from_watch = self.watches.iter().find_map(|watch| {
+            watch
+                .supervisor
+                .status
+                .lock()
+                .ok()
+                .and_then(|status| status.met.clone())
+        });
+        from_watch
+            .or(from_host)
+            .filter(|friend| !self.is_friend(&friend.id))
+    }
+
+    /// Decline the offer.
+    ///
+    /// Clears the child's record rather than remembering a refusal: the offer
+    /// only exists while that session does, so there is nothing to remember
+    /// once it is gone.
+    fn dismiss_pending_friend(&mut self) {
+        if let Some(host) = self.host.as_ref() {
+            if let Ok(mut status) = host.status.lock() {
+                status.met = None;
+            }
+        }
+        for watch in &self.watches {
+            if let Ok(mut status) = watch.supervisor.status.lock() {
+                status.met = None;
+            }
+        }
+    }
+
+    /// Keep someone met through a code join.
+    ///
+    /// Deliberately not automatic. A code gets pasted into group chats, so
+    /// auto-adding would hand a permanent view of when you stream to everyone
+    /// who ever clicked it out of curiosity. The user decides.
+    fn add_friend(&mut self, friend: session::Friend) {
+        if let Some(existing) = self.friends.iter_mut().find(|f| f.id == friend.id) {
+            *existing = friend;
+        } else {
+            let name = friend.name.clone();
+            self.friends.push(friend);
+            self.show_notice(NoticeKind::Ordinary, format!("Added {name}"));
+        }
+        self.save_preferences();
+    }
+
+    /// Forget someone, and stop showing them as live.
+    ///
+    /// The stale presence entry has to go with them: it is keyed by id, and
+    /// re-adding the same person would otherwise show whatever state was last
+    /// seen before the removal.
+    fn remove_friend(&mut self, id: &str) {
+        let Some(index) = self.friends.iter().position(|friend| friend.id == id) else {
+            return;
+        };
+        let removed = self.friends.remove(index);
+        self.presence.remove(id);
+        self.friend_avatars.remove(id);
+        self.show_notice(NoticeKind::Ordinary, format!("Removed {}", removed.name));
+        self.save_preferences();
+    }
+
+    fn is_friend(&self, id: &str) -> bool {
+        self.friends.iter().any(|friend| friend.id == id)
+    }
+
     fn save_preferences(&mut self) {
         let preferences = session::Preferences {
             quality: self.quality,
@@ -815,10 +895,10 @@ impl Orange {
                     code,
                     supervisor: stream,
                 });
-                if self.host.is_none() && self.screen != Screen::Friends {
-                    // Joining from the friends list stays there, so a second
-                    // friend is one more click rather than a click and a Back.
-                    // The row itself flips to "Watching", which is the
+                if self.host.is_none() && self.screen != Screen::Home {
+                    // Joining from the friends list on Home stays there, so a
+                    // second friend is one more click rather than a click and
+                    // a Back. The row itself flips to "Watching", which is the
                     // feedback the screen change used to provide.
                     self.screen = Screen::Watching;
                 }

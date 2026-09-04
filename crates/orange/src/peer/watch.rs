@@ -32,6 +32,9 @@ use super::{
 /// The mirror of this string lives in `orange-tray`'s supervisor, which is the
 /// same arrangement as `[host-status]` and `Share this code:`.
 const WATCH_ENDED: &str = "[watch-status] ended";
+/// Who this stream belongs to, so the tray can offer to keep them as a friend.
+/// A separate marker from `[watch-status]`, which the tray matches whole.
+const WATCH_HOST: &str = "[watch-host]";
 
 fn enable_incoming_video_nack(bin: &gst::Element) {
     bin.connect("on-new-transceiver", false, move |values| {
@@ -422,7 +425,12 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                 } => {
                     bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
                 }
-                Signal::StreamInfo { host_name, .. } => {
+                Signal::StreamInfo {
+                    host_name,
+                    host_id,
+                    host_avatar,
+                    ..
+                } => {
                     joined = true;
                     if let Some(playback) = &viewer_playback {
                         playback.connection_event(ConnectionEvent::StreamInfo);
@@ -431,6 +439,18 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                         if let Ok(mut state) = overlay.lock() {
                             state.host = host_name.clone();
                         }
+                    }
+                    // Only an authenticated host has an id, and without one
+                    // there is nothing the tray could offer to remember.
+                    if let Some(id) = host_id {
+                        println!(
+                            "{WATCH_HOST} {}",
+                            serde_json::json!({
+                                "id": id,
+                                "name": host_name.clone(),
+                                "avatar_url": host_avatar,
+                            })
+                        );
                     }
                     if let Some(name) = host_name {
                         println!("[watch] {name}'s stream");
@@ -583,6 +603,8 @@ mod tests {
     fn watch_receipt_accepts_only_stream_info_diagnostic_session() {
         let stream_info = Signal::StreamInfo {
             host_name: Some("Host Name".to_string()),
+            host_id: None,
+            host_avatar: None,
             diagnostic_session: Some("watch-session".to_string()),
         };
         let unexpected_hosting = Signal::Hosting {

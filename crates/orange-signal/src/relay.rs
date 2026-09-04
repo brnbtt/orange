@@ -545,6 +545,8 @@ pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Aut
                             };
                             room.viewers.insert(peer.clone(), tx.clone());
                             let host_name = room.host_name.clone();
+                            let host_id = room.host_id.clone();
+                            let host_avatar = room.host_avatar.clone();
                             let diagnostic_session = room.diagnostic_session.clone();
                             joined = Some((code.clone(), Role::Viewer(peer.clone())));
 
@@ -553,6 +555,10 @@ pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Aut
                                     Signal::ViewerJoined {
                                         peer,
                                         name: identity.as_ref().map(|i| i.name.clone()),
+                                        id: identity.as_ref().map(|i| i.id.clone()),
+                                        avatar_url: identity
+                                            .as_ref()
+                                            .and_then(|i| i.avatar_url.clone()),
                                     }
                                     .to_json(),
                                 ))?;
@@ -560,6 +566,8 @@ pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Aut
                             let _ = tx.try_send(Message::Text(
                                 Signal::StreamInfo {
                                     host_name,
+                                    host_id,
+                                    host_avatar,
                                     diagnostic_session: Some(diagnostic_session),
                                 }
                                 .to_json(),

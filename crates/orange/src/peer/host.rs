@@ -206,7 +206,7 @@ pub(crate) async fn run_host(
                         if let Some(branch) = viewers.remove(&peer) {
                             let label = branch.label.clone();
                             viewer_teardown.enqueue(branch).await?;
-                            print_viewer_status("left", &peer, &label);
+                            print_viewer_status("left", &peer, &label, None, None);
                             println!(
                                 "[host] {label} left ({} remaining)",
                                 viewers.len()
@@ -224,7 +224,12 @@ pub(crate) async fn run_host(
                         println!("\n  Share this code:  {code}\n");
                         println!("  Viewers run:  orange watch --code {code}\n");
                     }
-                    Signal::ViewerJoined { peer, name } => {
+                    Signal::ViewerJoined {
+                        peer,
+                        name,
+                        id,
+                        avatar_url,
+                    } => {
                         if viewers.contains_key(&peer) {
                             eprintln!("[host] ignoring duplicate join from viewer {peer}");
                             continue;
@@ -255,7 +260,7 @@ pub(crate) async fn run_host(
                                 }
                                 crate::targets::request_redraw(settings.hwnd);
                                 println!("[host] {label} joined ({} watching)", viewers.len());
-                                print_viewer_status("joined", &peer, &label);
+                                print_viewer_status("joined", &peer, &label, id, avatar_url);
                             }
                             Err(err) => eprintln!("[host] could not add viewer {peer}: {err}"),
                         }
@@ -265,7 +270,7 @@ pub(crate) async fn run_host(
                             let label = branch.label.clone();
                             viewer_teardown.enqueue(branch).await?;
                             println!("[host] {label} left ({} remaining)", viewers.len());
-                            print_viewer_status("left", &peer, &label);
+                            print_viewer_status("left", &peer, &label, None, None);
                         }
                     }
                     Signal::Sdp { peer, kind, sdp } if kind == "answer" => {
@@ -385,10 +390,26 @@ fn build_audio_tee(pipeline: &gst::Pipeline, pid: u32) -> Result<gst::Element> {
     Ok(tee)
 }
 
-fn print_viewer_status(event: &str, peer: &str, label: &str) {
+/// `id` and `avatar_url` are only present on a join, and only when the viewer
+/// authenticated: they are what the tray needs to offer to keep this person as
+/// a friend. `peer` is a routing id the relay reassigns per session, so it can
+/// address a branch but can never identify anybody.
+fn print_viewer_status(
+    event: &str,
+    peer: &str,
+    label: &str,
+    id: Option<String>,
+    avatar_url: Option<String>,
+) {
     println!(
         "[host-status] {}",
-        serde_json::json!({ "event": event, "peer": peer, "label": label })
+        serde_json::json!({
+            "event": event,
+            "peer": peer,
+            "label": label,
+            "id": id,
+            "avatar_url": avatar_url,
+        })
     );
 }
 
@@ -404,6 +425,8 @@ mod tests {
         };
         let untrusted_stream_info = Signal::StreamInfo {
             host_name: Some("Viewer Supplied".to_string()),
+            host_id: None,
+            host_avatar: None,
             diagnostic_session: Some("viewer-controlled".to_string()),
         };
 
