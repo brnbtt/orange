@@ -10,6 +10,6 @@
 # the tool that asked for them was pointed. Three of them reached the repo root.
 *.wav
 
-# Source assets are checked in explicitly: the logo is compiled into the tray
+# Source assets are checked in explicitly: the logo is compiled into the client
 # binary with include_bytes!, so a clone without it does not build.
-!crates/orange-tray/logo.png
+!crates/orange-client/logo.png

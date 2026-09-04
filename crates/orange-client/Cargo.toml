@@ -1,11 +1,18 @@
 [package]
-name = "orange-tray"
+name = "orange-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Host-side tray UI for orange"
+description = "Desktop client for orange"
 
+# The artifact keeps its old name on purpose. The updater that performs an
+# upgrade is the one already installed, so it only learns "orange-client.exe"
+# from the release that teaches it -- and orange.iss has no [InstallDelete], so
+# renaming before then would leave both binaries present and reopen the older
+# one, which would find the same update waiting and loop. Flip this to
+# orange-client once installs predating that updater are gone, and change
+# orange.iss with it.
 [[bin]]
 name = "orange-tray"
 path = "src/main.rs"

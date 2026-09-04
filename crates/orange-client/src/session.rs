@@ -1,6 +1,6 @@
 //! Reading the session written by `orange login`.
 //!
-//! The tray does not perform the OAuth flow itself; it shells out to the
+//! The client does not perform the OAuth flow itself; it shells out to the
 //! `orange` binary, which owns that logic, and then reads the result. One
 //! implementation of login, not two.
 
@@ -19,7 +19,7 @@ pub struct Session {
     #[allow(dead_code)]
     pub id: String,
     pub avatar_url: Option<String>,
-    /// Relay session token. The tray reads it only to authenticate presence
+    /// Relay session token. The client reads it only to authenticate presence
     /// polls; it still never performs or refreshes a login. `orange login`
     /// remains the sole writer of this file.
     pub token: String,
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn session_with_cli_token_fields_loads_tray_identity() {
+    fn session_with_cli_token_fields_loads_client_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.json");
         std::fs::write(

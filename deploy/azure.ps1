@@ -20,7 +20,7 @@ param(
     [string]$AppName       = "orange-relay",
     [string]$Environment   = "orange-env",
     # Holds every published installer and the live orange-beta.json manifest.
-    # The name is baked into shipped clients (orange-tray/src/update.rs) and so
+    # The name is baked into shipped clients (orange-client/src/update.rs) and so
     # can never change without stranding their update path. The "alpha" in it is
     # historical; the alpha channel is gone.
     [string]$ReleaseStorageAccount = "orangealpha0d8d5893e69a3"

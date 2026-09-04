@@ -110,7 +110,7 @@ A docs-only or comment-only change does not need a release. Commit and push
 ## Reading Diagnostic Logs
 
 Sessions write JSONL to `%LOCALAPPDATA%\orange\diagnostics\orange-media-<pid>.jsonl`.
-`ORANGE_MEDIA_DIAGNOSTICS` is set by the tray when it spawns children, not in
+`ORANGE_MEDIA_DIAGNOSTICS` is set by the client when it spawns children, not in
 the user environment, so it looks unset from a normal shell.
 
 **A running session's log looks empty.** NTFS does not update the directory

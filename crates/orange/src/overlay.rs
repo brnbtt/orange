@@ -34,7 +34,7 @@ pub(crate) use gst::attach;
 /// How long the controls stay up after the last mouse movement.
 const HIDE_AFTER: Duration = Duration::from_millis(1_000);
 const FADE: Duration = Duration::from_millis(200);
-/// One breath of the live dot. The tray's status dot uses the same period, so
+/// One breath of the live dot. The client's status dot uses the same period, so
 /// a host with both windows open sees one rhythm rather than two.
 const BREATH: Duration = Duration::from_millis(1_600);
 

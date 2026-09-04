@@ -159,7 +159,7 @@ pub(crate) enum Presence {
 ///
 /// The profile is only populated while they are live, because that is the only
 /// time the relay holds their identity. A caller keeps the last value it saw
-/// for everyone else, which is why the tray caches it locally.
+/// for everyone else, which is why the client caches it locally.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Found {
     pub(crate) presence: Presence,
@@ -336,7 +336,7 @@ mod presence_tests {
             Some("https://cdn.discordapp.com/avatars/host/hash.png")
         );
         // Nothing is invented for someone the relay is not currently holding a
-        // connection for. The tray keeps the last profile it saw instead.
+        // connection for. The client keeps the last profile it saw instead.
         assert_eq!(found[1].1.name, None);
         assert_eq!(found[1].1.avatar_url, None);
     }
@@ -357,7 +357,7 @@ mod presence_tests {
     }
 
     /// A friend shown "Live" who clicks and immediately gets "stream is full"
-    /// from the join path was misled by the button. The tray needs the
+    /// from the join path was misled by the button. The client needs the
     /// distinction to render a disabled state instead.
     #[tokio::test]
     async fn presence_reports_a_full_room_as_full_rather_than_live() {
@@ -396,7 +396,7 @@ mod presence_tests {
         }
     }
 
-    /// The tray renders one row per friend and pairs the answers up by
+    /// The client renders one row per friend and pairs the answers up by
     /// position. Dropping offline friends from the reply would silently shift
     /// every row after them onto the wrong person.
     #[tokio::test]

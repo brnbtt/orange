@@ -16,7 +16,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// How often the tray asks. Chosen as the largest delay that still feels like
+/// How often the client asks. Chosen as the largest delay that still feels like
 /// "my friend just went live" rather than "I refreshed and noticed".
 pub(crate) const INTERVAL: Duration = Duration::from_secs(15);
 
@@ -24,7 +24,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
 const RESPONSE_MAX_BYTES: u64 = 256 * 1024;
 
 /// Mirrors the relay's presence encoding. Kept as its own type rather than
-/// shared with `orange-signal` because the tray has no dependency on that
+/// shared with `orange-signal` because the client has no dependency on that
 /// crate and gaining one would drag tokio into a process with no async runtime.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
@@ -38,7 +38,7 @@ pub(crate) enum Presence {
 pub(crate) struct Entry {
     pub(crate) id: String,
     /// Present only while the friend is live: the relay holds a profile just
-    /// for the length of a host connection. The tray keeps the last one it
+    /// for the length of a host connection. The client keeps the last one it
     /// saw in `preferences.json`, so an offline friend still has a face.
     #[serde(default)]
     pub(crate) name: Option<String>,
@@ -158,8 +158,8 @@ mod tests {
         assert_eq!(presence_url("ws:///ws"), None);
     }
 
-    /// The tray pairs answers to rows by id. Decoding has to survive the relay
-    /// returning them in an order the tray did not ask for, has to keep `full`
+    /// The client pairs answers to rows by id. Decoding has to survive the relay
+    /// returning them in an order the client did not ask for, has to keep `full`
     /// distinct from `live` or a full room renders as joinable, and has to
     /// tolerate a profile being absent for an offline friend.
     #[test]

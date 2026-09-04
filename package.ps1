@@ -51,7 +51,7 @@ try {
     # .cargo/config.toml selects rust-lld to keep local iteration fast. Release
     # artifacts stay on link.exe, which is what every shipped beta used.
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "link.exe"
-    cargo build --locked --release -p orange -p orange-tray -p orange-updater
+    cargo build --locked --release -p orange -p orange-client -p orange-updater
     if ($LASTEXITCODE -ne 0) {
         throw "Release build failed."
     }
@@ -87,7 +87,7 @@ try {
         $staged.Plugins, $staged.Files, ($staged.Bytes / 1MB), $staged.Elements) -ForegroundColor DarkGray
 
     $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-    $version = ($metadata.packages | Where-Object name -eq "orange-tray").version
+    $version = ($metadata.packages | Where-Object name -eq "orange-client").version
     Assert-PackageProvenance -Root $root -BuildId $BuildId | Out-Null
     & $iscc "/DAppVersion=$version" ".\packaging\windows\orange.iss"
     if ($LASTEXITCODE -ne 0) {

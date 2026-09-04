@@ -23,17 +23,17 @@ use super::{
 
 /// Printed when a stream we were watching finishes normally.
 ///
-/// The tray reads this off stdout. Without it, a host stopping and a viewer
+/// The client reads this off stdout. Without it, a host stopping and a viewer
 /// closing their own window are the same thing from the outside: a child that
 /// exited zero. They are not the same thing to the person watching, so the
 /// difference has to be said out loud rather than inferred from an exit code
 /// that only has two values.
 ///
-/// The mirror of this string lives in `orange-tray`'s supervisor, which is the
+/// The mirror of this string lives in `orange-client`'s supervisor, which is the
 /// same arrangement as `[host-status]` and `Share this code:`.
 const WATCH_ENDED: &str = "[watch-status] ended";
-/// Who this stream belongs to, so the tray can offer to keep them as a friend.
-/// A separate marker from `[watch-status]`, which the tray matches whole.
+/// Who this stream belongs to, so the client can offer to keep them as a friend.
+/// A separate marker from `[watch-status]`, which the client matches whole.
 const WATCH_HOST: &str = "[watch-host]";
 
 fn enable_incoming_video_nack(bin: &gst::Element) {
@@ -441,7 +441,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                         }
                     }
                     // Only an authenticated host has an id, and without one
-                    // there is nothing the tray could offer to remember.
+                    // there is nothing the client could offer to remember.
                     if let Some(id) = host_id {
                         println!(
                             "{WATCH_HOST} {}",
@@ -463,7 +463,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                     if joined {
                         // A stream you were watching finishing is the ordinary
                         // end of a session, not a failure of one. Saying so on
-                        // stdout lets the tray tell it apart from the viewer
+                        // stdout lets the client tell it apart from the viewer
                         // closing their own window, which also exits cleanly.
                         println!("{WATCH_ENDED}");
                         break;

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="crates/orange-tray/logo.png" width="88" alt="orange">
+  <img src="crates/orange-client/logo.png" width="88" alt="orange">
 </p>
 
 <h1 align="center">orange</h1>
@@ -24,7 +24,7 @@ Ten core product milestones are implemented:
 | 7 | Window process-tree audio and whole-screen system audio | done |
 | 8 | GPU-composited viewer controls | done |
 | 9 | Optional Discord identity | done |
-| 10 | Tray UI, installer, beta update checks and SHA-256 download verification | done |
+| 10 | Client UI, installer, beta update checks and SHA-256 download verification | done |
 
 Autostart is not implemented. Current local installed acceptance covers H.265
 streaming checks, preview, and file output. Direct two-machine WAN remains an
@@ -43,7 +43,7 @@ and avatars and authorizes alpha diagnostic uploads; anonymous peers can still
 host and watch when the relay is not configured for Discord.
 
 ```text
-tray -> browser -> Discord consent
+client -> browser -> Discord consent
                      |
                      v
              relay /auth/callback       client_secret stays on relay
@@ -52,7 +52,7 @@ tray -> browser -> Discord consent
                session token
                      ^
                      |
-tray polls /auth/poll?state=...          no local callback port
+client polls /auth/poll?state=...          no local callback port
 ```
 
 ```powershell
@@ -87,7 +87,7 @@ Without this configuration, anonymous signalling remains available and
 
 ## Media Path
 
-The tray production policy prefers zero-copy H.265. It first tries Windows
+The client production policy prefers zero-copy H.265. It first tries Windows
 Media Foundation, then NVIDIA, and falls back to a compatible zero-copy H.264
 encoder when neither H.265 encoder can accept D3D11 textures:
 
@@ -112,7 +112,7 @@ encoder. CPU conversion elements such as `videoconvert` or `videoscale` in that
 production chain would change its performance profile.
 
 The CLI default remains explicit Media Foundation H.265. `--codec auto` uses
-the tray policy; explicit `h265`, `h264`, and `av1` choices never fall back to a
+the client policy; explicit `h265`, `h264`, and `av1` choices never fall back to a
 different factory or codec.
 
 ### Audio scope
@@ -126,7 +126,7 @@ wasapi2src loopback=true loopback-mode=include-process-tree \
 ```
 
 Whole-screen sharing includes system output audio, except orange's own process
-tree: the tray plays short cues when a viewer arrives or leaves, and those are
+tree: the client plays short cues when a viewer arrives or leaves, and those are
 for the person hosting rather than for the people watching them. Pass
 `--no-audio` to disable audio. Failure while constructing optional audio
 disables it and leaves video running; a later audio error in the shared host
@@ -135,8 +135,8 @@ pipeline can end the session.
 ### Sound
 
 Streaming happens while you are looking at the game, so a viewer arriving, or
-the stream you are watching ending, is invisible unless the tray is in front of
-you. Five cues cover that, synthesised in `crates/orange-tray/src/sound.rs`
+the stream you are watching ending, is invisible unless the client is in front of
+you. Five cues cover that, synthesised in `crates/orange-client/src/sound.rs`
 rather than shipped as audio files.
 
 How many times a cue speaks is the part of the vocabulary that carries: your own
@@ -176,7 +176,7 @@ alone. The result installs offline from a single 17 MB file.
 Installed beta builds check the public update channel at startup and every six
 hours. `Update now` downloads from the fixed release host, enforces size and
 manifest rules, verifies SHA-256, hands off to `orange-updater.exe`, closes the
-tray and media children, applies the installer silently, and reopens the tray.
+client and media children, applies the installer silently, and reopens the client.
 Failed checks and downloads do not stop streaming.
 
 The installer is not yet Authenticode-signed. HTTPS host restrictions constrain

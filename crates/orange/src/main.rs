@@ -40,7 +40,7 @@ struct Cli {
 enum Command {
     /// List windows that can be captured.
     List {
-        /// Emit JSON, for the tray UI to consume.
+        /// Emit JSON, for the client UI to consume.
         #[arg(long)]
         json: bool,
     },
@@ -94,7 +94,7 @@ enum Command {
         server: String,
         /// Discord ids allowed to see this stream in their friends list and be
         /// handed the code without being told it. The roster lives with the
-        /// tray, which owns preferences; this process is only the messenger.
+        /// client, which owns preferences; this process is only the messenger.
         #[arg(long, value_delimiter = ',')]
         visible_to: Vec<String>,
         #[command(flatten)]
@@ -542,7 +542,7 @@ fn cmd_list(json: bool) -> Result<()> {
     let windows = targets::list_windows()?;
 
     if json {
-        // The tray consumes this, so keep it stable.
+        // The client consumes this, so keep it stable.
         let items: Vec<_> = windows
             .iter()
             .map(|t| {
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(overridden.bitrate, Some(100_001));
     }
 
-    /// The tray joins the roster with commas and omits the flag entirely for an
+    /// The client joins the roster with commas and omits the flag entirely for an
     /// empty one, because clap reads `--visible-to` with no value as the start
     /// of the next flag. Both halves of that contract are pinned here.
     #[test]

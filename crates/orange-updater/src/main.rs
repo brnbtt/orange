@@ -184,11 +184,11 @@ fn apply_update(args: UpdateArgs) -> Result<()> {
         bail!("Orange installer exited with code {code}");
     }
 
-    let tray = app_binary(&args.install_dir);
-    Command::new(&tray)
+    let app = app_binary(&args.install_dir);
+    Command::new(&app)
         .current_dir(&args.install_dir)
         .spawn()
-        .with_context(|| format!("could not reopen {}", tray.display()))?;
+        .with_context(|| format!("could not reopen {}", app.display()))?;
     let _ = std::fs::remove_file(args.installer);
     Ok(())
 }
@@ -242,8 +242,8 @@ fn main() {
             if let Err(error) = apply_update(args) {
                 write_failure(&error);
                 if parent_has_exited(retry.parent).unwrap_or(false) {
-                    let tray = app_binary(&retry.install_dir);
-                    let _ = Command::new(tray).current_dir(retry.install_dir).spawn();
+                    let app = app_binary(&retry.install_dir);
+                    let _ = Command::new(app).current_dir(retry.install_dir).spawn();
                 }
             }
         }

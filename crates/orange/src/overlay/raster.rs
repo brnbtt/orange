@@ -22,10 +22,10 @@ const DOT: f32 = 3.5;
 const TRACK_HEIGHT: f32 = 6.0;
 const KNOB: f32 = 9.0;
 
-// The app's palette, matching the tray. Kept as floats because tiny-skia wants
+// The app's palette, matching the client. Kept as floats because tiny-skia wants
 // them that way; the hex on the right is the value on the identity board.
 //
-// The panel is darker than the tray's card surface and very nearly opaque. A
+// The panel is darker than the client's card surface and very nearly opaque. A
 // control panel has to read the same over a dark game and a white browser, and
 // at 0.94 the same fill looked like two different greys depending on the frame
 // behind it.

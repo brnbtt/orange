@@ -346,11 +346,11 @@ pub(crate) async fn run_host(
     )
 }
 
-/// The tray's process id, when the tray started us.
+/// The client's process id, when the client started us.
 ///
-/// Set by `orange-tray` so whole-screen capture can leave the tray's own cues
+/// Set by `orange-client` so whole-screen capture can leave the client's own cues
 /// out of the stream. Absent when `orange host` is run straight from a shell,
-/// where there is no tray making noise to exclude.
+/// where there is no client making noise to exclude.
 fn ui_process_id() -> Option<u32> {
     std::env::var("ORANGE_UI_PID").ok()?.parse().ok()
 }
@@ -391,7 +391,7 @@ fn build_audio_tee(pipeline: &gst::Pipeline, pid: u32) -> Result<gst::Element> {
 }
 
 /// `id` and `avatar_url` are only present on a join, and only when the viewer
-/// authenticated: they are what the tray needs to offer to keep this person as
+/// authenticated: they are what the client needs to offer to keep this person as
 /// a friend. `peer` is a routing id the relay reassigns per session, so it can
 /// address a branch but can never identify anybody.
 fn print_viewer_status(

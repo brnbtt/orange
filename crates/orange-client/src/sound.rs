@@ -2,7 +2,7 @@
 //!
 //! Sound earns its place here for one reason: streaming happens while you are
 //! looking at the game, not at this window. A viewer arriving, or the stream
-//! you are watching ending, is invisible unless the tray is in front of you.
+//! you are watching ending, is invisible unless the client is in front of you.
 //!
 //! The tones are generated rather than shipped as files. Five WAVs would be
 //! five assets to source, licence, embed and keep in step; this file has none
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     #[ignore = "writes files for listening; run with --ignored"]
     fn export_cues_for_listening() {
-        // cargo test -p orange-tray export_cues -- --ignored --nocapture
+        // cargo test -p orange-client export_cues -- --ignored --nocapture
         //
         // A timbre is not something anyone can settle by reading a struct
         // literal. This existed alongside a table of alternatives while the

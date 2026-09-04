@@ -1,6 +1,6 @@
 //! Supervising the streaming processes.
 //!
-//! The tray runs `orange host` and `orange watch` as child processes rather
+//! The client runs `orange host` and `orange watch` as child processes rather
 //! than driving the pipeline in-process. GPUI runs its own executor and the
 //! pipeline runs on tokio, so in-process would mean reconciling two runtimes;
 //! more importantly, a crash in the media pipeline should not take the UI down
@@ -48,7 +48,7 @@ impl WindowTarget {
     }
 }
 
-/// Path to the `orange` binary, assumed to sit beside the tray executable.
+/// Path to the `orange` binary, assumed to sit beside the client executable.
 fn orange_exe() -> Result<std::path::PathBuf> {
     let dir = std::env::current_exe()?
         .parent()
@@ -62,7 +62,7 @@ fn orange_exe() -> Result<std::path::PathBuf> {
 /// `orange.exe` links GStreamer dynamically, so those DLLs must be on the
 /// PATH of the *child* process or it dies at load time with a
 /// "gstreamer-1.0-0.dll was not found" dialog before `main` ever runs. The
-/// tray itself has no GStreamer dependency, which is why it starts fine and
+/// client itself has no GStreamer dependency, which is why it starts fine and
 /// only the child fails.
 fn gstreamer_bin() -> Option<std::path::PathBuf> {
     // The copy installed beside us wins over everything else. It is the exact
@@ -229,7 +229,7 @@ pub fn list_windows() -> Result<Vec<WindowTarget>> {
 }
 
 /// Kick off `orange login`, which opens the browser and writes the session
-/// file when it completes. The tray notices by watching for that file.
+/// file when it completes. The client notices by watching for that file.
 ///
 /// The server must be passed explicitly: the binary's default points at
 /// localhost, which is not where the relay lives.
@@ -325,7 +325,7 @@ pub struct StreamStatus {
     /// to the viewer closing their own window. Both exit zero.
     pub ended: bool,
     /// Who this session put us in contact with, if they were signed in: the
-    /// host when watching, the newest viewer when hosting. The tray offers to
+    /// host when watching, the newest viewer when hosting. The client offers to
     /// keep them; it never adds them on its own.
     pub met: Option<Friend>,
     viewer_labels: Vec<(String, String)>,
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn a_stream_ending_is_reported_separately_from_a_stream_breaking() {
-        // Both exit zero, so without this marker the tray cannot tell the host
+        // Both exit zero, so without this marker the client cannot tell the host
         // stopping from the viewer closing their own window - and it used to
         // guess, by grepping stderr for the substring "error".
         let status = Arc::new(Mutex::new(StreamStatus::default()));
@@ -886,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_quality_constraint_is_retained_for_the_live_tray_notice() {
+    fn automatic_quality_constraint_is_retained_for_the_live_client_notice() {
         let status = Arc::new(Mutex::new(StreamStatus::default()));
 
         parse_line(

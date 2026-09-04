@@ -6,7 +6,7 @@
 //!
 //! Why not GPUI here: GPUI expects to own its window and render loop, and
 //! there is no supported way to composite GStreamer's D3D11 output underneath
-//! it. Video stays native; GPUI is the right tool for the host-side tray panel,
+//! it. Video stays native; GPUI is the right tool for the host-side client panel,
 //! where there is no video surface to share.
 //!
 //! Win32 requires a window's message loop to run on the thread that created
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn taskbar_identity_matches_tray_process() {
+    fn taskbar_identity_matches_client_process() {
         assert_eq!(APP_USER_MODEL_ID, "brnbtt.orange");
         set_taskbar_identity().expect("taskbar identity should be accepted by Windows");
     }

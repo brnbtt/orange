@@ -10,7 +10,7 @@
 //!
 //! Segoe UI is loaded from the system rather than embedded. This is a
 //! Windows-only product, the font is already on every machine that can run
-//! it, and it keeps the binary a megabyte smaller while matching the tray.
+//! it, and it keeps the binary a megabyte smaller while matching the client.
 
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont};
 use std::sync::OnceLock;

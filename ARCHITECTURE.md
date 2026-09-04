@@ -10,8 +10,8 @@ ownership, media defaults, compatibility contracts, and validation paths.
                   +-----------------------------+
                   |                             v
 +-----------------+--+       child stdout   +----------------+
-| orange-tray.exe    |<----------------------| orange.exe     |
-| GPUI + Win32 tray  |                       | list/login     |
+| orange-client.exe  |<----------------------| orange.exe     |
+| GPUI + Win32 icon  |                       | list/login     |
 |                    |-- supervises -------->| host/watch     |
 | UI state + prefs   |                       +-------+--------+
 +---------+----------+                               |
@@ -19,7 +19,7 @@ ownership, media defaults, compatibility contracts, and validation paths.
           v                                           v
 +--------------------+                       +------------------+
 | orange-updater.exe |                       | orange-relay     |
-| waits for tray,    |                       | HTTP + /ws       |
+| waits for client,  |                       | HTTP + /ws       |
 | runs installer,    |                       | rooms/auth in RAM|
 | starts successor   |                       +------------------+
 +--------------------+
@@ -28,11 +28,11 @@ ownership, media defaults, compatibility contracts, and validation paths.
                   (relay forwards SDP/ICE, never media)
 ```
 
-- `orange-tray.exe` is the long-lived desktop coordinator. It invokes list and
+- `orange-client` is the long-lived desktop coordinator. It invokes list and
   login commands plus separate `orange.exe host` and `orange.exe watch` children.
 - A host child owns capture, one encoder, and one WebRTC branch per viewer.
 - Each watch child owns one native playback window and receive pipeline.
-- The updater is a temporary successor that waits, installs, and reopens the tray.
+- The updater is a temporary successor that waits, installs, and reopens the client.
 - `orange-relay` is the production relay entry point; `orange serve` exposes the
   same signal server for local use.
 - Direct ICE media and public STUN are implemented. No TURN configuration exists, so TURN-required networks are unsupported.
@@ -42,32 +42,40 @@ ownership, media defaults, compatibility contracts, and validation paths.
 | Crate | Artifact | Responsibility |
 | --- | --- | --- |
 | `orange` | `orange.exe` | CLI, Windows capture, hardware encoding, WebRTC peers, playback window, overlay, local media diagnostics |
-| `orange-tray` | `orange-tray.exe` | GPUI desktop UI, Win32 tray icon, child supervision, preferences, update client |
+| `orange-client` | `orange-tray.exe` (see below) | GPUI desktop UI, Win32 notification icon, child supervision, preferences, update client |
 | `orange-signal` | library | Signal wire format, client, room relay, Discord identity, HTTP/WebSocket server, diagnostic upload |
 | `orange-relay` | `orange-relay` | Small production process that binds `PORT` and runs `orange_signal::serve` |
-| `orange-updater` | `orange-updater.exe` | Verifies handoff, waits for the tray, runs Inno Setup silently, reopens the tray |
+| `orange-updater` | `orange-updater.exe` | Verifies handoff, waits for the client, runs Inno Setup silently, reopens the client |
 
-Compile dependencies point `orange -> orange-signal <- orange-relay`; tray/updater communicate through processes/files and have no workspace crate dependency.
+Compile dependencies point `orange -> orange-signal <- orange-relay`; client/updater communicate through processes/files and have no workspace crate dependency.
 
-## Tray Source Map
+The `orange-client` crate still builds an artifact named `orange-tray.exe`, set
+by `[[bin]]` in its `Cargo.toml`. The updater that performs an upgrade is the
+one already installed, so it only learns the new name from the release that
+teaches it, and `orange.iss` has no `[InstallDelete]` — renaming the artifact
+before every install carries that updater would leave both binaries present and
+reopen the older one, which would find the same update waiting and loop.
+`crates/orange-updater/src/main.rs` already accepts both names.
+
+## Client Source Map
 
 | File | Authoritative responsibility |
 | --- | --- |
-| `crates/orange-tray/src/main.rs` | Application state machine, GPUI startup, polling, child lifecycle, picker actions, update handoff, top-level tray ownership |
-| `crates/orange-tray/src/view.rs` | All screen rendering and UI event wiring: signed out, home, picker, streaming, watching, settings, update banner |
-| `crates/orange-tray/src/ui/theme.rs` | Design tokens: colour, type, metrics, motion. No elements |
-| `crates/orange-tray/src/ui/controls.rs` | Reusable GPUI controls: buttons, pills, cards, rows, titlebar |
-| `crates/orange-tray/src/ui/mark.rs` | The logo, its states, and the glow behind it |
-| `crates/orange-tray/src/ui/decor.rs` | Ambient layer: drifting grid, viewfinder brackets, registration marks |
-| `crates/orange-tray/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
-| `crates/orange-tray/src/background.rs` | Cancelled-and-joined thumbnail and avatar jobs, bounded avatar download and decode |
-| `crates/orange-tray/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
-| `crates/orange-tray/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
-| `crates/orange-tray/src/session.rs` | Reads CLI session JSON; atomically reads/writes tray preferences |
-| `crates/orange-tray/src/tray.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
-| `crates/orange-tray/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
+| `crates/orange-client/src/main.rs` | Application state machine, GPUI startup, polling, child lifecycle, picker actions, update handoff, top-level notification-icon ownership |
+| `crates/orange-client/src/view.rs` | All screen rendering and UI event wiring: signed out, home, picker, streaming, watching, settings, update banner |
+| `crates/orange-client/src/ui/theme.rs` | Design tokens: colour, type, metrics, motion. No elements |
+| `crates/orange-client/src/ui/controls.rs` | Reusable GPUI controls: buttons, pills, cards, rows, titlebar |
+| `crates/orange-client/src/ui/mark.rs` | The logo, its states, and the glow behind it |
+| `crates/orange-client/src/ui/decor.rs` | Ambient layer: drifting grid, viewfinder brackets, registration marks |
+| `crates/orange-client/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
+| `crates/orange-client/src/background.rs` | Cancelled-and-joined thumbnail and avatar jobs, bounded avatar download and decode |
+| `crates/orange-client/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
+| `crates/orange-client/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
+| `crates/orange-client/src/session.rs` | Reads CLI session JSON; atomically reads/writes client preferences |
+| `crates/orange-client/src/client.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
+| `crates/orange-client/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
 
-The tray requests automatic zero-copy encoder selection and leaves bitrate selection to the media child after output resolution and frame rate are known. The measured automatic policy anchors at 18 Mbps for 1080p60, scales sublinearly with pixels and linearly with frame rate, and caps at 80 Mbps with a tray-visible quality warning. Selection prefers H.265 (Media Foundation, then NVIDIA) and falls back to H.264 (Media Foundation, then NVIDIA). The CLI defaults to explicit Media Foundation H.265; `--bitrate` remains an advanced override.
+The client requests automatic zero-copy encoder selection and leaves bitrate selection to the media child after output resolution and frame rate are known. The measured automatic policy anchors at 18 Mbps for 1080p60, scales sublinearly with pixels and linearly with frame rate, and caps at 80 Mbps with a client-visible quality warning. Selection prefers H.265 (Media Foundation, then NVIDIA) and falls back to H.264 (Media Foundation, then NVIDIA). The CLI defaults to explicit Media Foundation H.265; `--bitrate` remains an advanced override.
 
 ## Media CLI Source Map
 
@@ -112,7 +120,7 @@ The tray requests automatic zero-copy encoder selection and leaves bitrate selec
 
 ## Host Media Flow
 
-The production tray policy prefers H.265 and falls back to H.264 only when no
+The production client policy prefers H.265 and falls back to H.264 only when no
 H.265 factory can statically link to D3D11 input. Frames remain D3D11-backed
 through capture, GPU conversion, and hardware encoding:
 
@@ -162,12 +170,12 @@ webrtcbin OPUS pad
 
 ## Ownership And Teardown
 
-- Unique owners initiate teardown: `PlaybackWindow`, `Tray`, `Supervisor`, `SignalClient`, `ViewerBranch`, `ReceiveWorkerRegistry`, and job handles.
+- Unique owners initiate teardown: `PlaybackWindow`, `Client`, `Supervisor`, `SignalClient`, `ViewerBranch`, `ReceiveWorkerRegistry`, and job handles.
 - Passive `PlaybackWindowHandle` clones may inspect the HWND/alive state and
   overlay, but dropping a handle never destroys the window.
 - Playback owners are declared before pipelines. Receive pipelines reach
   `gst::State::Null` before the owner destroys its HWND.
-- Tray and playback HWNDs are created, messaged, and destroyed on their native
+- Client and playback HWNDs are created, messaged, and destroyed on their native
   creator threads. Incomplete native cleanup is fail-fast; detaching a thread
   with unprovable HWND/context ownership is not allowed.
 - `SignalClient::close` requests graceful WebSocket close and awaits/reaps tasks; abort handles unfinished work and drop fallback. Other workers are cancelled/disconnected and joined.
@@ -180,16 +188,16 @@ webrtcbin OPUS pad
 | Contract | Authority |
 | --- | --- |
 | Signal JSON tags, fields, defaults, and peer stamping | `crates/orange-signal/src/protocol.rs` |
-| Tray window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
-| Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --scale --fps`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
-| Host stdout markers `Share this code:` and `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
-| Automatic bitrate cap marker `[quality-status] <json>` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
-| Watch stdout marker `[watch-status] ended` | producer: `crates/orange/src/peer/watch.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
-| `ORANGE_UI_PID`, so whole-screen capture can exclude the tray's own cues | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/peer/host.rs` |
-| Session file `%APPDATA%\orange\session.json` | writer: `crates/orange/src/auth.rs`; reader: `crates/orange-tray/src/session.rs` |
-| Preferences `%APPDATA%\orange\preferences.json` | `crates/orange-tray/src/session.rs` |
-| Beta manifest schema/host/name/hash | producer: `publish-beta.ps1`; consumer: `crates/orange-tray/src/update.rs` |
-| Updater flags `--installer --sha256 --parent --install-dir` | producer: `crates/orange-tray/src/update.rs`; consumer: `crates/orange-updater/src/main.rs` |
+| Client window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
+| Client child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --scale --fps`; `watch --code --server --cascade --profile` | producer: `crates/orange-client/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
+| Host stdout markers `Share this code:` and `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
+| Automatic bitrate cap marker `[quality-status] <json>` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
+| Watch stdout marker `[watch-status] ended` | producer: `crates/orange/src/peer/watch.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
+| `ORANGE_UI_PID`, so whole-screen capture can exclude the client's own cues | producer: `crates/orange-client/src/supervisor.rs`; consumer: `crates/orange/src/peer/host.rs` |
+| Session file `%APPDATA%\orange\session.json` | writer: `crates/orange/src/auth.rs`; reader: `crates/orange-client/src/session.rs` |
+| Preferences `%APPDATA%\orange\preferences.json` | `crates/orange-client/src/session.rs` |
+| Beta manifest schema/host/name/hash | producer: `publish-beta.ps1`; consumer: `crates/orange-client/src/update.rs` |
+| Updater flags `--installer --sha256 --parent --install-dir` | producer: `crates/orange-client/src/update.rs`; consumer: `crates/orange-updater/src/main.rs` |
 | RTP video payload 96, RTX 97, Opus 111, clocks and 100 ms receive latency | `crates/orange/src/webrtc/transport.rs` |
 | Local diagnostic JSONL fields and `ORANGE_*` metadata | producer: `crates/orange/src/media_diagnostics/writer.rs`; consumer: a human, via Settings -> Diagnostics -> Open folder |
 
@@ -197,7 +205,7 @@ webrtcbin OPUS pad
 
 | Change | Start here |
 | --- | --- |
-| CLI flags/defaults and tray child invocations | `crates/orange/src/main.rs`, `crates/orange-tray/src/supervisor.rs` |
+| CLI flags/defaults and client child invocations | `crates/orange/src/main.rs`, `crates/orange-client/src/supervisor.rs` |
 | Capture elements, encoder choice, Opus send chain | `crates/orange/src/pipeline.rs` |
 | Host fan-out, late join, keyframe behavior | `crates/orange/src/peer/host.rs`, `crates/orange/src/peer/host_branch.rs` |
 | Viewer negotiation and session lifetime | `crates/orange/src/peer/watch.rs` |
@@ -205,18 +213,18 @@ webrtcbin OPUS pad
 | RTP payloads, jitterbuffer latency/drop policy | `crates/orange/src/webrtc/transport.rs` |
 | Native viewer behavior and HWND lifetime | `crates/orange/src/window.rs`, `crates/orange/src/window/native.rs` |
 | Overlay behavior/layout | `crates/orange/src/overlay.rs`, `crates/orange/src/overlay/raster.rs`, `crates/orange/src/overlay/gst.rs` |
-| Tray screens | `crates/orange-tray/src/view.rs` |
-| Tray colors/components | `crates/orange-tray/src/ui/theme.rs`, `crates/orange-tray/src/ui/controls.rs` |
-| Logo, glow, ambient grid | `crates/orange-tray/src/ui/mark.rs`, `crates/orange-tray/src/ui/decor.rs` |
-| Tray sound cues | `crates/orange-tray/src/sound.rs` |
-| Tray quality tiers and child log parsing | `crates/orange-tray/src/supervisor.rs` |
-| Frame-rate options and the 120 fps cap | `crates/orange-tray/src/supervisor.rs` (`FRAME_RATES`), `crates/orange/src/pipeline.rs` (`MAX_FPS`) |
-| Session/preferences persistence | `crates/orange/src/auth.rs`, `crates/orange-tray/src/session.rs` |
+| Client screens | `crates/orange-client/src/view.rs` |
+| Client colors/components | `crates/orange-client/src/ui/theme.rs`, `crates/orange-client/src/ui/controls.rs` |
+| Logo, glow, ambient grid | `crates/orange-client/src/ui/mark.rs`, `crates/orange-client/src/ui/decor.rs` |
+| Client sound cues | `crates/orange-client/src/sound.rs` |
+| Client quality tiers and child log parsing | `crates/orange-client/src/supervisor.rs` |
+| Frame-rate options and the 120 fps cap | `crates/orange-client/src/supervisor.rs` (`FRAME_RATES`), `crates/orange/src/pipeline.rs` (`MAX_FPS`) |
+| Session/preferences persistence | `crates/orange/src/auth.rs`, `crates/orange-client/src/session.rs` |
 | Signal wire format | `crates/orange-signal/src/protocol.rs` |
 | Relay room policy and limits | `crates/orange-signal/src/relay.rs`, `crates/orange-signal/src/server.rs` |
 | Discord OAuth/session policy | `crates/orange-signal/src/auth.rs` |
 | Local media diagnostic records | `crates/orange/src/media_diagnostics/writer.rs` |
-| Update manifest/client handoff | `publish-beta.ps1`, `crates/orange-tray/src/update.rs`, `crates/orange-updater/src/main.rs` |
+| Update manifest/client handoff | `publish-beta.ps1`, `crates/orange-client/src/update.rs`, `crates/orange-updater/src/main.rs` |
 | Installer contents/prerequisites | `package.ps1`, `packaging/windows/orange.iss` |
 | Which GStreamer elements ship in the installer | `packaging/windows/stage-gstreamer.ps1` |
 | Release procedure (bump, test, commit, push, publish) | `ship.ps1` |

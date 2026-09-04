@@ -1,6 +1,6 @@
-//! A real system tray icon.
+//! A real system client icon.
 //!
-//! GPUI has no tray support, so this is raw Win32: a hidden message-only
+//! GPUI has no client support, so this is raw Win32: a hidden message-only
 //! window owns the notification icon and receives its callbacks. It runs on
 //! its own thread because a window's message loop must live on the thread
 //! that created it.
@@ -41,7 +41,7 @@ const ID_SHOW: usize = 1;
 const ID_QUIT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayEvent {
+pub enum ClientEvent {
     /// Left click, or "Open" from the menu.
     Show,
     Quit,
@@ -50,14 +50,14 @@ pub enum TrayEvent {
 static TRAY_CLASS_RESULT: OnceLock<std::result::Result<(), u32>> = OnceLock::new();
 static TRAY_MESSAGE_RESULT: OnceLock<std::result::Result<u32, u32>> = OnceLock::new();
 
-struct TrayContext {
-    events: RefCell<Option<Sender<TrayEvent>>>,
+struct ClientContext {
+    events: RefCell<Option<Sender<ClientEvent>>>,
     icon_added: Cell<bool>,
     cleaned: Cell<bool>,
     shutdown_event: isize,
 }
 
-impl TrayContext {
+impl ClientContext {
     fn disconnect_events(&self) {
         self.events.borrow_mut().take();
     }
@@ -91,17 +91,17 @@ impl Drop for OwnedIcon {
     }
 }
 
-/// Owns one tray window, its events, and its native message-loop thread.
-pub struct Tray {
+/// Owns one client window, its events, and its native message-loop thread.
+pub struct Client {
     hwnd: isize,
-    events: Receiver<TrayEvent>,
+    events: Receiver<ClientEvent>,
     worker: Option<JoinHandle<std::result::Result<(), String>>>,
     shutdown_event: Option<OwnedHandle>,
     cleanup_error: Option<String>,
 }
 
-impl Tray {
-    /// Install the tray icon and start its native message loop.
+impl Client {
+    /// Install the client icon and start its native message loop.
     pub fn install() -> Result<Self> {
         Self::install_inner(true)
     }
@@ -118,8 +118,8 @@ impl Tray {
         let shutdown_handle = shutdown_event.as_raw_handle() as isize;
         let worker = std::thread::spawn(move || {
             // SAFETY: The owner keeps shutdown_handle open until this worker
-            // terminates, and tray_worker owns all native window operations.
-            unsafe { tray_worker(event_tx, ready_tx, add_icon, shutdown_handle) }
+            // terminates, and client_worker owns all native window operations.
+            unsafe { client_worker(event_tx, ready_tx, add_icon, shutdown_handle) }
         });
 
         match ready_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
@@ -138,18 +138,18 @@ impl Tray {
                 finish_setup_worker(worker, &shutdown_event, FINAL_SHUTDOWN_TIMEOUT);
                 match error {
                     RecvTimeoutError::Timeout => {
-                        anyhow::bail!("tray thread was not ready within {SHUTDOWN_TIMEOUT:?}")
+                        anyhow::bail!("client thread was not ready within {SHUTDOWN_TIMEOUT:?}")
                     }
                     RecvTimeoutError::Disconnected => {
-                        Err(error).context("tray thread died before it was ready")
+                        Err(error).context("client thread died before it was ready")
                     }
                 }
             }
         }
     }
 
-    /// Receive a pending tray action without blocking.
-    pub fn try_recv(&self) -> std::result::Result<TrayEvent, TryRecvError> {
+    /// Receive a pending client action without blocking.
+    pub fn try_recv(&self) -> std::result::Result<ClientEvent, TryRecvError> {
         self.events.try_recv()
     }
 
@@ -175,7 +175,7 @@ impl Tray {
             };
         };
         if worker.thread().id() == std::thread::current().id() {
-            anyhow::bail!("cannot join tray worker from itself");
+            anyhow::bail!("cannot join client worker from itself");
         }
 
         let deadline = Instant::now() + timeout;
@@ -185,7 +185,7 @@ impl Tray {
                 .as_ref()
                 .expect("live worker retains its shutdown event");
             signal_event(shutdown_event)?;
-            if let Ok(message) = unsafe { tray_message() } {
+            if let Ok(message) = unsafe { client_message() } {
                 if let Err(error) = unsafe {
                     PostMessageW(
                         Some(HWND(self.hwnd as *mut _)),
@@ -196,14 +196,14 @@ impl Tray {
                 } {
                     let _ = writeln!(
                         std::io::stderr().lock(),
-                        "[tray] modal wake post failed; event wait remains active: {error}"
+                        "[client] modal wake post failed; event wait remains active: {error}"
                     );
                 }
             }
         }
         match wait_for_thread(worker, deadline.saturating_duration_since(Instant::now()))? {
             true => self.join_finished_worker(),
-            false => anyhow::bail!("tray worker did not stop within {timeout:?}"),
+            false => anyhow::bail!("client worker did not stop within {timeout:?}"),
         }
     }
 
@@ -224,7 +224,7 @@ impl Tray {
                 Err(anyhow::anyhow!(error))
             }
             Err(_) => {
-                let error = "tray worker panicked before proving native cleanup".to_string();
+                let error = "client worker panicked before proving native cleanup".to_string();
                 self.cleanup_error = Some(error.clone());
                 Err(anyhow::anyhow!(error))
             }
@@ -232,10 +232,10 @@ impl Tray {
     }
 }
 
-impl Drop for Tray {
+impl Drop for Client {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown_final() {
-            fail_fast("tray Drop could not complete native cleanup", &error);
+            fail_fast("client Drop could not complete native cleanup", &error);
         }
     }
 }
@@ -262,12 +262,12 @@ fn wait_for_thread<T>(worker: &JoinHandle<T>, timeout: Duration) -> Result<bool>
         Ok(false)
     } else if result == WAIT_FAILED {
         Err(anyhow::anyhow!(
-            "waiting for tray thread failed (Win32 error {})",
+            "waiting for client thread failed (Win32 error {})",
             unsafe { GetLastError().0 }
         ))
     } else {
         Err(anyhow::anyhow!(
-            "waiting for tray thread returned unexpected status {result:?}"
+            "waiting for client thread returned unexpected status {result:?}"
         ))
     }
 }
@@ -278,21 +278,21 @@ fn finish_setup_worker(
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
-    signal_event(event).unwrap_or_else(|error| fail_fast("could not stop tray setup", &error));
+    signal_event(event).unwrap_or_else(|error| fail_fast("could not stop client setup", &error));
     match wait_for_thread(&worker, deadline.saturating_duration_since(Instant::now())) {
         Ok(true) => {}
         Ok(false) => fail_fast(
-            "tray setup did not terminate before the final deadline",
+            "client setup did not terminate before the final deadline",
             &anyhow::anyhow!("timeout after {timeout:?}"),
         ),
-        Err(error) => fail_fast("could not wait for tray setup", &error),
+        Err(error) => fail_fast("could not wait for client setup", &error),
     }
     match worker.join() {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => fail_fast("tray setup cleanup failed", &anyhow::anyhow!(error)),
+        Ok(Err(error)) => fail_fast("client setup cleanup failed", &anyhow::anyhow!(error)),
         Err(_) => fail_fast(
-            "tray setup worker panicked",
-            &anyhow::anyhow!("native tray ownership may be incomplete"),
+            "client setup worker panicked",
+            &anyhow::anyhow!("native client ownership may be incomplete"),
         ),
     }
 }
@@ -309,16 +309,16 @@ fn retry_error_if_owned<E>(
 }
 
 pub(crate) fn fail_fast(context: &str, error: &anyhow::Error) -> ! {
-    let _ = writeln!(std::io::stderr().lock(), "[tray] {context}: {error:#}");
+    let _ = writeln!(std::io::stderr().lock(), "[client] {context}: {error:#}");
     std::process::abort();
 }
 
-unsafe fn ensure_tray_class(instance: HINSTANCE) -> Result<()> {
+unsafe fn ensure_client_class(instance: HINSTANCE) -> Result<()> {
     let result = TRAY_CLASS_RESULT.get_or_init(|| {
         let class = WNDCLASSW {
-            lpfnWndProc: Some(tray_proc),
+            lpfnWndProc: Some(client_proc),
             hInstance: instance,
-            lpszClassName: w!("orange_tray_icon"),
+            lpszClassName: w!("orange_client_icon"),
             ..Default::default()
         };
         if RegisterClassW(&class) != 0 {
@@ -330,15 +330,15 @@ unsafe fn ensure_tray_class(instance: HINSTANCE) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            anyhow::bail!("failed to register tray window class (Win32 error {error})")
+            anyhow::bail!("failed to register client window class (Win32 error {error})")
         }
     }
 }
 
-unsafe fn tray_message() -> Result<u32> {
+unsafe fn client_message() -> Result<u32> {
     let result = TRAY_MESSAGE_RESULT.get_or_init(|| {
         let message = RegisterWindowMessageW(w!(
-            "orange_tray_callback_88dd87b7-0a96-42aa-babd-fc9841a93f71"
+            "orange_client_callback_88dd87b7-0a96-42aa-babd-fc9841a93f71"
         ));
         if message == 0 {
             Err(GetLastError().0)
@@ -346,26 +346,25 @@ unsafe fn tray_message() -> Result<u32> {
             Ok(message)
         }
     });
-    result
-        .as_ref()
-        .copied()
-        .map_err(|error| anyhow::anyhow!("failed to register tray callback (Win32 error {error})"))
+    result.as_ref().copied().map_err(|error| {
+        anyhow::anyhow!("failed to register client callback (Win32 error {error})")
+    })
 }
 
-fn is_tray_message(message: u32) -> bool {
+fn is_client_message(message: u32) -> bool {
     TRAY_MESSAGE_RESULT
         .get()
         .and_then(|result| result.as_ref().ok())
         .is_some_and(|registered| *registered == message)
 }
 
-unsafe fn tray_worker(
-    events: Sender<TrayEvent>,
+unsafe fn client_worker(
+    events: Sender<ClientEvent>,
     ready_tx: Sender<Result<isize>>,
     add_icon: bool,
     shutdown_handle: isize,
 ) -> std::result::Result<(), String> {
-    let context = Box::new(TrayContext {
+    let context = Box::new(ClientContext {
         events: RefCell::new(Some(events)),
         icon_added: Cell::new(false),
         cleaned: Cell::new(false),
@@ -375,7 +374,7 @@ unsafe fn tray_worker(
     let mut owned_icon = None;
     match create(&context, add_icon, &mut hwnd, &mut owned_icon) {
         Ok(()) => {
-            let window = hwnd.expect("successful tray setup has an HWND");
+            let window = hwnd.expect("successful client setup has an HWND");
             // Auto-reset and initially unset: every signal wakes the loop
             // exactly once. Created after the window exists, so a signal can
             // never arrive before there is something to show.
@@ -384,7 +383,7 @@ unsafe fn tray_worker(
                 if let Err(error) =
                     run_message_loop(window, HANDLE(shutdown_handle as *mut _), show_event)
                 {
-                    let _ = writeln!(std::io::stderr().lock(), "[tray] {error}");
+                    let _ = writeln!(std::io::stderr().lock(), "[client] {error}");
                 }
             }
             if let Some(event) = show_event {
@@ -411,14 +410,14 @@ unsafe fn tray_worker(
 }
 
 unsafe fn create(
-    context: &TrayContext,
+    context: &ClientContext,
     add_icon: bool,
     hwnd: &mut Option<HWND>,
     owned_icon: &mut Option<OwnedIcon>,
 ) -> Result<()> {
     let instance = GetModuleHandleW(None)?;
-    let class_name = w!("orange_tray_icon");
-    ensure_tray_class(instance.into())?;
+    let class_name = w!("orange_client_icon");
+    ensure_client_class(instance.into())?;
 
     // HWND_MESSAGE creates a message-only window: no pixels, never shown.
     let window = CreateWindowExW(
@@ -458,23 +457,23 @@ unsafe fn create(
     };
 
     SetLastError(ERROR_SUCCESS);
-    let context_ptr = context as *const TrayContext as isize;
+    let context_ptr = context as *const ClientContext as isize;
     let previous = SetWindowLongPtrW(window, GWLP_USERDATA, context_ptr);
     if previous == 0 {
         let error = GetLastError();
         if error != ERROR_SUCCESS {
-            anyhow::bail!("failed to install tray context (Win32 error {})", error.0);
+            anyhow::bail!("failed to install client context (Win32 error {})", error.0);
         }
     } else {
         SetWindowLongPtrW(window, GWLP_USERDATA, 0);
         let _ = writeln!(
             std::io::stderr().lock(),
-            "[tray] replaced unexpected existing window context"
+            "[client] replaced unexpected existing window context"
         );
-        anyhow::bail!("tray window unexpectedly had an existing context");
+        anyhow::bail!("client window unexpectedly had an existing context");
     }
 
-    let callback_message = tray_message()?;
+    let callback_message = client_message()?;
     if !add_icon {
         return Ok(());
     }
@@ -486,7 +485,7 @@ unsafe fn create(
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: callback_message,
         // Load the optical small-size entry from the multi-resolution icon;
-        // asking for the system tray metric avoids a blurry 32px downscale.
+        // asking for the system client metric avoids a blurry 32px downscale.
         hIcon: icon,
         ..Default::default()
     };
@@ -498,7 +497,7 @@ unsafe fn create(
     // the matching delete path. Deleting an icon that was not added is safe.
     context.icon_added.set(true);
     if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
-        anyhow::bail!("Shell_NotifyIcon refused to add the tray icon");
+        anyhow::bail!("Shell_NotifyIcon refused to add the client icon");
     }
     Ok(())
 }
@@ -509,7 +508,7 @@ unsafe fn run_message_loop(
     show_event: Option<HANDLE>,
 ) -> std::result::Result<(), String> {
     // Shutdown is always index 0. The show event is optional: without it the
-    // tray still works, a second launch just cannot raise this window.
+    // client still works, a second launch just cannot raise this window.
     let handles: Vec<HANDLE> = match show_event {
         Some(show) => vec![shutdown_event, show],
         None => vec![shutdown_event],
@@ -527,8 +526,8 @@ unsafe fn run_message_loop(
         if show_event.is_some() && wait.0 == WAIT_OBJECT_0.0 + 1 {
             // A second launch asked us to surface. The event auto-resets, so
             // there is nothing to clear. Emitting Show lands this on the same
-            // path as the tray menu's Open rather than a second one.
-            emit(hwnd, TrayEvent::Show);
+            // path as the client menu's Open rather than a second one.
+            emit(hwnd, ClientEvent::Show);
             continue;
         }
         if wait.0 == WAIT_OBJECT_0.0 + handles.len() as u32 {
@@ -571,15 +570,15 @@ unsafe fn run_message_loop(
     }
 }
 
-unsafe fn context_still_owned(hwnd: HWND, expected: *const TrayContext) -> bool {
+unsafe fn context_still_owned(hwnd: HWND, expected: *const ClientContext) -> bool {
     SetLastError(ERROR_SUCCESS);
-    let actual = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
+    let actual = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ClientContext;
     if actual.is_null() {
         let error = GetLastError();
         if error != ERROR_SUCCESS {
             let _ = writeln!(
                 std::io::stderr().lock(),
-                "[tray] could not verify failed-destroy HWND ownership (Win32 error {})",
+                "[client] could not verify failed-destroy HWND ownership (Win32 error {})",
                 error.0
             );
         }
@@ -588,8 +587,8 @@ unsafe fn context_still_owned(hwnd: HWND, expected: *const TrayContext) -> bool 
     actual == expected
 }
 
-unsafe fn destroy_window(hwnd: HWND, context: &TrayContext) -> Result<()> {
-    let expected = context as *const TrayContext;
+unsafe fn destroy_window(hwnd: HWND, context: &ClientContext) -> Result<()> {
+    let expected = context as *const ClientContext;
     let mut last_error = None;
     for attempt in 1..=DESTROY_ATTEMPTS {
         let result = DestroyWindow(hwnd);
@@ -599,7 +598,7 @@ unsafe fn destroy_window(hwnd: HWND, context: &TrayContext) -> Result<()> {
         };
         let _ = writeln!(
             std::io::stderr().lock(),
-            "[tray] owned HWND DestroyWindow attempt {attempt} failed: {error}"
+            "[client] owned HWND DestroyWindow attempt {attempt} failed: {error}"
         );
         last_error = Some(error);
         if attempt == DESTROY_ATTEMPTS {
@@ -610,7 +609,7 @@ unsafe fn destroy_window(hwnd: HWND, context: &TrayContext) -> Result<()> {
         if wait == WAIT_FAILED {
             let _ = writeln!(
                 std::io::stderr().lock(),
-                "[tray] cleanup message wait failed (Win32 error {})",
+                "[client] cleanup message wait failed (Win32 error {})",
                 GetLastError().0
             );
         }
@@ -627,7 +626,7 @@ unsafe fn destroy_window(hwnd: HWND, context: &TrayContext) -> Result<()> {
     }
     Err(last_error
         .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow::anyhow!("failed to destroy owned tray HWND")))
+        .unwrap_or_else(|| anyhow::anyhow!("failed to destroy owned client HWND")))
 }
 
 /// Runs `action` synchronously with the context installed for this HWND.
@@ -636,17 +635,17 @@ unsafe fn destroy_window(hwnd: HWND, context: &TrayContext) -> Result<()> {
 ///
 /// The HWND must be accessed on its creator thread. The action must not destroy
 /// the window or dispatch reentrant messages. A non-null `GWLP_USERDATA` must
-/// be the live `TrayContext` allocation installed by `create`.
+/// be the live `ClientContext` allocation installed by `create`.
 unsafe fn with_context<R>(
     hwnd: HWND,
-    action: impl for<'a> FnOnce(&'a TrayContext) -> R,
+    action: impl for<'a> FnOnce(&'a ClientContext) -> R,
 ) -> Option<R> {
-    let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
+    let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ClientContext;
     // SAFETY: The caller upholds the pointer validity and reentrancy contract.
     context.as_ref().map(action)
 }
 
-unsafe fn emit(hwnd: HWND, event: TrayEvent) {
+unsafe fn emit(hwnd: HWND, event: ClientEvent) {
     let _ = with_context(hwnd, |context| {
         if let Some(events) = context.events.borrow().as_ref() {
             let _ = events.send(event);
@@ -654,10 +653,10 @@ unsafe fn emit(hwnd: HWND, event: TrayEvent) {
     });
 }
 
-extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+extern "system" fn client_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            message if is_tray_message(message) => {
+            message if is_client_message(message) => {
                 let shutdown = with_context(hwnd, |context| {
                     let status = WaitForSingleObject(HANDLE(context.shutdown_event as *mut _), 0);
                     let error = (status == WAIT_FAILED).then(|| GetLastError().0);
@@ -672,7 +671,7 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     Some((status, error)) => {
                         let _ = writeln!(
                             std::io::stderr().lock(),
-                            "[tray] callback event wait returned {status:?}{}",
+                            "[client] callback event wait returned {status:?}{}",
                             error
                                 .map(|error| format!(" (Win32 error {error})"))
                                 .unwrap_or_default()
@@ -683,7 +682,7 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 // The mouse message arrives in the low word of lparam.
                 match (lparam.0 as u32) & 0xFFFF {
-                    x if x == WM_LBUTTONUP => emit(hwnd, TrayEvent::Show),
+                    x if x == WM_LBUTTONUP => emit(hwnd, ClientEvent::Show),
                     x if x == WM_RBUTTONUP => show_menu(hwnd),
                     _ => {}
                 }
@@ -691,14 +690,14 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             }
             WM_COMMAND => {
                 match wparam.0 & 0xFFFF {
-                    ID_SHOW => emit(hwnd, TrayEvent::Show),
-                    ID_QUIT => emit(hwnd, TrayEvent::Quit),
+                    ID_SHOW => emit(hwnd, ClientEvent::Show),
+                    ID_QUIT => emit(hwnd, ClientEvent::Quit),
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_DESTROY => {
-                let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
+                let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ClientContext;
                 SetLastError(ERROR_SUCCESS);
                 let previous = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if previous == 0 {
@@ -706,7 +705,7 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     if error != ERROR_SUCCESS {
                         let _ = writeln!(
                             std::io::stderr().lock(),
-                            "[tray] failed to clear tray context (Win32 error {})",
+                            "[client] failed to clear client context (Win32 error {})",
                             error.0
                         );
                     }
@@ -722,7 +721,7 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             WM_NCDESTROY => {
                 // Retry a failed WM_DESTROY clear while the worker-owned
                 // context is still live. Cleanup itself is idempotent.
-                let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
+                let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ClientContext;
                 if !context.is_null() {
                     SetLastError(ERROR_SUCCESS);
                     let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -748,7 +747,7 @@ static INSTANCE_CLAIM: OnceLock<OwnedHandle> = OnceLock::new();
 /// Clicking a pinned taskbar icon launches a fresh process whenever the app has
 /// no taskbar button - which is exactly the state the close button leaves it in,
 /// since it hides the window rather than quitting. Without this guard every such
-/// click started a rival process with its own tray icon, all of them writing the
+/// click started a rival process with its own client icon, all of them writing the
 /// same preferences file.
 pub fn defer_to_running_instance() -> bool {
     // `Local\` scopes the claim to the logon session, so two users on one
@@ -788,7 +787,7 @@ fn show_event_name() -> PCWSTR {
 /// Ask the instance holding the claim to bring its window up.
 ///
 /// This signals a named event rather than posting to the running instance's
-/// window. Its tray window is message-only, and `FindWindowEx` cannot resolve
+/// window. Its client window is message-only, and `FindWindowEx` cannot resolve
 /// that class name from another process - measured, not assumed: the window is
 /// there and enumerable as a child of the message-only parent, but every name
 /// lookup returns null, including one handed that parent explicitly. A named
@@ -815,7 +814,7 @@ fn signal_show_event(name: PCWSTR) -> bool {
     }
 }
 
-/// Hide the main window entirely, leaving the app alive in the tray.
+/// Hide the main window entirely, leaving the app alive in the client.
 ///
 /// GPUI exposes `minimize` but no per-window hide, so this goes through Win32.
 /// The handle is found by enumerating our own top-level windows and cached,
@@ -861,7 +860,7 @@ unsafe extern "system" fn find_proc(hwnd: HWND, lparam: LPARAM) -> windows::core
     if GetWindowRect(hwnd, &mut rect).is_err() {
         return windows::core::BOOL(1);
     }
-    // The message-only tray window has no size; the UI window does.
+    // The message-only client window has no size; the UI window does.
     if rect.right - rect.left > 100 && rect.bottom - rect.top > 100 {
         *out = Some(hwnd);
         return windows::core::BOOL(0);
@@ -902,7 +901,7 @@ unsafe fn show_menu(hwnd: HWND) {
 
 #[cfg(test)]
 mod tests {
-    use super::{retry_error_if_owned, tray_message, Tray};
+    use super::{client_message, retry_error_if_owned, Client};
     use std::cell::Cell;
     use std::os::windows::io::AsRawHandle;
     use std::process::Command;
@@ -1006,7 +1005,7 @@ mod tests {
             .args([
                 "--ignored",
                 "--exact",
-                "tray::tests::native_lifecycle_child",
+                "client::tests::native_lifecycle_child",
                 "--test-threads=1",
             ])
             .env(LIFECYCLE_CHILD, "1")
@@ -1017,13 +1016,13 @@ mod tests {
         if wait == WAIT_TIMEOUT {
             let kill = child.kill();
             let reap = child.wait();
-            panic!("tray lifecycle child exceeded five seconds; kill={kill:?}; wait={reap:?}");
+            panic!("client lifecycle child exceeded five seconds; kill={kill:?}; wait={reap:?}");
         }
         if wait != WAIT_OBJECT_0 {
             let kill = child.kill();
             let reap = child.wait();
             panic!(
-                "waiting for tray lifecycle child failed: {wait:?}; kill={kill:?}; wait={reap:?}"
+                "waiting for client lifecycle child failed: {wait:?}; kill={kill:?}; wait={reap:?}"
             );
         }
         assert!(child.wait().unwrap().success());
@@ -1036,9 +1035,9 @@ mod tests {
             return;
         }
 
-        let mut first = Tray::install_inner(false).expect("first tray should install");
+        let mut first = Client::install_inner(false).expect("first client should install");
         assert!(!first.worker.as_ref().unwrap().is_finished());
-        let callback = unsafe { tray_message().expect("wake message should be registered") };
+        let callback = unsafe { client_message().expect("wake message should be registered") };
         let delivered = unsafe {
             SendMessageTimeoutW(
                 windows::Win32::Foundation::HWND(first.hwnd as *mut _),
@@ -1055,7 +1054,7 @@ mod tests {
             !first.worker.as_ref().unwrap().is_finished(),
             "an unsignaled instance event must reject the wake"
         );
-        first.shutdown().expect("first tray should shut down");
+        first.shutdown().expect("first client should shut down");
         assert!(first.worker.is_none());
         assert_eq!(
             first.try_recv(),
@@ -1065,7 +1064,7 @@ mod tests {
             .shutdown()
             .expect("repeated shutdown should be harmless");
 
-        let mut second = Tray::install_inner(false).expect("second tray should install");
+        let mut second = Client::install_inner(false).expect("second client should install");
         let thread_id = unsafe {
             GetWindowThreadProcessId(
                 windows::Win32::Foundation::HWND(second.hwnd as *mut _),
@@ -1086,21 +1085,22 @@ mod tests {
         );
 
         let owner = std::rc::Rc::new(std::cell::RefCell::new(Some(
-            Tray::install_inner(false).expect("app-owned tray should install"),
+            Client::install_inner(false).expect("app-owned client should install"),
         )));
-        crate::shutdown_owned_tray(&owner).expect("app-owned tray should shut down");
+        crate::shutdown_owned_client(&owner).expect("app-owned client should shut down");
         assert!(owner.borrow().is_none());
 
         let final_owner = std::rc::Rc::new(std::cell::RefCell::new(Some(
-            Tray::install_inner(false).expect("final app tray should install"),
+            Client::install_inner(false).expect("final app client should install"),
         )));
-        crate::finish_owned_tray(&final_owner).expect("outer app owner should finish shutdown");
+        crate::finish_owned_client(&final_owner).expect("outer app owner should finish shutdown");
         assert!(final_owner.borrow().is_none());
 
-        drop(Tray::install_inner(false).expect("drop-owned tray should install"));
-        let mut after_drop = Tray::install_inner(false).expect("install after Drop should succeed");
+        drop(Client::install_inner(false).expect("drop-owned client should install"));
+        let mut after_drop =
+            Client::install_inner(false).expect("install after Drop should succeed");
         after_drop
             .shutdown()
-            .expect("post-Drop tray should shut down");
+            .expect("post-Drop client should shut down");
     }
 }

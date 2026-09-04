@@ -8,7 +8,7 @@ $checks = [ordered]@{
     "StorageV2" = '--kind\s+StorageV2'
     "Standard LRS" = '--sku\s+Standard_LRS'
     # This account name is compiled into every shipped client
-    # (orange-tray/src/update.rs). Changing it strands their update path.
+    # (orange-client/src/update.rs). Changing it strands their update path.
     "pinned release account" = 'orangealpha0d8d5893e69a3'
     "public releases container" = 'container create[\s\S]*--name\s+releases[\s\S]*--public-access\s+blob'
     "single replica pinned" = '--min-replicas\s+1[\s\S]*--max-replicas\s+1'

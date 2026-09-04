@@ -1,4 +1,4 @@
-use super::{tray, update, Orange, Screen};
+use super::{client, update, Orange, Screen};
 use crate::{
     presence::Presence,
     sound,
@@ -324,7 +324,7 @@ impl Orange {
                         },
                     ))
                     // Close hides the window completely - no taskbar entry -
-                    // while the app keeps running in the tray. Minimise is a
+                    // while the app keeps running in the client. Minimise is a
                     // normal minimise; the two should not do the same thing.
                     .child(
                         titlebar_button("close", "×", DANGER_HOVER).on_click(cx.listener(
@@ -332,8 +332,8 @@ impl Orange {
                                 if this.screen == Screen::PickWindow {
                                     this.leave_picker(Screen::Home);
                                 }
-                                if this.tray_available {
-                                    tray::hide_main_window();
+                                if this.client_available {
+                                    client::hide_main_window();
                                 } else {
                                     cx.quit();
                                 }

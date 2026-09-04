@@ -4068,6 +4068,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "orange-client"
+version = "0.8.3"
+dependencies = [
+ "anyhow",
+ "embed-resource",
+ "gpui",
+ "image",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "orange-relay"
 version = "0.8.3"
 dependencies = [
@@ -4091,23 +4108,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tower",
-]
-
-[[package]]
-name = "orange-tray"
-version = "0.8.3"
-dependencies = [
- "anyhow",
- "embed-resource",
- "gpui",
- "image",
- "reqwest",
- "semver",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "windows 0.62.2",
 ]
 
 [[package]]

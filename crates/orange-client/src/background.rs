@@ -1,4 +1,4 @@
-use crate::{capture, tray};
+use crate::{capture, client};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -63,7 +63,7 @@ pub(super) fn join_background_worker(worker: JoinHandle<()>, timeout: Duration, 
     let deadline = Instant::now() + timeout;
     while !worker.is_finished() {
         if Instant::now() >= deadline {
-            tray::fail_fast(
+            client::fail_fast(
                 &format!("{name} worker did not terminate before its deadline"),
                 &anyhow::anyhow!("timeout after {timeout:?}"),
             );
@@ -71,7 +71,7 @@ pub(super) fn join_background_worker(worker: JoinHandle<()>, timeout: Duration, 
         std::thread::sleep(Duration::from_millis(5));
     }
     if worker.join().is_err() {
-        eprintln!("[tray] {name} worker panicked");
+        eprintln!("[client] {name} worker panicked");
     }
 }
 
@@ -158,7 +158,7 @@ pub(super) fn stop_avatar_job(job: &mut Option<AvatarJob>) {
 /// One worker fetching sequentially rather than a thread per friend: a roster
 /// is unbounded and each fetch already allows a 4 MiB body, so the parallel
 /// form would let a large friend list decide how much memory and how many
-/// sockets the tray uses.
+/// sockets the client uses.
 pub(super) struct FriendAvatarJob {
     cancel: Arc<AtomicBool>,
     pub(super) receiver: mpsc::Receiver<(String, capture::Thumbnail)>,

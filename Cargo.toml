@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/orange-signal", "crates/orange-relay", "crates/orange", "crates/orange-tray", "crates/orange-updater"]
+members = ["crates/orange-signal", "crates/orange-relay", "crates/orange", "crates/orange-client", "crates/orange-updater"]
 
 [workspace.package]
 version = "0.8.3"

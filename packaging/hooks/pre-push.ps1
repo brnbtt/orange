@@ -1,4 +1,4 @@
-# Fast pre-push gate. Deliberately excludes `orange` and `orange-tray`: they
+# Fast pre-push gate. Deliberately excludes `orange` and `orange-client`: they
 # pull in GStreamer, GPUI and resvg, and a hook slow enough to be annoying is a
 # hook that gets bypassed. Those crates are covered by the full suite that
 # ship.ps1 runs before it commits anything.

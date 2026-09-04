@@ -18,7 +18,7 @@ $checks = [ordered]@{
     "no task page" = '(?m)^\[Tasks\]\s*$'
     "bundled media runtime" = 'Source: "\.\.\\\.\.\\target\\package\\gstreamer\\\*"; DestDir: "\{app\}\\gstreamer"[^\r\n]*recursesubdirs'
     "media runtime staged before Inno" = 'Copy-GStreamerRuntime[\s\S]*& \$iscc'
-    "updater release build" = 'cargo build --locked --release -p orange -p orange-tray -p orange-updater'
+    "updater release build" = 'cargo build --locked --release -p orange -p orange-client -p orange-updater'
     "beta build channel" = 'ORANGE_UPDATE_CHANNEL\s*=\s*"beta"'
     "automatic install click" = 'CurPageID\s*=\s*wpReady[\s\S]*PostMessage\(WizardForm\.NextButton\.Handle,\s*CN_COMMAND'
 }

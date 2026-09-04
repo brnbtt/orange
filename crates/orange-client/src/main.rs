@@ -1,4 +1,4 @@
-//! orange tray - the host-side UI.
+//! orange client - the host-side UI.
 //!
 //! GPUI fits here precisely because there is no video: this is ordinary UI.
 //! The viewer window stays native because GPUI's `Surface` element has no
@@ -10,11 +10,11 @@
 
 mod background;
 mod capture;
+mod client;
 mod presence;
 mod session;
 mod sound;
 mod supervisor;
-mod tray;
 mod ui;
 mod update;
 mod view;
@@ -103,7 +103,7 @@ fn poll_login(
 const COPIED_FOR: Duration = Duration::from_secs(2);
 
 struct Orange {
-    tray_available: bool,
+    client_available: bool,
     screen: Screen,
     session: Option<session::Session>,
     windows: Vec<WindowTarget>,
@@ -180,7 +180,7 @@ struct Orange {
 /// `tick` runs twice a second whether or not anything happened, and used to
 /// end in an unconditional `cx.notify()`. That re-rendered every element in
 /// the app twice a second forever, including while the window was hidden in
-/// the tray and there was nobody to show it to.
+/// the client and there was nobody to show it to.
 ///
 /// Comparing two of these costs a few dozen bytes and a handful of integer
 /// compares, and turns a permanent background repaint into one that happens
@@ -377,7 +377,7 @@ impl Orange {
 }
 
 impl Orange {
-    fn new(cx: &mut Context<Self>, tray_available: bool) -> Self {
+    fn new(cx: &mut Context<Self>, client_available: bool) -> Self {
         update::cleanup_helpers();
         // The UI reflects state owned by child processes, so poll rather than
         // trying to push updates across process boundaries.
@@ -413,7 +413,7 @@ impl Orange {
         );
         let updates = update::UpdateController::new();
         Self {
-            tray_available,
+            client_available,
             screen: if session.is_some() {
                 Screen::Home
             } else {
@@ -971,35 +971,35 @@ impl Drop for Orange {
     }
 }
 
-type TrayOwner = Rc<RefCell<Option<tray::Tray>>>;
+type ClientOwner = Rc<RefCell<Option<client::Client>>>;
 
-fn shutdown_owned_tray(owner: &TrayOwner) -> anyhow::Result<()> {
-    shutdown_owned_tray_with(owner, tray::Tray::shutdown)
+fn shutdown_owned_client(owner: &ClientOwner) -> anyhow::Result<()> {
+    shutdown_owned_client_with(owner, client::Client::shutdown)
 }
 
-fn finish_owned_tray(owner: &TrayOwner) -> anyhow::Result<()> {
-    shutdown_owned_tray_with(owner, tray::Tray::shutdown_final)
+fn finish_owned_client(owner: &ClientOwner) -> anyhow::Result<()> {
+    shutdown_owned_client_with(owner, client::Client::shutdown_final)
 }
 
-fn shutdown_owned_tray_with(
-    owner: &TrayOwner,
-    shutdown: impl FnOnce(&mut tray::Tray) -> anyhow::Result<()>,
+fn shutdown_owned_client_with(
+    owner: &ClientOwner,
+    shutdown: impl FnOnce(&mut client::Client) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let Some(mut tray) = owner.borrow_mut().take() else {
+    let Some(mut client) = owner.borrow_mut().take() else {
         return Ok(());
     };
-    if let Err(error) = shutdown(&mut tray) {
-        owner.borrow_mut().replace(tray);
+    if let Err(error) = shutdown(&mut client) {
+        owner.borrow_mut().replace(client);
         return Err(error);
     }
     Ok(())
 }
 
 fn main() {
-    // Must precede every window so the tray and viewer processes share one
+    // Must precede every window so the client and viewer processes share one
     // taskbar group despite being different executables.
     if let Err(error) = set_taskbar_identity() {
-        eprintln!("[tray] could not set taskbar identity: {error}");
+        eprintln!("[client] could not set taskbar identity: {error}");
     }
 
     // Diagnostic: capture every window and report, since a windowsgui binary
@@ -1029,25 +1029,25 @@ fn main() {
     }
 
     // A second launch should surface the window that already exists rather than
-    // start a rival process. Checked before the tray so the loser exits without
+    // start a rival process. Checked before the client so the loser exits without
     // ever adding a second icon.
-    if tray::defer_to_running_instance() {
+    if client::defer_to_running_instance() {
         return;
     }
 
     // Installed before the UI so a failure here is visible as a missing icon
     // rather than a half-started app.
-    let tray_owner = Rc::new(RefCell::new(tray::Tray::install().ok()));
-    let tray_available = tray_owner.borrow().is_some();
-    let app_tray_owner = Rc::clone(&tray_owner);
+    let client_owner = Rc::new(RefCell::new(client::Client::install().ok()));
+    let client_available = client_owner.borrow().is_some();
+    let app_client_owner = Rc::clone(&client_owner);
 
     Application::new().run(move |cx: &mut App| {
-        let quit_owner = Rc::clone(&app_tray_owner);
+        let quit_owner = Rc::clone(&app_client_owner);
         cx.on_app_quit(move |_| {
             let quit_owner = Rc::clone(&quit_owner);
             async move {
-                if let Err(error) = shutdown_owned_tray(&quit_owner) {
-                    eprintln!("[tray] app-quit shutdown failed: {error:#}");
+                if let Err(error) = shutdown_owned_client(&quit_owner) {
+                    eprintln!("[client] app-quit shutdown failed: {error:#}");
                 }
             }
         })
@@ -1075,17 +1075,17 @@ fn main() {
                     is_resizable: false,
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| Orange::new(cx, tray_available)),
+                |_, cx| cx.new(|cx| Orange::new(cx, client_available)),
             )
             .unwrap();
         cx.activate(true);
 
-        // Closing the window hides it instead of quitting: a tray app should
-        // keep streaming when its window is dismissed. Quit lives in the tray
+        // Closing the window hides it instead of quitting: a client app should
+        // keep streaming when its window is dismissed. Quit lives in the client
         // menu.
         let _ = window.update(cx, |_, window, cx| {
             window.on_window_should_close(cx, move |window, _cx| {
-                if tray_available {
+                if client_available {
                     window.minimize_window();
                     false
                 } else {
@@ -1094,24 +1094,24 @@ fn main() {
             });
         });
 
-        // The tray runs its own Win32 message loop on another thread, so its
+        // The client runs its own Win32 message loop on another thread, so its
         // events arrive over a channel and are drained on a timer here.
-        if tray_available {
-            let event_owner = Rc::clone(&app_tray_owner);
+        if client_available {
+            let event_owner = Rc::clone(&app_client_owner);
             cx.spawn(async move |cx| loop {
                 Timer::after(Duration::from_millis(200)).await;
                 loop {
-                    let event = match event_owner.borrow().as_ref().map(tray::Tray::try_recv) {
+                    let event = match event_owner.borrow().as_ref().map(client::Client::try_recv) {
                         None => return,
                         Some(Ok(event)) => event,
                         Some(Err(std::sync::mpsc::TryRecvError::Empty)) => break,
                         Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => return,
                     };
                     match event {
-                        tray::TrayEvent::Show => {
+                        client::ClientEvent::Show => {
                             // The window may be hidden rather than merely
                             // unfocused, so un-hide before activating.
-                            tray::show_main_window();
+                            client::show_main_window();
                             let _ = cx.update(|cx| {
                                 let _ = window.update(cx, |view, window, cx| {
                                     view.logo_epoch = view.logo_epoch.wrapping_add(1);
@@ -1120,9 +1120,9 @@ fn main() {
                                 });
                             });
                         }
-                        tray::TrayEvent::Quit => {
-                            if let Err(error) = shutdown_owned_tray(&event_owner) {
-                                eprintln!("[tray] tray-quit shutdown failed: {error:#}");
+                        client::ClientEvent::Quit => {
+                            if let Err(error) = shutdown_owned_client(&event_owner) {
+                                eprintln!("[client] client-quit shutdown failed: {error:#}");
                             }
                             let _ = cx.update(|cx| cx.quit());
                             return;
@@ -1134,9 +1134,9 @@ fn main() {
         }
     });
 
-    if let Err(error) = finish_owned_tray(&tray_owner) {
-        tray::fail_fast(
-            "final app shutdown could not clean up tray ownership",
+    if let Err(error) = finish_owned_client(&client_owner) {
+        client::fail_fast(
+            "final app shutdown could not clean up client ownership",
             &error,
         );
     }

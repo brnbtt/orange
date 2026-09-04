@@ -1,6 +1,6 @@
 //! Design tokens: colour, type, metrics and motion.
 //!
-//! Everything visual in the tray resolves to something in this file. The
+//! Everything visual in the client resolves to something in this file. The
 //! video overlay in the `orange` crate mirrors these values by hand, in
 //! floats, because tiny-skia and GPUI share no colour type - `overlay/raster.rs`
 //! carries the hex on each line so the two can be diffed by eye.

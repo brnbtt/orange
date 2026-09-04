@@ -92,7 +92,7 @@ function Get-OptionalNativeJson {
 function Get-WorkspaceVersion {
     $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw "Could not read the workspace version" }
-    ($metadata.packages | Where-Object name -eq "orange-tray").version
+    ($metadata.packages | Where-Object name -eq "orange-client").version
 }
 
 # Fails in seconds on the two mistakes that otherwise surface only after a full

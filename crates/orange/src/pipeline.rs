@@ -1,6 +1,6 @@
 //! The capture and encode pipeline.
 //!
-//! The tray prefers H.265 and selects the first hardware encoder that can link
+//! The client prefers H.265 and selects the first hardware encoder that can link
 //! directly to the D3D11 conversion path. Explicit CLI codec choices stay strict.
 //!
 //! The property that makes it cheap is that frames never leave VRAM.
@@ -200,10 +200,10 @@ impl Default for CaptureSettings {
 /// stream. Capturing the whole output device would pick all of that up.
 ///
 /// A pid of zero means whole-screen sharing, where capturing everything the
-/// machine plays is the expected behaviour - with one exception. The tray plays
+/// machine plays is the expected behaviour - with one exception. The client plays
 /// short cues when a viewer arrives or leaves, and those are meant for the
 /// person hosting, not for the people watching them. `exclude_pid` carries the
-/// tray's own process id so that one tree can be left out while everything else
+/// client's own process id so that one tree can be left out while everything else
 /// is still captured.
 ///
 /// Opus at 128 kbps stereo is transparent enough for games and is a rounding
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn sharing_one_window_captures_only_that_window() {
         // Scoping to the shared app is what keeps voice chat and music out of
-        // the stream, and it has to win even when a tray pid is offered: there
+        // the stream, and it has to win even when a client pid is offered: there
         // is nothing to exclude from a capture that is already this narrow.
         let chain = build_audio_chain(42, Some(7));
         assert!(chain.contains("loopback-mode=include-process-tree loopback-target-pid=42"));
@@ -603,13 +603,13 @@ mod tests {
     #[test]
     fn sharing_the_whole_screen_captures_everything_except_our_own_cues() {
         // Whole-screen sharing is meant to pick up everything the machine
-        // plays. The tray's cues are the exception: a chime that says "someone
+        // plays. The client's cues are the exception: a chime that says "someone
         // joined" is for the person hosting, and broadcasting it to everyone
         // already watching is the opposite of feedback.
         let chain = build_audio_chain(0, Some(7));
         assert!(chain.contains("loopback-mode=exclude-process-tree loopback-target-pid=7"));
 
-        // Run without a tray - `orange host` from a shell - and there is no
+        // Run without a client - `orange host` from a shell - and there is no
         // process making cues, so nothing is excluded.
         let unattended = build_audio_chain(0, None);
         assert!(!unattended.contains("loopback-mode"));

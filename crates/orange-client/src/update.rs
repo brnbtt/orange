@@ -133,7 +133,7 @@ impl UpdateJob {
         let deadline = Instant::now() + UPDATE_JOIN_TIMEOUT;
         while !worker.is_finished() {
             if Instant::now() >= deadline {
-                crate::tray::fail_fast(
+                crate::client::fail_fast(
                     "update worker did not terminate before its deadline",
                     &anyhow::anyhow!("timeout after {UPDATE_JOIN_TIMEOUT:?}"),
                 );
@@ -141,7 +141,7 @@ impl UpdateJob {
             std::thread::sleep(Duration::from_millis(5));
         }
         if worker.join().is_err() {
-            eprintln!("[tray] update worker panicked");
+            eprintln!("[client] update worker panicked");
         }
     }
 }
@@ -1370,7 +1370,7 @@ mod tests {
         let temporary = directory.path().join("temporary");
         std::fs::create_dir_all(&install_dir).unwrap();
         std::fs::create_dir_all(&temporary).unwrap();
-        std::fs::write(install_dir.join("orange-tray.exe"), b"tray").unwrap();
+        std::fs::write(install_dir.join("orange-tray.exe"), b"client").unwrap();
         std::fs::write(install_dir.join("orange-updater.exe"), b"updater").unwrap();
         std::fs::write(install_dir.join("vcruntime140.dll"), b"runtime").unwrap();
         let installer = directory.path().join("orange-setup-0.2.0-beta.2.exe");
