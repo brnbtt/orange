@@ -321,7 +321,7 @@ pub fn build_receive_branch(
         .element
         .static_pad("src")
         .context("decoder has no src pad")?;
-    if let Some(progress) = progress {
+    if let Some(progress) = &progress {
         track_pad(
             &depay
                 .element
@@ -338,7 +338,7 @@ pub fn build_receive_branch(
             MediaStage::Parsed,
             progress.clone(),
         );
-        track_pad(&decoded_pad, MediaStage::Decoded, progress);
+        track_pad(&decoded_pad, MediaStage::Decoded, progress.clone());
     }
     if let Some(playback) = window_playback {
         notify_on_first_buffer(&decoded_pad, move || {
@@ -370,6 +370,19 @@ pub fn build_receive_branch(
 
             let sink = build_video_sink(diagnostic_role)?;
             attach_video_sink_to_playback(&sink, &playback)?;
+            // Probed at the sink rather than at the decoder, so the timestamp
+            // pairs with the audio sink's and their difference is the offset a
+            // viewer actually perceives.
+            if let Some(progress) = &progress {
+                track_pad(
+                    &sink
+                        .element
+                        .static_pad("sink")
+                        .context("video sink has no sink pad")?,
+                    MediaStage::VideoSinkInput,
+                    progress.clone(),
+                );
+            }
 
             vec![queue, composition, sink]
         }

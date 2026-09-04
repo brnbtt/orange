@@ -32,6 +32,19 @@ struct WebRtcReport {
     outbound_video: Option<OutboundRtpStats>,
     inbound_audio: Option<InboundRtpStats>,
     outbound_audio: Option<OutboundRtpStats>,
+    /// RTP streams whose media type could not be established.
+    ///
+    /// `inbound_audio` was null in every sample of a session whose audio was
+    /// demonstrably flowing, which made an audio transport fault undiagnosable
+    /// from these logs. Rather than assume why, count the streams that fall
+    /// through so the next log says whether classification is still the
+    /// problem.
+    #[serde(skip_serializing_if = "is_zero")]
+    unclassified_streams: u64,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -72,10 +85,17 @@ fn parse_webrtc_stats(stats: &gst::StructureRef) -> WebRtcReport {
         let Ok(sample) = value.get::<gst::Structure>() else {
             continue;
         };
-        let Ok(media) = sample.get::<String>("kind") else {
+        let Ok(kind) = sample.get::<gst_webrtc::WebRTCStatsType>("type") else {
             continue;
         };
-        let Ok(kind) = sample.get::<gst_webrtc::WebRTCStatsType>("type") else {
+        if !matches!(
+            kind,
+            gst_webrtc::WebRTCStatsType::InboundRtp | gst_webrtc::WebRTCStatsType::OutboundRtp
+        ) {
+            continue;
+        }
+        let Some(media) = media_kind(&sample, stats) else {
+            report.unclassified_streams += 1;
             continue;
         };
         match kind {
@@ -83,7 +103,10 @@ fn parse_webrtc_stats(stats: &gst::StructureRef) -> WebRtcReport {
                 let inbound = match media.as_str() {
                     "video" => &mut report.inbound_video,
                     "audio" => &mut report.inbound_audio,
-                    _ => continue,
+                    _ => {
+                        report.unclassified_streams += 1;
+                        continue;
+                    }
                 }
                 .get_or_insert_with(InboundRtpStats::default);
                 accumulate_inbound(inbound, &sample);
@@ -92,7 +115,10 @@ fn parse_webrtc_stats(stats: &gst::StructureRef) -> WebRtcReport {
                 let outbound = match media.as_str() {
                     "video" => &mut report.outbound_video,
                     "audio" => &mut report.outbound_audio,
-                    _ => continue,
+                    _ => {
+                        report.unclassified_streams += 1;
+                        continue;
+                    }
                 }
                 .get_or_insert_with(OutboundRtpStats::default);
                 accumulate_outbound(outbound, &sample);
@@ -101,6 +127,23 @@ fn parse_webrtc_stats(stats: &gst::StructureRef) -> WebRtcReport {
         }
     }
     report
+}
+
+/// Establish whether an RTP stream stat describes audio or video.
+///
+/// `kind` is what webrtcbin is supposed to carry, and it is what video arrives
+/// with. Audio reached the viewer perfectly well in a session where every
+/// sample still reported no inbound audio, so `kind` cannot be the only route:
+/// fall back to the codec the stream references, whose mime type names the
+/// media directly.
+fn media_kind(sample: &gst::StructureRef, stats: &gst::StructureRef) -> Option<String> {
+    if let Ok(kind) = sample.get::<String>("kind") {
+        return Some(kind);
+    }
+    let codec_id = sample.get::<String>("codec-id").ok()?;
+    let codec = stats.get::<gst::Structure>(&codec_id).ok()?;
+    let mime = codec.get::<String>("mime-type").ok()?;
+    Some(mime.split('/').next()?.to_ascii_lowercase())
 }
 
 fn accumulate_inbound(inbound: &mut InboundRtpStats, sample: &gst::StructureRef) {
@@ -331,5 +374,61 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("inbound-sensitive-id"));
         assert!(!json.contains("203.0.113.10"));
+        // Everything classified, so the escape hatch stays out of the payload.
+        assert_eq!(report.unclassified_streams, 0);
+        assert!(!json.contains("unclassified_streams"));
+    }
+
+    #[test]
+    fn a_stream_without_a_kind_is_classified_by_its_codec() {
+        // Audio was flowing perfectly in a session that reported no inbound
+        // audio for its whole 29 minutes, so `kind` is not always present.
+        gst::init().unwrap();
+        let codec = gst::Structure::builder("codec-for-opus")
+            .field("type", gst_webrtc::WebRTCStatsType::Codec)
+            .field("mime-type", "audio/OPUS")
+            .field("payload-type", 111u32)
+            .build();
+        let inbound = gst::Structure::builder("inbound-audio")
+            .field("type", gst_webrtc::WebRTCStatsType::InboundRtp)
+            .field("codec-id", "codec-for-opus")
+            .field("packets-received", 1_000u64)
+            .build();
+        let stats = gst::Structure::builder("application/x-webrtc-stats")
+            .field("codec-for-opus", codec)
+            .field("inbound-audio-id", inbound)
+            .build();
+
+        let report = parse_webrtc_stats(&stats);
+
+        assert_eq!(
+            report.inbound_audio.as_ref().unwrap().packets_received,
+            1_000
+        );
+        assert!(report.inbound_video.is_none());
+        assert_eq!(report.unclassified_streams, 0);
+    }
+
+    #[test]
+    fn a_stream_that_cannot_be_classified_is_counted_rather_than_dropped() {
+        // Silently skipping is what made the null inbound audio impossible to
+        // explain from a log. If the fallback misses too, the count says so.
+        gst::init().unwrap();
+        let inbound = gst::Structure::builder("inbound-mystery")
+            .field("type", gst_webrtc::WebRTCStatsType::InboundRtp)
+            .field("packets-received", 500u64)
+            .build();
+        let stats = gst::Structure::builder("application/x-webrtc-stats")
+            .field("inbound-mystery-id", inbound)
+            .build();
+
+        let report = parse_webrtc_stats(&stats);
+
+        assert!(report.inbound_audio.is_none());
+        assert!(report.inbound_video.is_none());
+        assert_eq!(report.unclassified_streams, 1);
+        assert!(serde_json::to_string(&report)
+            .unwrap()
+            .contains("unclassified_streams"));
     }
 }
