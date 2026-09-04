@@ -80,7 +80,11 @@ Five things that are not obvious:
    Untracked files are fine.
 3. **`ConfirmImpact` is `High`.** Non-interactive runs need `-Confirm:$false` or
    they hang on a prompt.
-4. **Never pipe it through `2>&1 |`.** It sets `ErrorActionPreference = "Stop"`,
+4. **It calls a bare `git`, which is not on `PATH` here.** Without MinGit
+   prepended it dies immediately with `CommandNotFoundException` at
+   "Checking the working tree". Prepend it first:
+   `$env:PATH = "$(Split-Path $git);$env:PATH"`.
+5. **Never pipe it through `2>&1 |`.** It sets `ErrorActionPreference = "Stop"`,
    and merging a native command's stderr into the pipeline turns cargo's
    ordinary `Compiling ...` progress into a terminating error. It will die
    mid-run for no real reason. Let it write to the console.
@@ -90,7 +94,7 @@ Five things that are not obvious:
    this command has been altered by the following extension: containerapp` to
    stderr on every single run. Piped, the deploy dies on that line before it
    builds anything.
-5. **If it fails, check before assuming damage.** Everything that can fail
+6. **If it fails, check before assuming damage.** Everything that can fail
    cheaply runs before anything mutates the repo, so an early failure leaves the
    version, the commits and the remote untouched. Verify with `git log` and
    `Cargo.toml` rather than guessing.
