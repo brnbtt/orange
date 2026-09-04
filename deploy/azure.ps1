@@ -23,7 +23,9 @@ param(
     # The name is baked into shipped clients (orange-client/src/update.rs) and so
     # can never change without stranding their update path. The "alpha" in it is
     # historical; the alpha channel is gone.
-    [string]$ReleaseStorageAccount = "orangealpha0d8d5893e69a3"
+    [string]$ReleaseStorageAccount = "orangealpha0d8d5893e69a3",
+    # Sessions live here so a deploy stops signing everyone out.
+    [string]$SessionTable = "sessions"
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,6 +72,25 @@ az storage container create `
     --only-show-errors | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "release container provisioning failed" }
 
+# Sessions outlive the relay process. Everything else it holds belongs to a
+# connection and dies with it, but a session is the only thing a user cannot
+# recreate without leaving the app, so keeping it in memory meant every deploy
+# signed everyone out. Table Storage in the account that already exists: no new
+# resource, no idle charge, and billed per operation on a few writes a day.
+Step "Session table $SessionTable"
+az storage table create `
+    --name $SessionTable `
+    --account-name $ReleaseStorageAccount `
+    --auth-mode key `
+    --only-show-errors | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "session table provisioning failed" }
+
+$storageKey = az storage account keys list `
+    --account-name $ReleaseStorageAccount `
+    --resource-group $ResourceGroup `
+    --query "[0].value" -o tsv
+if ($LASTEXITCODE -ne 0 -or -not $storageKey) { throw "could not read the storage account key" }
+
 # --- deploy ------------------------------------------------------------------
 # `--source` builds in the cloud, so no local Docker daemon is needed.
 Step "Building and deploying (this takes a few minutes the first time)"
@@ -88,10 +109,31 @@ try {
 }
 finally { Pop-Location }
 
+Step "Session storage configuration"
+# The key is a secret reference rather than a plain env var, so it does not
+# appear in `az containerapp show` output or the portal's environment listing.
+az containerapp secret set `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --secrets "table-key=$storageKey" `
+    --only-show-errors | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "storing the table key failed" }
+
+az containerapp update `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --set-env-vars `
+        "ORANGE_TABLE_ACCOUNT=$ReleaseStorageAccount" `
+        "ORANGE_TABLE_NAME=$SessionTable" `
+        "ORANGE_TABLE_KEY=secretref:table-key" `
+    --only-show-errors | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "session storage configuration failed" }
+
 Step "Pinning to a single always-on replica"
 # One replica keeps WebSocket state coherent: rooms live in memory, so two
 # replicas behind the same ingress could put host and viewer on different
-# instances and they would never find each other.
+# instances and they would never find each other. Sessions are durable now,
+# but rooms are not, so this constraint is unchanged.
 az containerapp update `
     --name $AppName `
     --resource-group $ResourceGroup `
@@ -112,7 +154,7 @@ Write-Host ""
 Write-Host "Host:  orange host --hwnd <id> --server wss://$fqdn"
 Write-Host "Watch: orange watch --code <CODE> --server wss://$fqdn"
 Write-Host ""
-Write-Host "Deploying drops every live room and signs everyone out: relay state is in memory." -ForegroundColor DarkGray
+Write-Host "Deploying drops every live room: rooms are in memory. Sessions now survive." -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Do NOT tear down with 'az group delete --name $ResourceGroup'." -ForegroundColor Yellow
 Write-Host "That would also destroy $ReleaseStorageAccount, which holds every published" -ForegroundColor DarkGray

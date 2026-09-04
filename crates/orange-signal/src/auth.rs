@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
 /// How long an unclaimed login attempt stays valid.
@@ -121,7 +121,10 @@ impl Pending {
 
 struct StoredSession {
     identity: Identity,
-    created_at: Instant,
+    /// Wall clock, not `Instant`: a session outlives the process now, and a
+    /// monotonic clock restarts with it -- every 30-day session would have had
+    /// its timer reset by each deploy.
+    created_at: SystemTime,
 }
 
 #[derive(Default)]
@@ -138,6 +141,12 @@ pub struct Auth {
     config: Option<DiscordConfig>,
     state: Arc<Mutex<AuthState>>,
     http: reqwest::Client,
+    /// Durable backing for `sessions`, when configured.
+    ///
+    /// Memory stays the read path; this is only consulted on a miss, so the
+    /// steady-state cost is nothing and a relay restart costs one lookup per
+    /// returning user rather than a forced re-login for all of them.
+    store: Option<crate::store::TableStore>,
 }
 
 impl Auth {
@@ -150,7 +159,15 @@ impl Auth {
                 .timeout(DISCORD_REQUEST_TIMEOUT)
                 .build()
                 .expect("constant Discord HTTP client configuration is valid"),
+            store: crate::store::TableStore::from_env(),
         }
+    }
+
+    /// Whether sessions survive a restart. Reported at startup so a deploy
+    /// that silently lost its storage configuration is visible immediately,
+    /// rather than the next time everyone is signed out.
+    pub fn durable(&self) -> bool {
+        self.store.is_some()
     }
 
     pub fn enabled(&self) -> bool {
@@ -191,9 +208,29 @@ impl Auth {
 
         let result = self.exchange(config, code).await;
 
-        let mut auth = self.state.lock().await;
-        auth.expire_pending(state, Instant::now());
-        auth.finish_completion(state, result)
+        let (identity, minted) = {
+            let mut auth = self.state.lock().await;
+            auth.expire_pending(state, Instant::now());
+            let identity = auth.finish_completion(state, result)?;
+            let minted = match auth.pending.get(state) {
+                Some(Pending::Ready { session, .. }) => Some(session.clone()),
+                _ => None,
+            };
+            (identity, minted)
+        };
+
+        // Persisted after the lock is released, and only best-effort: a login
+        // that works but is not written down still works until the next
+        // restart, which is strictly better than refusing the login outright.
+        if let (Some(store), Some(session)) = (self.store.as_ref(), minted) {
+            if let Err(error) = store
+                .put_session(&session, &identity, SystemTime::now())
+                .await
+            {
+                eprintln!("[auth] session was not persisted: {error:#}");
+            }
+        }
+        Ok(identity)
     }
 
     /// Terminalize a browser cancellation so the desktop poller does not wait
@@ -301,12 +338,50 @@ impl Auth {
     }
 
     /// Who a session belongs to, if it is still valid.
+    ///
+    /// Memory first, then the durable store. The store is only reached on a
+    /// miss, so a warm relay never touches it and a cold one pays a single
+    /// lookup per returning user.
     pub async fn identify(&self, session: &str) -> Option<Identity> {
-        let mut auth = self.state.lock().await;
-        auth.expire_session(session, Instant::now());
-        auth.sessions
-            .get(session)
-            .map(|stored| stored.identity.clone())
+        {
+            let mut auth = self.state.lock().await;
+            auth.expire_session(session, SystemTime::now());
+            if let Some(stored) = auth.sessions.get(session) {
+                return Some(stored.identity.clone());
+            }
+        }
+
+        let store = self.store.as_ref()?;
+        // The lock is released across this await on purpose: a table round
+        // trip while holding it would serialise every other authentication.
+        let found = match store.get_session(session).await {
+            Ok(found) => found,
+            Err(error) => {
+                // Unreachable storage is not proof of a missing session, and
+                // treating it as one would sign everyone out during exactly
+                // the incident this store exists to survive.
+                eprintln!("[auth] session lookup failed: {error:#}");
+                return None;
+            }
+        };
+        let (identity, created_at) = found?;
+        if SystemTime::now()
+            .duration_since(created_at)
+            .unwrap_or_default()
+            >= SESSION_TTL
+        {
+            let _ = store.delete_session(session).await;
+            return None;
+        }
+
+        self.state.lock().await.sessions.insert(
+            session.to_string(),
+            StoredSession {
+                identity: identity.clone(),
+                created_at,
+            },
+        );
+        Some(identity)
     }
 
     /// Mint a session without a round trip to Discord, so tests of things that
@@ -318,7 +393,7 @@ impl Auth {
             session.to_string(),
             StoredSession {
                 identity,
-                created_at: Instant::now(),
+                created_at: SystemTime::now(),
             },
         );
     }
@@ -342,11 +417,10 @@ impl AuthState {
         }
     }
 
-    fn expire_session(&mut self, session: &str, now: Instant) {
-        let expired = self
-            .sessions
-            .get(session)
-            .is_some_and(|stored| now.saturating_duration_since(stored.created_at) >= SESSION_TTL);
+    fn expire_session(&mut self, session: &str, now: SystemTime) {
+        let expired = self.sessions.get(session).is_some_and(|stored| {
+            now.duration_since(stored.created_at).unwrap_or_default() >= SESSION_TTL
+        });
         if expired {
             self.sessions.remove(session);
         }
@@ -403,7 +477,7 @@ impl AuthState {
                     session.clone(),
                     StoredSession {
                         identity: identity.clone(),
-                        created_at: now,
+                        created_at: SystemTime::now(),
                     },
                 );
                 self.pending.insert(
@@ -586,10 +660,14 @@ mod tests {
 
     #[test]
     fn successful_completion_at_4096_sessions_evicts_only_the_oldest() {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let mut auth = AuthState::default();
-        auth.pending
-            .insert("state".into(), Pending::Completing { since: now });
+        auth.pending.insert(
+            "state".into(),
+            Pending::Completing {
+                since: Instant::now(),
+            },
+        );
         auth.sessions.insert(
             "oldest".into(),
             StoredSession {
@@ -661,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn identify_expires_only_the_requested_session() {
         let auth = Auth::new(None);
-        let expired = Instant::now() - SESSION_TTL;
+        let expired = SystemTime::now() - SESSION_TTL;
         {
             let mut state = auth.state.lock().await;
             state.sessions.insert(

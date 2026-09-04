@@ -168,6 +168,15 @@ rather than reasoning from the source alone.
 - **Use parallel subagents for multi-area research.** When investigating multiple independent components, spawn background subagents (`agent: "explore"` or `"general"` with `background: true`) to execute in parallel child sessions.
 - Reserve `shell` strictly for native builds, cargo, and git commands.
 
+## Flaky Under Load
+
+`peer_worker_review_*` in `crates/orange` spawn child processes and kill them
+on a deadline (`crates/orange/src/test_support.rs`). Run immediately after a
+release build or another full suite they can miss that deadline and fail, which
+looks alarming when the change under test was in another crate entirely. Re-run
+the named tests on an idle machine before believing it. Two failed this way
+during a change that touched only `orange-signal` and `orange-client`.
+
 ## Bulk Renames
 
 PowerShell here is **5.1**, where `` `u{XXXX} `` is not an escape. A rename that

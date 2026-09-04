@@ -1,1 +1,38 @@
-1 ICON "icon.ico"
+// Resource ID 1 is the icon the client asks LoadIconW for and the one Explorer
+// shows for the executable.
+1 ICON "@ICON@"
+
+// Without a VERSIONINFO block Windows has nothing to display but the file name,
+// so Task Manager listed the process as "orange-tray" -- an internal crate name
+// no user should ever see. FileDescription is what it reads, and it keeps
+// reading "orange" after the artifact is eventually renamed, which makes that
+// rename invisible to users rather than merely deferred.
+//
+// The @...@ placeholders are filled in by build.rs from CARGO_PKG_VERSION, so
+// Cargo.toml stays the only place the version is stated.
+1 VERSIONINFO
+FILEVERSION     @VERSION_COMMAS@
+PRODUCTVERSION  @VERSION_COMMAS@
+FILEOS          0x4L
+FILETYPE        0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "brnbtt"
+            VALUE "FileDescription",  "orange"
+            VALUE "FileVersion",      "@VERSION@"
+            VALUE "InternalName",     "orange"
+            VALUE "OriginalFilename", "orange.exe"
+            VALUE "ProductName",      "orange"
+            VALUE "ProductVersion",   "@VERSION@"
+            VALUE "LegalCopyright",   "MIT licensed"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        // US English, Unicode.
+        VALUE "Translation", 0x409, 1200
+    END
+END

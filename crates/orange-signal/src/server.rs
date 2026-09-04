@@ -40,6 +40,17 @@ pub async fn serve(addr: &str) -> Result<()> {
     } else {
         println!("Discord login: not configured (set DISCORD_CLIENT_ID/SECRET/REDIRECT_URI)");
     }
+    if auth.durable() {
+        println!("Sessions: durable (Azure Table Storage)");
+    } else {
+        // Said at startup rather than discovered later: without this the only
+        // symptom is that a deploy signs everyone out, which looks like a bug
+        // in the client rather than missing configuration here.
+        println!(
+            "Sessions: in memory only, a restart signs everyone out \
+             (set ORANGE_TABLE_ACCOUNT/KEY/NAME)"
+        );
+    }
 
     let state = AppState {
         rooms: Arc::new(Mutex::new(HashMap::new())),

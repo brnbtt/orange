@@ -17,6 +17,13 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rand = "0.8"
+# Azure Table Storage is reached over its REST API rather than through an SDK:
+# the requests are two verbs and the signature is one HMAC, which is less code
+# than the client library would add, and it reuses the reqwest already here.
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+httpdate = "1"
 
 [dev-dependencies]
 tower.workspace = true
