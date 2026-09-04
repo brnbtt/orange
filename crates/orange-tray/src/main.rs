@@ -114,7 +114,7 @@ struct Orange {
     avatar: Option<std::sync::Arc<gpui::RenderImage>>,
     avatar_job: Option<AvatarJob>,
     quality: usize,
-    fps: Option<u32>,
+    fps: u32,
     active_target: Option<WindowTarget>,
     active_preview: Option<std::sync::Arc<gpui::RenderImage>>,
     host: Option<Supervisor>,
@@ -486,7 +486,7 @@ impl Orange {
     fn save_preferences(&mut self) {
         let preferences = session::Preferences {
             quality: self.quality,
-            fps: self.fps,
+            fps: Some(self.fps),
             own_codes: self.own_codes.clone(),
         };
         if let Err(error) = session::save_preferences(&preferences) {

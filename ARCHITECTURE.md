@@ -181,7 +181,7 @@ webrtcbin OPUS pad
 | --- | --- |
 | Signal JSON tags, fields, defaults, and peer stamping | `crates/orange-signal/src/protocol.rs` |
 | Tray window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
-| Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --scale [--fps]`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
+| Tray child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --scale --fps`; `watch --code --server --cascade --profile` | producer: `crates/orange-tray/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
 | Host stdout markers `Share this code:` and `[host-status] <json>` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | Automatic bitrate cap marker `[quality-status] <json>` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
 | Watch stdout marker `[watch-status] ended` | producer: `crates/orange/src/peer/watch.rs`; consumer: `crates/orange-tray/src/supervisor.rs` |
@@ -210,6 +210,7 @@ webrtcbin OPUS pad
 | Logo, glow, ambient grid | `crates/orange-tray/src/ui/mark.rs`, `crates/orange-tray/src/ui/decor.rs` |
 | Tray sound cues | `crates/orange-tray/src/sound.rs` |
 | Tray quality tiers and child log parsing | `crates/orange-tray/src/supervisor.rs` |
+| Frame-rate options and the 120 fps cap | `crates/orange-tray/src/supervisor.rs` (`FRAME_RATES`), `crates/orange/src/pipeline.rs` (`MAX_FPS`) |
 | Session/preferences persistence | `crates/orange/src/auth.rs`, `crates/orange-tray/src/session.rs` |
 | Signal wire format | `crates/orange-signal/src/protocol.rs` |
 | Relay room policy and limits | `crates/orange-signal/src/relay.rs`, `crates/orange-signal/src/server.rs` |

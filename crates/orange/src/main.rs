@@ -163,7 +163,8 @@ struct QualityArgs {
     /// Override the resolution/FPS-derived video bitrate, in kilobits per second.
     #[arg(long)]
     bitrate: Option<u32>,
-    /// Frames per second. Defaults to the captured window's display refresh.
+    /// Frames per second, capped at 120. Defaults to the captured window's
+    /// display refresh, capped the same way.
     #[arg(long)]
     fps: Option<u32>,
     /// Downscale on the GPU, e.g. 1920x1080.
@@ -173,13 +174,9 @@ struct QualityArgs {
 
 impl QualityArgs {
     fn settings(&self, hwnd: isize) -> Result<CaptureSettings> {
-        let fps = self
-            .fps
-            .or_else(|| window::target_refresh_rate(hwnd))
-            .unwrap_or(60);
-        if fps == 0 {
-            anyhow::bail!("fps must be greater than zero");
-        }
+        // Capped before the bitrate is derived from it, so an uncapped display
+        // refresh cannot inflate the bitrate for frames that never get encoded.
+        let fps = capture_fps(self.fps.or_else(|| window::target_refresh_rate(hwnd)))?;
         let requested = if self.codec.eq_ignore_ascii_case("auto") {
             None
         } else {
@@ -236,6 +233,19 @@ impl QualityArgs {
             },
         })
     }
+}
+
+/// Resolve the capture rate. `None` means nothing asked for one and the display
+/// did not report a usable refresh rate.
+///
+/// The cap applies to a display's refresh rate as much as to an explicit
+/// `--fps`, because the display is where the high rates came from.
+fn capture_fps(requested: Option<u32>) -> Result<u32> {
+    let fps = requested.unwrap_or(60);
+    if fps == 0 {
+        anyhow::bail!("fps must be greater than zero");
+    }
+    Ok(fps.min(pipeline::MAX_FPS))
 }
 
 fn parse_scale(s: &str) -> Result<(u32, u32)> {
@@ -687,9 +697,10 @@ fn report_file(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_error_chain, gst, run_pipeline_while, run_pipeline_while_with_shutdown,
-        run_pipeline_while_with_shutdown_and_state, start_pipeline_with, stop_pipeline_with,
-        timed_pipeline_should_continue, watch_window_title, Cli, Command, QualityArgs,
+        capture_fps, format_error_chain, gst, pipeline, run_pipeline_while,
+        run_pipeline_while_with_shutdown, run_pipeline_while_with_shutdown_and_state,
+        start_pipeline_with, stop_pipeline_with, timed_pipeline_should_continue,
+        watch_window_title, Cli, Command, QualityArgs,
     };
     use clap::Parser;
     use gst::prelude::*;
@@ -713,6 +724,20 @@ mod tests {
 
         assert_eq!(automatic.bitrate, None);
         assert_eq!(overridden.bitrate, Some(100_001));
+    }
+
+    #[test]
+    fn a_high_refresh_display_is_capped_rather_than_followed() {
+        // A measured 180 Hz host asked for 180 fps and delivered 53.6 to its
+        // viewer with zero packets lost, so the rate the display reports is not
+        // a rate worth honouring.
+        assert_eq!(capture_fps(Some(180)).unwrap(), pipeline::MAX_FPS);
+        assert_eq!(capture_fps(Some(240)).unwrap(), pipeline::MAX_FPS);
+        assert_eq!(capture_fps(Some(120)).unwrap(), 120);
+        assert_eq!(capture_fps(Some(60)).unwrap(), 60);
+        // No display refresh and no flag still has to produce a rate.
+        assert_eq!(capture_fps(None).unwrap(), 60);
+        assert!(capture_fps(Some(0)).is_err());
     }
 
     #[test]

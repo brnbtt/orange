@@ -450,11 +450,9 @@ impl Orange {
         let hosting = self.host.is_some();
         let watching = !self.watches.is_empty();
         let defaults = format!(
-            "{} · {}",
+            "{} · {} FPS",
             self.quality().label.to_ascii_uppercase(),
             self.fps
-                .map(|fps| format!("{fps} FPS"))
-                .unwrap_or_else(|| "AUTO FPS".into())
         );
         let user_name = self
             .session
@@ -867,13 +865,7 @@ impl Orange {
                 }
             })
             .unwrap_or_else(|| "Selected source".into());
-        let stream_details = format!(
-            "{} · {}",
-            quality.label,
-            self.fps
-                .map(|fps| format!("{fps} fps"))
-                .unwrap_or_else(|| "display refresh".into())
-        );
+        let stream_details = format!("{} · {} fps", quality.label, self.fps);
         let preview = self.active_preview.clone();
         let just_copied = self
             .copied_at
@@ -1258,7 +1250,7 @@ impl Orange {
             .map(|rate| {
                 let fps = rate.fps;
                 option_pill(
-                    SharedString::from(format!("settings-fps-{}", fps.unwrap_or(0))),
+                    SharedString::from(format!("settings-fps-{fps}")),
                     rate.label,
                     fps == selected,
                 )
@@ -1277,9 +1269,8 @@ impl Orange {
             .unwrap_or(&FRAME_RATES[0])
             .detail;
 
-        // No readout: a readout shows what an abstract label resolves to. "60"
-        // is not abstract, and "Auto" has nothing true to resolve to until the
-        // stream starts and the display is known.
+        // No readout: a readout shows what an abstract label resolves to, and
+        // "60" is not abstract.
         setting_choice("Frame rate", None, pills, detail).into_any_element()
     }
 

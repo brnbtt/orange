@@ -24,6 +24,9 @@ pub struct Session {
 pub struct Preferences {
     pub quality: usize,
     /// `None` follows the captured window's display refresh rate.
+    /// The rate the picker last wrote. `None` predates the 120 fps cap, when
+    /// the default was to follow the captured display's refresh rate;
+    /// `supervisor::supported_frame_rate` resolves it to an offered rate.
     pub fps: Option<u32>,
     pub own_codes: Vec<String>,
 }

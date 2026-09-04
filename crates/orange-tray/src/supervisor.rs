@@ -334,12 +334,7 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// Start `orange host` for a window and begin parsing its output.
-    pub fn host(
-        target: &WindowTarget,
-        quality: &Quality,
-        fps: Option<u32>,
-        server: &str,
-    ) -> Result<Self> {
+    pub fn host(target: &WindowTarget, quality: &Quality, fps: u32, server: &str) -> Result<Self> {
         let (width, height) = quality.fit(target);
         let mut command = orange_command()?;
         command
@@ -348,10 +343,10 @@ impl Supervisor {
             .args(["--server", server])
             // Every tier lets the child pick the best encoder its GPU offers.
             .args(["--codec", "auto"])
+            // Always explicit. Omitting it lets the child fall back to the
+            // display's refresh rate, which is what the cap exists to avoid.
+            .args(["--fps", &fps.to_string()])
             .args(["--scale", &format!("{width}x{height}")]);
-        if let Some(fps) = fps {
-            command.args(["--fps", &fps.to_string()]);
-        }
         Self::spawn(command)
     }
 
@@ -565,38 +560,45 @@ pub const QUALITIES: &[Quality] = &[
     },
 ];
 
-/// Frame-rate choices. `None` follows the captured display's refresh rate.
+/// Frame-rate choices, capped at 120.
+///
+/// "Auto" used to lead this list and follow the captured display's refresh
+/// rate. On a 180 Hz panel that meant a 180 fps capture, and a measured session
+/// showed the encoder delivering 53.6 fps of it with zero packets lost in
+/// transit, plus 123 decoder keyframe requests on intact data. There is no rate
+/// above 120 worth offering, and so nothing left for Auto to choose between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameRate {
-    pub fps: Option<u32>,
+    pub fps: u32,
     pub label: &'static str,
     pub detail: &'static str,
 }
 
 pub const FRAME_RATES: &[FrameRate] = &[
     FrameRate {
-        fps: None,
-        label: "Auto",
-        detail: "Matches the captured display's refresh rate",
-    },
-    FrameRate {
-        fps: Some(60),
+        fps: 60,
         label: "60",
         detail: "Works on every display",
     },
     FrameRate {
-        fps: Some(120),
+        fps: 120,
         label: "120",
         detail: "Needs a 120 Hz display. Heavier to encode",
     },
 ];
 
-/// Fall back to Auto for a rate that is no longer offered.
+/// The rate to fall back to when a preferences file names one that is gone.
+pub const DEFAULT_FPS: u32 = 60;
+
+/// Resolve a stored frame rate to one that is actually offered.
 ///
-/// 240 was offered once. Without this, a preferences file written by that build
-/// leaves the picker with nothing selected and no description to show.
-pub fn supported_frame_rate(fps: Option<u32>) -> Option<u32> {
-    fps.filter(|value| FRAME_RATES.iter().any(|rate| rate.fps == Some(*value)))
+/// `None` is Auto, which was the default every build before the cap wrote, so
+/// most preferences files hold it. 240 shipped once as an explicit choice.
+/// Without this the picker shows nothing selected and no description, and the
+/// display's own refresh rate still reaches the encoder.
+pub fn supported_frame_rate(fps: Option<u32>) -> u32 {
+    fps.filter(|value| FRAME_RATES.iter().any(|rate| rate.fps == *value))
+        .unwrap_or(DEFAULT_FPS)
 }
 
 #[cfg(test)]
@@ -644,17 +646,36 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_rate_that_is_no_longer_offered_falls_back_to_auto() {
-        // 240 shipped in an earlier build, so preferences files contain it.
-        assert_eq!(supported_frame_rate(Some(240)), None);
-        assert_eq!(supported_frame_rate(Some(60)), Some(60));
-        assert_eq!(supported_frame_rate(Some(120)), Some(120));
-        assert_eq!(supported_frame_rate(None), None);
+    fn a_frame_rate_that_is_no_longer_offered_falls_back_to_the_default() {
+        // Auto (None) was the default until the cap, so nearly every installed
+        // client has it in preferences.json, and 240 shipped as an explicit
+        // choice before that.
+        assert_eq!(supported_frame_rate(None), DEFAULT_FPS);
+        assert_eq!(supported_frame_rate(Some(240)), DEFAULT_FPS);
+        assert_eq!(supported_frame_rate(Some(180)), DEFAULT_FPS);
+        assert_eq!(supported_frame_rate(Some(60)), 60);
+        assert_eq!(supported_frame_rate(Some(120)), 120);
         // Every offered rate survives the filter, so adding one cannot silently
         // become unselectable.
         for rate in FRAME_RATES {
-            assert_eq!(supported_frame_rate(rate.fps), rate.fps, "{}", rate.label);
+            assert_eq!(
+                supported_frame_rate(Some(rate.fps)),
+                rate.fps,
+                "{}",
+                rate.label
+            );
         }
+    }
+
+    #[test]
+    fn the_picker_offers_two_rates_and_neither_is_above_the_cap() {
+        // The whole point of the list. An entry above 120, or one that follows
+        // the display again, puts the 180 fps reports straight back.
+        assert_eq!(
+            FRAME_RATES.iter().map(|rate| rate.fps).collect::<Vec<_>>(),
+            [60, 120]
+        );
+        assert!(FRAME_RATES.iter().any(|rate| rate.fps == DEFAULT_FPS));
     }
 
     #[test]

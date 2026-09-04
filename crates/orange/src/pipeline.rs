@@ -154,6 +154,17 @@ pub(crate) fn select_encoder(requested: Option<Codec>) -> Result<(Codec, &'stati
     select_encoder_with(requested, supports_d3d11_input)
 }
 
+/// Capture rate ceiling.
+///
+/// Capture used to follow the display's refresh rate, so a 165, 180 or 240 Hz
+/// monitor set the encode rate directly. A measured 180 fps host delivered 53.6
+/// fps to its viewer with zero packets lost in transit: the encoder simply
+/// never produced the rest. What does arrive is worse than a lower rate would
+/// be, because the same bitrate spreads thinner over every frame and the
+/// decoder is handed output it repeatedly fails on. 120 is the highest rate
+/// worth offering.
+pub const MAX_FPS: u32 = 120;
+
 #[derive(Debug, Clone)]
 pub struct CaptureSettings {
     pub hwnd: isize,
