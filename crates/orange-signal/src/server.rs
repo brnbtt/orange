@@ -4,7 +4,7 @@
 //! ingress. `axum` handles the routing and the WebSocket upgrade.
 
 use crate::auth::{Auth, DiscordConfig, PollResult};
-use crate::relay::{handle_peer, presence_for, Presence, Rooms};
+use crate::relay::{handle_peer, presence_for, Found, Rooms};
 use anyhow::{Context, Result};
 use axum::{
     extract::{
@@ -167,8 +167,14 @@ struct PresenceParams {
 #[derive(Serialize)]
 struct PresenceEntry {
     id: String,
+    /// Omitted for an offline friend: the relay only holds a profile while
+    /// its owner is connected. The caller keeps the last one it saw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_url: Option<String>,
     #[serde(flatten)]
-    presence: Presence,
+    presence: crate::relay::Presence,
 }
 
 #[derive(Serialize)]
@@ -208,7 +214,19 @@ async fn presence(
     let friends = presence_for(&app.rooms, &identity.id, &ids)
         .await
         .into_iter()
-        .map(|(id, presence)| PresenceEntry { id, presence })
+        .map(|(id, found)| {
+            let Found {
+                presence,
+                name,
+                avatar_url,
+            } = found;
+            PresenceEntry {
+                id,
+                name,
+                avatar_url,
+                presence,
+            }
+        })
         .collect();
     Json(PresenceBody { friends }).into_response()
 }

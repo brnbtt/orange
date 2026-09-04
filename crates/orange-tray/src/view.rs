@@ -1205,10 +1205,13 @@ impl Orange {
                             .items_center()
                             .gap_2p5()
                             .min_w(px(0.0))
-                            // No avatar fetch yet: `avatar` falls back to the
-                            // initial, which is enough to tell rows apart while
-                            // the roster is still seeded by hand.
-                            .child(avatar(None, &friend.name, 32.0))
+                            // Real Discord picture when one has been fetched;
+                            // `avatar` falls back to the initial until then.
+                            .child(avatar(
+                                self.friend_avatars.get(&friend.id).cloned(),
+                                &friend.name,
+                                32.0,
+                            ))
                             .child(
                                 div()
                                     .flex()

@@ -37,6 +37,13 @@ pub(crate) enum Presence {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct Entry {
     pub(crate) id: String,
+    /// Present only while the friend is live: the relay holds a profile just
+    /// for the length of a host connection. The tray keeps the last one it
+    /// saw in `preferences.json`, so an offline friend still has a face.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[serde(default)]
+    pub(crate) avatar_url: Option<String>,
     #[serde(flatten)]
     pub(crate) presence: Presence,
 }
@@ -152,14 +159,15 @@ mod tests {
     }
 
     /// The tray pairs answers to rows by id. Decoding has to survive the relay
-    /// returning them in an order the tray did not ask for, and has to keep
-    /// `full` distinct from `live` or a full room renders as joinable.
+    /// returning them in an order the tray did not ask for, has to keep `full`
+    /// distinct from `live` or a full room renders as joinable, and has to
+    /// tolerate a profile being absent for an offline friend.
     #[test]
-    fn presence_body_decodes_every_state() {
+    fn presence_body_decodes_every_state_and_an_optional_profile() {
         let body: Body = serde_json::from_str(
             r#"{"friends":[
                 {"id":"a","state":"offline"},
-                {"id":"b","state":"live","code":"ABC-234"},
+                {"id":"b","name":"Bee","avatar_url":"https://cdn/b.png","state":"live","code":"ABC-234"},
                 {"id":"c","state":"full"}
             ]}"#,
         )
@@ -170,16 +178,22 @@ mod tests {
             vec![
                 Entry {
                     id: "a".into(),
+                    name: None,
+                    avatar_url: None,
                     presence: Presence::Offline
                 },
                 Entry {
                     id: "b".into(),
+                    name: Some("Bee".into()),
+                    avatar_url: Some("https://cdn/b.png".into()),
                     presence: Presence::Live {
                         code: "ABC-234".into()
                     }
                 },
                 Entry {
                     id: "c".into(),
+                    name: None,
+                    avatar_url: None,
                     presence: Presence::Full
                 },
             ]

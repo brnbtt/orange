@@ -120,6 +120,13 @@ pub(crate) struct Room {
     /// host, which is why an anonymous room can never be found by `/presence`:
     /// there is no id to look it up under.
     host_id: Option<String>,
+    /// Avatar of the host at the moment it went live.
+    ///
+    /// Carried so a friend's row can show their current Discord picture. The
+    /// `identify` scope only ever returns the caller's own profile, so a room
+    /// going live is the one moment the relay legitimately learns it; there is
+    /// no lookup to fall back on.
+    host_avatar: Option<String>,
     /// Discord ids the host is willing to be discovered by. Not an access
     /// control boundary on the room itself -- anyone holding the code can still
     /// join -- it only decides who is handed the code without being told it.
@@ -147,6 +154,19 @@ pub(crate) enum Presence {
     Full,
 }
 
+/// One friend's answer: their state, plus whatever the relay currently knows
+/// about their Discord profile.
+///
+/// The profile is only populated while they are live, because that is the only
+/// time the relay holds their identity. A caller keeps the last value it saw
+/// for everyone else, which is why the tray caches it locally.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Found {
+    pub(crate) presence: Presence,
+    pub(crate) name: Option<String>,
+    pub(crate) avatar_url: Option<String>,
+}
+
 /// Resolve what `viewer` may know about each of `ids`, in the order asked.
 ///
 /// Scans the room table once rather than per id: the table is bounded by the
@@ -156,10 +176,10 @@ pub(crate) async fn presence_for(
     rooms: &Rooms,
     viewer: &str,
     ids: &[String],
-) -> Vec<(String, Presence)> {
+) -> Vec<(String, Found)> {
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let rooms = rooms.lock().await;
-    let mut best: HashMap<&str, Presence> = HashMap::new();
+    let mut best: HashMap<&str, Found> = HashMap::new();
 
     for (code, room) in rooms.iter() {
         if room.host.is_none() {
@@ -171,23 +191,37 @@ pub(crate) async fn presence_for(
         if !wanted.contains(host_id) || !room.visible_to.iter().any(|id| id == viewer) {
             continue;
         }
-        let found = if room.viewers.len() < ROOM_VIEWER_CAPACITY {
-            Presence::Live { code: code.clone() }
-        } else {
-            Presence::Full
+        let found = Found {
+            presence: if room.viewers.len() < ROOM_VIEWER_CAPACITY {
+                Presence::Live { code: code.clone() }
+            } else {
+                Presence::Full
+            },
+            name: room.host_name.clone(),
+            avatar_url: room.host_avatar.clone(),
         };
         // One host can hold two rooms open. Iteration order over a HashMap is
         // not stable, so without preferring the joinable one the answer for
         // that host would flap between polls.
-        if !matches!(best.get(host_id), Some(Presence::Live { .. })) {
+        if !matches!(
+            best.get(host_id),
+            Some(Found {
+                presence: Presence::Live { .. },
+                ..
+            })
+        ) {
             best.insert(host_id, found);
         }
     }
 
     ids.iter()
         .map(|id| {
-            let presence = best.get(id.as_str()).cloned().unwrap_or(Presence::Offline);
-            (id.clone(), presence)
+            let found = best.get(id.as_str()).cloned().unwrap_or(Found {
+                presence: Presence::Offline,
+                name: None,
+                avatar_url: None,
+            });
+            (id.clone(), found)
         })
         .collect()
 }
@@ -245,6 +279,16 @@ mod presence_tests {
         ))
     }
 
+    /// Most of these assert on state alone; the profile has its own test.
+    async fn states(rooms: &Rooms, viewer: &str, ids: &[&str]) -> Vec<(String, Presence)> {
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        presence_for(rooms, viewer, &ids)
+            .await
+            .into_iter()
+            .map(|(id, found)| (id, found.presence))
+            .collect()
+    }
+
     /// The whole privacy claim of the feature. If this regresses, knowing a
     /// Discord id -- which is public -- is enough to be handed a join code for
     /// a stranger's stream, which is strictly worse than the paste flow it
@@ -253,9 +297,8 @@ mod presence_tests {
     async fn presence_hides_a_room_from_someone_the_host_did_not_list() {
         let rooms = rooms(vec![("ABC-234", room("host", &["friend"], 0))]);
 
-        let allowed = presence_for(&rooms, "friend", &["host".to_string()]).await;
         assert_eq!(
-            allowed,
+            states(&rooms, "friend", &["host"]).await,
             vec![(
                 "host".to_string(),
                 Presence::Live {
@@ -263,9 +306,39 @@ mod presence_tests {
                 }
             )]
         );
+        assert_eq!(
+            states(&rooms, "stranger", &["host"]).await,
+            vec![("host".to_string(), Presence::Offline)]
+        );
+    }
 
-        let stranger = presence_for(&rooms, "stranger", &["host".to_string()]).await;
-        assert_eq!(stranger, vec![("host".to_string(), Presence::Offline)]);
+    /// A friend's row shows their Discord name and picture. `identify` only
+    /// ever returns the caller's own profile, so going live is the one moment
+    /// the relay learns a host's; if it is not carried here there is no lookup
+    /// to fall back on and rows would be bare ids forever.
+    #[tokio::test]
+    async fn presence_carries_the_discord_profile_of_a_live_friend() {
+        let mut live = room("host", &["friend"], 0);
+        live.host_name = Some("Host Person".into());
+        live.host_avatar = Some("https://cdn.discordapp.com/avatars/host/hash.png".into());
+        let rooms = rooms(vec![("ABC-234", live)]);
+
+        let found = presence_for(
+            &rooms,
+            "friend",
+            &["host".to_string(), "absent".to_string()],
+        )
+        .await;
+
+        assert_eq!(found[0].1.name.as_deref(), Some("Host Person"));
+        assert_eq!(
+            found[0].1.avatar_url.as_deref(),
+            Some("https://cdn.discordapp.com/avatars/host/hash.png")
+        );
+        // Nothing is invented for someone the relay is not currently holding a
+        // connection for. The tray keeps the last profile it saw instead.
+        assert_eq!(found[1].1.name, None);
+        assert_eq!(found[1].1.avatar_url, None);
     }
 
     /// A host who never signed in has no id to be found under. Without the
@@ -277,8 +350,10 @@ mod presence_tests {
         anonymous.host_id = None;
         let rooms = rooms(vec![("ABC-234", anonymous)]);
 
-        let found = presence_for(&rooms, "friend", &["".to_string()]).await;
-        assert_eq!(found, vec![("".to_string(), Presence::Offline)]);
+        assert_eq!(
+            states(&rooms, "friend", &[""]).await,
+            vec![("".to_string(), Presence::Offline)]
+        );
     }
 
     /// A friend shown "Live" who clicks and immediately gets "stream is full"
@@ -291,8 +366,10 @@ mod presence_tests {
             room("host", &["friend"], ROOM_VIEWER_CAPACITY),
         )]);
 
-        let found = presence_for(&rooms, "friend", &["host".to_string()]).await;
-        assert_eq!(found, vec![("host".to_string(), Presence::Full)]);
+        assert_eq!(
+            states(&rooms, "friend", &["host"]).await,
+            vec![("host".to_string(), Presence::Full)]
+        );
     }
 
     /// One person can leave a stale host connection open and start a second.
@@ -307,9 +384,8 @@ mod presence_tests {
         ]);
 
         for _ in 0..16 {
-            let found = presence_for(&rooms, "friend", &["host".to_string()]).await;
             assert_eq!(
-                found,
+                states(&rooms, "friend", &["host"]).await,
                 vec![(
                     "host".to_string(),
                     Presence::Live {
@@ -336,7 +412,7 @@ mod presence_tests {
         let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, ["offline", "live", "also-offline"]);
         assert_eq!(
-            found[1].1,
+            found[1].1.presence,
             Presence::Live {
                 code: "ABC-234".into()
             }
@@ -425,6 +501,7 @@ pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Aut
                     let diagnostic_session = generate_diagnostic_session();
                     let name = identity.as_ref().map(|i| i.name.clone());
                     let host_id = identity.as_ref().map(|i| i.id.clone());
+                    let host_avatar = identity.as_ref().and_then(|i| i.avatar_url.clone());
                     let code = {
                         let mut rooms = rooms.lock().await;
                         insert_room_with_code(
@@ -433,6 +510,7 @@ pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Aut
                                 host: Some(tx.clone()),
                                 host_name: name,
                                 host_id,
+                                host_avatar,
                                 visible_to,
                                 diagnostic_session: diagnostic_session.clone(),
                                 viewers: HashMap::new(),
@@ -947,7 +1025,7 @@ mod tests {
             Identity {
                 id: "host-id".into(),
                 name: "Host".into(),
-                avatar_url: None,
+                avatar_url: Some("https://cdn.discordapp.com/avatars/host-id/h.png".into()),
             },
         )
         .await;
@@ -1022,8 +1100,10 @@ mod tests {
 
         assert_eq!(
             ask("friend-token").await,
-            format!(r#"{{"friends":[{{"id":"host-id","state":"live","code":"{code}"}}]}}"#),
-            "a listed friend was not handed the code"
+            format!(
+                r#"{{"friends":[{{"id":"host-id","name":"Host","avatar_url":"https://cdn.discordapp.com/avatars/host-id/h.png","state":"live","code":"{code}"}}]}}"#
+            ),
+            "a listed friend was not handed the code and profile"
         );
         assert_eq!(
             ask("stranger-token").await,

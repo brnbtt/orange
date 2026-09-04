@@ -20,8 +20,8 @@ mod update;
 mod view;
 
 use background::{
-    fetch_avatar, replace_avatar_job, replace_thumbnail_job, stop_avatar_job, stop_thumbnail_job,
-    AvatarJob, ThumbnailJob,
+    fetch_avatar, replace_avatar_job, replace_friend_avatar_job, replace_thumbnail_job,
+    stop_avatar_job, stop_thumbnail_job, AvatarJob, FriendAvatarJob, ThumbnailJob,
 };
 use gpui::{
     prelude::*, px, size, App, Application, Bounds, Context, Timer, TitlebarOptions, WindowBounds,
@@ -157,6 +157,11 @@ struct Orange {
     /// silently showing every friend offline is indistinguishable from every
     /// friend actually being offline.
     presence_error: Option<String>,
+    /// Friend pictures decoded off the UI thread, keyed by Discord id. Same
+    /// shape as `thumbnails`, and for the same reason: an async fill of a
+    /// keyed cache that render reads synchronously.
+    friend_avatars: std::collections::HashMap<String, std::sync::Arc<gpui::RenderImage>>,
+    friend_avatar_job: Option<FriendAvatarJob>,
     logo_epoch: u64,
     /// Whether ambient animation should run: true only while this window is
     /// the active one.
@@ -209,6 +214,9 @@ struct Digest {
     /// list would only refresh when something unrelated moved.
     presence: Vec<(String, Option<presence::Presence>)>,
     presence_error: Option<String>,
+    /// Friend pictures arrive one at a time from a background worker. Without
+    /// this the rows would keep their initials until something else moved.
+    friend_avatars: usize,
 }
 
 impl Orange {
@@ -238,6 +246,7 @@ impl Orange {
                 .map(|friend| (friend.id.clone(), self.presence.get(&friend.id).cloned()))
                 .collect(),
             presence_error: self.presence_error.clone(),
+            friend_avatars: self.friend_avatars.len(),
         }
     }
 
@@ -265,6 +274,7 @@ impl Orange {
                 match result {
                     Some(Ok(entries)) => {
                         self.presence_error = None;
+                        self.absorb_profiles(&entries);
                         self.presence = entries
                             .into_iter()
                             .map(|entry| (entry.id, entry.presence))
@@ -300,6 +310,66 @@ impl Orange {
             session.token.clone(),
             &self.friends,
         );
+    }
+
+    /// Refresh the cached Discord profile of any friend who is currently live.
+    ///
+    /// `identify` only ever returns the caller's own profile, so a friend going
+    /// live is the only moment their name or picture can be re-learned. Without
+    /// this, a friend who changes their avatar would show the old one until
+    /// they were removed and added again.
+    fn absorb_profiles(&mut self, entries: &[presence::Entry]) {
+        let mut changed = false;
+        for entry in entries {
+            let Some(friend) = self.friends.iter_mut().find(|f| f.id == entry.id) else {
+                continue;
+            };
+            if let Some(name) = entry.name.as_ref() {
+                if &friend.name != name {
+                    friend.name = name.clone();
+                    changed = true;
+                }
+            }
+            if entry.avatar_url.is_some() && friend.avatar_url != entry.avatar_url {
+                friend.avatar_url = entry.avatar_url.clone();
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_preferences();
+        }
+    }
+
+    /// Fetch pictures for friends that do not have one decoded yet.
+    ///
+    /// Only starts when nothing is in flight, so a roster larger than one poll
+    /// interval cannot pile up overlapping workers.
+    fn poll_friend_avatars(&mut self) {
+        if let Some(job) = self.friend_avatar_job.as_ref() {
+            while let Ok((id, pixels)) = job.receiver.try_recv() {
+                if let Some(image) = capture::to_image(pixels) {
+                    self.friend_avatars.insert(id, image);
+                }
+            }
+            if job.is_finished() {
+                if let Some(mut job) = self.friend_avatar_job.take() {
+                    job.join();
+                }
+            }
+            return;
+        }
+        let wanted: Vec<(String, String)> = self
+            .friends
+            .iter()
+            .filter(|friend| !self.friend_avatars.contains_key(&friend.id))
+            .filter_map(|friend| {
+                friend
+                    .avatar_url
+                    .clone()
+                    .map(|url| (friend.id.clone(), url))
+            })
+            .collect();
+        replace_friend_avatar_job(&mut self.friend_avatar_job, wanted, fetch_avatar);
     }
 }
 
@@ -380,6 +450,8 @@ impl Orange {
             // friend who is already live is on screen when the window opens.
             presence_due: Instant::now(),
             presence_error: None,
+            friend_avatars: std::collections::HashMap::new(),
+            friend_avatar_job: None,
             logo_epoch: 0,
             // Corrected on the first render, before anything is painted.
             animate: false,
@@ -392,6 +464,7 @@ impl Orange {
         self.drain_thumbnails();
         self.poll_updates(cx);
         self.poll_presence();
+        self.poll_friend_avatars();
         let avatar_result = self.avatar_job.as_ref().and_then(|job| {
             job.is_finished().then(|| match job.receiver.try_recv() {
                 Ok(pixels) => Some(Some(pixels)),
@@ -742,7 +815,11 @@ impl Orange {
                     code,
                     supervisor: stream,
                 });
-                if self.host.is_none() {
+                if self.host.is_none() && self.screen != Screen::Friends {
+                    // Joining from the friends list stays there, so a second
+                    // friend is one more click rather than a click and a Back.
+                    // The row itself flips to "Watching", which is the
+                    // feedback the screen change used to provide.
                     self.screen = Screen::Watching;
                 }
                 self.clear_error();

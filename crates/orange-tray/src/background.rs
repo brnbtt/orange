@@ -153,6 +153,72 @@ pub(super) fn stop_avatar_job(job: &mut Option<AvatarJob>) {
     drop(job.take());
 }
 
+/// Avatars for a list of friends, keyed by Discord id.
+///
+/// One worker fetching sequentially rather than a thread per friend: a roster
+/// is unbounded and each fetch already allows a 4 MiB body, so the parallel
+/// form would let a large friend list decide how much memory and how many
+/// sockets the tray uses.
+pub(super) struct FriendAvatarJob {
+    cancel: Arc<AtomicBool>,
+    pub(super) receiver: mpsc::Receiver<(String, capture::Thumbnail)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl FriendAvatarJob {
+    pub(super) fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    pub(super) fn join(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            join_background_worker(worker, AVATAR_JOIN_TIMEOUT, "friend avatar fetch");
+        }
+    }
+}
+
+impl Drop for FriendAvatarJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.join();
+    }
+}
+
+pub(super) fn replace_friend_avatar_job(
+    job: &mut Option<FriendAvatarJob>,
+    wanted: Vec<(String, String)>,
+    fetch: impl Fn(&str) -> Option<Vec<u8>> + Send + 'static,
+) {
+    drop(job.take());
+    if wanted.is_empty() {
+        return;
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for (id, url) in wanted {
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let pixels = fetch(&url).and_then(decode_avatar);
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            if let Some(pixels) = pixels {
+                if sender.send((id, pixels)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    *job = Some(FriendAvatarJob {
+        cancel,
+        receiver,
+        worker: Some(worker),
+    });
+}
+
 pub(super) fn fetch_avatar(url: &str) -> Option<Vec<u8>> {
     let mut response = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
