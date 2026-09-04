@@ -1,3 +1,9 @@
+//! Test-only helpers. `main.rs` declares this module under `#[cfg(test)]`, so
+//! nothing here reaches a shipped binary despite sitting beside the production
+//! modules. Used by the tests in `webrtc/workers.rs` and `peer/host_branch.rs`,
+//! which spawn a child process so a hang fails on a deadline instead of
+//! blocking the suite.
+
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};

@@ -14,7 +14,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ORANGE_BUILD_ID");
     println!("cargo:rerun-if-env-changed=ORANGE_UPDATE_CHANNEL");
     println!("cargo:rerun-if-changed=app.rc");
-    println!("cargo:rerun-if-changed=icon.ico");
+    println!("cargo:rerun-if-changed=../../assets/icon.ico");
 
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets this"));
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets this"));
@@ -31,7 +31,14 @@ fn main() {
 
     // The generated file lives outside the crate, so the icon needs an
     // absolute path. Backslashes are escapes inside an .rc string literal.
-    let icon = manifest
+    // The icon is shared with the `orange` crate, so it lives in the workspace
+    // `assets/` directory rather than in either crate.
+    let workspace = manifest
+        .parent()
+        .and_then(|crates| crates.parent())
+        .expect("the crate lives two directories below the workspace root");
+    let icon = workspace
+        .join("assets")
         .join("icon.ico")
         .display()
         .to_string()

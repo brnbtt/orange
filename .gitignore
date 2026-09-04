@@ -11,5 +11,6 @@
 *.wav
 
 # Source assets are checked in explicitly: the logo is compiled into the client
-# binary with include_bytes!, so a clone without it does not build.
-!crates/orange-client/logo.png
+# binary with include_bytes!, so a clone without it does not build. Excluding
+# the whole directory keeps this from breaking each time an asset is added.
+!/assets/**

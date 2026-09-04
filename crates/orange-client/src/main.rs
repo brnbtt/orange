@@ -1149,7 +1149,7 @@ mod tests {
     use super::*;
 
     fn icon_frame(size: u16) -> image::RgbaImage {
-        let source = include_bytes!("../icon.ico");
+        let source = include_bytes!("../../../assets/icon.ico");
         let count = u16::from_le_bytes([source[4], source[5]]) as usize;
         for index in 0..count {
             let start = 6 + index * 16;

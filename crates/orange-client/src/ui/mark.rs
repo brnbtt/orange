@@ -110,7 +110,7 @@ fn mark() -> Option<std::sync::Arc<gpui::RenderImage>> {
     static MARK: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
         std::sync::OnceLock::new();
     MARK.get_or_init(|| {
-        let decoded = image::load_from_memory(include_bytes!("../../logo.png"))
+        let decoded = image::load_from_memory(include_bytes!("../../../../assets/logo.png"))
             .ok()?
             .into_rgba8();
         let (width, height) = decoded.dimensions();

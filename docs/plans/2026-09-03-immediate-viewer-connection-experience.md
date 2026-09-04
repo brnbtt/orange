@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.98, Tokio, GStreamer/webrtcbin 0.25, windows-rs 0.62 Win32/GDI, existing Orange diagnostics and overlay infrastructure
 
-**Spec:** `docs/superpowers/specs/2026-09-03-immediate-viewer-connection-experience.md`
+**Spec:** `docs/specs/2026-09-03-immediate-viewer-connection-experience.md`
 
 ## Global Constraints
 

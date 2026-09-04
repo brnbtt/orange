@@ -51,6 +51,22 @@ ownership, media defaults, compatibility contracts, and validation paths.
 
 Compile dependencies point `orange -> orange-signal <- orange-relay`; client/updater communicate through processes/files and have no workspace crate dependency.
 
+### Layout Conventions
+
+- A module with submodules is a `foo.rs` file beside a `foo/` directory, never
+  a `foo/mod.rs`. The facade file names its submodules and says what each one
+  owns, so the directory listing and the file agree.
+- Shared source assets live in the workspace `assets/` directory. `icon.ico` is
+  compiled into both executables and is why it is not in either crate.
+- Tests are inline `#[cfg(test)] mod tests` blocks. Two of them outgrew their
+  module and live in a sibling file pulled in with `#[path]`:
+  `crates/orange-client/src/update_tests.rs` and
+  `crates/orange/src/peer/host_branch_tests.rs`. They stay in-crate because
+  both crates are binaries, so an integration test could not reach the private
+  items they cover.
+- `docs/` holds point-in-time specs and plans. This file is the current-state
+  document; nothing in `docs/` supersedes it.
+
 The `orange-client` crate still builds an artifact named `orange-tray.exe`, set
 by `[[bin]]` in its `Cargo.toml`. The updater that performs an upgrade is the
 one already installed, so it only learns the new name from the release that
@@ -64,7 +80,14 @@ reopen the older one, which would find the same update waiting and loop.
 | File | Authoritative responsibility |
 | --- | --- |
 | `crates/orange-client/src/main.rs` | Application state machine, GPUI startup, polling, child lifecycle, picker actions, update handoff, top-level notification-icon ownership |
-| `crates/orange-client/src/view.rs` | All screen rendering and UI event wiring: signed out, home, picker, streaming, watching, settings, update banner |
+| `crates/orange-client/src/view.rs` | The shared frame, the entry animation, and the dispatch from `Screen` to its renderer |
+| `crates/orange-client/src/view/chrome.rs` | Custom titlebar, breadcrumb, window controls |
+| `crates/orange-client/src/view/toast.rs` | The floating notice layer: update banner and error toast |
+| `crates/orange-client/src/view/home.rs` | Signed-out screen, home screen, friend rows |
+| `crates/orange-client/src/view/pick.rs` | Share picker: quality choice, whole-display row, window cards |
+| `crates/orange-client/src/view/stream.rs` | Streaming and watching screens |
+| `crates/orange-client/src/view/settings.rs` | Settings sections and the cards inside them |
+| `crates/orange-client/src/ui.rs` | Design-layer facade: what each `ui/` file owns and the rule that keeps them apart |
 | `crates/orange-client/src/ui/theme.rs` | Design tokens: colour, type, metrics, motion. No elements |
 | `crates/orange-client/src/ui/controls.rs` | Reusable GPUI controls: buttons, pills, cards, rows, titlebar |
 | `crates/orange-client/src/ui/mark.rs` | The logo, its states, and the glow behind it |
@@ -77,6 +100,7 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/session.rs` | Reads CLI session JSON including the relay token; atomically reads/writes client preferences and the friend roster |
 | `crates/orange-client/src/client.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-client/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
+| `crates/orange-client/src/update_tests.rs` | The `update.rs` test module, in a sibling file because it outgrew the module |
 
 The client requests automatic zero-copy encoder selection and leaves bitrate selection to the media child after output resolution and frame rate are known. The measured automatic policy anchors at 18 Mbps for 1080p60, scales sublinearly with pixels and linearly with frame rate, and caps at 80 Mbps with a client-visible quality warning. Selection prefers H.265 (Media Foundation, then NVIDIA) and falls back to H.264 (Media Foundation, then NVIDIA). The CLI defaults to explicit Media Foundation H.265; `--bitrate` remains an advanced override.
 
@@ -89,6 +113,7 @@ The client requests automatic zero-copy encoder selection and leaves bitrate sel
 | `crates/orange/src/peer.rs` | Peer facade and shared signalling/WebRTC helpers, STUN setting, bus and connection-state reporting |
 | `crates/orange/src/peer/host.rs` | Host session, shared capture/audio tees, viewer map, idle redraw, keyframe cadence, signal loop, final teardown |
 | `crates/orange/src/peer/host_branch.rs` | Per-viewer WebRTC branches, request-pad ownership, offer creation, startup keyframes, blocked branch removal worker |
+| `crates/orange/src/peer/host_branch_tests.rs` | The `host_branch.rs` test module, in a sibling file because it outgrew the module |
 | `crates/orange/src/peer/watch.rs` | Viewer join, offer/answer handling, dynamic receive pads, playback ownership, receive teardown |
 | `crates/orange/src/webrtc.rs` | WebRTC facade, loopback graph, payloaders, output ownership split, accepted-pad dispatch |
 | `crates/orange/src/webrtc/receive.rs` | Transactional dynamic video/audio receive branches, decoder/sink construction, rollback |
@@ -107,6 +132,10 @@ The client requests automatic zero-copy encoder selection and leaves bitrate sel
 | `crates/orange/src/auth.rs` | Desktop OAuth polling and atomic `%APPDATA%\orange\session.json` ownership |
 | `crates/orange/src/targets.rs` | Capturable-window enumeration/filtering, HWND-to-PID lookup, late-join redraw request |
 | `crates/orange/src/text.rs` | System font loading and glyph rasterization for the video overlay |
+| `crates/orange/src/connection.rs` | Privacy-safe connection progress stages and failures shared by signalling, WebRTC and playback |
+| `crates/orange/src/window/connection_surface.rs` | What the viewer window draws before media arrives: connection stage, close hit test |
+| `crates/orange/src/encoder_characterization.rs` | Developer-only `characterize-encoder` subcommand. It sits outside `media_diagnostics/` on purpose: that tree instruments live sessions, this one benchmarks encoders in a throwaway process and never runs for a user |
+| `crates/orange/src/test_support.rs` | `#[cfg(test)]` only: runs a test in a deadline-bounded child process |
 
 ## Signal And Entry Source Map
 
@@ -259,8 +288,8 @@ webrtcbin OPUS pad
 | RTP payloads, jitterbuffer latency/drop policy | `crates/orange/src/webrtc/transport.rs` |
 | Native viewer behavior and HWND lifetime | `crates/orange/src/window.rs`, `crates/orange/src/window/native.rs` |
 | Overlay behavior/layout | `crates/orange/src/overlay.rs`, `crates/orange/src/overlay/raster.rs`, `crates/orange/src/overlay/gst.rs` |
-| Client screens | `crates/orange-client/src/view.rs` |
-| Friends list, presence polling, add/remove | `crates/orange-client/src/presence.rs`, `crates/orange-client/src/view.rs`, `crates/orange-client/src/main.rs` |
+| Client screens | `crates/orange-client/src/view/` — one file per screen |
+| Friends list, presence polling, add/remove | `crates/orange-client/src/presence.rs`, `crates/orange-client/src/view/home.rs`, `crates/orange-client/src/main.rs` |
 | Who may discover a stream | `visible_to` on `Signal::Host`, set in `crates/orange-client/src/main.rs`, filtered in `crates/orange-signal/src/relay.rs` |
 | Client colors/components | `crates/orange-client/src/ui/theme.rs`, `crates/orange-client/src/ui/controls.rs` |
 | Logo, glow, ambient grid | `crates/orange-client/src/ui/mark.rs`, `crates/orange-client/src/ui/decor.rs` |
@@ -278,6 +307,8 @@ webrtcbin OPUS pad
 | Which GStreamer elements ship in the installer | `packaging/windows/stage-gstreamer.ps1` |
 | Release procedure (bump, test, commit, push, publish) | `ship.ps1` |
 | Pre-push gate | `packaging/hooks/pre-push.ps1` |
+| Continuous integration | `.github/workflows/ci.yml` |
+| Application icon or logo | `assets/` |
 | Azure single-replica deployment | `deploy/azure.ps1` |
 
 ## Validation
@@ -303,7 +334,9 @@ cargo build --locked --release --workspace --all-features
 The fast subset of the source gates runs automatically on `git push` once
 `git config core.hooksPath packaging/hooks` is set. See
 `packaging/hooks/pre-push.ps1` for what it covers and what it deliberately
-leaves to the full matrix above.
+leaves to the full matrix above. `.github/workflows/ci.yml` runs the same
+subset on GitHub so the gate holds whether or not that hook is installed; it
+cannot cover `orange` or `orange-client`, which need GStreamer and Win32.
 
 Direct PowerShell contract tests do not publish or deploy:
 

@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# Ordered as the dependency graph reads: the signal library, then the relay
+# built on it, then the media CLI, then the client and the updater it hands off
+# to, neither of which depends on a workspace crate.
 members = ["crates/orange-signal", "crates/orange-relay", "crates/orange", "crates/orange-client", "crates/orange-updater"]
 
 [workspace.package]

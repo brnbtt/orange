@@ -1,3 +1,11 @@
+//! The `characterize-encoder` subcommand: a developer benchmark, not part of
+//! any user-facing path.
+//!
+//! It sits outside `media_diagnostics/` on purpose. That tree instruments a
+//! live session and ships in every binary that streams; this one drives an
+//! encoder through scripted phases in a throwaway process and only ever runs
+//! when someone asks for it by name.
+
 use anyhow::{bail, Context, Result};
 use gst::prelude::*;
 use gstreamer as gst;

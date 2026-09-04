@@ -1,0 +1,53 @@
+# The Linux-safe part of the gate in ARCHITECTURE.md, so it holds on every push
+# without each clone having to run `git config core.hooksPath packaging/hooks`.
+#
+# `orange` and `orange-client` are deliberately absent: they need GStreamer,
+# D3D11 and Win32, so they cannot build here at all. They stay covered by the
+# full local suite that ship.ps1 runs before it commits anything. What is left
+# still covers the relay, which is the one component where a bug breaks every
+# user at once and which deploys on its own path.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version and the components, so there is
+      # nothing to state twice here.
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Formatting covers the whole workspace: rustfmt parses rather than
+      # compiles, so the Windows-only crates are checked here even though they
+      # cannot be built.
+      - name: formatting
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --locked -p orange-signal -p orange-relay --all-targets -- -D warnings
+
+      - name: tests
+        run: cargo test --locked -p orange-signal -p orange-relay

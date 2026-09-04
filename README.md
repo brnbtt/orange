@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="crates/orange-client/logo.png" width="88" alt="orange">
+  <img src="assets/logo.png" width="88" alt="orange">
 </p>
 
 <h1 align="center">orange</h1>
