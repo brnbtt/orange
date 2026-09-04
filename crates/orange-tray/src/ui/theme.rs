@@ -56,12 +56,78 @@ pub(crate) const FRAME: u32 = 0x40180c;
 /// trade is worth making: nothing wraps it, ellipsises it or selects it.
 pub(crate) const WORDMARK: &str = "O R A N G E";
 
-pub(crate) const PICKER_PREVIEW_HEIGHT: f32 = 142.0;
+/// The window, at the one size it is ever drawn.
+///
+/// It used to be four sizes - 400x540, 400x660, 480x640 and 576x660 - with a
+/// `window.resize` on every screen change. The inconsistency was the visible
+/// half of the problem; two things in GPUI's Windows backend made it worse.
+/// `resize` calls `SetWindowPos` with `SWP_NOMOVE`, so every change anchored
+/// the top-left corner and walked the panel rightward across the display
+/// instead of growing about its centre. And it defers that call to the next
+/// executor tick while the new screen lays out immediately, so entering the
+/// picker rendered its two-column grid inside a 400px window for a frame,
+/// wrapped it to one column, then reflowed once the window caught up.
+///
+/// One size removes the resize call, and with it all three. The width is set
+/// by the picker, which is the only screen that needs two columns; the height
+/// by the home hero, which was squeezed to a third of its height at 540.
+pub(crate) const WINDOW_WIDTH: f32 = 480.0;
+pub(crate) const WINDOW_HEIGHT: f32 = 660.0;
+
+/// The `px_5` gutter on each side of every screen's content column.
+const GUTTER: f32 = 20.0;
+/// The `gap_3` between the picker's two columns.
+const COLUMN_GAP: f32 = 12.0;
+
+/// The content column, inside the gutters. Any element that wants to be as
+/// wide as a screen gets is this wide.
+pub(crate) const CONTENT_WIDTH: f32 = WINDOW_WIDTH - 2.0 * GUTTER;
+
+/// A picker card is half the content column. One pixel comes off each so the
+/// pair sums to less than the row rather than exactly filling it, leaving the
+/// wrap something to absorb.
+pub(crate) const PICKER_CARD_WIDTH: f32 = (CONTENT_WIDTH - COLUMN_GAP) / 2.0 - 1.0;
+/// The preview is the card at 16:9, which is the aspect the thumbnails are
+/// captured at, so the image fills the well exactly instead of being clipped.
+pub(crate) const PICKER_PREVIEW_HEIGHT: f32 = PICKER_CARD_WIDTH * 9.0 / 16.0;
 pub(crate) const PICKER_DETAILS_HEIGHT: f32 = 52.0;
 pub(crate) const PICKER_CARD_HEIGHT: f32 = PICKER_PREVIEW_HEIGHT + PICKER_DETAILS_HEIGHT;
+
+/// The whole-screen entry sits above the grid as a row rather than a card, so
+/// its thumbnail is small and beside the text.
+pub(crate) const SCREEN_THUMB_HEIGHT: f32 = 54.0;
+
+/// The live source preview on the streaming screen.
+///
+/// Bounded so the image is never wider than the content column: at 16:9 this
+/// is 427 against a column of 440. It used to be a flat 220 applied with
+/// `w_full`, which stretched a 16:9 capture to 2:1 and squashed the picture by
+/// about a ninth.
+pub(crate) const STREAM_PREVIEW_HEIGHT: f32 = 240.0;
+
 /// Height of the custom titlebar. The toast layer hangs directly below it, so
 /// the two have to agree.
 pub(crate) const TITLEBAR_HEIGHT: f32 = 44.0;
+
+// Both of these relate constants to each other, so they are checked at compile
+// time rather than in a test - a runtime assertion on two constants can only
+// ever fail after shipping.
+//
+// The picker is the only screen that needs two columns, and it is what sets
+// WINDOW_WIDTH. Narrowing the window without narrowing the card would wrap the
+// second card onto a row of its own, which reads as a layout bug rather than a
+// size that no longer fits.
+const _: () = assert!(
+    2.0 * PICKER_CARD_WIDTH + COLUMN_GAP <= CONTENT_WIDTH,
+    "two picker cards no longer fit across the content column"
+);
+// The stream preview is sized by height with its width left to follow, so one
+// any taller would be clipped at the sides by the well's `overflow_hidden`
+// instead of letterboxed inside it.
+const _: () = assert!(
+    STREAM_PREVIEW_HEIGHT * 16.0 / 9.0 <= CONTENT_WIDTH,
+    "the stream preview is wider than the content column"
+);
 
 /// The three sizes the mark is drawn at.
 ///

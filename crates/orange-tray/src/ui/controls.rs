@@ -646,6 +646,49 @@ pub(crate) fn dot(color: u32) -> gpui::Div {
     div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(color))
 }
 
+/// The bottom edge of a scrolling region, faded into the background to say
+/// there is more below. `None` when the region is at its end, or does not
+/// scroll at all.
+///
+/// GPUI has no scrollbar, so `overflow_y_scroll` on its own gives a list no
+/// edge: a picker showing four sources out of twelve looks exactly like one
+/// showing four out of four, and the settings list simply ran out under the
+/// version footer.
+///
+/// The condition lives here rather than at the call sites so the two regions
+/// cannot drift apart on when they show an edge.
+pub(crate) fn scroll_fade(scroll: &gpui::ScrollHandle) -> Option<gpui::Div> {
+    // Offsets run negative as a region scrolls down, hence the absolute value.
+    // `max_offset` is zero until the region has been laid out and for as long
+    // as everything fits, which is exactly when there should be no edge. The
+    // pixel of tolerance stops the fade flickering back on at the bottom.
+    let travelled = scroll.offset().y.abs();
+    let total = scroll.max_offset().height;
+    if total <= px(0.0) || travelled >= total - px(1.0) {
+        return None;
+    }
+
+    let base: gpui::Hsla = rgb(BG).into();
+    Some(
+        // Drawn over the content rather than beside it, so appearing and
+        // disappearing never changes the width of the region and reflows it.
+        div()
+            .absolute()
+            .bottom(px(0.0))
+            .left(px(0.0))
+            .w_full()
+            .h(px(28.0))
+            // Angle 0 points at the top, so the first stop is the bottom edge.
+            // Both stops are the background colour and only the alpha moves,
+            // which is what keeps the fade from greying the cards under it.
+            .bg(gpui::linear_gradient(
+                0.0,
+                gpui::linear_color_stop(base, 0.0),
+                gpui::linear_color_stop(base.opacity(0.0), 1.0),
+            )),
+    )
+}
+
 /// A dot that breathes, for "this is live right now".
 pub(crate) fn live_dot() -> impl IntoElement {
     dot(SUCCESS).with_animation(

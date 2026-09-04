@@ -122,9 +122,12 @@ struct Orange {
     logging_in: Option<LoginAttempt>,
     notice: Option<Notice>,
     server: String,
-    /// Last screen the window was sized for, so resize happens once per
-    /// transition rather than every frame.
-    sized_for: Option<Screen>,
+    /// Scroll position of the picker grid. Read during render so the view can
+    /// tell whether there is anything below the fold, which a bare
+    /// `overflow_y_scroll` gives no indication of.
+    picker_scroll: gpui::ScrollHandle,
+    /// The same, for the settings list.
+    settings_scroll: gpui::ScrollHandle,
     /// Whether the update toast is collapsed to its heading. The toast cannot
     /// be dismissed, only folded away: an available update stays actionable.
     update_collapsed: bool,
@@ -275,7 +278,8 @@ impl Orange {
                 expires_at: Instant::now() + Duration::from_secs(4),
             }),
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
-            sized_for: None,
+            picker_scroll: gpui::ScrollHandle::new(),
+            settings_scroll: gpui::ScrollHandle::new(),
             update_collapsed: false,
             settings_open: [true; 3],
             copied_at: None,
@@ -792,7 +796,7 @@ fn main() {
         // until the App emitter itself is dropped.
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(400.0), px(540.0)), cx);
+        let bounds = Bounds::centered(None, size(px(ui::WINDOW_WIDTH), px(ui::WINDOW_HEIGHT)), cx);
         let window = cx
             .open_window(
                 WindowOptions {
@@ -804,7 +808,11 @@ fn main() {
                         appears_transparent: true,
                         traffic_light_position: None,
                     }),
-                    window_min_size: Some(size(px(360.0), px(480.0))),
+                    // Every screen is laid out for exactly this size and the
+                    // window never changes size again, so there is no minimum
+                    // to declare - `window_min_size` was set to 360x480 here,
+                    // below every size the app actually used, and was inert
+                    // anyway because the window is not resizable.
                     is_resizable: false,
                     ..Default::default()
                 },

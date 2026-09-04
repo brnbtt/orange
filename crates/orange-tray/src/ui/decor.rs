@@ -16,9 +16,16 @@ const CELL: f32 = 32.0;
 /// into view as a bare strip. One cell of overscan is exactly enough for a
 /// drift of one cell.
 const OVERSCAN: f32 = CELL;
-/// Generous enough for the widest screen (the picker, at 576) plus overscan.
-const FIELD_W: f32 = 640.0;
-const FIELD_H: f32 = 760.0;
+/// The field is pinned to the left edge and never moves horizontally, so it
+/// only has to reach the far side. Vertically it starts one overscan high and
+/// drifts down by a cell, so at the start of every loop its bottom sits
+/// `OVERSCAN` short of `FIELD_H` - which is the case the height has to cover.
+///
+/// Derived rather than written down. These were 640 and 760, chosen to clear
+/// the largest of the four window sizes the app used to have, and they had to
+/// be revisited by hand every time one of those changed.
+const FIELD_W: f32 = WINDOW_WIDTH;
+const FIELD_H: f32 = WINDOW_HEIGHT + OVERSCAN;
 
 /// A hairline. Width or height of one, depending which way it runs.
 const HAIR: f32 = 1.0;
@@ -28,9 +35,12 @@ const HAIR: f32 = 1.0;
 // loop, which is the kind of thing nobody notices until they cannot stop
 // noticing it. Checked here rather than in a test because both sides are
 // constants: a runtime assertion could only ever fail after shipping.
+//
+// The other two conditions - that the field is as wide and as tall as the
+// window - used to be assertions against hand-written screen dimensions. They
+// are now how `FIELD_W` and `FIELD_H` are defined, so there is nothing left to
+// check.
 const _: () = assert!(OVERSCAN >= CELL);
-const _: () = assert!(FIELD_W >= 576.0 + OVERSCAN, "narrower than the picker");
-const _: () = assert!(FIELD_H >= 660.0, "shorter than the tallest screen");
 
 /// The grid: a field of hairlines that drifts by exactly one cell and repeats.
 ///
@@ -163,19 +173,4 @@ pub(crate) fn crosshair(size: f32, color: u32) -> gpui::Div {
                 .h(px(size))
                 .bg(rgb(color)),
         )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The grid has to outlast the tallest screen in both directions or it
-    /// stops short of the edge on the picker.
-    #[test]
-    fn the_field_covers_every_screen() {
-        let widest: f32 = 576.0;
-        let tallest: f32 = 660.0;
-        assert!(FIELD_W - OVERSCAN >= widest);
-        assert!(FIELD_H >= tallest);
-    }
 }

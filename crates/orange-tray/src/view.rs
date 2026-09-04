@@ -10,32 +10,15 @@ use crate::{
 const SECTION_ACCOUNT: usize = 0;
 const SECTION_STREAMING: usize = 1;
 const SECTION_APPLICATION: usize = 2;
-use gpui::{
-    div, prelude::*, px, rgb, size, Context, FontWeight, Pixels, SharedString, Size, Window,
-};
+use gpui::{div, prelude::*, px, rgb, Context, FontWeight, SharedString, Window};
 use std::time::Instant;
 
 /// Per-screen view metadata.
 ///
 /// Every match here is exhaustive with no `_` arm on purpose. Adding a screen
-/// should be a compile error in each of these, not a window that silently opens
-/// at the wrong size or a titlebar that silently shows nothing.
+/// should be a compile error in each of these, rather than a titlebar that
+/// silently shows nothing.
 impl Screen {
-    /// The picker needs room for a two-column grid; every other screen is a
-    /// narrow column. Resizing on transition keeps both comfortable rather
-    /// than compromising on one size for all of them.
-    fn size(self) -> Size<Pixels> {
-        match self {
-            Screen::PickWindow => size(px(576.0), px(660.0)),
-            Screen::Streaming => size(px(480.0), px(640.0)),
-            // Home carries the hero, two route cards and the footer. At 540 the
-            // hero was squeezed to a third of its height and the footer fell
-            // off the bottom edge.
-            Screen::Home => size(px(400.0), px(660.0)),
-            Screen::SignedOut | Screen::Watching | Screen::Settings => size(px(400.0), px(540.0)),
-        }
-    }
-
     /// Distinguishes screens for the entry animation, which restarts when this
     /// changes.
     fn animation_key(self) -> &'static str {
@@ -62,12 +45,6 @@ impl Screen {
 
 impl Render for Orange {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Toasts float above the content rather than sitting in the flow, so
-        // showing one never reflows the screen underneath or resizes the window.
-        if self.sized_for != Some(self.screen) {
-            self.sized_for = Some(self.screen);
-            window.resize(self.screen.size());
-        }
         // Decoration runs only while this window is the one you are looking
         // at. GPUI refreshes the window when activation changes, so reading it
         // here is enough to start and stop the ambient layer.
@@ -592,11 +569,26 @@ impl Orange {
 
     fn render_pick(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.quality;
-        let count = self.windows.len();
         // Distinguishes "still capturing" from "this window refuses to draw",
         // which previously both showed as "no preview" and made every card
         // flash a failure message before its thumbnail arrived.
         let capturing = self.thumbnail_job.is_some();
+
+        // Sharing a display and sharing a window are different decisions - one
+        // of them puts every notification you receive on the stream, along
+        // with all system audio. They used to be the same kind of card in the
+        // same grid, told apart only by their caption. The display is pulled
+        // out above the grid so the choice is made before the scanning starts.
+        let (displays, windows): (Vec<_>, Vec<_>) = self
+            .windows
+            .iter()
+            .cloned()
+            .partition(|target| target.hwnd == 0);
+        let count = windows.len();
+
+        // Last frame's scroll state, which is close enough for an edge that
+        // only says "there is more".
+        let fade = scroll_fade(&self.picker_scroll);
 
         div()
             .flex()
@@ -628,34 +620,51 @@ impl Orange {
                         })),
                     ),
             )
+            .children(
+                displays
+                    .into_iter()
+                    .map(|target| self.display_row(target, capturing, cx))
+                    .collect::<Vec<_>>(),
+            )
             .child(
+                // The scroll region and its fade share this box, so the fade
+                // can sit on the bottom edge of the region rather than the
+                // bottom of the screen, above the footer.
                 div()
-                    .id("windows")
+                    .relative()
                     .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_start()
-                    .gap_3()
+                    .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .when(count == 0, |d| {
-                        d.child(
-                            card()
-                                .w_full()
-                                .items_center()
-                                .child(label("No windows found", MUTED).text_xs()),
-                        )
-                    })
-                    .children(
-                        self.windows
-                            .clone()
-                            .into_iter()
-                            .map(|target| self.window_card(target, capturing, cx))
-                            .collect::<Vec<_>>(),
-                    ),
-            )
-            // Quality is a setting, not the task, so it sits in a footer rather
+                    .child(
+                        div()
+                            .id("windows")
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_start()
+                            .gap_3()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.picker_scroll)
+                            .when(count == 0, |d| {
+                                d.child(
+                                    card()
+                                        .w_full()
+                                        .items_center()
+                                        .child(label("No windows found", MUTED).text_xs()),
+                                )
+                            })
+                            .children(
+                                windows
+                                    .into_iter()
+                                    .map(|target| self.window_card(target, capturing, cx))
+                                    .collect::<Vec<_>>(),
+                            ),
+                    )
+                    .children(fade),
+            ) // Quality is a setting, not the task, so it sits in a footer rather
             // than competing with the grid for attention. One row, vertically
             // centred: the hint used to hang below and break the alignment.
             .child(
@@ -669,36 +678,33 @@ impl Orange {
                     .border_t_1()
                     .border_color(rgb(BORDER))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div().flex().gap_1p5().children(
-                                    QUALITIES
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(index, q)| {
-                                            option_pill(
-                                                SharedString::from(format!("q{index}")),
-                                                q.label,
-                                                index == selected,
-                                            )
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.quality = index;
-                                                    this.save_preferences();
-                                                    cx.notify();
-                                                }),
-                                            )
-                                        })
-                                        .collect::<Vec<_>>(),
-                                ),
-                            )
-                            .child(
-                                label("Streaming quality adjusts automatically", FAINT).text_xs(),
-                            ),
+                        div().flex().items_center().gap_1p5().children(
+                            QUALITIES
+                                .iter()
+                                .enumerate()
+                                .map(|(index, q)| {
+                                    option_pill(
+                                        SharedString::from(format!("q{index}")),
+                                        q.label,
+                                        index == selected,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.quality = index;
+                                            this.save_preferences();
+                                            cx.notify();
+                                        },
+                                    ))
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
                     )
+                    // No hint line beside the pills. "Streaming quality adjusts
+                    // automatically" fitted the 576-wide picker and does not fit
+                    // 440 of content: it pushed Back off the right edge, which
+                    // left the titlebar as the only way out of this screen. The
+                    // same sentence is the detail on Settings -> Resolution,
+                    // where somebody actually choosing a quality will read it.
                     .child(
                         ghost("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
                             this.leave_picker(Screen::Home);
@@ -706,6 +712,93 @@ impl Orange {
                         })),
                     ),
             )
+    }
+
+    /// The whole-display entry, pinned above the grid.
+    ///
+    /// A row rather than a card, because it is not one of the windows and
+    /// should not be scanned as one. The preview is small for the same reason:
+    /// nobody needs a thumbnail to recognise their own desktop, and the thing
+    /// worth reading here is the warning about system audio.
+    fn display_row(
+        &self,
+        target: WindowTarget,
+        capturing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let thumb = self.thumbnails.get(&target.hwnd).cloned();
+        let group = SharedString::from("display-row");
+        let meta = if target.width > 0 && target.height > 0 {
+            format!(
+                "{}\u{d7}{} \u{b7} includes all system audio",
+                target.width, target.height
+            )
+        } else {
+            "Full display \u{b7} includes all system audio".to_string()
+        };
+
+        div()
+            .id("display")
+            .group(group.clone())
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .gap_3()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE)))
+            .active(|s| s.bg(rgb(BG)).border_color(rgb(ORANGE_DIM)))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .h(px(SCREEN_THUMB_HEIGHT))
+                    .w(px(SCREEN_THUMB_HEIGHT * 16.0 / 9.0))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(INK))
+                    .child(match (thumb, capturing) {
+                        (Some(image), _) => gpui::img(image)
+                            .h(px(SCREEN_THUMB_HEIGHT))
+                            .into_any_element(),
+                        (None, true) => micro("\u{2026}", FAINT).into_any_element(),
+                        (None, false) => micro("NO PREVIEW", FAINT).into_any_element(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT))
+                            .group_hover(group.clone(), |s| s.text_color(rgb(ORANGE)))
+                            .child(target.title.clone()),
+                    )
+                    .child(label(meta, FAINT).text_xs()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .opacity(0.0)
+                    .group_hover(group, |s| s.opacity(1.0))
+                    .child(go_badge()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.start_stream(target.clone());
+                cx.notify();
+            }))
     }
 
     /// One card in the picker grid.
@@ -718,17 +811,17 @@ impl Orange {
         capturing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_screen = target.hwnd == 0;
         let title = if target.title.is_empty() {
             target.app_name()
         } else {
             target.title.clone()
         };
-        let meta = if is_screen {
-            "Full display · includes all system audio".to_string()
-        } else {
-            format!("{} · {}×{}", target.app_name(), target.width, target.height)
-        };
+        let meta = format!(
+            "{} \u{b7} {}\u{d7}{}",
+            target.app_name(),
+            target.width,
+            target.height
+        );
         let thumb = self.thumbnails.get(&target.hwnd).cloned();
         let hwnd = target.hwnd;
         let group = SharedString::from(format!("card-{hwnd}"));
@@ -740,7 +833,7 @@ impl Orange {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(252.0))
+            .w(px(PICKER_CARD_WIDTH))
             .h(px(PICKER_CARD_HEIGHT))
             .rounded_md()
             .overflow_hidden()
@@ -923,14 +1016,18 @@ impl Orange {
                             .items_center()
                             .justify_center()
                             .w_full()
-                            .h(px(220.0))
+                            .h(px(STREAM_PREVIEW_HEIGHT))
                             .flex_shrink_0()
                             .overflow_hidden()
                             .bg(rgb(BG))
                             .child(match preview {
-                                Some(image) => {
-                                    gpui::img(image).w_full().h(px(220.0)).into_any_element()
-                                }
+                                // Height only, with the width left to follow.
+                                // This was `w_full` with a fixed height, which
+                                // stretched a 16:9 capture to the shape of the
+                                // well and squashed the picture by a ninth.
+                                Some(image) => gpui::img(image)
+                                    .h(px(STREAM_PREVIEW_HEIGHT))
+                                    .into_any_element(),
                                 None => label("Source preview unavailable", FAINT)
                                     .text_xs()
                                     .into_any_element(),
@@ -1345,6 +1442,7 @@ impl Orange {
     }
 
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let fade = scroll_fade(&self.settings_scroll);
         let account = self.settings_account_card(cx);
         let resolution = self.settings_resolution_card(cx);
         let frame_rate = self.settings_frame_rate_card(cx);
@@ -1391,17 +1489,30 @@ impl Orange {
                 // The list outgrew the window once Updates and Diagnostics were
                 // added. Scroll the list and pin the footer so Done is always
                 // reachable without scrolling to find it.
+                //
+                // The scroll region and its edge share this box so the fade
+                // lands on the bottom of the list, not on the footer below it.
                 div()
-                    .id("settings-scroll")
+                    .relative()
                     .flex()
                     .flex_col()
-                    .gap_4()
                     .flex_1()
                     .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .child(account)
-                    .child(video)
-                    .child(system),
+                    .child(
+                        div()
+                            .id("settings-scroll")
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.settings_scroll)
+                            .child(account)
+                            .child(video)
+                            .child(system),
+                    )
+                    .children(fade),
             )
             .child(micro(
                 format!(
