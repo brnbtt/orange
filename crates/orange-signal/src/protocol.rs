@@ -13,7 +13,17 @@ pub enum Signal {
     /// Server -> peer: identity accepted.
     Authenticated { name: String },
     /// Host -> server: open a room.
-    Host,
+    ///
+    /// `visible_to` lists the Discord ids allowed to discover this room through
+    /// `/presence`. The friend list lives on the host's machine, so the host is
+    /// the only thing that knows it; the relay just indexes what it is told.
+    /// Empty means the room is discoverable by nobody and can only be joined by
+    /// someone who was given the code, which is what every pre-friends client
+    /// sends and what an anonymous host gets.
+    Host {
+        #[serde(default)]
+        visible_to: Vec<String>,
+    },
     /// Server -> host: the room is open under this code.
     Hosting {
         code: String,
@@ -114,5 +124,17 @@ mod tests {
             panic!("expected stream info signal");
         };
         assert_eq!(viewer_session, None);
+    }
+
+    /// Every shipped client sends the bare `{"type":"host"}`, and the relay is
+    /// deployed independently of them. Without the default a relay carrying
+    /// this change would reject every existing installation's host request.
+    #[test]
+    fn a_host_request_from_a_client_that_predates_friends_still_opens_a_room() {
+        let host: Signal = serde_json::from_str(r#"{"type":"host"}"#).unwrap();
+        let Signal::Host { visible_to } = host else {
+            panic!("expected host signal");
+        };
+        assert!(visible_to.is_empty());
     }
 }

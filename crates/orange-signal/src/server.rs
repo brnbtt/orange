@@ -4,14 +4,14 @@
 //! ingress. `axum` handles the routing and the WebSocket upgrade.
 
 use crate::auth::{Auth, DiscordConfig, PollResult};
-use crate::relay::{handle_peer, Rooms};
+use crate::relay::{handle_peer, presence_for, Presence, Rooms};
 use anyhow::{Context, Result};
 use axum::{
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -63,6 +63,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/auth/start", get(auth_start))
         .route("/auth/callback", get(auth_callback))
         .route("/auth/poll", get(auth_poll))
+        .route("/presence", get(presence))
         .route("/ws", get(ws_upgrade))
         .with_state(state)
 }
@@ -149,6 +150,77 @@ async fn auth_poll(
         PollResult::Unknown => PollBody::Unknown,
     };
     Json(body)
+}
+
+/// Cap on ids per presence query. Far above any plausible friend list, but it
+/// stops one request from pinning the room lock while it walks an attacker's
+/// arbitrarily long id list.
+const PRESENCE_QUERY_CAPACITY: usize = 256;
+
+#[derive(Deserialize)]
+struct PresenceParams {
+    /// Comma-separated Discord ids.
+    #[serde(default)]
+    ids: String,
+}
+
+#[derive(Serialize)]
+struct PresenceEntry {
+    id: String,
+    #[serde(flatten)]
+    presence: Presence,
+}
+
+#[derive(Serialize)]
+struct PresenceBody {
+    friends: Vec<PresenceEntry>,
+}
+
+/// Who among the caller's friends is streaming right now.
+///
+/// Unlike `/ws`, this refuses an unauthenticated caller. Presence is answered
+/// in terms of "who are you", so there is no anonymous form of the question,
+/// and a silent empty answer would be indistinguishable from every friend
+/// being offline.
+async fn presence(
+    State(app): State<AppState>,
+    Query(params): Query<PresenceParams>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = bearer_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    };
+    let Some(identity) = app.auth.identify(token).await else {
+        return (StatusCode::UNAUTHORIZED, "unknown or expired session").into_response();
+    };
+
+    let ids: Vec<String> = params
+        .ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    if ids.len() > PRESENCE_QUERY_CAPACITY {
+        return (StatusCode::BAD_REQUEST, "too many ids").into_response();
+    }
+
+    let friends = presence_for(&app.rooms, &identity.id, &ids)
+        .await
+        .into_iter()
+        .map(|(id, presence)| PresenceEntry { id, presence })
+        .collect();
+    Json(PresenceBody { friends }).into_response()
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
@@ -260,6 +332,95 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    /// `/ws` deliberately accepts anonymous peers, so it would be easy to give
+    /// `/presence` the same treatment. It must not have it: the answer is
+    /// "which of *your* friends are live", and an anonymous caller returning an
+    /// empty list is indistinguishable from every friend being offline.
+    #[tokio::test]
+    async fn presence_refuses_a_caller_without_a_valid_session() {
+        let state = AppState {
+            rooms: Default::default(),
+            auth: Auth::new(None),
+        };
+        state
+            .auth
+            .insert_session_for_test(
+                "good-token",
+                crate::auth::Identity {
+                    id: "me".into(),
+                    name: "Me".into(),
+                    avatar_url: None,
+                },
+            )
+            .await;
+
+        for authorization in [None, Some("Bearer expired"), Some("good-token")] {
+            let mut request = Request::get("/presence?ids=friend");
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = router(state.clone())
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated presence query was answered: {authorization:?}"
+            );
+        }
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::get("/presence?ids=friend")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            r#"{"friends":[{"id":"friend","state":"offline"}]}"#
+        );
+    }
+
+    /// A friend list is unbounded but the room lock is shared with every
+    /// signalling message, so one caller must not be able to hold it while the
+    /// relay walks an arbitrarily long id list.
+    #[tokio::test]
+    async fn presence_rejects_a_query_longer_than_any_real_friend_list() {
+        let state = AppState {
+            rooms: Default::default(),
+            auth: Auth::new(None),
+        };
+        state
+            .auth
+            .insert_session_for_test(
+                "good-token",
+                crate::auth::Identity {
+                    id: "me".into(),
+                    name: "Me".into(),
+                    avatar_url: None,
+                },
+            )
+            .await;
+
+        let ids = vec!["1"; PRESENCE_QUERY_CAPACITY + 1].join(",");
+        let response = router(state)
+            .oneshot(
+                Request::get(format!("/presence?ids={ids}"))
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

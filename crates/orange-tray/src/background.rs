@@ -59,7 +59,7 @@ impl Drop for AvatarJob {
     }
 }
 
-fn join_background_worker(worker: JoinHandle<()>, timeout: Duration, name: &str) {
+pub(super) fn join_background_worker(worker: JoinHandle<()>, timeout: Duration, name: &str) {
     let deadline = Instant::now() + timeout;
     while !worker.is_finished() {
         if Instant::now() >= deadline {

@@ -92,6 +92,11 @@ enum Command {
         hwnd: isize,
         #[arg(long, default_value = "ws://127.0.0.1:9000/ws", env = "ORANGE_SERVER")]
         server: String,
+        /// Discord ids allowed to see this stream in their friends list and be
+        /// handed the code without being told it. The roster lives with the
+        /// tray, which owns preferences; this process is only the messenger.
+        #[arg(long, value_delimiter = ',')]
+        visible_to: Vec<String>,
         #[command(flatten)]
         quality: QualityArgs,
     },
@@ -350,6 +355,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Host {
             hwnd,
             server,
+            visible_to,
             quality,
         } => {
             let settings = quality.settings(hwnd)?;
@@ -357,7 +363,7 @@ fn run(cli: Cli) -> Result<()> {
                 "Hosting hwnd {hwnd} as {:?} at {} kbps / {} fps",
                 settings.codec, settings.bitrate, settings.fps
             );
-            runtime()?.block_on(peer::run_host(&settings, &server))
+            runtime()?.block_on(peer::run_host(&settings, &server, visible_to))
         }
         Command::Watch {
             code,
@@ -724,6 +730,23 @@ mod tests {
 
         assert_eq!(automatic.bitrate, None);
         assert_eq!(overridden.bitrate, Some(100_001));
+    }
+
+    /// The tray joins the roster with commas and omits the flag entirely for an
+    /// empty one, because clap reads `--visible-to` with no value as the start
+    /// of the next flag. Both halves of that contract are pinned here.
+    #[test]
+    fn the_friend_roster_arrives_as_one_comma_separated_flag_or_not_at_all() {
+        let visible_to = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Host { visible_to, .. } => visible_to,
+            _ => panic!("expected host command"),
+        };
+
+        assert!(visible_to(&["orange", "host", "--hwnd", "1"]).is_empty());
+        assert_eq!(
+            visible_to(&["orange", "host", "--hwnd", "1", "--visible-to", "123,456"]),
+            vec!["123".to_string(), "456".to_string()]
+        );
     }
 
     #[test]

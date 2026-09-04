@@ -10,6 +10,7 @@
 
 mod background;
 mod capture;
+mod presence;
 mod session;
 mod sound;
 mod supervisor;
@@ -52,6 +53,7 @@ enum Screen {
     SignedOut,
     Home,
     PickWindow,
+    Friends,
     Streaming,
     Watching,
     Settings,
@@ -142,6 +144,19 @@ struct Orange {
     /// Viewer count at the last tick, so arrivals and departures can be told
     /// apart. Reset to zero whenever no stream is running.
     viewers_seen: usize,
+    /// The roster this machine wants presence for. Seeded by hand in
+    /// `preferences.json` until the invite flow exists.
+    friends: Vec<session::Friend>,
+    /// Last answer from the relay, keyed by Discord id. Absent means "not
+    /// asked yet or the poll failed", which the view renders differently from
+    /// a friend who is genuinely offline.
+    presence: std::collections::HashMap<String, presence::Presence>,
+    presence_job: Option<presence::PresenceJob>,
+    presence_due: Instant,
+    /// Why the last poll failed, if it did. Surfaced rather than swallowed:
+    /// silently showing every friend offline is indistinguishable from every
+    /// friend actually being offline.
+    presence_error: Option<String>,
     logo_epoch: u64,
     /// Whether ambient animation should run: true only while this window is
     /// the active one.
@@ -189,6 +204,11 @@ struct Digest {
     /// repaints.
     recently_copied: bool,
     update_status: String,
+    /// Presence is polled on a timer, so the tick that learns a friend went
+    /// live has to be the one that repaints the row. Without this the friends
+    /// list would only refresh when something unrelated moved.
+    presence: Vec<(String, Option<presence::Presence>)>,
+    presence_error: Option<String>,
 }
 
 impl Orange {
@@ -212,7 +232,74 @@ impl Orange {
             has_preview: self.active_preview.is_some(),
             recently_copied: self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FOR),
             update_status: self.updates.settings_detail(),
+            presence: self
+                .friends
+                .iter()
+                .map(|friend| (friend.id.clone(), self.presence.get(&friend.id).cloned()))
+                .collect(),
+            presence_error: self.presence_error.clone(),
         }
+    }
+
+    /// The ids this machine is willing to be discovered by. A host tells the
+    /// relay this at `Host` time; the relay never learns it any other way.
+    fn visible_to(&self) -> Vec<String> {
+        self.friends
+            .iter()
+            .map(|friend| friend.id.clone())
+            .collect()
+    }
+
+    /// Start a poll when one is due, and collect the answer from the last one.
+    ///
+    /// Runs inside the 500 ms tick but only reaches the network every
+    /// `presence::INTERVAL`, the same shape as the update controller's
+    /// six-hourly check.
+    fn poll_presence(&mut self) {
+        if let Some(job) = self.presence_job.as_ref() {
+            if job.is_finished() {
+                let result = job.receiver.try_recv().ok();
+                if let Some(mut job) = self.presence_job.take() {
+                    job.join();
+                }
+                match result {
+                    Some(Ok(entries)) => {
+                        self.presence_error = None;
+                        self.presence = entries
+                            .into_iter()
+                            .map(|entry| (entry.id, entry.presence))
+                            .collect();
+                    }
+                    Some(Err(error)) => self.presence_error = Some(error.to_string()),
+                    // The worker was cancelled before it sent anything. Leave
+                    // the previous answer standing rather than blanking the
+                    // list on a race.
+                    None => {}
+                }
+            }
+            return;
+        }
+
+        if Instant::now() < self.presence_due {
+            return;
+        }
+        self.presence_due = Instant::now() + presence::INTERVAL;
+
+        let Some(session) = self.session.as_ref() else {
+            self.presence.clear();
+            return;
+        };
+        let Some(url) = presence::presence_url(&self.server) else {
+            self.presence_error =
+                Some(format!("cannot derive a presence URL from {}", self.server));
+            return;
+        };
+        presence::start(
+            &mut self.presence_job,
+            url,
+            session.token.clone(),
+            &self.friends,
+        );
     }
 }
 
@@ -286,6 +373,13 @@ impl Orange {
             copied_code: None,
             own_codes: preferences.own_codes,
             viewers_seen: 0,
+            friends: preferences.friends,
+            presence: std::collections::HashMap::new(),
+            presence_job: None,
+            // Ask immediately on startup rather than after one interval, so a
+            // friend who is already live is on screen when the window opens.
+            presence_due: Instant::now(),
+            presence_error: None,
             logo_epoch: 0,
             // Corrected on the first render, before anything is painted.
             animate: false,
@@ -297,6 +391,7 @@ impl Orange {
         let before = self.digest();
         self.drain_thumbnails();
         self.poll_updates(cx);
+        self.poll_presence();
         let avatar_result = self.avatar_job.as_ref().and_then(|job| {
             job.is_finished().then(|| match job.receiver.try_recv() {
                 Ok(pixels) => Some(Some(pixels)),
@@ -492,6 +587,7 @@ impl Orange {
             quality: self.quality,
             fps: Some(self.fps),
             own_codes: self.own_codes.clone(),
+            friends: self.friends.clone(),
         };
         if let Err(error) = session::save_preferences(&preferences) {
             self.show_error(format!("Could not save preferences: {error}"));
@@ -602,7 +698,13 @@ impl Orange {
             return;
         }
         let preview = self.thumbnails.get(&target.hwnd).cloned();
-        match Supervisor::host(&target, &self.quality(), self.fps, &self.server) {
+        match Supervisor::host(
+            &target,
+            &self.quality(),
+            self.fps,
+            &self.server,
+            &self.visible_to(),
+        ) {
             Ok(stream) => {
                 self.active_target = Some(target);
                 self.active_preview = preview;
@@ -953,6 +1055,7 @@ mod tests {
             name: "Orange User".into(),
             id: "123".into(),
             avatar_url: None,
+            token: "token".into(),
         }
     }
 

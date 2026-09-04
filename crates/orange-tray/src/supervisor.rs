@@ -334,7 +334,13 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// Start `orange host` for a window and begin parsing its output.
-    pub fn host(target: &WindowTarget, quality: &Quality, fps: u32, server: &str) -> Result<Self> {
+    pub fn host(
+        target: &WindowTarget,
+        quality: &Quality,
+        fps: u32,
+        server: &str,
+        visible_to: &[String],
+    ) -> Result<Self> {
         let (width, height) = quality.fit(target);
         let mut command = orange_command()?;
         command
@@ -347,6 +353,11 @@ impl Supervisor {
             // display's refresh rate, which is what the cap exists to avoid.
             .args(["--fps", &fps.to_string()])
             .args(["--scale", &format!("{width}x{height}")]);
+        // Omitted entirely when empty: clap would read `--visible-to` with no
+        // value as the start of the next flag.
+        if !visible_to.is_empty() {
+            command.args(["--visible-to", &visible_to.join(",")]);
+        }
         Self::spawn(command)
     }
 

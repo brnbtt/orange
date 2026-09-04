@@ -63,7 +63,11 @@ fn handle_host_diagnostic_signal(signal: &Signal) {
 /// The window is captured and encoded **once**. Encoded video is fanned out to
 /// a fresh RTP payloader per viewer, so late joiners receive their own RTP
 /// stream and initialization while still sharing the expensive encoder.
-pub(crate) async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()> {
+pub(crate) async fn run_host(
+    settings: &CaptureSettings,
+    url: &str,
+    visible_to: Vec<String>,
+) -> Result<()> {
     check_elements(settings)?;
     let mut client = connect(url).await?;
 
@@ -73,7 +77,7 @@ pub(crate) async fn run_host(settings: &CaptureSettings, url: &str) -> Result<()
             session: session.token,
         })?;
     }
-    client.outgoing.send(Signal::Host)?;
+    client.outgoing.send(Signal::Host { visible_to })?;
 
     // --- pipeline ---------------------------------------------------------
     let pipeline = gst::Pipeline::new();

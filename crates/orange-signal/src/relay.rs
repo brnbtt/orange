@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{bail, Result};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
@@ -53,6 +53,7 @@ fn hosting_collision_preserves_live_room_and_uses_next_code() {
             host_name: Some("existing host".into()),
             diagnostic_session: "existing session".into(),
             viewers: HashMap::new(),
+            ..Room::default()
         },
     )]);
     let mut codes = ["ABC-234", "XYZ-789"].into_iter();
@@ -115,11 +116,81 @@ impl Tx {
 pub(crate) struct Room {
     host: Option<Tx>,
     host_name: Option<String>,
+    /// Discord id of the host, when it authenticated. `None` for an anonymous
+    /// host, which is why an anonymous room can never be found by `/presence`:
+    /// there is no id to look it up under.
+    host_id: Option<String>,
+    /// Discord ids the host is willing to be discovered by. Not an access
+    /// control boundary on the room itself -- anyone holding the code can still
+    /// join -- it only decides who is handed the code without being told it.
+    visible_to: Vec<String>,
     diagnostic_session: String,
     viewers: HashMap<String, Tx>,
 }
 
 pub(crate) type Rooms = Arc<Mutex<HashMap<String, Room>>>;
+
+/// What one friend's stream looks like to someone allowed to see it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum Presence {
+    /// Not streaming, or streaming somewhere this viewer was not listed.
+    /// The two are deliberately indistinguishable: telling a viewer "they are
+    /// live but not for you" leaks the thing hiding was meant to hide.
+    Offline,
+    /// Streaming with room to spare. The code is the join capability, so
+    /// releasing it here is what replaces the paste.
+    Live { code: String },
+    /// Streaming, but at `ROOM_VIEWER_CAPACITY`. Kept distinct from `Live`
+    /// because a viewer shown a join button that immediately fails with
+    /// "stream is full" was misled by the button.
+    Full,
+}
+
+/// Resolve what `viewer` may know about each of `ids`, in the order asked.
+///
+/// Scans the room table once rather than per id: the table is bounded by the
+/// connection semaphore, but a friend list is not, and the naive form is a
+/// product of the two.
+pub(crate) async fn presence_for(
+    rooms: &Rooms,
+    viewer: &str,
+    ids: &[String],
+) -> Vec<(String, Presence)> {
+    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let rooms = rooms.lock().await;
+    let mut best: HashMap<&str, Presence> = HashMap::new();
+
+    for (code, room) in rooms.iter() {
+        if room.host.is_none() {
+            continue;
+        }
+        let Some(host_id) = room.host_id.as_deref() else {
+            continue;
+        };
+        if !wanted.contains(host_id) || !room.visible_to.iter().any(|id| id == viewer) {
+            continue;
+        }
+        let found = if room.viewers.len() < ROOM_VIEWER_CAPACITY {
+            Presence::Live { code: code.clone() }
+        } else {
+            Presence::Full
+        };
+        // One host can hold two rooms open. Iteration order over a HashMap is
+        // not stable, so without preferring the joinable one the answer for
+        // that host would flap between polls.
+        if !matches!(best.get(host_id), Some(Presence::Live { .. })) {
+            best.insert(host_id, found);
+        }
+    }
+
+    ids.iter()
+        .map(|id| {
+            let presence = best.get(id.as_str()).cloned().unwrap_or(Presence::Offline);
+            (id.clone(), presence)
+        })
+        .collect()
+}
 
 fn insert_room_with_code(
     rooms: &mut HashMap<String, Room>,
@@ -138,6 +209,139 @@ fn insert_room_with_code(
 enum Role {
     Host,
     Viewer(String),
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    /// `presence_for` only inspects whether a host exists and counts viewers,
+    /// so these channels are never read from and the receivers can go.
+    fn tx() -> Tx {
+        let (messages, _) = mpsc::channel::<Message>(1);
+        let (disconnect, _) = tokio::sync::watch::channel(false);
+        Tx {
+            messages,
+            disconnect,
+        }
+    }
+
+    fn room(host_id: &str, visible_to: &[&str], viewers: usize) -> Room {
+        Room {
+            host: Some(tx()),
+            host_id: Some(host_id.to_string()),
+            visible_to: visible_to.iter().map(|id| id.to_string()).collect(),
+            viewers: (0..viewers).map(|n| (format!("viewer{n}"), tx())).collect(),
+            ..Room::default()
+        }
+    }
+
+    fn rooms(entries: Vec<(&str, Room)>) -> Rooms {
+        Arc::new(Mutex::new(
+            entries
+                .into_iter()
+                .map(|(code, room)| (code.to_string(), room))
+                .collect(),
+        ))
+    }
+
+    /// The whole privacy claim of the feature. If this regresses, knowing a
+    /// Discord id -- which is public -- is enough to be handed a join code for
+    /// a stranger's stream, which is strictly worse than the paste flow it
+    /// replaced.
+    #[tokio::test]
+    async fn presence_hides_a_room_from_someone_the_host_did_not_list() {
+        let rooms = rooms(vec![("ABC-234", room("host", &["friend"], 0))]);
+
+        let allowed = presence_for(&rooms, "friend", &["host".to_string()]).await;
+        assert_eq!(
+            allowed,
+            vec![(
+                "host".to_string(),
+                Presence::Live {
+                    code: "ABC-234".into()
+                }
+            )]
+        );
+
+        let stranger = presence_for(&rooms, "stranger", &["host".to_string()]).await;
+        assert_eq!(stranger, vec![("host".to_string(), Presence::Offline)]);
+    }
+
+    /// A host who never signed in has no id to be found under. Without the
+    /// explicit `host_id` check an anonymous room would answer to whatever the
+    /// caller asked for, because `None == None` would have matched.
+    #[tokio::test]
+    async fn presence_never_reveals_an_anonymous_room() {
+        let mut anonymous = room("ignored", &["friend"], 0);
+        anonymous.host_id = None;
+        let rooms = rooms(vec![("ABC-234", anonymous)]);
+
+        let found = presence_for(&rooms, "friend", &["".to_string()]).await;
+        assert_eq!(found, vec![("".to_string(), Presence::Offline)]);
+    }
+
+    /// A friend shown "Live" who clicks and immediately gets "stream is full"
+    /// from the join path was misled by the button. The tray needs the
+    /// distinction to render a disabled state instead.
+    #[tokio::test]
+    async fn presence_reports_a_full_room_as_full_rather_than_live() {
+        let rooms = rooms(vec![(
+            "ABC-234",
+            room("host", &["friend"], ROOM_VIEWER_CAPACITY),
+        )]);
+
+        let found = presence_for(&rooms, "friend", &["host".to_string()]).await;
+        assert_eq!(found, vec![("host".to_string(), Presence::Full)]);
+    }
+
+    /// One person can leave a stale host connection open and start a second.
+    /// Iteration order over the room table is not stable, so answering with
+    /// whichever room came first would flap the friend between joinable and
+    /// full on alternate polls.
+    #[tokio::test]
+    async fn presence_prefers_a_joinable_room_when_a_host_opened_two() {
+        let rooms = rooms(vec![
+            ("FUL-LLL", room("host", &["friend"], ROOM_VIEWER_CAPACITY)),
+            ("ABC-234", room("host", &["friend"], 1)),
+        ]);
+
+        for _ in 0..16 {
+            let found = presence_for(&rooms, "friend", &["host".to_string()]).await;
+            assert_eq!(
+                found,
+                vec![(
+                    "host".to_string(),
+                    Presence::Live {
+                        code: "ABC-234".into()
+                    }
+                )]
+            );
+        }
+    }
+
+    /// The tray renders one row per friend and pairs the answers up by
+    /// position. Dropping offline friends from the reply would silently shift
+    /// every row after them onto the wrong person.
+    #[tokio::test]
+    async fn presence_answers_every_requested_id_in_the_order_asked() {
+        let rooms = rooms(vec![("ABC-234", room("live", &["friend"], 0))]);
+        let asked = [
+            "offline".to_string(),
+            "live".to_string(),
+            "also-offline".to_string(),
+        ];
+
+        let found = presence_for(&rooms, "friend", &asked).await;
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["offline", "live", "also-offline"]);
+        assert_eq!(
+            found[1].1,
+            Presence::Live {
+                code: "ABC-234".into()
+            }
+        );
+    }
 }
 
 /// Serve one connected peer for its lifetime.
@@ -214,12 +418,13 @@ pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Aut
                         }
                     }
                 }
-                Signal::Host => {
+                Signal::Host { visible_to } => {
                     if joined.is_some() {
                         bail!("peer attempted to change signalling role");
                     }
                     let diagnostic_session = generate_diagnostic_session();
                     let name = identity.as_ref().map(|i| i.name.clone());
+                    let host_id = identity.as_ref().map(|i| i.id.clone());
                     let code = {
                         let mut rooms = rooms.lock().await;
                         insert_room_with_code(
@@ -227,6 +432,8 @@ pub(crate) async fn handle_peer(socket: WebSocket, rooms: Rooms, auth: auth::Aut
                             Room {
                                 host: Some(tx.clone()),
                                 host_name: name,
+                                host_id,
+                                visible_to,
                                 diagnostic_session: diagnostic_session.clone(),
                                 viewers: HashMap::new(),
                             },
@@ -465,7 +672,10 @@ mod tests {
         let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         host.send(tokio_tungstenite::tungstenite::Message::Text(
-            Signal::Host.to_json(),
+            Signal::Host {
+                visible_to: Vec::new(),
+            }
+            .to_json(),
         ))
         .await
         .unwrap();
@@ -474,7 +684,10 @@ mod tests {
             Signal::Hosting { .. }
         ));
         host.send(tokio_tungstenite::tungstenite::Message::Text(
-            Signal::Host.to_json(),
+            Signal::Host {
+                visible_to: Vec::new(),
+            }
+            .to_json(),
         ))
         .await
         .unwrap();
@@ -504,7 +717,10 @@ mod tests {
             for cycle in 0..64 {
                 let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
                 host.send(tokio_tungstenite::tungstenite::Message::Text(
-                    Signal::Host.to_json(),
+                    Signal::Host {
+                        visible_to: Vec::new(),
+                    }
+                    .to_json(),
                 ))
                 .await
                 .unwrap();
@@ -561,7 +777,10 @@ mod tests {
 
         let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         host.send(tokio_tungstenite::tungstenite::Message::Text(
-            Signal::Host.to_json(),
+            Signal::Host {
+                visible_to: Vec::new(),
+            }
+            .to_json(),
         ))
         .await
         .expect("failed to send host command");
@@ -715,6 +934,121 @@ mod tests {
         relay.abort();
     }
 
+    /// The whole feature in one test: a host goes live over the WebSocket
+    /// naming who may see it, and a friend learns the join code over HTTP
+    /// without anybody pasting anything. The unit tests around `presence_for`
+    /// check the filtering in isolation; this checks that the two transports
+    /// actually agree, which is where a real deployment would break.
+    #[tokio::test]
+    async fn a_friend_is_handed_the_join_code_over_http_without_ever_being_told_it() {
+        let auth = auth::Auth::new(None);
+        auth.insert_session_for_test(
+            "host-token",
+            Identity {
+                id: "host-id".into(),
+                name: "Host".into(),
+                avatar_url: None,
+            },
+        )
+        .await;
+        auth.insert_session_for_test(
+            "friend-token",
+            Identity {
+                id: "friend-id".into(),
+                name: "Friend".into(),
+                avatar_url: None,
+            },
+        )
+        .await;
+        auth.insert_session_for_test(
+            "stranger-token",
+            Identity {
+                id: "stranger-id".into(),
+                name: "Stranger".into(),
+                avatar_url: None,
+            },
+        )
+        .await;
+
+        let rooms = Rooms::default();
+        let app = server::router(server::AppState {
+            rooms: rooms.clone(),
+            auth,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (mut host, _) = tokio_tungstenite::connect_async(&format!("ws://{address}/ws"))
+            .await
+            .unwrap();
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Authenticate {
+                session: "host-token".into(),
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive_signal(&mut host).await,
+            Signal::Authenticated { .. }
+        ));
+        host.send(tokio_tungstenite::tungstenite::Message::Text(
+            Signal::Host {
+                visible_to: vec!["friend-id".into()],
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+        let Signal::Hosting { code, .. } = receive_signal(&mut host).await else {
+            panic!("host did not receive a room code");
+        };
+
+        let ask = |token: &'static str| async move {
+            let body = reqwest::Client::new()
+                .get(format!("http://{address}/presence"))
+                .query(&[("ids", "host-id")])
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            body
+        };
+
+        assert_eq!(
+            ask("friend-token").await,
+            format!(r#"{{"friends":[{{"id":"host-id","state":"live","code":"{code}"}}]}}"#),
+            "a listed friend was not handed the code"
+        );
+        assert_eq!(
+            ask("stranger-token").await,
+            r#"{"friends":[{"id":"host-id","state":"offline"}]}"#,
+            "an unlisted caller learned the host was live"
+        );
+
+        // The room is the host's connection. Dropping it must take presence
+        // with it, or friends keep a stale code that no longer joins anything.
+        drop(host);
+        for _ in 0..50 {
+            if rooms.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ask("friend-token").await,
+            r#"{"friends":[{"id":"host-id","state":"offline"}]}"#,
+            "presence outlived the host connection"
+        );
+
+        relay.abort();
+    }
+
     #[tokio::test]
     async fn abrupt_viewer_disconnect_notifies_host() {
         let rooms = Rooms::default();
@@ -729,7 +1063,10 @@ mod tests {
 
         let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         host.send(tokio_tungstenite::tungstenite::Message::Text(
-            Signal::Host.to_json(),
+            Signal::Host {
+                visible_to: Vec::new(),
+            }
+            .to_json(),
         ))
         .await
         .unwrap();
@@ -786,7 +1123,10 @@ mod tests {
         .await
         .unwrap();
         host.send(tokio_tungstenite::tungstenite::Message::Text(
-            Signal::Host.to_json(),
+            Signal::Host {
+                visible_to: Vec::new(),
+            }
+            .to_json(),
         ))
         .await
         .unwrap();
@@ -813,7 +1153,10 @@ mod tests {
 
         let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         host.send(tokio_tungstenite::tungstenite::Message::Text(
-            Signal::Host.to_json(),
+            Signal::Host {
+                visible_to: Vec::new(),
+            }
+            .to_json(),
         ))
         .await
         .unwrap();
@@ -863,7 +1206,10 @@ mod tests {
 
         let (mut host, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         host.send(tokio_tungstenite::tungstenite::Message::Text(
-            Signal::Host.to_json(),
+            Signal::Host {
+                visible_to: Vec::new(),
+            }
+            .to_json(),
         ))
         .await
         .unwrap();

@@ -308,6 +308,20 @@ impl Auth {
             .get(session)
             .map(|stored| stored.identity.clone())
     }
+
+    /// Mint a session without a round trip to Discord, so tests of things that
+    /// merely require an authenticated caller do not have to fake the OAuth
+    /// exchange as well.
+    #[cfg(test)]
+    pub(crate) async fn insert_session_for_test(&self, session: &str, identity: Identity) {
+        self.state.lock().await.sessions.insert(
+            session.to_string(),
+            StoredSession {
+                identity,
+                created_at: Instant::now(),
+            },
+        );
+    }
 }
 
 pub enum PollResult {

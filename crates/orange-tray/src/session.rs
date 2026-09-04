@@ -14,8 +14,28 @@ use std::{
 #[derive(Debug, Clone, Deserialize)]
 pub struct Session {
     pub name: String,
+    /// Not rendered anywhere yet. Kept because it is this machine's Discord
+    /// id, which is what a friend has to add to see this user go live.
     #[allow(dead_code)]
     pub id: String,
+    pub avatar_url: Option<String>,
+    /// Relay session token. The tray reads it only to authenticate presence
+    /// polls; it still never performs or refreshes a login. `orange login`
+    /// remains the sole writer of this file.
+    pub token: String,
+}
+
+/// Someone whose stream this machine wants to be told about.
+///
+/// Held here rather than at the relay because the relay keeps nothing across a
+/// restart, and a roster that vanishes on every deploy is not a roster. Name
+/// and avatar are a cached copy for rendering the row while offline; `id` is
+/// the only field presence is keyed on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Friend {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
     pub avatar_url: Option<String>,
 }
 
@@ -29,6 +49,7 @@ pub struct Preferences {
     /// `supervisor::supported_frame_rate` resolves it to an offered rate.
     pub fps: Option<u32>,
     pub own_codes: Vec<String>,
+    pub friends: Vec<Friend>,
 }
 
 impl Default for Preferences {
@@ -37,6 +58,7 @@ impl Default for Preferences {
             quality: 1,
             fps: None,
             own_codes: Vec::new(),
+            friends: Vec::new(),
         }
     }
 }
@@ -225,6 +247,7 @@ mod tests {
             quality: 2,
             fps: Some(120),
             own_codes: vec!["ORANGE".into()],
+            ..Preferences::default()
         };
 
         save_preferences_to(&path, &preferences).unwrap();
