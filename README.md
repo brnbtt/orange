@@ -350,7 +350,7 @@ not evidence for or against the source or deployment design.
 
 ## License
 
-MIT. GPUI is Apache-2.0.
+MIT — see [LICENSE](LICENSE). GPUI is Apache-2.0.
 
 The installer redistributes part of the GStreamer runtime, dynamically linked
 and unmodified: LGPL-2.1-or-later for GStreamer itself and most plugins,

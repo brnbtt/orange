@@ -58,12 +58,15 @@ Compile dependencies point `orange -> orange-signal <- orange-relay`; client/upd
   owns, so the directory listing and the file agree.
 - Shared source assets live in the workspace `assets/` directory. `icon.ico` is
   compiled into both executables and is why it is not in either crate.
-- Tests are inline `#[cfg(test)] mod tests` blocks. Two of them outgrew their
-  module and live in a sibling file pulled in with `#[path]`:
-  `crates/orange-client/src/update_tests.rs` and
-  `crates/orange/src/peer/host_branch_tests.rs`. They stay in-crate because
-  both crates are binaries, so an integration test could not reach the private
-  items they cover.
+- Tests are inline `#[cfg(test)] mod tests` blocks, except where the block grew
+  past roughly 450 lines and stopped being readable next to the code it covers.
+  Those live in a `<module>_tests.rs` sibling pulled in with
+  `#[cfg(test)] #[path = "..."] mod tests;`, which keeps the test paths and the
+  privacy exactly as they were: `relay.rs`, `window.rs`,
+  `media_diagnostics/writer.rs`, `peer/host_branch.rs` and
+  `orange-client/src/update.rs`. They stay in-crate rather than moving to
+  `tests/` because three of those crates are binaries, so an integration test
+  could not reach the private items they cover.
 - `docs/` holds point-in-time specs and plans. This file is the current-state
   document; nothing in `docs/` supersedes it.
 
@@ -120,12 +123,14 @@ The client requests automatic zero-copy encoder selection and leaves bitrate sel
 | `crates/orange/src/webrtc/workers.rs` | First audio/video pad claims, audio-control and bitrate workers, cancellation, probe removal, joining |
 | `crates/orange/src/webrtc/transport.rs` | RTP payload/caps constants and live jitterbuffer policy |
 | `crates/orange/src/window.rs` | Playback owner versus passive handle, dedicated window thread, DPI/refresh helpers, bounded shutdown policy |
+| `crates/orange/src/window_tests.rs` | The `window.rs` test module, in a sibling file because it outgrew the module |
 | `crates/orange/src/window/native.rs` | Win32 class/window/message loop, input, sizing/fullscreen, HWND context installation and destruction |
 | `crates/orange/src/overlay.rs` | Shared overlay state, visibility, hit testing, volume/fullscreen/close state, scale and cache identity |
 | `crates/orange/src/overlay/raster.rs` | Tiny-skia layout and rasterization of overlay clusters and icons |
 | `crates/orange/src/overlay/gst.rs` | `overlaycomposition` callbacks, caps-to-overlay state, source aspect notification, composition draw callback |
 | `crates/orange/src/media_diagnostics.rs` | Facade for diagnostic writer, operation timing, progress probes, WebRTC monitor |
 | `crates/orange/src/media_diagnostics/writer.rs` | Bounded JSONL queue/file writer, metadata, size cap, process-global sink, joined shutdown |
+| `crates/orange/src/media_diagnostics/writer_tests.rs` | The `writer.rs` test module, in a sibling file because it outgrew the module |
 | `crates/orange/src/media_diagnostics/operation.rs` | Started/finished timing records around media graph operations |
 | `crates/orange/src/media_diagnostics/progress.rs` | RTP/depay/parsed/decoded pad counters, keyframes, queue overruns |
 | `crates/orange/src/media_diagnostics/webrtc_monitor.rs` | Periodic sanitized WebRTC statistics and UI/media progress worker |
@@ -145,6 +150,7 @@ The client requests automatic zero-copy encoder selection and leaves bitrate sel
 | `crates/orange-signal/src/protocol.rs` | Serde-tagged `Signal` protocol and relay-controlled peer routing IDs |
 | `crates/orange-signal/src/client.rs` | WebSocket tasks/channels, heartbeat, graceful-close request, task await/reap, abort fallback |
 | `crates/orange-signal/src/relay.rs` | Room codes, in-memory rooms, role rules, routing, viewer cap, queues and rate limit |
+| `crates/orange-signal/src/relay_tests.rs` | The `relay.rs` test module, in a sibling file because it outgrew the module |
 | `crates/orange-signal/src/server.rs` | Axum routes, 512-connection semaphore, OAuth HTTP endpoints, `/ws` |
 | `crates/orange-signal/src/auth.rs` | Discord OAuth exchange, pending attempts, opaque sessions cached in memory over a durable store, expiration and capacities |
 | `crates/orange-signal/src/store.rs` | Azure Table Storage session rows: Shared Key Lite signing, hashed row keys, upsert/get/delete, optional configuration |
@@ -255,6 +261,24 @@ webrtcbin OPUS pad
 - Requested `webrtcbin` and tee pads are owned by branch guards and released.
   Temporary block/idle and bitrate probes are removed on rollback or teardown.
 - Teardown combines primary and cleanup errors rather than hiding either one.
+
+## Environment Variables
+
+Every variable the shipped code reads. Names beginning `ORANGE_TEST_` and not
+listed here belong to individual tests, which use them to mark the child half
+of a bounded subprocess run; they are named in the test that owns them.
+
+| Variable | Read by | Meaning |
+| --- | --- | --- |
+| `ORANGE_SERVER` | `crates/orange/src/main.rs` | Relay URL default for `login`, `host` and `watch`. `--server` wins |
+| `ORANGE_UI_PID` | `crates/orange/src/peer/host.rs` | Client PID, so whole-screen capture can exclude the client's own cues. Set by the supervisor |
+| `ORANGE_MEDIA_DIAGNOSTICS` | `crates/orange/src/media_diagnostics/writer.rs` | Directory for the JSONL diagnostic log. Absent disables the log. Set by the client when it spawns a child, never in the user environment |
+| `ORANGE_BUILD_ID`, `ORANGE_RUN_ID`, `ORANGE_DEVICE_ID`, `ORANGE_TEST_PROFILE` | `crates/orange/src/media_diagnostics/writer.rs` | Metadata stamped on every diagnostic record. `build` is the commit and is what a log should be read against |
+| `ORANGE_RTP_BUFFER_MODE` | `crates/orange/src/webrtc/transport.rs` | `none` disables jitterbuffer smoothing and RTCP sync. A latency experiment, not a supported setting |
+| `ORANGE_UPDATE_CHANNEL` | `crates/orange-client/src/update.rs` (compile time) | `beta` enables update checks. Baked in by `package.ps1`, so a local build never checks |
+| `ORANGE_TABLE_ACCOUNT`, `ORANGE_TABLE_KEY`, `ORANGE_TABLE_NAME` | `crates/orange-signal/src/store.rs` | Azure Table Storage for durable sessions. All three absent runs the relay with memory-only sessions |
+| `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_REDIRECT_URI` | `crates/orange-signal/src/auth.rs` | Discord OAuth. Absent leaves identity off and peers anonymous |
+| `PORT` | `crates/orange-relay/src/main.rs` | Listen port, injected by Container Apps. Defaults to 9000 |
 
 ## Compatibility Contracts
 

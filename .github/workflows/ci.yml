@@ -2,10 +2,11 @@
 # without each clone having to run `git config core.hooksPath packaging/hooks`.
 #
 # `orange` and `orange-client` are deliberately absent: they need GStreamer,
-# D3D11 and Win32, so they cannot build here at all. They stay covered by the
-# full local suite that ship.ps1 runs before it commits anything. What is left
-# still covers the relay, which is the one component where a bug breaks every
-# user at once and which deploys on its own path.
+# D3D11 and Win32, so they cannot build here at all. `orange-updater` is absent
+# for the same reason. They stay covered by the full local suite that ship.ps1
+# runs before it commits anything. What is left still covers the relay, which
+# is the one component where a bug breaks every user at once and which deploys
+# on its own path.
 
 name: ci
 
