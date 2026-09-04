@@ -184,7 +184,7 @@ fn apply_update(args: UpdateArgs) -> Result<()> {
         bail!("Orange installer exited with code {code}");
     }
 
-    let tray = args.install_dir.join("orange-tray.exe");
+    let tray = app_binary(&args.install_dir);
     Command::new(&tray)
         .current_dir(&args.install_dir)
         .spawn()
@@ -204,6 +204,29 @@ fn write_failure(error: &anyhow::Error) {
     let _ = std::fs::write(directory.join("update-error.txt"), message);
 }
 
+/// The application binary, newest name first.
+///
+/// The updater that performs an upgrade is the one already installed, spawned
+/// before the new installer runs, so it cannot be taught anything by the
+/// release it is installing. A rename therefore has to be accepted by the
+/// updater one release *before* it happens; otherwise the old updater reopens
+/// a binary the new installer did not write, or -- because the installer has
+/// no `[InstallDelete]` and leaves old files in place -- reopens the previous
+/// version, which finds the same update waiting and loops.
+const APP_BINARIES: [&str; 2] = ["orange-client.exe", "orange-tray.exe"];
+
+/// Where the application actually landed, preferring the newest name present.
+///
+/// Falls back to the last candidate so a missing install still produces a
+/// specific path to report rather than an empty one.
+fn app_binary(install_dir: &Path) -> PathBuf {
+    APP_BINARIES
+        .iter()
+        .map(|name| install_dir.join(name))
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| install_dir.join(APP_BINARIES[APP_BINARIES.len() - 1]))
+}
+
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
     let mut end = value.len().min(max_bytes);
     while !value.is_char_boundary(end) {
@@ -219,7 +242,7 @@ fn main() {
             if let Err(error) = apply_update(args) {
                 write_failure(&error);
                 if parent_has_exited(retry.parent).unwrap_or(false) {
-                    let tray = retry.install_dir.join("orange-tray.exe");
+                    let tray = app_binary(&retry.install_dir);
                     let _ = Command::new(tray).current_dir(retry.install_dir).spawn();
                 }
             }
@@ -231,6 +254,30 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This updater ships one release ahead of the rename it enables, so its
+    /// whole job is to already know a name that does not exist yet.
+    ///
+    /// The installer has no `[InstallDelete]`, so an upgrade leaves the old
+    /// binary next to the new one. Preferring the old name there would reopen
+    /// the previous version, which would find the same update waiting and
+    /// download it again -- an update loop, from code already on users' disks
+    /// and therefore unfixable by the release doing the renaming.
+    #[test]
+    fn the_newest_binary_name_wins_when_an_upgrade_leaves_both_behind() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing installed yet: still names a specific path to report.
+        assert_eq!(app_binary(dir.path()), dir.path().join("orange-tray.exe"));
+
+        // Only the old name, which is every install that exists today.
+        std::fs::write(dir.path().join("orange-tray.exe"), b"old").unwrap();
+        assert_eq!(app_binary(dir.path()), dir.path().join("orange-tray.exe"));
+
+        // Both, which is what an upgrade across the rename actually leaves.
+        std::fs::write(dir.path().join("orange-client.exe"), b"new").unwrap();
+        assert_eq!(app_binary(dir.path()), dir.path().join("orange-client.exe"));
+    }
 
     #[test]
     fn parses_complete_update_request() {
