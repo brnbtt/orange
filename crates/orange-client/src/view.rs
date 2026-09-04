@@ -1,6 +1,6 @@
 use super::{client, update, Orange, Screen};
 use crate::{
-    presence::Presence,
+    presence::{Presence, PresenceError},
     sound,
     supervisor::{WindowTarget, FRAME_RATES, QUALITIES},
     ui::*,
@@ -746,14 +746,50 @@ impl Orange {
                             })),
                     )
                     .children(self.presence_error.clone().map(|error| {
-                        // A failed poll must not read as "nobody is live". The
-                        // likeliest cause is a relay that forgot this session,
-                        // which is the signed-out case wearing a different hat.
-                        card()
-                            .py_2()
-                            .flex_shrink_0()
-                            .child(label("Could not reach the relay", DANGER).text_xs())
-                            .child(label(error, FAINT).text_xs())
+                        match error {
+                            // The relay answered; it simply does not know this
+                            // session any more. Reporting that as a network fault
+                            // sends people to look at their connection, and the
+                            // raw URL tells them nothing they can act on.
+                            PresenceError::SignedOut => card()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .py_2()
+                                .flex_shrink_0()
+                                .border_color(rgb(ORANGE_DIM))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .min_w(px(0.0))
+                                        .child(
+                                            label("Signed out", TEXT)
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_xs(),
+                                        )
+                                        .child(
+                                            label(
+                                                "The relay restarted. Sign in to see friends.",
+                                                FAINT,
+                                            )
+                                            .text_xs(),
+                                        ),
+                                )
+                                .child(ghost("presence-signin", "Sign in").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.start_login();
+                                        cx.notify();
+                                    },
+                                ))),
+                            PresenceError::Unreachable(detail) => card()
+                                .py_2()
+                                .flex_shrink_0()
+                                .child(label("Could not reach the relay", DANGER).text_xs())
+                                .child(label(detail, FAINT).text_xs()),
+                        }
                     }))
                     .child(
                         div()

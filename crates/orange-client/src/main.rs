@@ -155,7 +155,7 @@ struct Orange {
     /// Why the last poll failed, if it did. Surfaced rather than swallowed:
     /// silently showing every friend offline is indistinguishable from every
     /// friend actually being offline.
-    presence_error: Option<String>,
+    presence_error: Option<presence::PresenceError>,
     /// Friend pictures decoded off the UI thread, keyed by Discord id. Same
     /// shape as `thumbnails`, and for the same reason: an async fill of a
     /// keyed cache that render reads synchronously.
@@ -212,7 +212,7 @@ struct Digest {
     /// live has to be the one that repaints the row. Without this the friends
     /// list would only refresh when something unrelated moved.
     presence: Vec<(String, Option<presence::Presence>)>,
-    presence_error: Option<String>,
+    presence_error: Option<presence::PresenceError>,
     /// Friend pictures arrive one at a time from a background worker. Without
     /// this the rows would keep their initials until something else moved.
     friend_avatars: usize,
@@ -283,7 +283,7 @@ impl Orange {
                             .map(|entry| (entry.id, entry.presence))
                             .collect();
                     }
-                    Some(Err(error)) => self.presence_error = Some(error.to_string()),
+                    Some(Err(error)) => self.presence_error = Some(error),
                     // The worker was cancelled before it sent anything. Leave
                     // the previous answer standing rather than blanking the
                     // list on a race.
@@ -303,8 +303,10 @@ impl Orange {
             return;
         };
         let Some(url) = presence::presence_url(&self.server) else {
-            self.presence_error =
-                Some(format!("cannot derive a presence URL from {}", self.server));
+            self.presence_error = Some(presence::PresenceError::Unreachable(format!(
+                "cannot derive a presence URL from {}",
+                self.server
+            )));
             return;
         };
         presence::start(

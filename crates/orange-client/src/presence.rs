@@ -55,7 +55,7 @@ struct Body {
 
 pub(crate) struct PresenceJob {
     cancel: Arc<AtomicBool>,
-    pub(crate) receiver: mpsc::Receiver<anyhow::Result<Vec<Entry>>>,
+    pub(crate) receiver: mpsc::Receiver<Result<Vec<Entry>, PresenceError>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -118,21 +118,54 @@ pub(crate) fn start(job: &mut Option<PresenceJob>, url: String, token: String, f
     });
 }
 
-fn fetch(url: &str, token: &str, ids: &[String]) -> anyhow::Result<Vec<Entry>> {
-    let response = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
-        .build()?
-        .get(url)
-        .query(&[("ids", ids.join(","))])
-        .bearer_auth(token)
-        .send()?
-        .error_for_status()?;
-    // A relay that has forgotten this session answers 401, which
-    // `error_for_status` turns into an error above. That is the signed-out
-    // case and the caller reports it rather than showing every friend offline.
-    let body: Body = serde_json::from_reader(std::io::Read::take(response, RESPONSE_MAX_BYTES))?;
+/// Why a poll failed, when the difference changes what the user should do.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PresenceError {
+    /// The relay answered, and does not know this session.
+    ///
+    /// Its sessions are in memory, so every relay restart produces this for
+    /// everyone at once. Worth its own variant because the fix is a specific
+    /// action -- sign in again -- and reporting it as a network failure sends
+    /// the user looking at their connection instead.
+    SignedOut,
+    /// Anything else: no route, TLS, timeout, a 500, malformed JSON.
+    Unreachable(String),
+}
+
+impl std::fmt::Display for PresenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PresenceError::SignedOut => write!(f, "the relay no longer knows this session"),
+            PresenceError::Unreachable(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+fn fetch(url: &str, token: &str, ids: &[String]) -> Result<Vec<Entry>, PresenceError> {
+    let send = || -> anyhow::Result<reqwest::blocking::Response> {
+        Ok(reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
+            .build()?
+            .get(url)
+            .query(&[("ids", ids.join(","))])
+            .bearer_auth(token)
+            .send()?)
+    };
+    let response = send().map_err(|error| PresenceError::Unreachable(error.to_string()))?;
+
+    // Checked before `error_for_status`, which flattens every HTTP failure into
+    // one message and loses the only distinction the user can act on.
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(PresenceError::SignedOut);
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| PresenceError::Unreachable(error.to_string()))?;
+
+    let body: Body = serde_json::from_reader(std::io::Read::take(response, RESPONSE_MAX_BYTES))
+        .map_err(|error| PresenceError::Unreachable(error.to_string()))?;
     Ok(body.friends)
 }
 
@@ -197,6 +230,29 @@ mod tests {
                     presence: Presence::Full
                 },
             ]
+        );
+    }
+
+    /// A relay that has forgotten this session answers 401, and the fix is a
+    /// specific action the user can take. Folding it into the generic HTTP
+    /// error produced "Could not reach the relay" over a raw URL: it described
+    /// a network fault that had not happened and named no remedy. Every relay
+    /// deploy shows this to everyone at once, because sessions are in memory.
+    #[test]
+    fn a_forgotten_session_is_reported_as_signed_out_not_as_a_network_fault() {
+        assert_eq!(
+            PresenceError::SignedOut.to_string(),
+            "the relay no longer knows this session"
+        );
+        // Anything else keeps its detail, which is the only useful thing to
+        // show when the cause really is the network.
+        assert_eq!(
+            PresenceError::Unreachable("dns error".into()).to_string(),
+            "dns error"
+        );
+        assert_ne!(
+            PresenceError::SignedOut,
+            PresenceError::Unreachable("401 Unauthorized".into())
         );
     }
 }
