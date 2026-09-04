@@ -2,7 +2,7 @@
 
 These are point-in-time design records. They describe what was intended when
 they were written, and they are not updated as the code moves on. Nothing here
-is authoritative about how orange behaves today.
+is authoritative about how Orange behaves today.
 
 For current state, read these instead:
 
