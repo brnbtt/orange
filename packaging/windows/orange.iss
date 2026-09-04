@@ -36,6 +36,7 @@ RestartApplications=no
 Source: "..\..\target\release\orange.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\orange-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\orange-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\package\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; The media runtime travels with us. package.ps1 stages the slice orange loads
 ; and proves every element resolves from it. GStreamer locates its own plugins

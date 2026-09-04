@@ -11,6 +11,7 @@ $checks = [ordered]@{
     "force close support" = 'CloseApplications=force'
     "updater installed" = 'Source: "\.\.\\\.\.\\target\\release\\orange-updater\.exe"'
     "app-local VC runtime" = 'Source: "\.\.\\\.\.\\target\\package\\vcruntime140\.dll"; DestDir: "\{app\}"'
+    "MIT license installed" = 'Source: "\.\.\\\.\.\\LICENSE"; DestDir: "\{app\}"'
     "interactive launch" = 'Filename: "\{app\}\\orange-tray\.exe";[^\r\n]*nowait[^\r\n]*skipifsilent'
     "shortcut shares taskbar identity" = 'Name: "\{group\}\\orange";[^\r\n]*AppUserModelID: "brnbtt\.orange"'
     "existing taskbar pin is migrated" = 'Name: "\{userappdata\}\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\\orange";[^\r\n]*AppUserModelID: "brnbtt\.orange";[^\r\n]*Check: IsOrangeTaskbarPin'

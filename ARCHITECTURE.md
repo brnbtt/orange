@@ -64,9 +64,9 @@ Compile dependencies point `orange -> orange-signal <- orange-relay`; client/upd
   `#[cfg(test)] #[path = "..."] mod tests;`, which keeps the test paths and the
   privacy exactly as they were: `relay.rs`, `window.rs`,
   `media_diagnostics/writer.rs`, `peer/host_branch.rs` and
-  `orange-client/src/update.rs`. They stay in-crate rather than moving to
-  `tests/` because three of those crates are binaries, so an integration test
-  could not reach the private items they cover.
+  `orange-client/src/update.rs`. They stay as unit-test submodules rather than
+  moving to `tests/` because they cover private items that integration tests
+  cannot reach; `orange` and `orange-client` are also binary-only crates.
 - `docs/` holds point-in-time specs and plans. This file is the current-state
   document; nothing in `docs/` supersedes it.
 
@@ -264,17 +264,23 @@ webrtcbin OPUS pad
 
 ## Environment Variables
 
-Every variable the shipped code reads. Names beginning `ORANGE_TEST_` and not
-listed here belong to individual tests, which use them to mark the child half
-of a bounded subprocess run; they are named in the test that owns them.
+Application, media-runtime and deployment variables read by shipped code are
+listed below. Ordinary Windows location variables (`APPDATA`, `LOCALAPPDATA`,
+`ProgramFiles`, `PATH` and `WINDIR`) and Cargo's standard build variables are
+omitted. Names beginning `ORANGE_TEST_` and not listed here belong to individual
+tests, which use them to mark the child half of a bounded subprocess run; they
+are named in the test that owns them.
 
 | Variable | Read by | Meaning |
 | --- | --- | --- |
-| `ORANGE_SERVER` | `crates/orange/src/main.rs` | Relay URL default for `login`, `host` and `watch`. `--server` wins |
+| `ORANGE_SERVER` | `crates/orange/src/main.rs`, `crates/orange-client/src/main.rs` | Relay URL used by the desktop client and the CLI default for `login`, `host` and `watch`. An explicit CLI `--server` wins |
+| `GSTREAMER_1_0_ROOT_MSVC_X86_64` | `crates/orange-client/src/supervisor.rs` | Development GStreamer root. The bundled runtime wins when present; this is the next lookup before installed locations |
 | `ORANGE_UI_PID` | `crates/orange/src/peer/host.rs` | Client PID, so whole-screen capture can exclude the client's own cues. Set by the supervisor |
-| `ORANGE_MEDIA_DIAGNOSTICS` | `crates/orange/src/media_diagnostics/writer.rs` | Directory for the JSONL diagnostic log. Absent disables the log. Set by the client when it spawns a child, never in the user environment |
-| `ORANGE_BUILD_ID`, `ORANGE_RUN_ID`, `ORANGE_DEVICE_ID`, `ORANGE_TEST_PROFILE` | `crates/orange/src/media_diagnostics/writer.rs` | Metadata stamped on every diagnostic record. `build` is the commit and is what a log should be read against |
+| `ORANGE_MEDIA_DIAGNOSTICS` | `crates/orange-client/src/supervisor.rs`, `crates/orange/src/media_diagnostics/writer.rs` | Directory for the JSONL diagnostic log. The client supplies its default to media children; absent in a media child disables the log |
+| `ORANGE_BUILD_ID` | `crates/orange-client/src/update.rs` and `crates/orange-client/src/supervisor.rs` (compile time), `crates/orange/src/media_diagnostics/writer.rs` | Release commit baked into the client and stamped on diagnostic records. It is what a log should be read against |
+| `ORANGE_RUN_ID`, `ORANGE_DEVICE_ID`, `ORANGE_TEST_PROFILE` | `crates/orange/src/media_diagnostics/writer.rs` | Optional run, machine and test-profile metadata stamped on diagnostic records |
 | `ORANGE_RTP_BUFFER_MODE` | `crates/orange/src/webrtc/transport.rs` | `none` disables jitterbuffer smoothing and RTCP sync. A latency experiment, not a supported setting |
+| `ORANGE_AV1_DECODER` | `crates/orange/src/webrtc/receive.rs` | `software` selects dav1d for live AV1 diagnostic comparisons. File output and every other value keep the D3D11 decoder |
 | `ORANGE_UPDATE_CHANNEL` | `crates/orange-client/src/update.rs` (compile time) | `beta` enables update checks. Baked in by `package.ps1`, so a local build never checks |
 | `ORANGE_TABLE_ACCOUNT`, `ORANGE_TABLE_KEY`, `ORANGE_TABLE_NAME` | `crates/orange-signal/src/store.rs` | Azure Table Storage for durable sessions. All three absent runs the relay with memory-only sessions |
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_REDIRECT_URI` | `crates/orange-signal/src/auth.rs` | Discord OAuth. Absent leaves identity off and peers anonymous |
