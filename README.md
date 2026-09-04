@@ -11,7 +11,7 @@
 
 ## Status
 
-Ten core product milestones are implemented:
+Eleven core product milestones are implemented:
 
 | # | Milestone | State |
 | --- | --- | --- |
@@ -25,6 +25,7 @@ Ten core product milestones are implemented:
 | 8 | GPU-composited viewer controls | done |
 | 9 | Optional Discord identity | done |
 | 10 | Client UI, installer, beta update checks and SHA-256 download verification | done |
+| 11 | Friends list with live presence, replacing per-stream code pasting | done |
 
 Autostart is not implemented. Current local installed acceptance covers H.265
 streaming checks, preview, and file output. Direct two-machine WAN remains an
@@ -67,8 +68,16 @@ exactly; the desktop polls with the generated state value.
 Identity is not authorization to a room. The room code is the access credential:
 anyone who has it can attempt to join and can share it with someone else.
 
-Relay OAuth sessions are in memory. A relay restart, deploy, or Container Apps
-revision switch signs users out and interrupts active rooms.
+Identity does decide **discovery**. A host tells the relay which Discord ids may
+see it go live, drawn from the friend list on its own machine, and those people
+are handed the code without being told it. That replaces pasting a code for
+every stream with pasting one invite per friend, once. Someone not on the list
+is told the host is offline, which is deliberately the same answer as a host who
+genuinely is not streaming.
+
+Relay OAuth sessions are stored in Azure Table Storage, so a restart, deploy or
+revision switch no longer signs users out. Rooms are still in memory and are
+still interrupted, because a room belongs to a connection either way.
 
 ### Relay OAuth configuration
 
@@ -278,6 +287,9 @@ orange serve
 orange host --hwnd 395876 --scale 1920x1080
 # Share this code: BC2-VH3
 orange watch --code BC2-VH3
+
+# Let named Discord ids discover the stream through /presence instead.
+orange host --hwnd 395876 --visible-to 182991943402389505,441122334455667788
 ```
 
 Point host and watch at another relay with `--server ws://host:9000/ws` or set
