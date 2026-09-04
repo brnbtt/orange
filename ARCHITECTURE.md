@@ -134,7 +134,7 @@ The client requests automatic zero-copy encoder selection and leaves bitrate sel
 | `crates/orange/src/text.rs` | System font loading and glyph rasterization for the video overlay |
 | `crates/orange/src/connection.rs` | Privacy-safe connection progress stages and failures shared by signalling, WebRTC and playback |
 | `crates/orange/src/window/connection_surface.rs` | What the viewer window draws before media arrives: connection stage, close hit test |
-| `crates/orange/src/encoder_characterization.rs` | Developer-only `characterize-encoder` subcommand. It sits outside `media_diagnostics/` on purpose: that tree instruments live sessions, this one benchmarks encoders in a throwaway process and never runs for a user |
+| `crates/orange/src/encoder_characterization.rs` | Developer-only `characterize-bitrate` subcommand. It sits outside `media_diagnostics/` on purpose: that tree instruments live sessions, this one benchmarks encoders in a throwaway process and never runs for a user |
 | `crates/orange/src/test_support.rs` | `#[cfg(test)]` only: runs a test in a deadline-bounded child process |
 
 ## Signal And Entry Source Map

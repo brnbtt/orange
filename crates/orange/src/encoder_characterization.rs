@@ -1,4 +1,4 @@
-//! The `characterize-encoder` subcommand: a developer benchmark, not part of
+//! The `characterize-bitrate` subcommand: a developer benchmark, not part of
 //! any user-facing path.
 //!
 //! It sits outside `media_diagnostics/` on purpose. That tree instruments a
