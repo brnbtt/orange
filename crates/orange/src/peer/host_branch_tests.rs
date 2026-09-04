@@ -26,11 +26,11 @@ fn shutdown_startup_worker_bounded(mut worker: StartupKeyframeWorker) -> bool {
 #[test]
 fn peer_worker_review_startup_cadence_has_exact_clock_free_progression() {
     if run_in_bounded_subprocess(
-            "ORANGE_TEST_STARTUP_CADENCE_CHILD",
-            "peer::host_branch::tests::peer_worker_review_startup_cadence_has_exact_clock_free_progression",
-        ) {
-            return;
-        }
+        "ORANGE_TEST_STARTUP_CADENCE_CHILD",
+        "peer::host_branch::tests::peer_worker_review_startup_cadence_has_exact_clock_free_progression",
+    ) {
+        return;
+    }
     let (calls, receive_calls) = std::sync::mpsc::sync_channel(4);
     let sequence = Arc::new(AtomicUsize::new(0));
     let sequence_for_worker = sequence.clone();
@@ -171,11 +171,11 @@ async fn peer_worker_review_dead_enqueue_fallback_surfaces_join_error() {
 #[test]
 fn peer_worker_review_viewer_teardown_drop_joins_synchronous_fallback() {
     if run_in_bounded_subprocess(
-            "ORANGE_TEST_VIEWER_DROP_CHILD",
-            "peer::host_branch::tests::peer_worker_review_viewer_teardown_drop_joins_synchronous_fallback",
-        ) {
-            return;
-        }
+        "ORANGE_TEST_VIEWER_DROP_CHILD",
+        "peer::host_branch::tests::peer_worker_review_viewer_teardown_drop_joins_synchronous_fallback",
+    ) {
+        return;
+    }
     gst::init().unwrap();
     let pipeline = gst::Pipeline::new();
     let (sender, receiver) = mpsc::channel(1);

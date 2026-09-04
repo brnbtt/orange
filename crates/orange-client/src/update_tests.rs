@@ -27,11 +27,11 @@ impl Drop for ReleaseOnDrop {
 
 fn update_info() -> UpdateInfo {
     UpdateInfo {
-            version: Version::parse("9.0.0").unwrap(),
-            installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-9.0.0.exe").unwrap(),
-            sha256: "A".repeat(64),
-            notes: "Faster joining".into(),
-        }
+        version: Version::parse("9.0.0").unwrap(),
+        installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-9.0.0.exe").unwrap(),
+        sha256: "A".repeat(64),
+        notes: "Faster joining".into(),
+    }
 }
 
 fn controller(status: UpdateStatus, job: Option<UpdateJob>) -> UpdateController {
@@ -509,8 +509,8 @@ fn only_a_semantically_newer_version_is_offered() {
     let hash = "A".repeat(64);
     let offered = |version: &str, current: &str| {
         let url = format!(
-                "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-{version}.exe"
-            );
+            "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-{version}.exe"
+        );
         parse_update_manifest(&manifest(version, &hash, &url), current)
             .unwrap()
             .map(|info| info.version.to_string())
@@ -561,10 +561,10 @@ fn manifest_rejects_wrong_filename_build_and_hash() {
         "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-wrong.exe";
     assert!(parse_update_manifest(&manifest("0.2.0-beta.2", &hash, url), "0.2.0-beta.1").is_err());
     assert!(parse_update_manifest(
-            &manifest("0.2.0-beta.2", "bad", "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe"),
-            "0.2.0-beta.1"
-        )
-        .is_err());
+        &manifest("0.2.0-beta.2", "bad", "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe"),
+        "0.2.0-beta.1"
+    )
+    .is_err());
 }
 
 #[test]
@@ -666,11 +666,11 @@ fn updater_handoff_uses_a_detached_temporary_copy() {
     let installer = directory.path().join("orange-setup-0.2.0-beta.2.exe");
     std::fs::write(&installer, b"installer").unwrap();
     let info = UpdateInfo {
-            version: Version::parse("0.2.0-beta.2").unwrap(),
-            installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe").unwrap(),
-            sha256: "A".repeat(64),
-            notes: String::new(),
-        };
+        version: Version::parse("0.2.0-beta.2").unwrap(),
+        installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe").unwrap(),
+        sha256: "A".repeat(64),
+        notes: String::new(),
+    };
 
     let launch = prepare_updater(&info, &installer, &install_dir, &temporary, 42).unwrap();
 
@@ -696,11 +696,11 @@ fn updater_handoff_uses_a_detached_temporary_copy() {
 #[test]
 fn banner_state_exposes_one_clear_action() {
     let info = UpdateInfo {
-            version: Version::parse("0.2.0-beta.2").unwrap(),
-            installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe").unwrap(),
-            sha256: "A".repeat(64),
-            notes: "Faster joining".into(),
-        };
+        version: Version::parse("0.2.0-beta.2").unwrap(),
+        installer_url: Url::parse("https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.2.0-beta.2.exe").unwrap(),
+        sha256: "A".repeat(64),
+        notes: "Faster joining".into(),
+    };
     assert_eq!(
         UpdateStatus::Available(info.clone()).action_label(),
         Some("Update now")
