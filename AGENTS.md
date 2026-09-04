@@ -84,6 +84,12 @@ Five things that are not obvious:
    and merging a native command's stderr into the pipeline turns cargo's
    ordinary `Compiling ...` progress into a terminating error. It will die
    mid-run for no real reason. Let it write to the console.
+
+   **`deploy/azure.ps1` has the same defect**, and it is easier to trip because
+   the trigger is instant: `az containerapp up` writes `WARNING: The behavior of
+   this command has been altered by the following extension: containerapp` to
+   stderr on every single run. Piped, the deploy dies on that line before it
+   builds anything.
 5. **If it fails, check before assuming damage.** Everything that can fail
    cheaply runs before anything mutates the repo, so an early failure leaves the
    version, the commits and the remote untouched. Verify with `git log` and
@@ -151,6 +157,28 @@ observed:
 `.agents/skills/orange-media-debugging` has the layer-by-layer ladder. Use it
 rather than reasoning from the source alone.
 
+## Tool Discipline & Execution Speed
+
+- **Never use `shell` for filesystem inspection.** Spawning PowerShell incurs ~150-250ms process overhead per call. Always use built-in tools (`read`, `grep`, `glob`, `edit`, `write`), which run in-process with 0ms process startup latency.
+- **Parallelize independent operations in a single turn.** Call multiple independent reads, globs, or searches concurrently rather than issuing them sequentially.
+- **Use parallel subagents for multi-area research.** When investigating multiple independent components, spawn background subagents (`agent: "explore"` or `"general"` with `background: true`) to execute in parallel child sessions.
+- Reserve `shell` strictly for native builds, cargo, and git commands.
+
+## Bulk Renames
+
+PowerShell here is **5.1**, where `` `u{XXXX} `` is not an escape. A rename that
+protected Win32 literals with `` "`u{0001}SENTINEL`u{0001}" `` wrote the literal
+text `u{0001}SENTINEL u{0001}` into the source, and the restore then failed a
+second time because `{0001}` is a regex quantifier. `Shell_TrayWnd` and
+`Shell_SecondaryTrayWnd` in `crates/orange/src/targets.rs` became strings
+Windows has never heard of. **It compiled**, because they are string literals;
+the only symptom would have been the taskbar appearing in the window picker.
+
+Two things follow. Check `$PSVersionTable.PSVersion` before using any escape
+newer than PowerShell 5.1. And after a bulk rename, grep for the term you
+replaced and confirm the survivors are exactly the ones you intended — a search
+returning *nothing* is a failure, not a success, when you meant to keep some.
+
 ## Conventions
 
 - Commit subjects are imperative and descriptive, no prefixes: `Cap capture at
@@ -163,6 +191,14 @@ rather than reasoning from the source alone.
 - Full local gate before shipping: `cargo test --locked --workspace
   --all-features`, `cargo clippy --locked --workspace --all-targets
   --all-features -- -D warnings`, `cargo fmt --all -- --check`.
+- The PowerShell contract tests are part of that gate for any packaging or
+  deployment change: `packaging\windows\test-installer.ps1`,
+  `test-package-provenance.ps1`, `test-beta-publish.ps1`,
+  `deploy\test-azure-script.ps1`. `test-package-provenance.ps1` shells out to a
+  bare `git`, which is not on `PATH` here, so it fails with
+  `CommandNotFoundException` until you prepend MinGit:
+  `$env:PATH = "$(Split-Path $git);$env:PATH"`. That failure is the environment,
+  not the change.
 - Tests are named as sentences describing the behaviour they protect, and carry
   a comment explaining the real failure that motivated them.
 
