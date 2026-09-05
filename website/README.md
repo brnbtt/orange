@@ -2,9 +2,21 @@
 
 Live: **https://orangealpha0d8d5893e69a3.z15.web.core.windows.net/**
 
-Plain HTML, CSS, and a small script. The desktop logo in `assets/logo.png` is
-copied into the website at deployment. `scene.svg` is an original illustration,
-not an application screenshot. No build step or production dependencies.
+Plain HTML, CSS, and a small download script. No build step or production
+dependencies. The desktop scanline mark in `assets/logo.png` is reused as-is.
+
+## Identity and app captures
+
+The site follows the original identity boards: tracked uppercase Orbitron,
+IBM Plex Mono, charcoal and sand, orange accents, hairline grids, open corner
+brackets, and registration marks. Copy describes actual actions and media flow;
+avoid slogans or claims that are not supported by the app.
+
+Fonts are self-hosted. Their sources and licenses are in `fonts/README.md`.
+The three screenshots are actual GPUI client renders with staged data, not
+HTML recreations of the app or images from the early concept boards. See
+`screenshots/README.md` for capture provenance. Screenshots link to their full
+resolution, and the page labels their demo data explicitly.
 
 ## Hosting and cost
 
@@ -30,9 +42,9 @@ node --test website/release.test.mjs
 .\deploy\website.ps1
 ```
 
-The script checks all six source assets, enables static hosting, discovers the
+The script checks all twelve source assets, enables static hosting, discovers the
 web endpoint, and adds a Blob-service GET/HEAD CORS rule for that origin if one
-does not already allow reads. Existing CORS rules are preserved. Only six
+does not already allow reads. Existing CORS rules are preserved. Only twelve
 explicit public files are uploaded, with correct MIME types and `no-cache`
 revalidation; the index is uploaded last. Re-running deploy updates these files.
 The script does not deploy the relay or publish an app release.
@@ -66,7 +78,10 @@ Stage the public assets locally, then use any static server. For example:
 ```powershell
 $preview = Join-Path $env:LOCALAPPDATA 'Temp\opencode\orange-site-preview'
 New-Item -ItemType Directory -Force $preview | Out-Null
-Copy-Item website\index.html, website\404.html, website\styles.css, website\release.js, website\scene.svg, assets\logo.png $preview
+Copy-Item website\index.html, website\404.html, website\styles.css, website\release.js, assets\logo.png $preview
+New-Item -ItemType Directory -Force "$preview\fonts", "$preview\screenshots" | Out-Null
+Copy-Item website\fonts\*.woff2, website\fonts\*-OFL.txt "$preview\fonts"
+Copy-Item website\screenshots\*.png "$preview\screenshots"
 npx --yes http-server $preview -p 4173 -c-1
 ```
 

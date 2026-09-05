@@ -457,7 +457,7 @@ not a source-level result.
 
 ## Deployment Model And Boundaries
 
-- The public landing page is plain HTML/CSS/JavaScript in the existing release storage account's `$web` container. `deploy/website.ps1` uploads six allowlisted assets and adds an origin-scoped Blob CORS rule. The browser reads the live beta manifest to resolve download links, with GitHub releases as the failure/no-JavaScript fallback; app releases do not require a website deploy. Hosting has no fixed compute charge, with storage, operations and bandwidth metered.
+- The public landing page is plain HTML/CSS/JavaScript in the existing release storage account's `$web` container. `deploy/website.ps1` uploads twelve allowlisted assets, including self-hosted identity fonts and real client captures with demo data, and adds an origin-scoped Blob CORS rule. The browser reads the live beta manifest to resolve download links, with GitHub releases as the failure/no-JavaScript fallback; app releases do not require a website deploy. Hosting has no fixed compute charge, with storage, operations and bandwidth metered.
 - Azure is deliberately pinned to one always-on replica in `deploy/azure.ps1`.
 - Sessions are durable in Azure Table Storage, so a deploy no longer signs users out. Memory is a read-through cache in front of it; the store is consulted only on a miss. Login and durable restoration share the same 4,096-entry eviction policy; replacing a cached token neither evicts another entry nor renews its original expiration.
 - Rooms and pending OAuth attempts are still in memory. A revision switch, deploy, or restart interrupts every active room. There is no horizontal-scaling claim: rooms are per-process, so two replicas behind one ingress could put host and viewer on different instances.

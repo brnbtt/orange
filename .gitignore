@@ -14,3 +14,6 @@
 # binary with include_bytes!, so a clone without it does not build. Excluding
 # the whole directory keeps this from breaking each time an asset is added.
 !/assets/**
+
+# These are published website assets, not local diagnostic captures.
+!/website/screenshots/*.png

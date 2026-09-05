@@ -4,7 +4,7 @@
 #   az login
 #   .\deploy\website.ps1
 #
-# Re-running overwrites the six public assets and adds CORS only if needed.
+# Re-running overwrites the public assets and adds CORS only if needed.
 # The index is uploaded last so its dependencies exist before it becomes live.
 
 $ErrorActionPreference = "Stop"
@@ -33,7 +33,13 @@ function Invoke-WebsiteAzure([string[]]$Arguments) {
 $uploads = @(
     @{ Source = 'website/styles.css'; Name = 'styles.css'; Type = 'text/css; charset=utf-8' }
     @{ Source = 'website/release.js'; Name = 'release.js'; Type = 'application/javascript; charset=utf-8' }
-    @{ Source = 'website/scene.svg'; Name = 'scene.svg'; Type = 'image/svg+xml' }
+    @{ Source = 'website/fonts/orbitron-latin-700.woff2'; Name = 'fonts/orbitron-latin-700.woff2'; Type = 'font/woff2' }
+    @{ Source = 'website/fonts/ibm-plex-mono-latin-400.woff2'; Name = 'fonts/ibm-plex-mono-latin-400.woff2'; Type = 'font/woff2' }
+    @{ Source = 'website/fonts/orbitron-OFL.txt'; Name = 'fonts/orbitron-OFL.txt'; Type = 'text/plain; charset=utf-8' }
+    @{ Source = 'website/fonts/ibm-plex-mono-OFL.txt'; Name = 'fonts/ibm-plex-mono-OFL.txt'; Type = 'text/plain; charset=utf-8' }
+    @{ Source = 'website/screenshots/home.png'; Name = 'screenshots/home.png'; Type = 'image/png' }
+    @{ Source = 'website/screenshots/pick.png'; Name = 'screenshots/pick.png'; Type = 'image/png' }
+    @{ Source = 'website/screenshots/streaming.png'; Name = 'screenshots/streaming.png'; Type = 'image/png' }
     @{ Source = 'website/404.html'; Name = '404.html'; Type = 'text/html; charset=utf-8' }
     @{ Source = 'assets/logo.png'; Name = 'logo.png'; Type = 'image/png' }
     @{ Source = 'website/index.html'; Name = 'index.html'; Type = 'text/html; charset=utf-8' }
@@ -94,7 +100,7 @@ foreach ($upload in $uploads) {
     Invoke-WebsiteAzure @(
         'storage', 'blob', 'upload', '--account-name', $storageAccount, '--auth-mode', 'key',
         '--container-name', '$web', '--name', $upload.Name, '--file', $upload.Path,
-        '--overwrite', 'true', '--content-type', $upload.Type, '--content-cache-control', 'no-cache'
+        '--overwrite', 'true', '--content-type', $upload.Type, '--content-cache-control', 'no-cache', '--no-progress'
     ) | Out-Null
 }
 
