@@ -4053,6 +4053,7 @@ dependencies = [
  "clap",
  "embed-resource",
  "gstreamer",
+ "gstreamer-base",
  "gstreamer-sdp",
  "gstreamer-video",
  "gstreamer-webrtc",

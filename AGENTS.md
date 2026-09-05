@@ -45,8 +45,9 @@ where those files do not exist.
 ## Worktrees
 
 Worktrees live in `%LOCALAPPDATA%\Temp\opencode\<name>`, not in `.worktrees/`.
-`.cargo/config.toml` shares the build cache across all of them, so a fresh
-worktree compiles quickly.
+`.cargo/config.toml` currently selects `rust-lld`, not a shared `target-dir`.
+A fresh worktree builds dependencies into its own `target/`; the A/V fix's
+first workspace test run spent about 90 seconds compiling before tests began.
 
 **Always branch from `origin/main` after fetching**, never from whatever the
 current checkout happens to be at:
@@ -148,8 +149,11 @@ analysed source had a defect that the build in the log had already fixed.
 
 Useful fields when triaging media: `media-progress` carries per-stage buffer,
 byte, `pts_ms` and `av_offset_ms` values; `webrtc-stats` carries loss, jitter,
-NACK/PLI/FIR and jitterbuffer counters. `av_offset_ms` is positive when the
-picture is ahead of the sound.
+NACK/PLI/FIR and jitterbuffer counters. `av_offset_ms` compares sink-input
+timestamps, not physical playback. The native regression uses output capture
+because these probes run before the audio ringbuffer and video presentation.
+Use an output-captured marker comparison to validate playout (see the hardware
+acceptance test in `webrtc/receive_playout_tests.rs`).
 
 ## Diagnosis Discipline
 

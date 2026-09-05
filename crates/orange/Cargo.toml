@@ -16,6 +16,7 @@ embed-resource = "3"
 [dependencies]
 orange-signal = { path = "../orange-signal" }
 gstreamer = "0.25"
+gstreamer-base = "0.25"
 gstreamer-video = "0.25"
 gstreamer-webrtc = { version = "0.25", features = ["v1_20"] }
 gstreamer-sdp = "0.25"

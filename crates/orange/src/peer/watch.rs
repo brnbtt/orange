@@ -11,7 +11,7 @@ use crate::media_diagnostics::{
 };
 use crate::webrtc::{
     accept_receive_pad, build_audio_branch, build_receive_branch, configure_receive_transport,
-    encoding_name, watch_incoming_bitrate, AcceptedReceivePad, Output, ReceiveOutput,
+    encoding_name, watch_incoming_bitrate, AcceptedReceivePad, LivePlayout, Output, ReceiveOutput,
     ReceiveWorkerRegistry,
 };
 use orange_signal::{connect, Signal};
@@ -176,6 +176,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
     println!("[watch] joining...");
 
     let pipeline = gst::Pipeline::new();
+    let playout = LivePlayout::new(&pipeline);
     let bin = make_webrtcbin("viewer").inspect_err(|_| {
         connection_failed(viewer_playback.as_ref(), ConnectionFailure::Playback);
     })?;
@@ -250,6 +251,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                     pad,
                     overlay_for_audio.clone(),
                     media_progress_for_pad.clone(),
+                    &playout,
                     "watch",
                 )
                 .map(|worker| {
@@ -272,6 +274,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                             pad,
                             output,
                             media_progress_for_pad.clone(),
+                            &playout,
                             "watch",
                         )
                         .map(|()| {

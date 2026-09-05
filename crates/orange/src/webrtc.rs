@@ -12,7 +12,9 @@
 //! The price is that we do signalling ourselves. This module proves the media
 //! path with both peers in one process, exchanging SDP by direct call.
 
+mod playout;
 mod receive;
+pub(crate) use playout::LivePlayout;
 mod transport;
 mod workers;
 pub(crate) use receive::build_audio_branch;
@@ -223,6 +225,8 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
 
     let pipeline = gst::Pipeline::new();
 
+    let playout = LivePlayout::new(&pipeline);
+
     // --- sending half -------------------------------------------------------
     let capture = gst::parse::bin_from_description(&build_capture_chain(settings), true)
         .context("failed to build capture chain")?;
@@ -274,8 +278,14 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
         };
         match accept_receive_pad(&workers_for_pad, pad) {
             Some(AcceptedReceivePad::Audio(claim)) => {
-                match build_audio_branch(&pipeline, pad, overlay_for_pad.clone(), None, "loopback")
-                {
+                match build_audio_branch(
+                    &pipeline,
+                    pad,
+                    overlay_for_pad.clone(),
+                    None,
+                    &playout,
+                    "loopback",
+                ) {
                     Ok(worker) => claim.complete_audio(worker),
                     Err(error) => eprintln!("[webrtc] could not build audio branch: {error}"),
                 }
@@ -288,7 +298,7 @@ pub fn run_loopback(settings: &CaptureSettings, output: Output, seconds: u64) ->
                 else {
                     return;
                 };
-                match build_receive_branch(&pipeline, pad, output, None, "loopback") {
+                match build_receive_branch(&pipeline, pad, output, None, &playout, "loopback") {
                     Ok(()) => {
                         if let Some(playback) = &playback_for_pad {
                             playback.reveal();
@@ -413,3 +423,7 @@ mod loopback_lifecycle_tests {
         assert_eq!(requested_sink_pad_count(&sender), baseline);
     }
 }
+
+#[cfg(test)]
+#[path = "webrtc/playout_webrtc_tests.rs"]
+mod playout_webrtc_tests;
