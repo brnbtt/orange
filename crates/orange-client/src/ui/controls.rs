@@ -690,16 +690,25 @@ pub(crate) fn scroll_fade(scroll: &gpui::ScrollHandle) -> Option<gpui::Div> {
 }
 
 /// A dot that breathes, for "this is live right now".
-pub(crate) fn live_dot() -> impl IntoElement {
-    dot(SUCCESS).with_animation(
-        SharedString::from("live-pulse"),
-        // GPUI ships this curve: a sine breath that eases at both ends. The
-        // hand-rolled triangle wave it replaces snapped at the turn.
+pub(crate) fn live_dot(moving: bool) -> impl IntoElement {
+    match live_dot_animation(moving) {
+        Some(animation) => dot(SUCCESS)
+            .with_animation(SharedString::from("live-pulse"), animation, |el, delta| {
+                el.opacity(delta)
+            })
+            .into_any_element(),
+        None => dot(SUCCESS).opacity(0.7).into_any_element(),
+    }
+}
+
+fn live_dot_animation(moving: bool) -> Option<Animation> {
+    // A repeating animation invalidates the entire screen, even though this
+    // dot is tiny. Use the same active-window gate as the grid and logo aura.
+    moving.then(|| {
         Animation::new(motion::BREATH)
             .repeat()
-            .with_easing(gpui::pulsating_between(0.35, 1.0)),
-        |el, delta| el.opacity(delta),
-    )
+            .with_easing(gpui::pulsating_between(0.35, 1.0))
+    })
 }
 
 /// The badge that appears on a picker preview under the cursor.
@@ -746,4 +755,17 @@ pub(crate) fn titlebar_button(
         .cursor_pointer()
         .hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(TEXT)))
         .child(glyph)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_live_indicators_do_not_schedule_a_repeating_animation() {
+        // Grid and aura already stopped on blur, but this remaining animation
+        // kept invalidating their entire containing screen in the background.
+        assert!(live_dot_animation(false).is_none());
+        assert!(live_dot_animation(true).is_some());
+    }
 }

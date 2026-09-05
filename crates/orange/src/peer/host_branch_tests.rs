@@ -471,3 +471,301 @@ fn viewer_teardown_starts_only_after_startup_worker_joins() {
     assert!(joined);
     assert!(teardown_started_after_join.load(Ordering::SeqCst));
 }
+
+fn synthetic_viewer(
+    pipeline: &gst::Pipeline,
+    tees: &[gst::Element],
+) -> (ViewerBranch, gst::Element) {
+    let bin = gst::ElementFactory::make("funnel").build().unwrap();
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .property("async", false)
+        .build()
+        .unwrap();
+    pipeline.add_many([&bin, &sink]).unwrap();
+    bin.link(&sink).unwrap();
+    sink.sync_state_with_parent().unwrap();
+    bin.sync_state_with_parent().unwrap();
+    let links = tees
+        .iter()
+        .map(|tee| {
+            let queue = gst::ElementFactory::make("queue").build().unwrap();
+            pipeline.add(&queue).unwrap();
+            let tee_pad = tee.request_pad_simple("src_%u").unwrap();
+            let bin_pad = bin.request_pad_simple("sink_%u").unwrap();
+            queue.static_pad("src").unwrap().link(&bin_pad).unwrap();
+            queue.sync_state_with_parent().unwrap();
+            tee_pad.link(&queue.static_pad("sink").unwrap()).unwrap();
+            TeeBranch {
+                tee: tee.clone(),
+                tee_pad,
+                elements: vec![queue],
+                bin_pad,
+            }
+        })
+        .collect();
+    (
+        ViewerBranch {
+            bin,
+            links,
+            label: "synthetic viewer".to_string(),
+            startup_keyframes: None,
+            diagnostics: None,
+        },
+        sink,
+    )
+}
+
+fn count_buffers(pad: &gst::Pad) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let observed = counter.clone();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        gst::PadProbeReturn::Ok
+    });
+    counter
+}
+
+fn count_viewer_buffers(branch: &ViewerBranch) -> Vec<Arc<AtomicUsize>> {
+    branch
+        .links
+        .iter()
+        .map(|link| count_buffers(&link.elements[0].static_pad("src").unwrap()))
+        .collect()
+}
+
+async fn wait_for_media(counters: &[Arc<AtomicUsize>], previous: &[usize]) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while counters
+            .iter()
+            .zip(previous)
+            .any(|(counter, previous)| counter.load(Ordering::SeqCst) <= *previous)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both live sources must produce media");
+}
+
+#[tokio::test]
+async fn last_viewer_suspension_stops_video_and_audio_until_a_new_branch_is_ready() {
+    // An empty viewer map used to leave both shared sources PLAYING forever.
+    // Real tee links exercise removal and restart without GPU or audio devices.
+    if run_in_bounded_subprocess(
+        "ORANGE_TEST_HOST_IDLE_MEDIA_CHILD",
+        "peer::host_branch::tests::last_viewer_suspension_stops_video_and_audio_until_a_new_branch_is_ready",
+    ) {
+        return;
+    }
+    gst::init().unwrap();
+    let pipeline = gst::parse::launch(
+        "videotestsrc is-live=true ! tee name=video allow-not-linked=true \
+         audiotestsrc is-live=true ! tee name=audio allow-not-linked=true",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    let tees = [
+        pipeline.by_name("video").unwrap(),
+        pipeline.by_name("audio").unwrap(),
+    ];
+    let counters: Vec<_> = tees
+        .iter()
+        .map(|tee| count_buffers(&tee.static_pad("sink").unwrap()))
+        .collect();
+    pipeline.set_state(gst::State::Ready).unwrap();
+    let (branch, sink) = synthetic_viewer(&pipeline, &tees);
+    let viewer_counters = count_viewer_buffers(&branch);
+    let bin = branch.bin.clone();
+    let teardown = ViewerTeardown::new(&pipeline).unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    wait_for_media(&counters, &[0, 0]).await;
+    wait_for_media(&viewer_counters, &[0, 0]).await;
+
+    teardown.enqueue(branch).await.unwrap();
+    teardown.suspend().await.unwrap();
+    teardown.finish().await.unwrap();
+    let state = pipeline.current_state();
+    let stopped: Vec<_> = counters
+        .iter()
+        .map(|counter| counter.load(Ordering::SeqCst))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let remained_stopped = counters
+        .iter()
+        .zip(&stopped)
+        .all(|(counter, count)| counter.load(Ordering::SeqCst) == *count);
+    let pads_released =
+        tees.iter().all(|tee| tee.src_pads().is_empty()) && bin.sink_pads().is_empty();
+    let detached = bin.parent().is_none();
+    sink.set_state(gst::State::Null).unwrap();
+    pipeline.remove(&sink).unwrap();
+
+    let (branch, sink) = synthetic_viewer(&pipeline, &tees);
+    let resumed_viewer_counters = count_viewer_buffers(&branch);
+    pipeline.set_state(gst::State::Playing).unwrap();
+    wait_for_media(&counters, &stopped).await;
+    wait_for_media(&resumed_viewer_counters, &[0, 0]).await;
+    remove_viewer(&pipeline, branch);
+    sink.set_state(gst::State::Null).unwrap();
+    pipeline.remove(&sink).unwrap();
+    pipeline.set_state(gst::State::Null).unwrap();
+
+    assert_eq!(state, gst::State::Ready);
+    assert!(
+        remained_stopped,
+        "video and audio must stay idle without viewers"
+    );
+    assert!(pads_released);
+    assert!(detached);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn suspension_waits_for_all_removals_without_blocking_the_executor() {
+    // The last removal may still be queued behind a startup worker join.
+    // READY must follow both removals, not just removal from the host's map.
+    if run_in_bounded_subprocess(
+        "ORANGE_TEST_HOST_IDLE_ORDER_CHILD",
+        "peer::host_branch::tests::suspension_waits_for_all_removals_without_blocking_the_executor",
+    ) {
+        return;
+    }
+    gst::init().unwrap();
+    let pipeline = gst::Pipeline::new();
+    let first = gst::ElementFactory::make("identity").build().unwrap();
+    let last = gst::ElementFactory::make("identity").build().unwrap();
+    pipeline.add_many([&first, &last]).unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let (entered, entry) = std_mpsc::sync_channel(1);
+    let (release, released) = std_mpsc::sync_channel(1);
+    let (startup, trigger) = StartupKeyframeWorker::spawn_with(move || {
+        entered.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(2));
+        false
+    })
+    .unwrap();
+    trigger.request();
+    entry.recv_timeout(Duration::from_secs(1)).unwrap();
+    let teardown = ViewerTeardown::new(&pipeline).unwrap();
+    for (bin, startup_keyframes) in [(first.clone(), Some(startup)), (last.clone(), None)] {
+        teardown
+            .enqueue(ViewerBranch {
+                bin,
+                links: Vec::new(),
+                label: "ordered removal".to_string(),
+                startup_keyframes,
+                diagnostics: None,
+            })
+            .await
+            .unwrap();
+    }
+    {
+        let suspension = teardown.suspend();
+        tokio::pin!(suspension);
+        let pending = tokio::time::timeout(Duration::from_millis(30), &mut suspension)
+            .await
+            .is_err();
+        let still_playing = pipeline.current_state() == gst::State::Playing;
+        let both_attached = first.parent().is_some() && last.parent().is_some();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), suspension)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pending,
+            "suspension must wait for the startup worker to join"
+        );
+        assert!(still_playing);
+        assert!(both_attached);
+    }
+    let suspended = pipeline.current_state();
+    let both_detached = first.parent().is_none() && last.parent().is_none();
+    teardown.finish().await.unwrap();
+    pipeline.set_state(gst::State::Null).unwrap();
+    assert_eq!(suspended, gst::State::Ready);
+    assert!(both_detached);
+}
+
+#[tokio::test]
+async fn suspension_fallback_stops_media_when_the_worker_channel_is_closed() {
+    // A failed send must keep the same off-executor fallback as branch removal.
+    gst::init().unwrap();
+    let pipeline = gst::Pipeline::new();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let teardown = ViewerTeardown {
+        sender: Some(sender),
+        pipeline: pipeline.clone(),
+        worker: None,
+    };
+    let result = teardown.suspend().await;
+    let state = pipeline.current_state();
+    teardown.finish().await.unwrap();
+    pipeline.set_state(gst::State::Null).unwrap();
+    result.unwrap();
+    assert_eq!(state, gst::State::Ready);
+}
+
+#[tokio::test]
+async fn suspension_propagates_state_change_failure_from_worker_and_fallback() {
+    // An acknowledgment must carry READY failure, not silently allow a rejoin
+    // against a pipeline whose shared sources never actually stopped.
+    gst::init().unwrap();
+    for fallback in [false, true] {
+        let pipeline = gst::Pipeline::new();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("async", false)
+            .build()
+            .unwrap();
+        pipeline.add(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        sink.set_property_from_str("state-error", "paused-to-ready");
+        let teardown = if fallback {
+            let (sender, receiver) = mpsc::channel(1);
+            drop(receiver);
+            ViewerTeardown {
+                sender: Some(sender),
+                pipeline: pipeline.clone(),
+                worker: None,
+            }
+        } else {
+            ViewerTeardown::new(&pipeline).unwrap()
+        };
+        let result = teardown.suspend().await;
+        teardown.finish().await.unwrap();
+        sink.set_property_from_str("state-error", "none");
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to suspend shared host media"));
+    }
+}
+
+#[tokio::test]
+async fn suspension_reports_a_lost_acknowledgment() {
+    // A lost command must not leave the host waiting indefinitely for READY.
+    gst::init().unwrap();
+    let pipeline = gst::Pipeline::new();
+    let (sender, mut receiver) = mpsc::channel(1);
+    let teardown = ViewerTeardown {
+        sender: Some(sender),
+        pipeline,
+        worker: None,
+    };
+    let receiver = tokio::spawn(async move {
+        drop(receiver.recv().await);
+    });
+    let result = tokio::time::timeout(Duration::from_secs(1), teardown.suspend())
+        .await
+        .unwrap();
+    receiver.await.unwrap();
+    teardown.finish().await.unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("stopped before suspending"));
+}

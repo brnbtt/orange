@@ -12,10 +12,12 @@
 use crate::session::Friend;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Child processes are console applications; without this each one flashes a
 /// black window in front of the user.
@@ -205,21 +207,133 @@ pub const MEDIA_RUNTIME_MISSING: &str =
     "The media runtime that ships with orange is missing. Reinstalling orange will restore it.";
 
 pub fn list_windows() -> Result<Vec<WindowTarget>> {
-    let output = orange_command()?
-        .args(["list", "--json"])
+    list_windows_cancelled(&AtomicBool::new(false))
+}
+
+fn list_windows_cancelled(cancel: &AtomicBool) -> Result<Vec<WindowTarget>> {
+    let mut command = orange_command()?;
+    command.args(["list", "--json"]);
+    list_windows_command(command, cancel, Duration::from_secs(10))
+}
+
+pub(super) fn picker_windows(cancel: &AtomicBool) -> Result<Vec<WindowTarget>> {
+    let mut windows = list_windows_cancelled(cancel)?;
+    windows.retain(|window| !window.process.to_lowercase().starts_with("orange"));
+    let (width, height) = crate::capture::screen_size().unwrap_or((0, 0));
+    // Zero is the existing whole-screen sentinel, not a capturable HWND.
+    windows.insert(
+        0,
+        WindowTarget {
+            hwnd: 0,
+            title: "Entire screen".into(),
+            process: "Desktop".into(),
+            width,
+            height,
+        },
+    );
+    Ok(windows)
+}
+
+// Only orange list needs a short deadline. Its owner always kills/reaps the
+// child and joins both pipe readers, including cancellation and parse failures.
+struct WindowListChild {
+    child: Child,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl WindowListChild {
+    fn finish_readers(&mut self) {
+        for reader in self.readers.drain(..) {
+            crate::background::join_background_worker(
+                reader,
+                Duration::from_secs(5),
+                "window list output",
+            );
+        }
+    }
+}
+
+impl Drop for WindowListChild {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            if let Err(error) = self.child.wait() {
+                crate::client::fail_fast("could not reap window list child", &error.into());
+            }
+        }
+        self.finish_readers();
+    }
+}
+
+fn list_windows_command(
+    mut command: Command,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<Vec<WindowTarget>> {
+    const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .context("could not run `orange list`")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "`orange list` exited with {}: {}",
-            output.status,
-            stderr.trim()
+    let mut owner = WindowListChild {
+        child,
+        readers: Vec::new(),
+    };
+    let (sender, receiver) = mpsc::channel();
+    // Read simultaneously: waiting first can deadlock if a large list fills
+    // stdout, or a loader failure fills stderr. Each buffer is capped.
+    let stdout = owner.child.stdout.take().context("missing list stdout")?;
+    let stderr = owner.child.stderr.take().context("missing list stderr")?;
+    let out_sender = sender.clone();
+    owner.readers.push(std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(MAX_OUTPUT + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = out_sender.send((true, result));
+    }));
+    owner.readers.push(std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr
+            .take(MAX_OUTPUT + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send((false, result));
+    }));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire),
+            "window enumeration cancelled"
         );
+        anyhow::ensure!(Instant::now() < deadline, "window enumeration timed out");
+        if let Some(status) = owner.child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    owner.finish_readers();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for (is_stdout, result) in receiver {
+        let bytes = result?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_OUTPUT,
+            "window enumeration output too large"
+        );
+        if is_stdout {
+            stdout = bytes;
+        } else {
+            stderr = bytes;
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        anyhow::bail!("`orange list` exited with {}: {}", status, stderr.trim());
+    }
+    let text = String::from_utf8_lossy(&stdout);
     // The binary prints nothing else on stdout in JSON mode, but be forgiving.
     let json = text
         .lines()
@@ -650,6 +764,10 @@ pub fn supported_frame_rate(fps: Option<u32>) -> u32 {
     fps.filter(|value| FRAME_RATES.iter().any(|rate| rate.fps == *value))
         .unwrap_or(DEFAULT_FPS)
 }
+
+#[cfg(test)]
+#[path = "supervisor_list_tests.rs"]
+mod list_tests;
 
 #[cfg(test)]
 mod tests {

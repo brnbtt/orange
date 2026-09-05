@@ -143,7 +143,7 @@ impl Orange {
                                     .items_center()
                                     .gap_1p5()
                                     .child(if matches!(state, Some(Presence::Live { .. })) {
-                                        live_dot().into_any_element()
+                                        live_dot(self.animate).into_any_element()
                                     } else {
                                         dot(status_color).into_any_element()
                                     })

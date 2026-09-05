@@ -15,7 +15,8 @@ impl Orange {
         // Distinguishes "still capturing" from "this window refuses to draw",
         // which previously both showed as "no preview" and made every card
         // flash a failure message before its thumbnail arrived.
-        let capturing = self.thumbnail_job.is_some();
+        let capturing = self.picker_busy();
+        let loading = self.picker_loading();
 
         // Sharing a display and sharing a window are different decisions - one
         // of them puts every notification you receive on the stream, along
@@ -49,7 +50,14 @@ impl Orange {
                             .flex()
                             .flex_col()
                             .gap_0p5()
-                            .child(micro(format!("{} SOURCES AVAILABLE", count), ORANGE))
+                            .child(micro(
+                                if loading {
+                                    "FINDING SOURCES".to_string()
+                                } else {
+                                    format!("{} SOURCES AVAILABLE", count)
+                                },
+                                ORANGE,
+                            ))
                             .child(heading("Choose what to share", 14.0))
                             .child(
                                 label("Click a preview to start streaming immediately.", FAINT)
@@ -93,10 +101,17 @@ impl Orange {
                             .track_scroll(&self.picker_scroll)
                             .when(count == 0, |d| {
                                 d.child(
-                                    card()
-                                        .w_full()
-                                        .items_center()
-                                        .child(label("No windows found", MUTED).text_xs()),
+                                    card().w_full().items_center().child(
+                                        label(
+                                            if loading {
+                                                "Finding windows…"
+                                            } else {
+                                                "No windows found"
+                                            },
+                                            MUTED,
+                                        )
+                                        .text_xs(),
+                                    ),
                                 )
                             })
                             .children(

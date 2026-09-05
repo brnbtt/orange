@@ -146,31 +146,122 @@ fn panel(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, alpha: f32
 
 // --- icons ------------------------------------------------------------------
 
-fn draw_svg_icon(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, path: &str, color: Color) {
-    let dimension = s.ceil().max(1.0) as u32;
-    let to_byte = |channel: f32| (channel * 255.0).round().clamp(0.0, 255.0) as u8;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Icon {
+    SpeakerNone,
+    SpeakerLow,
+    SpeakerHigh,
+    SpeakerSlash,
+    Close,
+    ArrowsOut,
+    ArrowsIn,
+}
+
+impl Icon {
+    fn path(self) -> &'static str {
+        match self {
+            Self::SpeakerNone => ICON_SPEAKER_NONE,
+            Self::SpeakerLow => ICON_SPEAKER_LOW,
+            Self::SpeakerHigh => ICON_SPEAKER_HIGH,
+            Self::SpeakerSlash => ICON_SPEAKER_SLASH,
+            Self::Close => ICON_X,
+            Self::ArrowsOut => ICON_ARROWS_OUT,
+            Self::ArrowsIn => ICON_ARROWS_IN,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct IconKey {
+    icon: Icon,
+    dimension: u32,
+    rgb: [u8; 3],
+}
+
+const MAX_ICON_RASTERS: usize = 32;
+const MAX_ICON_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct IconCache {
+    entries: Vec<(IconKey, Pixmap)>,
+    bytes: usize,
+}
+
+impl IconCache {
+    fn insert(&mut self, key: IconKey, pixmap: Pixmap) {
+        let bytes = pixmap.data().len();
+        // Unusual DPI values must not retain huge rasters. They still draw at
+        // the requested size; only cache admission is limited.
+        if bytes > MAX_ICON_BYTES {
+            return;
+        }
+        while self.entries.len() >= MAX_ICON_RASTERS || self.bytes + bytes > MAX_ICON_BYTES {
+            let (_, oldest) = self.entries.remove(0);
+            self.bytes -= oldest.data().len();
+        }
+        self.bytes += bytes;
+        self.entries.push((key, pixmap));
+    }
+}
+
+thread_local! {
+    // The draw callback owns its thread's small cache. No global lock is
+    // added to playback, and thread teardown releases all retained rasters.
+    static ICON_CACHE: std::cell::RefCell<IconCache> = std::cell::RefCell::new(IconCache::default());
+}
+
+#[cfg(test)]
+thread_local! {
+    static SVG_RASTERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn rasterize_icon(key: IconKey) -> Option<Pixmap> {
+    #[cfg(test)]
+    SVG_RASTERS.set(SVG_RASTERS.get() + 1);
+    let dimension = key.dimension;
+    let path = key.icon.path();
     let svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{dimension}" height="{dimension}" viewBox="0 0 256 256" fill="#{:02x}{:02x}{:02x}" fill-opacity="{}"><path d="{path}"/></svg>"##,
-        to_byte(color.red()),
-        to_byte(color.green()),
-        to_byte(color.blue()),
-        color.alpha()
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{dimension}" height="{dimension}" viewBox="0 0 256 256" fill="#{:02x}{:02x}{:02x}"><path d="{path}"/></svg>"##,
+        key.rgb[0], key.rgb[1], key.rgb[2],
     );
-    let Ok(tree) = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()) else {
-        return;
-    };
-    let Some(mut icon) = Pixmap::new(dimension, dimension) else {
-        return;
-    };
+    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok()?;
+    let mut icon = Pixmap::new(dimension, dimension)?;
     resvg::render(&tree, Transform::identity(), &mut icon.as_mut());
-    pixmap.draw_pixmap(
-        x.round() as i32,
-        y.round() as i32,
-        icon.as_ref(),
-        &PixmapPaint::default(),
-        Transform::identity(),
-        None,
-    );
+    Some(icon)
+}
+
+fn draw_svg_icon(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, icon: Icon, color: Color) {
+    let to_byte = |channel: f32| (channel * 255.0).round().clamp(0.0, 255.0) as u8;
+    let key = IconKey {
+        icon,
+        dimension: s.ceil().max(1.0) as u32,
+        rgb: [
+            to_byte(color.red()),
+            to_byte(color.green()),
+            to_byte(color.blue()),
+        ],
+    };
+    let mut draw = |icon: &Pixmap| {
+        pixmap.draw_pixmap(
+            x.round() as i32,
+            y.round() as i32,
+            icon.as_ref(),
+            &PixmapPaint {
+                opacity: color.alpha(),
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    };
+    ICON_CACHE.with_borrow_mut(|cache| {
+        if let Some((_, icon)) = cache.entries.iter().find(|(cached, _)| *cached == key) {
+            draw(icon);
+        } else if let Some(icon) = rasterize_icon(key) {
+            draw(&icon);
+            cache.insert(key, icon);
+        }
+    });
 }
 
 /// The speaker glyph that matches what you would actually hear.
@@ -179,21 +270,21 @@ fn draw_svg_icon(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, path: &str, color:
 /// from 100% is to read the slider, which is exactly the thing the icon is
 /// there to save you from - and at 20% the difference between "quiet" and
 /// "muted" is the one distinction worth drawing.
-fn speaker_icon(muted: bool, level: f32) -> &'static str {
+fn speaker_icon(muted: bool, level: f32) -> Icon {
     if muted || level <= 0.0 {
         // Muted and turned-to-zero are different acts, so they get different
         // glyphs: the slash is something you did, the silent cone is where
         // the slider is.
         return if muted {
-            ICON_SPEAKER_SLASH
+            Icon::SpeakerSlash
         } else {
-            ICON_SPEAKER_NONE
+            Icon::SpeakerNone
         };
     }
     if level < 0.5 {
-        ICON_SPEAKER_LOW
+        Icon::SpeakerLow
     } else {
-        ICON_SPEAKER_HIGH
+        Icon::SpeakerHigh
     }
 }
 
@@ -202,7 +293,7 @@ fn speaker(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, muted: bool, level: f32,
 }
 
 fn cross(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
-    draw_svg_icon(pixmap, x, y, s, ICON_X, color);
+    draw_svg_icon(pixmap, x, y, s, Icon::Close, color);
 }
 
 /// The live dot.
@@ -221,9 +312,9 @@ fn expand(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, exiting: bool, color: Col
         y,
         s,
         if exiting {
-            ICON_ARROWS_IN
+            Icon::ArrowsIn
         } else {
-            ICON_ARROWS_OUT
+            Icon::ArrowsOut
         },
         color,
     );
@@ -276,7 +367,10 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
         return transparent_composition();
     }
 
-    let signature = state.signature();
+    // One tracker read keeps the cache key, title and detail on the same
+    // connection stage even if progress advances while we are painting.
+    let connection = state.connection_stage();
+    let signature = state.signature(connection);
     if let Some((cached, composition)) = &state.cache {
         if *cached == signature {
             return Some(composition.clone());
@@ -321,14 +415,19 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
     {
         let expanded = status_expanded(state.hot == Some(Control::Stats));
         let pulse = state.live_pulse();
-        let received = state.quality_label();
-        let quality = if persistent_live {
-            String::from("LIVE")
+        let has_text = (expanded || persistent_live) && text::available();
+        let received = if expanded && has_text {
+            state.quality_label(connection)
         } else {
-            received.clone()
+            String::new()
         };
-        let mut detail = if expanded {
-            let detail = state.detail_label();
+        let quality = if persistent_live {
+            "LIVE"
+        } else {
+            received.as_str()
+        };
+        let mut detail = if expanded && has_text {
+            let detail = state.detail_label(connection);
             if persistent_live {
                 Some(match detail {
                     Some(detail) => format!("{received}  \u{00b7}  {detail}"),
@@ -344,14 +443,13 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
         // destination rectangle and for the source pixmap.
         let h = if persistent_live { 28.0 } else { CHIP };
         let leading = h;
-        let has_text = text::available();
         let show_label = (expanded || persistent_live) && has_text;
         let label_gap = if persistent_live { 4.0 } else { 8.0 };
         let end_pad = if persistent_live { 10.0 } else { PAD };
         let max_w = status_max_width(logical_width).max(h);
         let label_size = LABEL * raster_scale;
         let measure = |detail: Option<&String>| {
-            let mut width = text::width(&quality, label_size, Weight::Semibold) / raster_scale;
+            let mut width = text::width(quality, label_size, Weight::Semibold) / raster_scale;
             if let Some(detail) = detail {
                 width += text::width(
                     &format!("  \u{00b7}  {detail}"),
@@ -361,9 +459,13 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
             }
             width
         };
-        let mut text_w = measure(detail.as_ref());
+        let mut text_w = if show_label {
+            measure(detail.as_ref())
+        } else {
+            0.0
+        };
         if expanded && persistent_live && leading + label_gap + text_w + end_pad > max_w {
-            detail = Some(received);
+            detail = Some(received.clone());
             text_w = measure(detail.as_ref());
         }
         if expanded && leading + label_gap + text_w + end_pad > max_w {
@@ -422,7 +524,7 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
                     pixmap,
                     caret,
                     baseline,
-                    &quality,
+                    quality,
                     label_size,
                     Weight::Semibold,
                     if persistent_live {
@@ -432,7 +534,7 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
                     },
                 );
                 if let Some(detail) = &detail {
-                    caret += text::width(&quality, label_size, Weight::Semibold);
+                    caret += text::width(quality, label_size, Weight::Semibold);
                     let joined = format!("  \u{00b7}  {detail}");
                     text::draw(
                         pixmap,
@@ -770,6 +872,282 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    fn populated_state() -> OverlayState {
+        let mut state =
+            OverlayState::new(crate::window::PlaybackProfile::FriendViewer { cascade: 0 });
+        state.video = (1920, 1080);
+        state.client = (1280, 720);
+        state.fps = Some(59.94);
+        state.bitrate_kbps = Some(18_000);
+        state.host = Some("A friend".into());
+        state.viewers = Some(3);
+        state
+    }
+
+    #[test]
+    fn hidden_cache_hits_do_not_build_labels() {
+        // Hidden playback used to format both populated labels on every frame.
+        gst::init().unwrap();
+        let mut state = populated_state();
+        let first = render(&mut state).unwrap();
+        let labels = super::super::LABEL_BUILDS.get();
+        let rasters = SVG_RASTERS.get();
+        for _ in 0..600 {
+            assert_eq!(render(&mut state).unwrap().seqnum(), first.seqnum());
+        }
+        assert_eq!(super::super::LABEL_BUILDS.get() - labels, 0);
+        assert_eq!(SVG_RASTERS.get() - rasters, 0);
+    }
+
+    #[test]
+    fn expanded_cache_hits_do_not_build_labels() {
+        // A genuinely expanded chip should reuse its composition, not just
+        // avoid work because the label is absent from the collapsed design.
+        gst::init().unwrap();
+        let mut state = populated_state();
+        state.pinned = true;
+        state.hot = Some(Control::Stats);
+        state.born = Instant::now();
+        let first = render(&mut state).unwrap();
+        let labels = super::super::LABEL_BUILDS.get();
+        for _ in 0..600 {
+            // Keep the pulse at the start of its lowest quantized bucket.
+            state.born = Instant::now();
+            assert_eq!(render(&mut state).unwrap().seqnum(), first.seqnum());
+        }
+        assert_eq!(super::super::LABEL_BUILDS.get() - labels, 0);
+    }
+
+    #[test]
+    fn collapsed_status_does_not_build_unused_receive_labels() {
+        // Even a raster miss used to prepare receive text for the dot-only
+        // viewer chip and for the monitor chip whose only label is LIVE.
+        gst::init().unwrap();
+        for profile in [
+            crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
+            crate::window::PlaybackProfile::LiveMonitor,
+        ] {
+            let mut state = populated_state();
+            state.profile = profile;
+            state.pinned = true;
+            let labels = super::super::LABEL_BUILDS.get();
+            render(&mut state).unwrap();
+            assert_eq!(super::super::LABEL_BUILDS.get() - labels, 0);
+        }
+    }
+
+    #[test]
+    fn changing_icon_alpha_reuses_the_same_svg_raster() {
+        // Fade alpha and hover opacity are not new artwork. Count the real
+        // resvg work, rather than just asserting that two keys compare equal.
+        let rasters = SVG_RASTERS.get();
+        for step in 1..=100 {
+            let mut pixmap = Pixmap::new(24, 24).unwrap();
+            draw_svg_icon(
+                &mut pixmap,
+                2.0,
+                2.0,
+                20.0,
+                Icon::Close,
+                rgba(CREAM, step as f32 / 100.0),
+            );
+            assert!(pixmap.pixels().iter().any(|pixel| pixel.alpha() > 0));
+        }
+        assert_eq!(SVG_RASTERS.get() - rasters, 1);
+    }
+
+    #[test]
+    fn live_pulse_redraws_reuse_button_artwork() {
+        // The pulsing dot invalidates the composition while all three button
+        // glyphs stay unchanged, so a composition cache alone cannot help.
+        gst::init().unwrap();
+        let mut state = populated_state();
+        state.pinned = true;
+        state.born = Instant::now();
+        let mut previous = render(&mut state).unwrap().seqnum();
+        let rasters = SVG_RASTERS.get();
+        for step in 0..20 {
+            state.born = Instant::now()
+                - if step % 2 == 0 {
+                    super::super::BREATH / 4
+                } else {
+                    std::time::Duration::ZERO
+                };
+            let next = render(&mut state).unwrap().seqnum();
+            assert_ne!(next, previous);
+            previous = next;
+        }
+        assert_eq!(SVG_RASTERS.get() - rasters, 0);
+    }
+
+    #[test]
+    fn icon_artwork_rgb_and_raster_dimensions_are_distinct_cache_inputs() {
+        // Color must distinguish close-hover danger ink; ceil dimensions must
+        // distinguish DPI without treating placement or fractional size as art.
+        ICON_CACHE.with_borrow_mut(|cache| *cache = IconCache::default());
+        let rasters = SVG_RASTERS.get();
+        let mut pixmap = Pixmap::new(64, 64).unwrap();
+        for (icon, size, rgb) in [
+            (Icon::Close, 19.1, CREAM),
+            (Icon::Close, 19.9, CREAM),
+            (Icon::Close, 19.1, DANGER),
+            (Icon::Close, 38.0, CREAM),
+            (Icon::ArrowsIn, 19.1, CREAM),
+            (Icon::ArrowsOut, 19.1, CREAM),
+        ] {
+            draw_svg_icon(&mut pixmap, 1.6, 2.4, size, icon, rgba(rgb, 0.85));
+        }
+        assert_eq!(SVG_RASTERS.get() - rasters, 5);
+    }
+
+    #[test]
+    fn icon_cache_evicts_old_dimensions_and_limits_retained_bytes() {
+        // Repeated DPI changes must not accumulate a raster for every size;
+        // a count bound alone also permits several enormous retained images.
+        ICON_CACHE.with_borrow_mut(|cache| *cache = IconCache::default());
+        let mut pixmap = Pixmap::new(2, 2).unwrap();
+        for dimension in 19..90 {
+            draw_svg_icon(
+                &mut pixmap,
+                0.0,
+                0.0,
+                dimension as f32,
+                Icon::Close,
+                rgba(CREAM, 1.0),
+            );
+            ICON_CACHE.with_borrow(|cache| {
+                assert!(cache.entries.len() <= MAX_ICON_RASTERS);
+                assert!(cache.bytes <= MAX_ICON_BYTES);
+            });
+        }
+        let rasters = SVG_RASTERS.get();
+        draw_svg_icon(&mut pixmap, 0.0, 0.0, 19.0, Icon::Close, rgba(CREAM, 1.0));
+        assert_eq!(
+            SVG_RASTERS.get() - rasters,
+            1,
+            "the oldest dimension should have been evicted"
+        );
+
+        for dimension in [300.0, 301.0, 302.0, 600.0] {
+            let retained = ICON_CACHE.with_borrow(|cache| cache.bytes);
+            draw_svg_icon(
+                &mut pixmap,
+                0.0,
+                0.0,
+                dimension,
+                Icon::Close,
+                rgba(CREAM, 1.0),
+            );
+            ICON_CACHE.with_borrow(|cache| {
+                assert!(cache.bytes <= MAX_ICON_BYTES);
+                assert_eq!(
+                    cache.bytes,
+                    cache
+                        .entries
+                        .iter()
+                        .map(|(_, icon)| icon.data().len())
+                        .sum::<usize>()
+                );
+                if dimension == 600.0 {
+                    assert_eq!(
+                        cache.bytes, retained,
+                        "oversized art should bypass the cache"
+                    );
+                }
+            });
+        }
+    }
+
+    fn legacy_icon(size: f32, icon: Icon, color: Color) -> Pixmap {
+        // Reference the pre-cache SVG fill-opacity path, not the new raster
+        // helper, to catch premultiplication or draw-time opacity mistakes.
+        let dimension = size.ceil().max(1.0) as u32;
+        let byte = |c: f32| (c * 255.0).round().clamp(0.0, 255.0) as u8;
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{dimension}" height="{dimension}" viewBox="0 0 256 256" fill="#{:02x}{:02x}{:02x}" fill-opacity="{}"><path d="{}"/></svg>"##,
+            byte(color.red()),
+            byte(color.green()),
+            byte(color.blue()),
+            color.alpha(),
+            icon.path()
+        );
+        let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).unwrap();
+        let mut pixmap = Pixmap::new(dimension, dimension).unwrap();
+        resvg::render(&tree, Transform::identity(), &mut pixmap.as_mut());
+        pixmap
+    }
+
+    #[test]
+    fn cached_icons_preserve_dpi_tint_and_faded_premultiplied_pixels() {
+        // Applying alpha twice darkens edges; omitting it makes icons outlive
+        // their fading panels. Allow only the 8-bit rounding of late opacity.
+        for icon in [
+            Icon::SpeakerNone,
+            Icon::SpeakerLow,
+            Icon::SpeakerHigh,
+            Icon::SpeakerSlash,
+            Icon::Close,
+            Icon::ArrowsOut,
+            Icon::ArrowsIn,
+        ] {
+            for size in [19.0, 23.75, 38.0, 57.0] {
+                for (rgb, alpha) in [
+                    (CREAM, 1.0),
+                    (CREAM, 0.85),
+                    (CREAM, 0.41),
+                    (DANGER, 1.0),
+                    (DANGER, 0.41),
+                    (CREAM, 0.0),
+                ] {
+                    let color = rgba(rgb, alpha);
+                    let original = legacy_icon(size, icon, color);
+                    let mut expected = Pixmap::new(64, 64).unwrap();
+                    expected.fill(rgba(SURFACE, 1.0));
+                    let mut actual = expected.clone();
+                    expected.draw_pixmap(
+                        2,
+                        2,
+                        original.as_ref(),
+                        &PixmapPaint::default(),
+                        Transform::identity(),
+                        None,
+                    );
+                    draw_svg_icon(&mut actual, 2.3, 1.6, size, icon, color);
+                    let max_delta = actual
+                        .data()
+                        .iter()
+                        .zip(expected.data())
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    assert!(
+                        max_delta <= if alpha == 1.0 || alpha == 0.0 { 0 } else { 2 },
+                        "size={size}, alpha={alpha}, max_delta={max_delta}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_speaker_artwork_keeps_muted_zero_low_and_high_distinct() {
+        // A key based on only muted/unmuted would reuse the wrong volume
+        // glyph, particularly at the silent-cone and half-volume boundaries.
+        for (muted, level, expected) in [
+            (true, 0.8, Icon::SpeakerSlash),
+            (false, 0.0, Icon::SpeakerNone),
+            (false, 0.49, Icon::SpeakerLow),
+            (false, 0.5, Icon::SpeakerHigh),
+        ] {
+            let mut actual = Pixmap::new(38, 38).unwrap();
+            speaker(&mut actual, 0.0, 0.0, 38.0, muted, level, rgba(CREAM, 1.0));
+            assert_eq!(
+                actual.data(),
+                legacy_icon(38.0, expected, rgba(CREAM, 1.0)).data()
+            );
+        }
+    }
+
     #[test]
     fn status_text_origin_scales_logical_height_once() {
         assert_eq!(status_text_origin(30.0, 4.0, 1.5), 51.0);
@@ -861,15 +1239,17 @@ mod tests {
 
     #[test]
     fn canonical_overlay_icons_render_visible_pixels() {
-        for path in [
-            ICON_SPEAKER_HIGH,
-            ICON_SPEAKER_SLASH,
-            ICON_X,
-            ICON_ARROWS_OUT,
-            ICON_ARROWS_IN,
+        for icon in [
+            Icon::SpeakerNone,
+            Icon::SpeakerLow,
+            Icon::SpeakerHigh,
+            Icon::SpeakerSlash,
+            Icon::Close,
+            Icon::ArrowsOut,
+            Icon::ArrowsIn,
         ] {
             let mut pixmap = Pixmap::new(24, 24).unwrap();
-            draw_svg_icon(&mut pixmap, 2.0, 2.0, 20.0, path, rgba(CREAM, 1.0));
+            draw_svg_icon(&mut pixmap, 2.0, 2.0, 20.0, icon, rgba(CREAM, 1.0));
             assert!(pixmap
                 .data()
                 .as_chunks::<4>()
@@ -888,17 +1268,20 @@ mod tests {
         );
         state.video = (1920, 1080);
         state.fps = Some(60.0);
-        assert_eq!(state.quality_label(), "1080p60");
+        assert_eq!(state.quality_label(state.connection_stage()), "1080p60");
 
         connection.begin();
         connection.advance(ConnectionEvent::IceChecking);
-        assert_eq!(state.quality_label(), "Finding a direct route");
         assert_eq!(
-            state.detail_label().as_deref(),
+            state.quality_label(state.connection_stage()),
+            "Finding a direct route"
+        );
+        assert_eq!(
+            state.detail_label(state.connection_stage()).as_deref(),
             Some("ICE is checking available network paths")
         );
 
         connection.advance(ConnectionEvent::FirstVideoFrame);
-        assert_eq!(state.quality_label(), "1080p60");
+        assert_eq!(state.quality_label(state.connection_stage()), "1080p60");
     }
 }

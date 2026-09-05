@@ -374,7 +374,7 @@ impl Auth {
             return None;
         }
 
-        self.state.lock().await.sessions.insert(
+        self.state.lock().await.cache_session(
             session.to_string(),
             StoredSession {
                 identity: identity.clone(),
@@ -407,6 +407,23 @@ pub enum PollResult {
 }
 
 impl AuthState {
+    fn cache_session(&mut self, token: String, session: StoredSession) {
+        // Restoration can race another lookup of the same token. Replacing it
+        // must not evict an unrelated session or reset its durable lifetime.
+        self.sessions.remove(&token);
+        while self.sessions.len() >= SESSION_CAPACITY {
+            let oldest = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, stored)| stored.created_at)
+                .map(|(token, _)| token.clone())
+                .expect("a full session cache is nonempty");
+            // This is only the read-through cache; the durable row survives.
+            self.sessions.remove(&oldest);
+        }
+        self.sessions.insert(token, session);
+    }
+
     fn expire_pending(&mut self, state: &str, now: Instant) {
         let expired = self
             .pending
@@ -463,17 +480,7 @@ impl AuthState {
             Ok(identity) => {
                 let session = random_token();
                 let now = Instant::now();
-                if self.sessions.len() == SESSION_CAPACITY {
-                    let oldest = self
-                        .sessions
-                        .iter()
-                        .min_by_key(|(_, stored)| stored.created_at)
-                        .map(|(session, _)| session.clone());
-                    if let Some(oldest) = oldest {
-                        self.sessions.remove(&oldest);
-                    }
-                }
-                self.sessions.insert(
+                self.cache_session(
                     session.clone(),
                     StoredSession {
                         identity: identity.clone(),
@@ -713,6 +720,104 @@ mod tests {
             auth.poll("state").await,
             PollResult::Failed(message) if message == "Login was cancelled" && message.len() == 19
         ));
+    }
+
+    #[test]
+    fn login_restores_the_cache_bound_after_durable_reads_overfilled_it() {
+        // Durable restoration bypassed eviction, then the equality-only login
+        // check stopped evicting too. Even an overfull cache must recover.
+        let now = SystemTime::now();
+        let mut auth = waiting_state();
+        auth.claim("state").unwrap();
+        for index in 0..SESSION_CAPACITY + 2 {
+            auth.sessions.insert(
+                format!("session-{index}"),
+                StoredSession {
+                    identity: identity("returning-user"),
+                    created_at: now - Duration::from_secs((SESSION_CAPACITY + 2 - index) as u64),
+                },
+            );
+        }
+
+        auth.finish_completion("state", Ok(identity("new-user")))
+            .unwrap();
+
+        assert_eq!(auth.sessions.len(), SESSION_CAPACITY);
+        for index in 0..3 {
+            assert!(!auth.sessions.contains_key(&format!("session-{index}")));
+        }
+        assert!(auth.sessions.contains_key("session-3"));
+        assert!(auth
+            .sessions
+            .values()
+            .any(|stored| stored.identity.id == "new-user"));
+    }
+
+    #[test]
+    fn restored_sessions_keep_their_original_expiration_and_bound_the_cache() {
+        // A cold relay must not cache every durable row forever. Restoration
+        // uses the same insertion path as login, without renewing the token.
+        let created_at = SystemTime::now() - SESSION_TTL + Duration::from_secs(1);
+        let mut auth = AuthState::default();
+        for index in 0..SESSION_CAPACITY + 2 {
+            auth.cache_session(
+                format!("restored-{index}"),
+                StoredSession {
+                    identity: identity("user"),
+                    created_at,
+                },
+            );
+            assert!(auth.sessions.len() <= SESSION_CAPACITY);
+        }
+        assert_eq!(auth.sessions.len(), SESSION_CAPACITY);
+        let last = format!("restored-{}", SESSION_CAPACITY + 1);
+        assert_eq!(auth.sessions[&last].created_at, created_at);
+        auth.expire_session(&last, created_at + SESSION_TTL);
+        assert!(!auth.sessions.contains_key(&last));
+    }
+
+    #[tokio::test]
+    async fn concurrent_restoration_of_one_token_does_not_evict_extra_sessions() {
+        // Both cold lookups can finish before either inserts. Their serialized
+        // cache writes must replace one token, not evict for each response.
+        let auth = Arc::new(Mutex::new(AuthState::default()));
+        let created_at = SystemTime::now();
+        {
+            let mut state = auth.lock().await;
+            for index in 0..SESSION_CAPACITY {
+                state.cache_session(
+                    format!("existing-{index}"),
+                    StoredSession {
+                        identity: identity("existing"),
+                        created_at: created_at
+                            - Duration::from_secs((SESSION_CAPACITY - index) as u64),
+                    },
+                );
+            }
+        }
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let auth = auth.clone();
+            tasks.push(tokio::spawn(async move {
+                auth.lock().await.cache_session(
+                    "restored".into(),
+                    StoredSession {
+                        identity: identity("returning"),
+                        created_at,
+                    },
+                );
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let state = auth.lock().await;
+        assert_eq!(state.sessions.len(), SESSION_CAPACITY);
+        assert!(!state.sessions.contains_key("existing-0"));
+        for index in 1..SESSION_CAPACITY {
+            assert!(state.sessions.contains_key(&format!("existing-{index}")));
+        }
+        assert_eq!(state.sessions["restored"].identity.id, "returning");
     }
 
     #[tokio::test]

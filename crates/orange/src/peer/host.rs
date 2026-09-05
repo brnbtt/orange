@@ -58,6 +58,18 @@ fn handle_host_diagnostic_signal(signal: &Signal) {
     );
 }
 
+async fn suspend_idle_host(
+    teardown: &ViewerTeardown,
+    remaining_viewers: usize,
+    pipeline_started: &mut bool,
+) -> Result<()> {
+    if remaining_viewers == 0 {
+        teardown.suspend().await?;
+        *pipeline_started = false;
+    }
+    Ok(())
+}
+
 /// Host: capture a window and serve any number of viewers.
 ///
 /// The window is captured and encoded **once**. Encoded video is fanned out to
@@ -206,6 +218,7 @@ pub(crate) async fn run_host(
                         if let Some(branch) = viewers.remove(&peer) {
                             let label = branch.label.clone();
                             viewer_teardown.enqueue(branch).await?;
+                            suspend_idle_host(&viewer_teardown, viewers.len(), &mut pipeline_started).await?;
                             print_viewer_status("left", &peer, &label, None, None);
                             println!(
                                 "[host] {label} left ({} remaining)",
@@ -269,6 +282,7 @@ pub(crate) async fn run_host(
                         if let Some(branch) = viewers.remove(&peer) {
                             let label = branch.label.clone();
                             viewer_teardown.enqueue(branch).await?;
+                            suspend_idle_host(&viewer_teardown, viewers.len(), &mut pipeline_started).await?;
                             println!("[host] {label} left ({} remaining)", viewers.len());
                             print_viewer_status("left", &peer, &label, None, None);
                         }
@@ -416,6 +430,59 @@ fn print_viewer_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_suspends_only_after_the_last_viewer_and_rearms_startup() {
+        // Both departure paths share this decision: an ordinary departure must
+        // not stop another viewer, and the last one must rearm initial capture.
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let teardown = ViewerTeardown::new(&pipeline).unwrap();
+        let mut pipeline_started = true;
+
+        suspend_idle_host(&teardown, 1, &mut pipeline_started)
+            .await
+            .unwrap();
+        let survivor_state = pipeline.current_state();
+        let survivor_started = pipeline_started;
+        suspend_idle_host(&teardown, 0, &mut pipeline_started)
+            .await
+            .unwrap();
+        let idle_state = pipeline.current_state();
+        teardown.finish().await.unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert_eq!(survivor_state, gst::State::Playing);
+        assert!(survivor_started);
+        assert_eq!(idle_state, gst::State::Ready);
+        assert!(!pipeline_started);
+    }
+
+    #[tokio::test]
+    async fn host_does_not_claim_capture_stopped_when_suspension_fails() {
+        // Clearing the startup flag before READY succeeds hides an active or
+        // partially stopped graph from the next join and from error cleanup.
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("async", false)
+            .build()
+            .unwrap();
+        pipeline.add(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        sink.set_property_from_str("state-error", "paused-to-ready");
+        let teardown = ViewerTeardown::new(&pipeline).unwrap();
+        let mut pipeline_started = true;
+
+        let result = suspend_idle_host(&teardown, 0, &mut pipeline_started).await;
+        teardown.finish().await.unwrap();
+        sink.set_property_from_str("state-error", "none");
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert!(result.is_err());
+        assert!(pipeline_started);
+    }
 
     #[test]
     fn host_receipt_accepts_only_hosting_diagnostic_session() {

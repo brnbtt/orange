@@ -45,7 +45,7 @@ impl Orange {
                             .items_center()
                             .gap_1p5()
                             .child(if code.is_some() {
-                                live_dot().into_any_element()
+                                live_dot(self.animate).into_any_element()
                             } else {
                                 dot(MUTED).into_any_element()
                             })
@@ -273,7 +273,7 @@ impl Orange {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(live_dot())
+                    .child(live_dot(self.animate))
                     .child(label("Watching friends", TEXT).font_weight(FontWeight::SEMIBOLD)),
             )
             .child(

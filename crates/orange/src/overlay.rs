@@ -26,10 +26,17 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::connection::ConnectionStage;
+
 mod gst;
 mod raster;
 
 pub(crate) use gst::attach;
+
+#[cfg(test)]
+thread_local! {
+    static LABEL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// How long the controls stay up after the last mouse movement.
 const HIDE_AFTER: Duration = Duration::from_millis(1_000);
@@ -307,14 +314,18 @@ impl OverlayState {
         std::mem::take(&mut self.volume_dragging)
     }
 
-    /// A short description of what is being received: the product's whole
-    /// claim, and until now invisible to the person watching.
-    fn quality_label(&self) -> String {
-        if let Some(stage) = self
-            .connection
+    fn connection_stage(&self) -> Option<ConnectionStage> {
+        self.connection
             .snapshot()
             .filter(|stage| !stage.is_connected())
-        {
+    }
+
+    /// A short description of what is being received: the product's whole
+    /// claim, and until now invisible to the person watching.
+    fn quality_label(&self, connection: Option<ConnectionStage>) -> String {
+        #[cfg(test)]
+        LABEL_BUILDS.set(LABEL_BUILDS.get() + 1);
+        if let Some(stage) = connection {
             return stage.copy().title.to_string();
         }
         let (w, h) = self.video;
@@ -334,12 +345,10 @@ impl OverlayState {
         }
     }
 
-    fn detail_label(&self) -> Option<String> {
-        if let Some(stage) = self
-            .connection
-            .snapshot()
-            .filter(|stage| !stage.is_connected())
-        {
+    fn detail_label(&self, connection: Option<ConnectionStage>) -> Option<String> {
+        #[cfg(test)]
+        LABEL_BUILDS.set(LABEL_BUILDS.get() + 1);
+        if let Some(stage) = connection {
             return Some(stage.copy().detail.to_string());
         }
         let mut parts = Vec::new();
@@ -360,7 +369,7 @@ impl OverlayState {
     }
 
     /// Identifies a cache entry. Any change here forces a redraw.
-    fn signature(&self) -> u64 {
+    fn signature(&self, connection: Option<ConnectionStage>) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.video.hash(&mut hasher);
         self.client.hash(&mut hasher);
@@ -373,8 +382,25 @@ impl OverlayState {
         self.fullscreen.hash(&mut hasher);
         self.profile.hash(&mut hasher);
         self.hot.map(|c| c as u8).hash(&mut hasher);
-        self.quality_label().hash(&mut hasher);
-        self.detail_label().hash(&mut hasher);
+        // Cache hits run on every video frame, including hidden controls.
+        // Hash borrowed metadata and the displayed numeric buckets rather
+        // than allocating the labels just to discover they did not change.
+        connection.map(|stage| stage.copy().title).hash(&mut hasher);
+        if let Some(stage) = connection {
+            stage.copy().detail.hash(&mut hasher);
+        } else {
+            self.fps
+                .filter(|fps| *fps > 0.0)
+                .map(|fps| fps.round() as u32)
+                .hash(&mut hasher);
+            // {:.0} rounds ties to even, unlike f32::round. Retain the f32
+            // division used in the label so half-Mbps boundaries agree.
+            self.bitrate_kbps
+                .map(|kbps| (kbps as f32 / 1000.0).round_ties_even() as u32)
+                .hash(&mut hasher);
+            self.host.as_deref().hash(&mut hasher);
+            self.viewers.hash(&mut hasher);
+        }
         // Only while the dot is actually on screen. Hashing the breath
         // unconditionally would re-rasterise the whole overlay a dozen times a
         // second behind a hidden control set, which is what the cache is for.
@@ -386,3 +412,124 @@ impl OverlayState {
 }
 
 pub type SharedOverlay = Arc<Mutex<OverlayState>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::ConnectionEvent;
+
+    fn state() -> OverlayState {
+        let mut state =
+            OverlayState::new(crate::window::PlaybackProfile::FriendViewer { cascade: 0 });
+        state.video = (1920, 1080);
+        state.client = (1280, 720);
+        state
+    }
+
+    #[test]
+    fn raw_signature_preserves_displayed_fps_rounding() {
+        // Raw float bits would turn invisible telemetry changes into redraws.
+        let mut state = state();
+        for (first, second, same) in [
+            (Some(59.6), Some(60.4), true),
+            (Some(60.4), Some(60.5), false),
+            (None, Some(0.0), true),
+            (None, Some(-1.0), true),
+            (None, Some(f64::NAN), true),
+            (None, Some(0.1), false),
+            (Some(f64::INFINITY), Some(f64::MAX), true),
+        ] {
+            state.fps = first;
+            let signature = state.signature(None);
+            let label = state.quality_label(None);
+            state.fps = second;
+            assert_eq!(signature == state.signature(None), same);
+            assert_eq!(label == state.quality_label(None), same);
+        }
+    }
+
+    #[test]
+    fn raw_signature_preserves_half_mbps_ties_to_even() {
+        // The label uses {:.0}, not round(): 2.5 Mbps displays as 2 Mbps.
+        let mut state = state();
+        for (first, second, same) in [
+            (Some(2499), Some(2500), true),
+            (Some(2500), Some(2501), false),
+            (Some(3499), Some(3500), false),
+            (Some(3500), Some(3501), true),
+            (Some(17_501), Some(18_499), true),
+            (Some(u32::MAX - 1), Some(u32::MAX), true),
+            (None, Some(0), false),
+        ] {
+            state.bitrate_kbps = first;
+            let signature = state.signature(None);
+            let label = state.detail_label(None);
+            state.bitrate_kbps = second;
+            assert_eq!(signature == state.signature(None), same);
+            assert_eq!(label == state.detail_label(None), same);
+        }
+    }
+
+    #[test]
+    fn metadata_and_control_changes_still_invalidate_the_signature() {
+        // Removing formatted labels must not remove any actual input to the
+        // picture, its physical-DPI raster or its interactive hit geometry.
+        let changes: &[fn(&mut OverlayState)] = &[
+            |s| s.video = (2560, 1440),
+            |s| s.client = (1920, 1080),
+            |s| s.dpi = 1.5,
+            |s| s.volume = 0.8,
+            |s| s.muted = true,
+            |s| s.volume_dragging = true,
+            |s| s.fullscreen = true,
+            |s| s.hot = Some(Control::Stats),
+            |s| s.host = Some("A friend".into()),
+            |s| s.viewers = Some(2),
+            |s| s.pinned = true,
+            |s| s.profile = crate::window::PlaybackProfile::LiveMonitor,
+        ];
+        for change in changes {
+            let mut state = state();
+            let before = state.signature(None);
+            change(&mut state);
+            assert_ne!(before, state.signature(None));
+        }
+    }
+
+    #[test]
+    fn one_connection_stage_drives_both_labels_and_the_signature() {
+        // Progress can advance between the cache lookup and rasterization;
+        // all three must use the stage captured by that render attempt.
+        let mut state = state();
+        state.connection.begin();
+        state.connection.advance(ConnectionEvent::IceChecking);
+        let stage = state.connection_stage();
+        let signature = state.signature(stage);
+        state.connection.advance(ConnectionEvent::FirstVideoFrame);
+        state.host = Some("Not yet displayed".into());
+        state.fps = Some(60.0);
+        state.bitrate_kbps = Some(18_000);
+        assert_eq!(state.signature(stage), signature);
+        assert_eq!(state.quality_label(stage), "Finding a direct route");
+        assert_eq!(
+            state.detail_label(stage).as_deref(),
+            Some("ICE is checking available network paths")
+        );
+        assert_ne!(state.signature(state.connection_stage()), signature);
+        assert_eq!(state.quality_label(state.connection_stage()), "1080p60");
+    }
+
+    #[test]
+    fn fading_controls_invalidate_the_signature_before_they_hide() {
+        // The raw metadata key must still include fade buckets, otherwise a
+        // cache hit holds fully opaque controls until their timeout.
+        let mut state = state();
+        state.born = Instant::now();
+        state.wake();
+        let opaque = state.signature(None);
+        state.shown_at = Instant::now() - (HIDE_AFTER - FADE / 2);
+        state.born = Instant::now();
+        assert!(state.visible());
+        assert_ne!(state.signature(None), opaque);
+    }
+}

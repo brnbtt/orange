@@ -7,7 +7,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::media_diagnostics::{
     diagnostics_enabled, start_webrtc_diagnostics, track_pad, DiagnosticsHandle, MediaProgress,
@@ -167,8 +167,28 @@ pub(super) struct ViewerBranch {
     diagnostics: Option<DiagnosticsHandle>,
 }
 
+enum ViewerTeardownCommand {
+    Remove(ViewerBranch),
+    Suspend(oneshot::Sender<Result<()>>),
+}
+
+impl ViewerTeardownCommand {
+    fn run(self, pipeline: &gst::Pipeline) {
+        match self {
+            Self::Remove(branch) => remove_viewer(pipeline, branch),
+            Self::Suspend(completed) => {
+                let result = pipeline
+                    .set_state(gst::State::Ready)
+                    .map(|_| ())
+                    .context("failed to suspend shared host media");
+                let _ = completed.send(result);
+            }
+        }
+    }
+}
+
 pub(super) struct ViewerTeardown {
-    sender: Option<mpsc::Sender<ViewerBranch>>,
+    sender: Option<mpsc::Sender<ViewerTeardownCommand>>,
     pipeline: gst::Pipeline,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -181,14 +201,14 @@ async fn run_viewer_teardown_blocking(teardown: impl FnOnce() + Send + 'static) 
 
 impl ViewerTeardown {
     pub(super) fn new(pipeline: &gst::Pipeline) -> Result<Self> {
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel::<ViewerTeardownCommand>(1);
         let worker_pipeline = pipeline.clone();
         let worker = std::thread::Builder::new()
             .name("viewer-teardown".to_string())
             .spawn(move || {
-                while let Some(branch) = receiver.blocking_recv() {
+                while let Some(command) = receiver.blocking_recv() {
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        remove_viewer(&worker_pipeline, branch);
+                        command.run(&worker_pipeline);
                     }))
                     .is_err()
                     {
@@ -207,13 +227,30 @@ impl ViewerTeardown {
     }
 
     pub(super) async fn enqueue(&self, branch: ViewerBranch) -> Result<()> {
+        self.enqueue_command(ViewerTeardownCommand::Remove(branch))
+            .await
+    }
+
+    // The single-owner host awaits this barrier before accepting another join.
+    // FIFO removal finishes first, so READY cannot race a new viewer branch or
+    // leave WASAPI running after the final video branch has disappeared.
+    pub(super) async fn suspend(&self) -> Result<()> {
+        let (completed, completion) = oneshot::channel();
+        self.enqueue_command(ViewerTeardownCommand::Suspend(completed))
+            .await?;
+        completion
+            .await
+            .context("viewer teardown stopped before suspending shared host media")?
+    }
+
+    async fn enqueue_command(&self, command: ViewerTeardownCommand) -> Result<()> {
         let sender = self
             .sender
             .as_ref()
             .expect("sender exists until viewer teardown drop");
-        if let Err(error) = sender.send(branch).await {
+        if let Err(error) = sender.send(command).await {
             let pipeline = self.pipeline.clone();
-            run_viewer_teardown_blocking(move || remove_viewer(&pipeline, error.0)).await?;
+            run_viewer_teardown_blocking(move || error.0.run(&pipeline)).await?;
         }
         Ok(())
     }

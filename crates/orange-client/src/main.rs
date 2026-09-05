@@ -19,17 +19,13 @@ mod ui;
 mod update;
 mod view;
 
-use background::{
-    fetch_avatar, replace_avatar_job, replace_friend_avatar_job, replace_thumbnail_job,
-    stop_avatar_job, stop_thumbnail_job, AvatarJob, FriendAvatarJob, ThumbnailJob,
-};
+use background::{AvatarJobs, FriendAvatarJobs, PickerEvent, PickerJobs};
 use gpui::{
     prelude::*, px, size, App, Application, Bounds, Context, Timer, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use supervisor::{LoginAttempt, Quality, Supervisor, WindowTarget, QUALITIES};
 
@@ -102,6 +98,18 @@ fn poll_login(
 /// linger until something else happened to trigger a render.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 
+fn begin_picker_refresh(
+    windows: &mut Vec<WindowTarget>,
+    thumbnails: &mut std::collections::HashMap<i64, std::sync::Arc<gpui::RenderImage>>,
+    jobs: &mut PickerJobs,
+) {
+    // Enumeration no longer holds the UI: remove last visit's selectable
+    // HWNDs before the new worker can run, not only when it returns a list.
+    windows.clear();
+    thumbnails.clear();
+    jobs.request();
+}
+
 struct Orange {
     client_available: bool,
     screen: Screen,
@@ -110,10 +118,10 @@ struct Orange {
     /// Thumbnails keyed by window handle, filled in asynchronously.
     thumbnails: std::collections::HashMap<i64, std::sync::Arc<gpui::RenderImage>>,
     /// Results arriving from the capture thread.
-    thumbnail_job: Option<ThumbnailJob>,
+    thumbnail_job: PickerJobs,
     /// Discord avatar decoded off the UI thread.
     avatar: Option<std::sync::Arc<gpui::RenderImage>>,
-    avatar_job: Option<AvatarJob>,
+    avatar_job: AvatarJobs,
     quality: usize,
     fps: u32,
     active_target: Option<WindowTarget>,
@@ -151,6 +159,7 @@ struct Orange {
     /// a friend who is genuinely offline.
     presence: std::collections::HashMap<String, presence::Presence>,
     presence_job: Option<presence::PresenceJob>,
+    presence_client: presence::PresenceClient,
     presence_due: Instant,
     /// Why the last poll failed, if it did. Surfaced rather than swallowed:
     /// silently showing every friend offline is indistinguishable from every
@@ -160,7 +169,7 @@ struct Orange {
     /// shape as `thumbnails`, and for the same reason: an async fill of a
     /// keyed cache that render reads synchronously.
     friend_avatars: std::collections::HashMap<String, std::sync::Arc<gpui::RenderImage>>,
-    friend_avatar_job: Option<FriendAvatarJob>,
+    friend_avatar_job: FriendAvatarJobs,
     logo_epoch: u64,
     /// Whether ambient animation should run: true only while this window is
     /// the active one.
@@ -202,6 +211,7 @@ struct Digest {
     windows: usize,
     thumbnails: usize,
     capturing: bool,
+    picker_loading: bool,
     has_preview: bool,
     /// The share code's "Copied" confirmation expires on a timer rather than
     /// on an event, so the tick that retires it has to be the one that
@@ -238,7 +248,8 @@ impl Orange {
             watches: self.watches.len(),
             windows: self.windows.len(),
             thumbnails: self.thumbnails.len(),
-            capturing: self.thumbnail_job.is_some(),
+            capturing: self.picker_busy(),
+            picker_loading: self.picker_loading(),
             has_preview: self.active_preview.is_some(),
             recently_copied: self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FOR),
             update_status: self.updates.settings_detail(),
@@ -270,7 +281,7 @@ impl Orange {
     fn poll_presence(&mut self) {
         if let Some(job) = self.presence_job.as_ref() {
             if job.is_finished() {
-                let result = job.receiver.try_recv().ok();
+                let result = job.take_result();
                 if let Some(mut job) = self.presence_job.take() {
                     job.join();
                 }
@@ -311,6 +322,7 @@ impl Orange {
         };
         presence::start(
             &mut self.presence_job,
+            self.presence_client.clone(),
             url,
             session.token.clone(),
             &self.friends,
@@ -350,19 +362,6 @@ impl Orange {
     /// Only starts when nothing is in flight, so a roster larger than one poll
     /// interval cannot pile up overlapping workers.
     fn poll_friend_avatars(&mut self) {
-        if let Some(job) = self.friend_avatar_job.as_ref() {
-            while let Ok((id, pixels)) = job.receiver.try_recv() {
-                if let Some(image) = capture::to_image(pixels) {
-                    self.friend_avatars.insert(id, image);
-                }
-            }
-            if job.is_finished() {
-                if let Some(mut job) = self.friend_avatar_job.take() {
-                    job.join();
-                }
-            }
-            return;
-        }
         let wanted: Vec<(String, String)> = self
             .friends
             .iter()
@@ -374,7 +373,11 @@ impl Orange {
                     .map(|url| (friend.id.clone(), url))
             })
             .collect();
-        replace_friend_avatar_job(&mut self.friend_avatar_job, wanted, fetch_avatar);
+        for (id, _, pixels) in self.friend_avatar_job.poll(&wanted, Instant::now()) {
+            if let Some(image) = pixels.and_then(capture::to_image) {
+                self.friend_avatars.insert(id, image);
+            }
+        }
     }
 }
 
@@ -407,12 +410,9 @@ impl Orange {
             (None, Some(error)) => Some(format!("Could not load preferences: {error}")),
             (None, None) => None,
         };
-        let mut avatar_job = None;
-        replace_avatar_job(
-            &mut avatar_job,
-            session.as_ref().and_then(|s| s.avatar_url.clone()),
-            fetch_avatar,
-        );
+        let mut avatar_job = AvatarJobs::default();
+        avatar_job.request(session.as_ref().and_then(|s| s.avatar_url.clone()));
+        avatar_job.poll();
         let updates = update::UpdateController::new();
         Self {
             client_available,
@@ -424,7 +424,7 @@ impl Orange {
             session,
             windows: Vec::new(),
             thumbnails: std::collections::HashMap::new(),
-            thumbnail_job: None,
+            thumbnail_job: PickerJobs::default(),
             avatar: None,
             avatar_job,
             quality: preferences.quality.min(QUALITIES.len() - 1),
@@ -451,12 +451,13 @@ impl Orange {
             friends: preferences.friends,
             presence: std::collections::HashMap::new(),
             presence_job: None,
+            presence_client: presence::PresenceClient::default(),
             // Ask immediately on startup rather than after one interval, so a
             // friend who is already live is on screen when the window opens.
             presence_due: Instant::now(),
             presence_error: None,
             friend_avatars: std::collections::HashMap::new(),
-            friend_avatar_job: None,
+            friend_avatar_job: FriendAvatarJobs::default(),
             logo_epoch: 0,
             // Corrected on the first render, before anything is painted.
             animate: false,
@@ -466,24 +467,15 @@ impl Orange {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         let before = self.digest();
-        self.drain_thumbnails();
+        if self.screen != Screen::PickWindow {
+            self.thumbnail_job.cancel();
+        }
+        let picker_changed = self.drain_thumbnails();
         self.poll_updates(cx);
         self.poll_presence();
         self.poll_friend_avatars();
-        let avatar_result = self.avatar_job.as_ref().and_then(|job| {
-            job.is_finished().then(|| match job.receiver.try_recv() {
-                Ok(pixels) => Some(Some(pixels)),
-                Err(mpsc::TryRecvError::Disconnected) => Some(None),
-                Err(mpsc::TryRecvError::Empty) => None,
-            })?
-        });
-        if let Some(result) = avatar_result {
-            if let Some(mut job) = self.avatar_job.take() {
-                job.join();
-            }
-            if let Some(Some(pixels)) = result {
-                self.avatar = capture::to_image(pixels);
-            }
+        if let Some(pixels) = self.avatar_job.poll() {
+            self.avatar = capture::to_image(pixels);
         }
 
         // Login happens in a child process; notice when it lands, and when it
@@ -492,12 +484,12 @@ impl Orange {
             match poll_login(session::load, || attempt.failure()) {
                 Some(Ok(session)) => {
                     self.avatar = None;
-                    replace_avatar_job(
-                        &mut self.avatar_job,
-                        session.avatar_url.clone(),
-                        fetch_avatar,
-                    );
+                    self.avatar_job.request(session.avatar_url.clone());
                     self.session = Some(session);
+                    if let Some(job) = self.presence_job.as_mut() {
+                        job.cancel();
+                    }
+                    self.presence_due = Instant::now();
                     self.logging_in = None;
                     self.screen = Screen::Home;
                 }
@@ -604,7 +596,12 @@ impl Orange {
         }
         // Only when something the screens can see actually moved. A poll that
         // finds nothing is not a reason to redraw the app.
-        if self.digest() != before {
+        // Child exit can navigate away from a picker opened while watching or
+        // hosting. Those transitions do not go through the Back button.
+        if self.screen != Screen::PickWindow {
+            self.thumbnail_job.cancel();
+        }
+        if picker_changed || self.digest() != before {
             cx.notify();
         }
     }
@@ -756,80 +753,58 @@ impl Orange {
         }
         self.session = None;
         self.avatar = None;
-        stop_avatar_job(&mut self.avatar_job);
+        self.avatar_job.request(None);
+        self.thumbnail_job.cancel();
+        if let Some(job) = self.presence_job.as_mut() {
+            job.cancel();
+        }
+        self.presence.clear();
+        self.presence_error = None;
+        self.presence_due = Instant::now();
         if let Some(destination) = destination {
             self.screen = destination;
         }
     }
 
+    fn picker_busy(&self) -> bool {
+        self.thumbnail_job.is_busy()
+    }
+
+    fn picker_loading(&self) -> bool {
+        self.thumbnail_job.is_loading()
+    }
+
     fn refresh_windows(&mut self) {
-        stop_thumbnail_job(&mut self.thumbnail_job);
-        match supervisor::list_windows() {
-            Ok(mut windows) => {
-                // Never offer our own windows as a capture target.
-                windows.retain(|w| !w.process.to_lowercase().starts_with("orange"));
-
-                // A zero handle is the sentinel for whole-screen capture, which
-                // the pipeline turns into a monitor source rather than a window
-                // one. It goes first because it is the common choice.
-                let (screen_width, screen_height) = capture::screen_size().unwrap_or((0, 0));
-                windows.insert(
-                    0,
-                    WindowTarget {
-                        hwnd: 0,
-                        title: "Entire screen".into(),
-                        process: "Desktop".into(),
-                        width: screen_width,
-                        height: screen_height,
-                    },
-                );
-
-                // Capture off the UI thread. PrintWindow is synchronous and
-                // costs tens of milliseconds per window, so doing this inline
-                // froze the app for as long as it took to walk the list.
-                let handles: Vec<i64> = windows.iter().map(|w| w.hwnd).collect();
-                replace_thumbnail_job(&mut self.thumbnail_job, handles, |hwnd| {
-                    if hwnd == 0 {
-                        capture::screen_thumbnail(320, 180)
-                    } else {
-                        capture::thumbnail(hwnd as isize, 320, 180)
-                    }
-                });
-
-                self.thumbnails.clear();
-                self.windows = windows;
-                self.clear_error();
-            }
-            Err(err) => self.show_error(err.to_string()),
-        }
+        begin_picker_refresh(
+            &mut self.windows,
+            &mut self.thumbnails,
+            &mut self.thumbnail_job,
+        );
+        self.drain_thumbnails();
     }
 
     /// Move any captured thumbnails into the map. Runs on the UI thread, which
     /// is where GPUI's image types have to be built.
     fn drain_thumbnails(&mut self) -> bool {
-        let Some(job) = &self.thumbnail_job else {
-            return false;
-        };
         let mut changed = false;
-        let mut terminal = false;
-        loop {
-            match job.receiver.try_recv() {
-                Ok((hwnd, thumb)) => {
+        for event in self.thumbnail_job.poll() {
+            match event {
+                PickerEvent::Windows(windows) => {
+                    self.windows = windows;
+                    self.thumbnails.clear();
+                    self.clear_error();
+                    changed = true;
+                }
+                PickerEvent::Thumbnail(hwnd, thumb) => {
                     if let Some(image) = capture::to_image(thumb) {
                         self.thumbnails.insert(hwnd, image);
                         changed = true;
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    terminal = job.is_finished();
-                    break;
+                PickerEvent::Failed(error) => {
+                    self.show_error(error);
+                    changed = true;
                 }
-            }
-        }
-        if terminal {
-            if let Some(mut job) = self.thumbnail_job.take() {
-                job.join();
             }
         }
         changed
@@ -847,7 +822,7 @@ impl Orange {
     }
 
     fn start_stream(&mut self, target: WindowTarget) {
-        stop_thumbnail_job(&mut self.thumbnail_job);
+        self.thumbnail_job.cancel();
         if !supervisor::gstreamer_available() {
             self.show_error(supervisor::MEDIA_RUNTIME_MISSING.to_string());
             return;
@@ -902,6 +877,7 @@ impl Orange {
                     // second friend is one more click rather than a click and
                     // a Back. The row itself flips to "Watching", which is the
                     // feedback the screen change used to provide.
+                    self.thumbnail_job.cancel();
                     self.screen = Screen::Watching;
                 }
                 self.clear_error();
@@ -915,6 +891,7 @@ impl Orange {
     }
 
     fn stop_host(&mut self) {
+        self.thumbnail_job.cancel();
         if let Some(mut host) = self.host.take() {
             host.stop();
         }
@@ -934,6 +911,7 @@ impl Orange {
             self.watches.remove(index);
         }
         if self.watches.is_empty() && self.host.is_none() {
+            self.thumbnail_job.cancel();
             self.screen = Screen::Home;
         }
     }
@@ -941,12 +919,13 @@ impl Orange {
     fn stop_all_watches(&mut self) {
         self.watches.clear();
         if self.host.is_none() {
+            self.thumbnail_job.cancel();
             self.screen = Screen::Home;
         }
     }
 
     fn leave_picker(&mut self, destination: Screen) {
-        stop_thumbnail_job(&mut self.thumbnail_job);
+        self.thumbnail_job.cancel();
         self.screen = destination;
     }
 
@@ -968,8 +947,14 @@ impl Orange {
 
 impl Drop for Orange {
     fn drop(&mut self) {
-        stop_thumbnail_job(&mut self.thumbnail_job);
-        stop_avatar_job(&mut self.avatar_job);
+        // Request every cancellation before field Drops join, so a slow picker
+        // cannot leave an entire avatar batch running during shutdown.
+        self.thumbnail_job.cancel();
+        self.avatar_job.request(None);
+        self.friend_avatar_job.cancel();
+        if let Some(job) = self.presence_job.as_mut() {
+            job.cancel();
+        }
     }
 }
 
@@ -1147,6 +1132,29 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopening_the_picker_removes_old_selectable_targets_before_enumeration() {
+        // A closed HWND from the previous visit must not remain selectable
+        // while the replacement list is waiting on a slow enumeration worker.
+        let mut windows = vec![WindowTarget {
+            hwnd: 7,
+            title: "Closed window".into(),
+            process: "test.exe".into(),
+            width: 1,
+            height: 1,
+        }];
+        let image = capture::to_image((1, 1, vec![0; 4])).unwrap();
+        let mut thumbnails = std::collections::HashMap::from([(7, image)]);
+        let mut jobs = PickerJobs::default();
+
+        begin_picker_refresh(&mut windows, &mut thumbnails, &mut jobs);
+
+        assert!(windows.is_empty(), "stale HWNDs are still selectable");
+        assert!(thumbnails.is_empty(), "stale previews are still visible");
+        assert!(jobs.is_loading());
+        assert!(jobs.is_busy());
+    }
 
     fn icon_frame(size: u16) -> image::RgbaImage {
         let source = include_bytes!("../../../assets/icon.ico");

@@ -96,16 +96,27 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/ui/mark.rs` | The logo, its states, and the glow behind it |
 | `crates/orange-client/src/ui/decor.rs` | Ambient layer: drifting grid, viewfinder brackets, registration marks |
 | `crates/orange-client/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
-| `crates/orange-client/src/background.rs` | Cancelled-and-joined thumbnail and avatar jobs, bounded avatar download and decode, sequential friend-avatar fetch |
-| `crates/orange-client/src/presence.rs` | Throttled `/presence` polling off the UI thread, signed-out versus unreachable, decoding friend state and profile |
+| `crates/orange-client/src/background.rs` | Owned discovery, thumbnail and avatar jobs; nonblocking cancellation, coalesced replacement, joined cleanup, bounded avatar download/decode and failed-avatar retry backoff |
+| `crates/orange-client/src/background_tests.rs` | Background-job ownership, cancellation, retry and HTTP reuse regression tests |
+| `crates/orange-client/src/presence.rs` | Throttled `/presence` polling off the UI thread with a reusable HTTP client, signed-out versus unreachable, decoding friend state and profile |
 | `crates/orange-client/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
-| `crates/orange-client/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
+| `crates/orange-client/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, bounds/cancels window enumeration and owns its output readers, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
+| `crates/orange-client/src/supervisor_list_tests.rs` | Real-child tests of enumeration output, cancellation, deadlines and errors |
 | `crates/orange-client/src/session.rs` | Reads CLI session JSON including the relay token; atomically reads/writes client preferences and the friend roster |
 | `crates/orange-client/src/client.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-client/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
 | `crates/orange-client/src/update_tests.rs` | The `update.rs` test module, in a sibling file because it outgrew the module |
 
 The client requests automatic zero-copy encoder selection and leaves bitrate selection to the media child after output resolution and frame rate are known. The measured automatic policy anchors at 18 Mbps for 1080p60, scales sublinearly with pixels and linearly with frame rate, and caps at 80 Mbps with a client-visible quality warning. Selection prefers H.265 (Media Foundation, then NVIDIA) and falls back to H.264 (Media Foundation, then NVIDIA). The CLI defaults to explicit Media Foundation H.265; `--bitrate` remains an advanced override.
+
+Picker enumeration and capture run off the UI thread. Navigation requests
+cancellation without waiting for an in-flight native capture or avatar request;
+the job owner retains and reaps the worker, discards stale results, and coalesces
+replacement work instead of accumulating threads. Final shutdown still joins
+owned workers. Avatar batches reuse an HTTP client and failed friend-avatar
+requests wait 30 seconds before retrying (changed URLs are eligible immediately).
+Decorative live dots use the same active-window
+animation gate as the grid and logo aura.
 
 ## Media CLI Source Map
 
@@ -126,7 +137,7 @@ The client requests automatic zero-copy encoder selection and leaves bitrate sel
 | `crates/orange/src/window_tests.rs` | The `window.rs` test module, in a sibling file because it outgrew the module |
 | `crates/orange/src/window/native.rs` | Win32 class/window/message loop, input, sizing/fullscreen, HWND context installation and destruction |
 | `crates/orange/src/overlay.rs` | Shared overlay state, visibility, hit testing, volume/fullscreen/close state, scale and cache identity |
-| `crates/orange/src/overlay/raster.rs` | Tiny-skia layout and rasterization of overlay clusters and icons |
+| `crates/orange/src/overlay/raster.rs` | Tiny-skia layout and rasterization of overlay clusters; fixed icon artwork cached independently of animation alpha, bounded to 32 rasters / 1 MiB per drawing thread |
 | `crates/orange/src/overlay/gst.rs` | `overlaycomposition` callbacks, caps-to-overlay state, source aspect notification, composition draw callback |
 | `crates/orange/src/media_diagnostics.rs` | Facade for diagnostic writer, operation timing, progress probes, WebRTC monitor |
 | `crates/orange/src/media_diagnostics/writer.rs` | Bounded JSONL queue/file writer, metadata, size cap, process-global sink, joined shutdown |
@@ -215,6 +226,10 @@ d3d11screencapturesrc
 ```
 
 - The shared tee is after the parser: capture and hardware encode happen once.
+- With no viewers, the shared graph waits in `READY`: capture, encoding, and
+  audio stop after the final viewer branch has been removed. A barrier on the
+  serial teardown worker finishes that transition before the host handles the
+  next join, whose branch is attached before capture restarts.
 - Every viewer receives its own payloader, RTP stream, WebRTC peer, offer, ICE, startup keyframe worker, diagnostics handle, and requested pads.
 - NACK, periodic keyframes, and redraw requests support recovery and late joins, including windows that are not repainting.
 - `--codec auto` tries `mfh265enc`, `nvd3d11h265enc`, `mfh264enc`, then `nvd3d11h264enc`; explicit CLI codec choices retain their fixed factories without fallback.
@@ -246,6 +261,9 @@ webrtcbin OPUS pad
 - Dynamic receive construction blocks the pad, links and synchronizes all elements, then removes the probe; failure unlinks, sets Null, removes elements, and removes the probe.
 - Live receive latency is 100 ms. Video/RTX jitterbuffers drop at the live edge;
   Opus does not silently drop late packets and uses decoder packet-loss concealment.
+- Overlay composition cache hits hash borrowed metadata and displayed numeric
+  buckets without formatting labels. One connection-stage snapshot supplies
+  the key and any labels drawn on a miss; collapsed status skips unused text.
 
 ## Ownership And Teardown
 
@@ -385,7 +403,7 @@ not a source-level result.
 ## Deployment Model And Boundaries
 
 - Azure is deliberately pinned to one always-on replica in `deploy/azure.ps1`.
-- Sessions are durable in Azure Table Storage, so a deploy no longer signs users out. Memory is a read-through cache in front of it; the store is consulted only on a miss.
+- Sessions are durable in Azure Table Storage, so a deploy no longer signs users out. Memory is a read-through cache in front of it; the store is consulted only on a miss. Login and durable restoration share the same 4,096-entry eviction policy; replacing a cached token neither evicts another entry nor renews its original expiration.
 - Rooms and pending OAuth attempts are still in memory. A revision switch, deploy, or restart interrupts every active room. There is no horizontal-scaling claim: rooms are per-process, so two replicas behind one ingress could put host and viewer on different instances.
 - Unreachable session storage degrades rather than fails: a lookup returns nothing but is never treated as proof that a session is absent, and a login that cannot be persisted still succeeds for the life of the process.
 - The process accepts at most 512 concurrent WebSocket connections and each room accepts at most 16 viewers.

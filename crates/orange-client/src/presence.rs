@@ -12,9 +12,9 @@
 use crate::{background::join_background_worker, session::Friend};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often the client asks. Chosen as the largest delay that still feels like
 /// "my friend just went live" rather than "I refreshed and noticed".
@@ -55,13 +55,36 @@ struct Body {
 
 pub(crate) struct PresenceJob {
     cancel: Arc<AtomicBool>,
-    pub(crate) receiver: mpsc::Receiver<Result<Vec<Entry>, PresenceError>>,
+    cancelled_at: Option<Instant>,
+    receiver: mpsc::Receiver<Result<Vec<Entry>, PresenceError>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl PresenceJob {
     pub(crate) fn is_finished(&self) -> bool {
-        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+        let finished = self.worker.as_ref().is_none_or(JoinHandle::is_finished);
+        if !finished {
+            crate::background::check_cancel_deadline(
+                self.cancelled_at,
+                JOIN_TIMEOUT,
+                "presence poll",
+            );
+        }
+        finished
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.cancelled_at.get_or_insert_with(Instant::now);
+    }
+
+    pub(crate) fn take_result(&self) -> Option<Result<Vec<Entry>, PresenceError>> {
+        // Signout can race a completed send. Cancellation is checked by the
+        // consumer too, not just immediately before the worker sends.
+        if self.cancel.load(Ordering::Acquire) {
+            return None;
+        }
+        self.receiver.try_recv().ok()
     }
 
     pub(crate) fn join(&mut self) {
@@ -73,7 +96,7 @@ impl PresenceJob {
 
 impl Drop for PresenceJob {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel();
         self.join();
     }
 }
@@ -92,9 +115,40 @@ pub(crate) fn presence_url(server: &str) -> Option<String> {
     Some(format!("{scheme}://{origin}/presence"))
 }
 
-pub(crate) fn start(job: &mut Option<PresenceJob>, url: String, token: String, friends: &[Friend]) {
-    drop(job.take());
-    if friends.is_empty() {
+/// Lazily built on the worker, then shared across polls without keeping an
+/// idle polling thread. The mutex only protects construction, not HTTP I/O.
+#[derive(Clone, Default)]
+pub(crate) struct PresenceClient(Arc<Mutex<Option<reqwest::blocking::Client>>>);
+
+impl PresenceClient {
+    fn client(&self) -> Result<reqwest::blocking::Client, PresenceError> {
+        let mut client = self
+            .0
+            .lock()
+            .map_err(|error| PresenceError::Unreachable(error.to_string()))?;
+        if client.is_none() {
+            *client = Some(
+                reqwest::blocking::Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(30))
+                    .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .map_err(|error| PresenceError::Unreachable(error.to_string()))?,
+            );
+        }
+        Ok(client.as_ref().expect("client was initialized").clone())
+    }
+}
+
+pub(crate) fn start(
+    job: &mut Option<PresenceJob>,
+    client: PresenceClient,
+    url: String,
+    token: String,
+    friends: &[Friend],
+) {
+    // A cancelled request still owns its worker until polling reaps it.
+    if job.is_some() || friends.is_empty() {
         return;
     }
     let ids: Vec<String> = friends.iter().map(|friend| friend.id.clone()).collect();
@@ -105,7 +159,9 @@ pub(crate) fn start(job: &mut Option<PresenceJob>, url: String, token: String, f
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
-        let result = fetch(&url, &token, &ids);
+        let result = client
+            .client()
+            .and_then(|client| fetch(&client, &url, &token, &ids));
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
@@ -113,6 +169,7 @@ pub(crate) fn start(job: &mut Option<PresenceJob>, url: String, token: String, f
     });
     *job = Some(PresenceJob {
         cancel,
+        cancelled_at: None,
         receiver,
         worker: Some(worker),
     });
@@ -141,13 +198,14 @@ impl std::fmt::Display for PresenceError {
     }
 }
 
-fn fetch(url: &str, token: &str, ids: &[String]) -> Result<Vec<Entry>, PresenceError> {
+fn fetch(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: &str,
+    ids: &[String],
+) -> Result<Vec<Entry>, PresenceError> {
     let send = || -> anyhow::Result<reqwest::blocking::Response> {
-        Ok(reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .user_agent(concat!("orange/", env!("CARGO_PKG_VERSION")))
-            .build()?
+        Ok(client
             .get(url)
             .query(&[("ids", ids.join(","))])
             .bearer_auth(token)
@@ -172,6 +230,141 @@ fn fetch(url: &str, token: &str, ids: &[String]) -> Result<Vec<Entry>, PresenceE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successive_presence_polls_reuse_their_http_connection() {
+        // Creating a Client inside fetch discarded the connection pool after
+        // every 15-second poll, despite the relay origin being unchanged.
+        let server = crate::background::tests::HttpServer::new(vec![
+            (200, br#"{"friends":[]}"#.to_vec()),
+            (200, br#"{"friends":[]}"#.to_vec()),
+        ]);
+        let friends = vec![Friend {
+            id: "42".into(),
+            name: "Friend".into(),
+            avatar_url: None,
+        }];
+        let mut job = None;
+        let client = PresenceClient::default();
+        for token in ["first-session", "second-session"] {
+            start(
+                &mut job,
+                client.clone(),
+                server.url("/presence"),
+                token.into(),
+                &friends,
+            );
+            job.as_ref()
+                .unwrap()
+                .receiver
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            job.take().unwrap().join();
+        }
+        let requests = server.finish();
+        assert_eq!(
+            requests[0].0, requests[1].0,
+            "each poll created a fresh connection"
+        );
+        assert!(requests[0].1.starts_with("GET /presence?ids=42 "));
+        assert!(requests[0]
+            .1
+            .to_ascii_lowercase()
+            .contains("authorization: bearer first-session"));
+        assert!(requests[1]
+            .1
+            .to_ascii_lowercase()
+            .contains("authorization: bearer second-session"));
+    }
+
+    #[test]
+    fn signout_rejects_presence_that_was_already_queued() {
+        // A result sent just before cancellation must not repopulate the UI
+        // with another account's presence after signout.
+        let server = crate::background::tests::HttpServer::new(vec![(
+            200,
+            br#"{"friends":[{"id":"42","state":"live","code":"ABC-234"}]}"#.to_vec(),
+        )]);
+        let friends = vec![Friend {
+            id: "42".into(),
+            name: "Friend".into(),
+            avatar_url: None,
+        }];
+        let mut job = None;
+        start(
+            &mut job,
+            PresenceClient::default(),
+            server.url("/presence"),
+            "secret".into(),
+            &friends,
+        );
+        let job = job.as_mut().unwrap();
+        job.join();
+        job.cancel();
+        assert!(job.take_result().is_none());
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn the_presence_scheduler_retains_a_cancelled_worker_until_it_is_reaped() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            let _ = sender.send(Ok(Vec::new()));
+        });
+        let mut job = Some(PresenceJob {
+            cancel: Arc::clone(&cancel),
+            cancelled_at: None,
+            receiver,
+            worker: Some(worker),
+        });
+        job.as_mut().unwrap().cancel();
+        start(
+            &mut job,
+            PresenceClient::default(),
+            "http://127.0.0.1:1/presence".into(),
+            "new".into(),
+            &[Friend {
+                id: "42".into(),
+                name: "Friend".into(),
+                avatar_url: None,
+            }],
+        );
+        assert!(Arc::ptr_eq(&job.as_ref().unwrap().cancel, &cancel));
+        assert!(!job.as_ref().unwrap().is_finished());
+        release_tx.send(()).unwrap();
+        job.as_mut().unwrap().join();
+        assert!(job.as_ref().unwrap().take_result().is_none());
+    }
+
+    #[test]
+    fn presence_http_errors_and_response_limits_survive_client_reuse() {
+        // Reusing transport must not flatten the actionable 401 distinction,
+        // or remove the existing bounded JSON reader.
+        let server = crate::background::tests::HttpServer::new(vec![
+            (401, Vec::new()),
+            (503, Vec::new()),
+            (200, vec![b'x'; RESPONSE_MAX_BYTES as usize + 1]),
+        ]);
+        let client = PresenceClient::default();
+        let http = client.client().unwrap();
+        assert_eq!(
+            fetch(&http, &server.url("/presence"), "secret", &[]),
+            Err(PresenceError::SignedOut)
+        );
+        assert!(matches!(
+            fetch(&http, &server.url("/presence"), "secret", &[]),
+            Err(PresenceError::Unreachable(_))
+        ));
+        assert!(matches!(
+            fetch(&http, &server.url("/presence"), "secret", &[]),
+            Err(PresenceError::Unreachable(_))
+        ));
+        assert_eq!(server.finish().len(), 3);
+    }
 
     /// `ORANGE_SERVER` and the shipped default are both WebSocket URLs ending
     /// in `/ws`. Building the HTTP origin by hand in two places is how they
