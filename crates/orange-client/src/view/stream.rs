@@ -28,7 +28,7 @@ impl Orange {
             .map(|t| t.elapsed() < crate::COPIED_FOR)
             .unwrap_or(false);
 
-        div()
+        let content = div()
             .id("streaming-content")
             .flex()
             .flex_col()
@@ -202,7 +202,17 @@ impl Orange {
                             })
                             .collect::<Vec<_>>(),
                     ),
-            )
+            );
+
+        // Friend offers and long viewer lists may scroll, but stopping a live
+        // stream must remain visible at the fixed window size.
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(content)
             .child(
                 secondary("back-streaming", "Back")
                     .flex_shrink_0()
