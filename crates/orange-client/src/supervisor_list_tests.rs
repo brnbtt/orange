@@ -19,10 +19,16 @@ fn window_list_child() {
         return;
     };
     match mode.as_str() {
-        "ok" => println!(
-            r#"[{{"hwnd":7,"title":"Window","process":"test.exe","width":640,"height":480}}]"#
-        ),
-        "malformed" => println!("[not json"),
+        // Serial libtest writes its test-name prefix without a newline. Keep
+        // fixture JSON on its own line, as the real orange list command does,
+        // even when the child inherits RUST_TEST_THREADS=1 from a release run.
+        "ok" => {
+            println!();
+            println!(
+                r#"[{{"hwnd":7,"title":"Window","process":"test.exe","width":640,"height":480}}]"#
+            );
+        }
+        "malformed" => println!("\n[not json"),
         "error" => {
             eprintln!("enumeration fixture failed");
             std::process::exit(7);
