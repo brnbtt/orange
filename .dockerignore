@@ -1,5 +1,8 @@
-target/
-.git/
+target
+dist
+.agents
+skills-lock.json
+.git
 *.mkv
 *.mp4
 *.png

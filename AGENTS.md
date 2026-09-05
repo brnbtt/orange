@@ -95,6 +95,11 @@ Five things that are not obvious:
    this command has been altered by the following extension: containerapp` to
    stderr on every single run. Piped, the deploy dies on that line before it
    builds anything.
+   A root-checkout deploy also stalled before any ACR run was created; its
+   source tree contained 15 old installers under `dist/` and a full build cache.
+   `.dockerignore` now excludes release artifacts and the local agent library,
+   using bare directory names for Azure archiver compatibility. A clean
+   deployment worktree avoids uploading local artifacts altogether.
 6. **If it fails, check before assuming damage.** Everything that can fail
    cheaply runs before anything mutates the repo, so an early failure leaves the
    version, the commits and the remote untouched. Verify with `git log` and
