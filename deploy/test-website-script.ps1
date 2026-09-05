@@ -56,10 +56,15 @@ $fixture = Join-Path $env:LOCALAPPDATA "Temp\opencode\website-test-$([Guid]::New
 $savedExitCode = $global:LASTEXITCODE
 $savedTestState = $global:OrangeWebsiteTestState
 try {
-    New-Item -ItemType Directory -Path "$fixture\deploy", "$fixture\website", "$fixture\assets" -Force | Out-Null
+    New-Item -ItemType Directory -Path "$fixture\deploy", "$fixture\website\fonts", "$fixture\website\screenshots", "$fixture\assets" -Force | Out-Null
     Copy-Item -LiteralPath $scriptPath -Destination "$fixture\deploy\website.ps1"
     $deploy = "$fixture\deploy\website.ps1"
-    $assets = @('website/index.html', 'website/styles.css', 'website/release.js', 'website/scene.svg', 'website/404.html', 'assets/logo.png')
+    $assets = @(
+        'website/index.html', 'website/styles.css', 'website/release.js', 'website/404.html', 'assets/logo.png',
+        'website/fonts/orbitron-latin-700.woff2', 'website/fonts/ibm-plex-mono-latin-400.woff2',
+        'website/fonts/orbitron-OFL.txt', 'website/fonts/ibm-plex-mono-OFL.txt',
+        'website/screenshots/home.png', 'website/screenshots/pick.png', 'website/screenshots/streaming.png'
+    )
     foreach ($asset in $assets) { Set-Content -LiteralPath (Join-Path $fixture $asset) -Value 'fixture' }
     Set-Content -LiteralPath "$fixture\website\private.txt" -Value 'must never upload'
 
@@ -96,12 +101,18 @@ try {
         'index.html' = @('website/index.html', 'text/html; charset=utf-8')
         'styles.css' = @('website/styles.css', 'text/css; charset=utf-8')
         'release.js' = @('website/release.js', 'application/javascript; charset=utf-8')
-        'scene.svg' = @('website/scene.svg', 'image/svg+xml')
         '404.html' = @('website/404.html', 'text/html; charset=utf-8')
         'logo.png' = @('assets/logo.png', 'image/png')
+        'fonts/orbitron-latin-700.woff2' = @('website/fonts/orbitron-latin-700.woff2', 'font/woff2')
+        'fonts/ibm-plex-mono-latin-400.woff2' = @('website/fonts/ibm-plex-mono-latin-400.woff2', 'font/woff2')
+        'fonts/orbitron-OFL.txt' = @('website/fonts/orbitron-OFL.txt', 'text/plain; charset=utf-8')
+        'fonts/ibm-plex-mono-OFL.txt' = @('website/fonts/ibm-plex-mono-OFL.txt', 'text/plain; charset=utf-8')
+        'screenshots/home.png' = @('website/screenshots/home.png', 'image/png')
+        'screenshots/pick.png' = @('website/screenshots/pick.png', 'image/png')
+        'screenshots/streaming.png' = @('website/screenshots/streaming.png', 'image/png')
     }
     $uploads = @($firstCalls | Where-Object { ($_ | Select-Object -First 3) -join ' ' -eq 'storage blob upload' })
-    Assert ($uploads.Count -eq 6) 'Only the six public assets may be uploaded'
+    Assert ($uploads.Count -eq 12) 'Only the twelve public assets may be uploaded'
     $names = @()
     foreach ($upload in $uploads) {
         $name = Option $upload '--name'
@@ -114,7 +125,7 @@ try {
         Assert ((Option $upload '--overwrite') -eq 'true') "Repeat deployment must overwrite $name"
         Assert ((Option $upload '--auth-mode') -eq 'key') 'Uploads must use key authentication'
     }
-    Assert (@($names | Select-Object -Unique).Count -eq 6) 'Each public asset must be uploaded once'
+    Assert (@($names | Select-Object -Unique).Count -eq 12) 'Each public asset must be uploaded once'
     Assert ($names[-1] -eq 'index.html') 'Index must be uploaded after its dependencies'
     foreach ($call in $firstCalls) {
         if ($call[1] -eq 'account') {
