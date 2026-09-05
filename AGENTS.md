@@ -99,6 +99,13 @@ Five things that are not obvious:
    version, the commits and the remote untouched. Verify with `git log` and
    `Cargo.toml` rather than guessing.
 
+7. **`ship.ps1 -SkipTests` currently still runs the tests.** Dot-sourcing
+   `publish-beta.ps1 -LibraryOnly` resets the shared `$SkipTests` parameter to
+   false. This repeated the parallel suite after a passing serial release gate
+   and hit the subprocess deadlines again. Set `$env:RUST_TEST_THREADS = "1"`
+   for the shipping process when using the serial workaround below; it also
+   applies to that extra test run. Do not assume the switch skipped it.
+
 If the *publish* fails partway, do **not** re-run `ship.ps1` — it would bump the
 version a second time. Re-run the idempotent publisher instead:
 
