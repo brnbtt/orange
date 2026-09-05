@@ -18,6 +18,7 @@
 //! dependency for the Discord exchange.
 
 use crate::auth::Identity;
+mod social;
 use anyhow::{Context, Result};
 use base64::Engine;
 use hmac::{Mac, SimpleHmac};
@@ -36,6 +37,7 @@ const PARTITION: &str = "session";
 #[derive(Clone)]
 pub(crate) struct TableStore {
     account: String,
+    endpoint: String,
     /// Base64 account key, decoded per request. Never logged.
     key: String,
     table: String,
@@ -71,6 +73,7 @@ impl TableStore {
             return None;
         }
         Some(Self {
+            endpoint: format!("https://{account}.table.core.windows.net"),
             account,
             key,
             table,
@@ -121,7 +124,7 @@ impl TableStore {
 
     fn request(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
         let date = httpdate::fmt_http_date(SystemTime::now());
-        let url = format!("https://{}.table.core.windows.net/{path}", self.account);
+        let url = format!("{}/{path}", self.endpoint);
         Ok(self
             .http
             .request(method, url)
@@ -228,6 +231,7 @@ mod tests {
     fn store() -> TableStore {
         TableStore {
             account: "testaccount1".into(),
+            endpoint: "https://testaccount1.table.core.windows.net".into(),
             // "key" base64-encoded; the signature itself is not asserted here.
             key: base64::engine::general_purpose::STANDARD.encode(b"key"),
             table: "sessions".into(),

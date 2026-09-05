@@ -14,9 +14,7 @@ use std::{
 #[derive(Debug, Clone, Deserialize)]
 pub struct Session {
     pub name: String,
-    /// Not rendered anywhere yet. Kept because it is this machine's Discord
-    /// id, which is what a friend has to add to see this user go live.
-    #[allow(dead_code)]
+    /// Stable Discord id, shared in personal friend codes.
     pub id: String,
     pub avatar_url: Option<String>,
     /// Relay session token. The client reads it only to authenticate presence
@@ -27,16 +25,65 @@ pub struct Session {
 
 /// Someone whose stream this machine wants to be told about.
 ///
-/// Held here rather than at the relay because the relay keeps nothing across a
-/// restart, and a roster that vanishes on every deploy is not a roster. Name
-/// and avatar are a cached copy for rendering the row while offline; `id` is
-/// the only field presence is keyed on.
+/// Cached profile for rendering while offline. Accepted friendships and
+/// pending requests are owned by the relay; this copy never grants access.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Friend {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub avatar_url: Option<String>,
+}
+
+impl Session {
+    pub fn friend_code(&self) -> Result<String> {
+        let code = format!("orange-friend:1:{}:{}", self.id, self.name.trim());
+        Friend::from_code(&code)?;
+        Ok(code)
+    }
+}
+
+impl Friend {
+    pub fn from_code(code: &str) -> Result<Self> {
+        anyhow::ensure!(code.len() <= 512, "friend code is too long");
+        let (id, name) = code
+            .trim()
+            .strip_prefix("orange-friend:1:")
+            .and_then(|profile| profile.split_once(':'))
+            .context("copy a personal friend code from Orange, then try again")?;
+        let number = id
+            .parse::<u64>()
+            .context("invalid Discord id in friend code")?;
+        anyhow::ensure!(
+            number != 0 && number.to_string() == id,
+            "invalid Discord id in friend code"
+        );
+        let name = name.trim();
+        anyhow::ensure!(
+            !name.is_empty() && name.chars().count() <= 128 && !name.chars().any(char::is_control),
+            "invalid name in friend code"
+        );
+        // Codes carry a shared display name, not authenticated credentials or
+        // a download URL. Presence refreshes the profile from the relay later.
+        Ok(Self {
+            id: id.into(),
+            name: name.into(),
+            avatar_url: None,
+        })
+    }
+}
+
+/// Retain distinct people until the UI can offer them. Bound both the child
+/// inbox and the UI backlog so repeated joins cannot grow them indefinitely.
+pub(crate) fn remember_friend(offers: &mut Vec<Friend>, friend: Friend) {
+    if let Some(existing) = offers.iter_mut().find(|existing| existing.id == friend.id) {
+        *existing = friend;
+    } else {
+        if offers.len() == 100 {
+            offers.remove(0);
+        }
+        offers.push(friend);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +97,26 @@ pub struct Preferences {
     pub fps: Option<u32>,
     pub own_codes: Vec<String>,
     pub friends: Vec<Friend>,
+    pub friend_accounts: std::collections::HashMap<String, AccountFriends>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountFriends {
+    pub friends: Vec<Friend>,
+    pub suggestions: Vec<Friend>,
+}
+
+impl Preferences {
+    pub fn friend_account(&mut self, id: &str) -> AccountFriends {
+        let account = self.friend_accounts.entry(id.to_string()).or_default();
+        // A local add was never consent from the other account. Preserve it
+        // as a suggestion to send a request, not as a mutual cloud friendship.
+        for friend in self.friends.drain(..) {
+            remember_friend(&mut account.suggestions, friend);
+        }
+        account.clone()
+    }
 }
 
 impl Default for Preferences {
@@ -59,6 +126,7 @@ impl Default for Preferences {
             fps: None,
             own_codes: Vec::new(),
             friends: Vec::new(),
+            friend_accounts: Default::default(),
         }
     }
 }
@@ -149,6 +217,92 @@ fn save_preferences_to(path: &Path, preferences: &Preferences) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_friends_become_suggestions_for_one_account_without_granting_friendship() {
+        // Device-wide lists used to follow whoever logged in next. Migrate
+        // once as suggestions and keep both accounts' caches separate.
+        let mut preferences: Preferences =
+            serde_json::from_str(r#"{"friends":[{"id":"42","name":"Legacy"}]}"#).unwrap();
+        let a = preferences.friend_account("1");
+        assert!(a.friends.is_empty());
+        assert_eq!(a.suggestions[0].id, "42");
+        assert!(preferences.friends.is_empty());
+        let b = preferences.friend_account("2");
+        assert!(b.friends.is_empty());
+        assert!(b.suggestions.is_empty());
+        let persisted = serde_json::to_string(&preferences).unwrap();
+        let mut loaded: Preferences = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(loaded.friend_account("1").suggestions[0].id, "42");
+        assert!(loaded.friend_account("2").suggestions.is_empty());
+    }
+
+    #[test]
+    fn friend_codes_share_a_profile_without_sharing_session_credentials() {
+        // A personal code must work offline and must never serialize Session:
+        // that would turn a shareable invitation into a leaked bearer token.
+        let session = Session {
+            id: "123456789012345678".into(),
+            name: "Jo / ジョー".into(),
+            avatar_url: Some("https://cdn.discordapp.com/avatar.png".into()),
+            token: "private-session-token".into(),
+        };
+        let code = session.friend_code().unwrap();
+        assert_eq!(code, "orange-friend:1:123456789012345678:Jo / ジョー");
+        let friend = Friend::from_code(&format!(" \n{code}\n")).unwrap();
+        assert_eq!(friend.id, "123456789012345678");
+        assert_eq!(friend.name, "Jo / ジョー");
+        assert_eq!(friend.avatar_url, None);
+    }
+
+    #[test]
+    fn invalid_friend_codes_cannot_be_saved_as_unusable_roster_entries() {
+        // Room codes, malformed ids, and control characters previously had no
+        // direct-add boundary. Reject them before they reach presence queries.
+        for code in [
+            "",
+            "ABC-234",
+            "orange-friend:2:42:Jo",
+            "orange-friend:1::Jo",
+            "orange-friend:1:0:Jo",
+            "orange-friend:1:0042:Jo",
+            "orange-friend:1:42,77:Jo",
+            "orange-friend:1:18446744073709551616:Jo",
+            "orange-friend:1:42:",
+            "orange-friend:1:42:Jo\nSomeone",
+        ] {
+            assert!(Friend::from_code(code).is_err(), "accepted {code:?}");
+        }
+        assert!(Friend::from_code(&format!("orange-friend:1:42:{}", "x".repeat(513))).is_err());
+    }
+
+    #[test]
+    fn repeated_profiles_refresh_one_offer_without_displacing_other_people() {
+        // Repeated joins must not fill the backlog with the same person, and
+        // a burst of new people must stay bounded while the UI is hidden.
+        let mut offers = Vec::new();
+        for id in 1..=101 {
+            remember_friend(
+                &mut offers,
+                Friend {
+                    id: id.to_string(),
+                    name: "Old".into(),
+                    avatar_url: None,
+                },
+            );
+        }
+        remember_friend(
+            &mut offers,
+            Friend {
+                id: "101".into(),
+                name: "New".into(),
+                avatar_url: None,
+            },
+        );
+        assert_eq!(offers.len(), 100);
+        assert_eq!(offers.first().unwrap().id, "2");
+        assert_eq!(offers.last().unwrap().name, "New");
+    }
 
     #[test]
     fn missing_session_is_absent() {

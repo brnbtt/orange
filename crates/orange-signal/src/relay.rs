@@ -177,6 +177,19 @@ pub(crate) async fn presence_for(
     viewer: &str,
     ids: &[String],
 ) -> Vec<(String, Found)> {
+    find_presence(rooms, Some(viewer), ids).await
+}
+
+/// IDs have already been authorized against accepted canonical friendships.
+pub(crate) async fn presence_for_friends(rooms: &Rooms, ids: &[String]) -> Vec<(String, Found)> {
+    find_presence(rooms, None, ids).await
+}
+
+async fn find_presence(
+    rooms: &Rooms,
+    legacy_viewer: Option<&str>,
+    ids: &[String],
+) -> Vec<(String, Found)> {
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let rooms = rooms.lock().await;
     let mut best: HashMap<&str, Found> = HashMap::new();
@@ -188,7 +201,9 @@ pub(crate) async fn presence_for(
         let Some(host_id) = room.host_id.as_deref() else {
             continue;
         };
-        if !wanted.contains(host_id) || !room.visible_to.iter().any(|id| id == viewer) {
+        if !wanted.contains(host_id)
+            || legacy_viewer.is_some_and(|viewer| !room.visible_to.iter().any(|id| id == viewer))
+        {
             continue;
         }
         let found = Found {

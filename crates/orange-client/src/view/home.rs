@@ -197,8 +197,93 @@ impl Orange {
             )
     }
 
+    pub(super) fn render_friend_offer(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        // Offered rather than added: a code gets pasted into group chats, so
+        // silently keeping everyone who clicks it would hand strangers a
+        // permanent view of when this user streams.
+        self.pending_friend().map(|friend| {
+            let name = friend.name.clone();
+            let id = friend.id.clone();
+            card()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .flex_shrink_0()
+                .border_color(rgb(ORANGE_DIM))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2p5()
+                        .min_w(px(0.0))
+                        .child(avatar(None, &name, 28.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .min_w(px(0.0))
+                                .child(
+                                    label(name.clone(), TEXT)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_ellipsis(),
+                                )
+                                .child(label(format!("Discord ID: {id}"), MUTED).text_xs()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .id("keep-friend")
+                                .tab_index(0)
+                                .px_3()
+                                .py_1p5()
+                                .rounded_md()
+                                .bg(rgb(ORANGE))
+                                .text_color(rgb(INK))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(ORANGE_HOT)))
+                                .focus(|style| style.bg(rgb(ORANGE_HOT)))
+                                .child(if self.friend_sync.busy() {
+                                    "Saving…"
+                                } else {
+                                    "Send request"
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // Act on the person rendered, not whoever
+                                    // happens to lead the queue when clicked.
+                                    this.add_friend(friend.clone());
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("dismiss-friend")
+                                .tab_index(0)
+                                .text_xs()
+                                .text_color(rgb(FAINT))
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(rgb(TEXT)))
+                                .focus(|style| style.text_color(rgb(TEXT)).bg(rgb(SURFACE_HOVER)))
+                                .child("Dismiss")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_friend_offer(&id);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+        })
+    }
+
     pub(super) fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let animate = self.animate;
         let hosting = self.host.is_some();
         let watching = !self.watches.is_empty();
         let defaults = format!(
@@ -225,86 +310,37 @@ impl Orange {
         let rows: Vec<_> = (0..self.friends.len())
             .map(|index| self.friend_row(index, cx).into_any_element())
             .collect();
-        // Offered rather than added: a code gets pasted into group chats, so
-        // silently keeping everyone who clicks it would hand strangers a
-        // permanent view of when this user streams.
-        let offer = self.pending_friend().map(|friend| {
-            let name = friend.name.clone();
-            card()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .flex_shrink_0()
-                .border_color(rgb(ORANGE_DIM))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2p5()
-                        .min_w(px(0.0))
-                        .child(avatar(None, &name, 28.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_0p5()
-                                .min_w(px(0.0))
-                                .child(
-                                    label(name.clone(), TEXT)
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_ellipsis(),
-                                )
-                                .child(label("Keep as a friend?", FAINT).text_xs()),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .flex_shrink_0()
-                        .child(
-                            div()
-                                .id("keep-friend")
-                                .px_3()
-                                .py_1p5()
-                                .rounded_md()
-                                .bg(rgb(ORANGE))
-                                .text_color(rgb(INK))
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(ORANGE_HOT)))
-                                .child("Add")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(friend) = this.pending_friend() {
-                                        this.add_friend(friend);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("dismiss-friend")
-                                .text_xs()
-                                .text_color(rgb(FAINT))
-                                .cursor_pointer()
-                                .hover(|style| style.text_color(rgb(TEXT)))
-                                .child("No")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.dismiss_pending_friend();
-                                    cx.notify();
-                                })),
-                        ),
-                )
-        });
+        let offer = self.render_friend_offer(cx);
+
+        let friend_tools = card()
+            .flex_shrink_0()
+            .gap_2()
+            .child(div().flex().items_center().justify_between()
+                .child(micro("FRIENDS", MUTED))
+                .child(ghost("paste-friend", "Add friend").tab_index(0).focus(|style| style.border_color(rgb(ORANGE))).on_click(cx.listener(|this, _, _, cx| {
+                    let code = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
+                    this.offer_friend_code(&code);
+                    cx.notify();
+                })))
+                .child(quiet("copy-friend", "Copy my friend code").tab_index(0).focus(|style| style.border_color(rgb(ORANGE))).on_click(cx.listener(|this, _, _, cx| {
+                    match this.session.as_ref().map(|session| session.friend_code()) {
+                        Some(Ok(code)) => {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
+                            this.show_notice(crate::NoticeKind::Ordinary, "Friend code copied. Send it to your friend so they can add you.");
+                        }
+                        Some(Err(error)) => this.show_error(format!("Could not copy friend code: {error}")),
+                        None => this.show_error("Sign in with Discord to share your friend code."),
+                    }
+                    cx.notify();
+                }))))
+            .child(label("Copy their code, then click Add friend. When they accept, you both become friends.", MUTED).text_xs());
 
         div()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
             .flex_1()
+            .min_h(px(0.0))
             .child(
                 div()
                     .flex()
@@ -316,36 +352,136 @@ impl Orange {
                     .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
                     .child(micro(defaults, MUTED)),
             )
-            .children(offer)
-            .child(if self.friends.is_empty() {
-                // Nothing to list yet, so the space explains how a list comes
-                // to exist rather than showing an empty box. This is the only
-                // moment the app can teach the flow, because once one friend
-                // exists the screen never looks like this again.
+            .child(if self.session.is_some() {
+                friend_tools
+            } else {
+                setting_row(
+                    "Add friends without streaming",
+                    "Sign in with Discord to exchange personal friend codes.",
+                    ghost("friends-signin", "Sign in")
+                        .tab_index(0)
+                        .focus(|style| style.border_color(rgb(ORANGE)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_login();
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                )
+            })
+            .children(self.session.is_some().then(|| {
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(
+                        quiet("friends-tab", format!("Friends ({})", self.friends.len()))
+                            .tab_index(0)
+                            .focus(|style| style.border_color(rgb(ORANGE)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.requests_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        ghost(
+                            "requests-tab",
+                            format!("Requests ({})", self.friend_sync.snapshot.incoming.len()),
+                        )
+                        .tab_index(0)
+                        .focus(|style| style.border_color(rgb(ORANGE)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.requests_open = true;
+                            this.friend_sync.refresh();
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        label(
+                            if self.friend_sync.busy() {
+                                "Saving…"
+                            } else if !self.friend_sync.synced {
+                                "Syncing…"
+                            } else {
+                                ""
+                            },
+                            MUTED,
+                        )
+                        .text_xs(),
+                    )
+            }))
+            .children(self.friend_sync.error.clone().map(|error| {
+                card()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("friend-error-detail")
+                            .max_h(px(40.0))
+                            .overflow_y_scroll()
+                            .child(
+                                label(
+                                    match error {
+                                        PresenceError::SignedOut => {
+                                            "Sign in again to sync friends.".into()
+                                        }
+                                        PresenceError::Unreachable(detail) => detail,
+                                    },
+                                    DANGER,
+                                )
+                                .text_xs(),
+                            ),
+                    )
+                    .child(
+                        quiet("retry-friends", "Retry")
+                            .tab_index(0)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if matches!(this.friend_sync.error, Some(PresenceError::SignedOut))
+                                {
+                                    this.start_login();
+                                } else {
+                                    this.friend_sync.refresh();
+                                }
+                                cx.notify();
+                            })),
+                    )
+            }))
+            .children(if self.requests_open { None } else { offer })
+            .child(if self.requests_open {
+                self.render_requests(cx).into_any_element()
+            } else if self.friends.is_empty() {
+                // Direct adding is available before either person streams.
+                // Keep this compact so the offer and both code actions fit.
+                div()
+                    .id("empty-friends")
                     .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
+                    .overflow_y_scroll()
                     .items_center()
                     .justify_center()
-                    .gap_3()
+                    .gap_2()
                     .child(corner_brackets(14.0, FRAME))
                     .child(div().absolute().left(px(0.0)).child(crosshair(9.0, FRAME)))
                     .child(div().absolute().right(px(0.0)).child(crosshair(9.0, FRAME)))
-                    .child(logo(
-                        MARK_HERO,
-                        if hosting {
-                            LogoState::Live
-                        } else {
-                            LogoState::Idle
-                        },
-                        self.logo_epoch,
-                        animate,
-                    ))
-                    .child(wordmark(23.0))
-                    .child(accent_rule(28.0))
+                    .children(
+                        (self.pending_friend().is_none() && self.friend_sync.error.is_none()).then(
+                            || {
+                                logo(
+                                    48.0,
+                                    if hosting {
+                                        LogoState::Live
+                                    } else {
+                                        LogoState::Idle
+                                    },
+                                    self.logo_epoch,
+                                    self.animate,
+                                )
+                            },
+                        ),
+                    )
                     .child(
                         div()
                             .flex()
@@ -362,14 +498,13 @@ impl Orange {
                             .items_center()
                             .max_w(px(300.0))
                             .child(
-                                label("Paste a friend's code below to watch them.", MUTED)
+                                label("Add friends above, even when nobody is streaming.", MUTED)
                                     .text_xs()
                                     .text_center(),
                             )
                             .child(
                                 label(
-                                    "Afterwards you can keep them, and their \
-                                     streams show up here automatically.",
+                                    "Already have a stream code? Use Join with a code below.",
                                     FAINT,
                                 )
                                 .text_xs()
@@ -497,9 +632,8 @@ impl Orange {
             .child(
                 secondary("join-code", "Join with a code").on_click(cx.listener(
                     |this, _, _, cx| {
-                        // Still the only way to reach someone you have never
-                        // watched. It is also how the roster starts, so it is
-                        // a first-class action rather than a fallback.
+                        // A room code opens video; a personal code only adds a
+                        // friend. Keep the clipboard actions distinct.
                         let code = cx
                             .read_from_clipboard()
                             .and_then(|item| item.text())

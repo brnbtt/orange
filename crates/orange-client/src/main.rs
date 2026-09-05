@@ -11,6 +11,7 @@
 mod background;
 mod capture;
 mod client;
+mod friends;
 mod presence;
 mod session;
 mod sound;
@@ -110,6 +111,28 @@ fn begin_picker_refresh(
     jobs.request();
 }
 
+fn collect_met_friends(
+    offers: &mut Vec<session::Friend>,
+    status: &std::sync::Mutex<supervisor::StreamStatus>,
+) {
+    if let Ok(mut status) = status.lock() {
+        for friend in status.met.drain(..) {
+            session::remember_friend(offers, friend);
+        }
+    }
+}
+
+fn next_friend_offer<'a>(
+    offers: &'a [session::Friend],
+    friends: &[session::Friend],
+    own_id: Option<&str>,
+) -> Option<&'a session::Friend> {
+    let own_id = own_id?;
+    offers
+        .iter()
+        .find(|offer| offer.id != own_id && !friends.iter().any(|friend| friend.id == offer.id))
+}
+
 struct Orange {
     client_available: bool,
     screen: Screen,
@@ -151,9 +174,15 @@ struct Orange {
     /// Viewer count at the last tick, so arrivals and departures can be told
     /// apart. Reset to zero whenever no stream is running.
     viewers_seen: usize,
-    /// The roster this machine wants presence for. Seeded by hand in
-    /// `preferences.json` until the invite flow exists.
+    /// The roster this machine wants presence for.
     friends: Vec<session::Friend>,
+    /// UI-owned offers survive child teardown and change inside the tick, so
+    /// the before/after digest can actually notice an arriving identity.
+    friend_offers: Vec<session::Friend>,
+    friend_accounts: std::collections::HashMap<String, session::AccountFriends>,
+    legacy_friends: Vec<session::Friend>,
+    friend_sync: friends::Sync,
+    requests_open: bool,
     /// Last answer from the relay, keyed by Discord id. Absent means "not
     /// asked yet or the poll failed", which the view renders differently from
     /// a friend who is genuinely offline.
@@ -229,9 +258,173 @@ struct Digest {
     /// The "keep this person?" offer appears when a child reports who it met,
     /// which is a background event with no click behind it.
     pending_friend: Option<String>,
+    friend_sync: (
+        friends::Snapshot,
+        Option<presence::PresenceError>,
+        bool,
+        bool,
+    ),
 }
 
 impl Orange {
+    fn load_friend_account(&mut self, id: &str) {
+        let account = self.friend_accounts.entry(id.to_string()).or_default();
+        for friend in self.legacy_friends.drain(..) {
+            session::remember_friend(&mut account.suggestions, friend);
+        }
+        self.friends = account.friends.clone();
+        self.friend_offers = account.suggestions.clone();
+        self.friend_avatars.clear();
+        self.presence.clear();
+        self.presence_error = None;
+        self.requests_open = false;
+    }
+
+    fn change_friend(&mut self, action: friends::Action, id: &str, revision: Option<String>) {
+        let Some(session) = &self.session else {
+            self.show_error("Sign in with Discord to manage friends.");
+            return;
+        };
+        if session.id == id {
+            self.show_error("That is your own account.");
+            return;
+        }
+        if action == friends::Action::Request {
+            if self.is_friend(id) {
+                self.show_notice(NoticeKind::Ordinary, "You are already friends.");
+                return;
+            }
+            if self
+                .friend_sync
+                .snapshot
+                .incoming
+                .iter()
+                .any(|contact| contact.profile.id == id)
+            {
+                self.requests_open = true;
+                self.screen = Screen::Home;
+                self.show_notice(
+                    NoticeKind::Ordinary,
+                    "They already sent you a request. Accept it in Requests.",
+                );
+                return;
+            }
+            if self
+                .friend_sync
+                .snapshot
+                .outgoing
+                .iter()
+                .any(|contact| contact.profile.id == id)
+            {
+                self.requests_open = true;
+                self.screen = Screen::Home;
+                self.show_notice(
+                    NoticeKind::Ordinary,
+                    "Your friend request is already pending.",
+                );
+                return;
+            }
+        }
+        if !self.friend_sync.request(friends::Change {
+            action,
+            target_id: id.into(),
+            revision,
+        }) {
+            self.show_notice(
+                NoticeKind::Ordinary,
+                if self.friend_sync.busy() {
+                    "A friend change is being saved. Please wait."
+                } else {
+                    "Wait for friends to sync, then try again."
+                },
+            );
+        }
+    }
+
+    fn poll_friends(&mut self) {
+        let before: Vec<_> = self
+            .friend_sync
+            .snapshot
+            .incoming
+            .iter()
+            .map(|contact| contact.profile.id.clone())
+            .collect();
+        let was_synced = self.friend_sync.synced;
+        let session = self
+            .session
+            .as_ref()
+            .filter(|_| self.logging_in.is_none())
+            .map(|s| (self.server.as_str(), s.token.as_str()));
+        match self.friend_sync.poll(self.presence_client.clone(), session) {
+            Some(friends::Event::Snapshot) => {
+                let friends: Vec<_> = self
+                    .friend_sync
+                    .snapshot
+                    .friends
+                    .iter()
+                    .map(|contact| contact.profile.clone())
+                    .collect();
+                let changed = friends != self.friends;
+                self.friends = friends;
+                self.friend_avatars
+                    .retain(|id, _| self.friends.iter().any(|friend| &friend.id == id));
+                self.presence
+                    .retain(|id, _| self.friends.iter().any(|friend| &friend.id == id));
+                self.friend_offers
+                    .retain(|offer| !self.friends.iter().any(|friend| friend.id == offer.id));
+                if changed || !was_synced {
+                    self.save_preferences();
+                    if let Some(job) = &mut self.presence_job {
+                        job.cancel();
+                    }
+                    self.presence_due = Instant::now();
+                }
+                if was_synced
+                    && self
+                        .friend_sync
+                        .snapshot
+                        .incoming
+                        .iter()
+                        .any(|contact| !before.contains(&contact.profile.id))
+                {
+                    self.show_notice(
+                        NoticeKind::Ordinary,
+                        "New friend request. Open Requests on Home to respond.",
+                    );
+                }
+            }
+            Some(friends::Event::Changed(change)) => {
+                self.dismiss_friend_offer(&change.target_id);
+                let message = match change.action {
+                    friends::Action::Request => {
+                        "Friend request sent. They can accept it in Requests."
+                    }
+                    friends::Action::Accept => {
+                        "Friend request accepted. You are now on each other's friend lists."
+                    }
+                    friends::Action::Decline => "Friend request declined.",
+                    friends::Action::Cancel => "Friend request cancelled.",
+                    friends::Action::Remove => "Friend removed from both friend lists.",
+                };
+                self.show_notice(NoticeKind::Ordinary, message);
+                self.save_preferences();
+            }
+            Some(friends::Event::Failed { mutation }) => {
+                if matches!(
+                    self.friend_sync.error,
+                    Some(presence::PresenceError::SignedOut)
+                ) {
+                    self.reject_session();
+                } else if mutation {
+                    if let Some(error) = &self.friend_sync.error {
+                        self.show_error(format!("Friend change failed: {error}"));
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
     fn digest(&self) -> Digest {
         Digest {
             screen: self.screen,
@@ -261,6 +454,12 @@ impl Orange {
             presence_error: self.presence_error.clone(),
             friend_avatars: self.friend_avatars.len(),
             pending_friend: self.pending_friend().map(|friend| friend.id),
+            friend_sync: (
+                self.friend_sync.snapshot.clone(),
+                self.friend_sync.error.clone(),
+                self.friend_sync.synced,
+                self.friend_sync.busy(),
+            ),
         }
     }
 
@@ -279,6 +478,9 @@ impl Orange {
     /// `presence::INTERVAL`, the same shape as the update controller's
     /// six-hourly check.
     fn poll_presence(&mut self) {
+        if self.logging_in.is_some() {
+            return;
+        }
         if let Some(job) = self.presence_job.as_ref() {
             if job.is_finished() {
                 let result = job.take_result();
@@ -294,6 +496,7 @@ impl Orange {
                             .map(|entry| (entry.id, entry.presence))
                             .collect();
                     }
+                    Some(Err(presence::PresenceError::SignedOut)) => self.reject_session(),
                     Some(Err(error)) => self.presence_error = Some(error),
                     // The worker was cancelled before it sent anything. Leave
                     // the previous answer standing rather than blanking the
@@ -398,7 +601,7 @@ impl Orange {
             Ok(session) => (session, None),
             Err(error) => (None, Some(error)),
         };
-        let (preferences, preference_error) = match session::load_preferences() {
+        let (mut preferences, preference_error) = match session::load_preferences() {
             Ok(preferences) => (preferences, None),
             Err(error) => (session::Preferences::default(), Some(error)),
         };
@@ -414,6 +617,10 @@ impl Orange {
         avatar_job.request(session.as_ref().and_then(|s| s.avatar_url.clone()));
         avatar_job.poll();
         let updates = update::UpdateController::new();
+        let account = session
+            .as_ref()
+            .map(|session| preferences.friend_account(&session.id))
+            .unwrap_or_default();
         Self {
             client_available,
             screen: if session.is_some() {
@@ -448,7 +655,12 @@ impl Orange {
             copied_code: None,
             own_codes: preferences.own_codes,
             viewers_seen: 0,
-            friends: preferences.friends,
+            friends: account.friends,
+            friend_offers: account.suggestions,
+            friend_accounts: preferences.friend_accounts,
+            legacy_friends: preferences.friends,
+            friend_sync: friends::Sync::default(),
+            requests_open: false,
             presence: std::collections::HashMap::new(),
             presence_job: None,
             presence_client: presence::PresenceClient::default(),
@@ -472,6 +684,7 @@ impl Orange {
         }
         let picker_changed = self.drain_thumbnails();
         self.poll_updates(cx);
+        self.poll_friends();
         self.poll_presence();
         self.poll_friend_avatars();
         if let Some(pixels) = self.avatar_job.poll() {
@@ -483,6 +696,19 @@ impl Orange {
         if let Some(attempt) = self.logging_in.as_mut() {
             match poll_login(session::load, || attempt.failure()) {
                 Some(Ok(session)) => {
+                    if self.session.as_ref().map(|current| current.id.as_str())
+                        != Some(session.id.as_str())
+                    {
+                        self.stop_host();
+                        self.stop_all_watches();
+                        self.save_preferences();
+                    }
+                    // Reauthentication can finish after old child events have
+                    // queued. Do not offer a previous account's encounters.
+                    self.collect_friend_offers();
+                    self.friend_offers.clear();
+                    self.friend_sync.reset();
+                    self.load_friend_account(&session.id);
                     self.avatar = None;
                     self.avatar_job.request(session.avatar_url.clone());
                     self.session = Some(session);
@@ -510,6 +736,7 @@ impl Orange {
             self.show_notice(NoticeKind::Ordinary, notice);
         }
         if self.host.as_mut().is_some_and(|host| !host.running()) {
+            self.collect_friend_offers();
             let host_error = self
                 .host
                 .as_ref()
@@ -531,7 +758,9 @@ impl Orange {
         let mut watch_error = None;
         let mut watch_ended = false;
         self.watches.retain_mut(|watch| {
-            if watch.supervisor.running() {
+            let running = watch.supervisor.running();
+            collect_met_friends(&mut self.friend_offers, &watch.supervisor.status);
+            if running {
                 true
             } else {
                 if let Ok(status) = watch.supervisor.status.lock() {
@@ -541,6 +770,10 @@ impl Orange {
                 false
             }
         });
+        self.collect_friend_offers();
+        if self.session.is_none() {
+            self.friend_offers.clear();
+        }
         if let Some(error) = watch_error {
             self.show_error(error);
         } else if watch_ended {
@@ -657,44 +890,82 @@ impl Orange {
         }
     }
 
-    /// Someone this session put us in contact with who is not a friend yet.
-    ///
-    /// Read from every live child, so it covers both directions: the host of a
-    /// stream being watched, and the newest viewer of a stream being hosted.
+    /// Offers belong to the UI, not to a playback process that may already
+    /// have exited by the time the user comes back to Home.
     fn pending_friend(&self) -> Option<session::Friend> {
-        let from_host = self
-            .host
-            .as_ref()
-            .and_then(|host| host.status.lock().ok())
-            .and_then(|status| status.met.clone());
-        let from_watch = self.watches.iter().find_map(|watch| {
-            watch
-                .supervisor
-                .status
-                .lock()
-                .ok()
-                .and_then(|status| status.met.clone())
-        });
-        from_watch
-            .or(from_host)
-            .filter(|friend| !self.is_friend(&friend.id))
+        let offers: Vec<_> = self
+            .friend_offers
+            .iter()
+            .filter(|offer| {
+                !self
+                    .friend_sync
+                    .snapshot
+                    .incoming
+                    .iter()
+                    .chain(&self.friend_sync.snapshot.outgoing)
+                    .any(|contact| contact.profile.id == offer.id)
+            })
+            .cloned()
+            .collect();
+        next_friend_offer(
+            &offers,
+            &self.friends,
+            self.session.as_ref().map(|s| s.id.as_str()),
+        )
+        .cloned()
     }
 
-    /// Decline the offer.
-    ///
-    /// Clears the child's record rather than remembering a refusal: the offer
-    /// only exists while that session does, so there is nothing to remember
-    /// once it is gone.
-    fn dismiss_pending_friend(&mut self) {
+    fn collect_friend_offers(&mut self) {
         if let Some(host) = self.host.as_ref() {
-            if let Ok(mut status) = host.status.lock() {
-                status.met = None;
-            }
+            collect_met_friends(&mut self.friend_offers, &host.status);
         }
         for watch in &self.watches {
-            if let Ok(mut status) = watch.supervisor.status.lock() {
-                status.met = None;
+            collect_met_friends(&mut self.friend_offers, &watch.supervisor.status);
+        }
+    }
+
+    fn dismiss_friend_offer(&mut self, id: &str) {
+        self.friend_offers.retain(|friend| friend.id != id);
+    }
+
+    fn offer_friend_code(&mut self, code: &str) {
+        let Some(session) = self.session.as_ref() else {
+            self.show_error("Sign in with Discord to add friends.");
+            return;
+        };
+        match session::Friend::from_code(code) {
+            Ok(friend) if friend.id == session.id => {
+                self.show_error("That is your own friend code.")
             }
+            Ok(friend) if self.is_friend(&friend.id) => {
+                self.show_notice(
+                    NoticeKind::Ordinary,
+                    format!("{} is already a friend.", friend.name),
+                );
+            }
+            Ok(friend)
+                if self
+                    .friend_sync
+                    .snapshot
+                    .incoming
+                    .iter()
+                    .chain(&self.friend_sync.snapshot.outgoing)
+                    .any(|contact| contact.profile.id == friend.id) =>
+            {
+                self.requests_open = true;
+                self.show_notice(
+                    NoticeKind::Ordinary,
+                    "There is already a pending request. Open it here to respond or cancel.",
+                );
+            }
+            Ok(friend) => {
+                self.requests_open = false;
+                self.dismiss_friend_offer(&friend.id);
+                self.friend_offers.insert(0, friend);
+                self.friend_offers.truncate(100);
+                self.clear_error();
+            }
+            Err(error) => self.show_error(format!("Could not add friend: {error}")),
         }
     }
 
@@ -704,14 +975,7 @@ impl Orange {
     /// auto-adding would hand a permanent view of when you stream to everyone
     /// who ever clicked it out of curiosity. The user decides.
     fn add_friend(&mut self, friend: session::Friend) {
-        if let Some(existing) = self.friends.iter_mut().find(|f| f.id == friend.id) {
-            *existing = friend;
-        } else {
-            let name = friend.name.clone();
-            self.friends.push(friend);
-            self.show_notice(NoticeKind::Ordinary, format!("Added {name}"));
-        }
-        self.save_preferences();
+        self.change_friend(friends::Action::Request, &friend.id, None);
     }
 
     /// Forget someone, and stop showing them as live.
@@ -720,30 +984,42 @@ impl Orange {
     /// re-adding the same person would otherwise show whatever state was last
     /// seen before the removal.
     fn remove_friend(&mut self, id: &str) {
-        let Some(index) = self.friends.iter().position(|friend| friend.id == id) else {
-            return;
-        };
-        let removed = self.friends.remove(index);
-        self.presence.remove(id);
-        self.friend_avatars.remove(id);
-        self.show_notice(NoticeKind::Ordinary, format!("Removed {}", removed.name));
-        self.save_preferences();
+        let revision = self
+            .friend_sync
+            .snapshot
+            .friends
+            .iter()
+            .find(|contact| contact.profile.id == id)
+            .map(|contact| contact.revision.clone());
+        self.change_friend(friends::Action::Remove, id, revision);
     }
 
     fn is_friend(&self, id: &str) -> bool {
         self.friends.iter().any(|friend| friend.id == id)
     }
 
-    fn save_preferences(&mut self) {
+    fn save_preferences(&mut self) -> bool {
+        if let Some(session) = &self.session {
+            self.friend_accounts.insert(
+                session.id.clone(),
+                session::AccountFriends {
+                    friends: self.friends.clone(),
+                    suggestions: self.friend_offers.clone(),
+                },
+            );
+        }
         let preferences = session::Preferences {
             quality: self.quality,
             fps: Some(self.fps),
             own_codes: self.own_codes.clone(),
-            friends: self.friends.clone(),
+            friends: self.legacy_friends.clone(),
+            friend_accounts: self.friend_accounts.clone(),
         };
         if let Err(error) = session::save_preferences(&preferences) {
             self.show_error(format!("Could not save preferences: {error}"));
+            return false;
         }
+        true
     }
 
     fn sign_out(&mut self, destination: Option<Screen>) {
@@ -751,7 +1027,17 @@ impl Orange {
             self.show_error(format!("Could not sign out: {error}"));
             return;
         }
+        // Children authenticate once at startup. Keeping them across signout
+        // would attribute encounters from account A's stream to account B.
+        self.stop_host();
+        self.stop_all_watches();
+        self.save_preferences();
         self.session = None;
+        self.friend_sync.reset();
+        self.friends.clear();
+        self.friend_avatars.clear();
+        self.requests_open = false;
+        self.friend_offers.clear();
         self.avatar = None;
         self.avatar_job.request(None);
         self.thumbnail_job.cancel();
@@ -763,6 +1049,16 @@ impl Orange {
         self.presence_due = Instant::now();
         if let Some(destination) = destination {
             self.screen = destination;
+        }
+    }
+
+    fn reject_session(&mut self) {
+        self.sign_out(Some(Screen::SignedOut));
+        if self.session.is_none() {
+            self.show_notice(
+                NoticeKind::Ordinary,
+                "Your session expired. Sign in with Discord to reconnect.",
+            );
         }
     }
 
@@ -813,6 +1109,10 @@ impl Orange {
     fn start_login(&mut self) {
         if self.logging_in.is_some() {
             return;
+        }
+        self.friend_sync.reset();
+        if let Some(job) = &mut self.presence_job {
+            job.cancel();
         }
         self.clear_error();
         match supervisor::start_login(&self.server) {
@@ -894,6 +1194,7 @@ impl Orange {
         self.thumbnail_job.cancel();
         if let Some(mut host) = self.host.take() {
             host.stop();
+            collect_met_friends(&mut self.friend_offers, &host.status);
         }
         self.active_target = None;
         self.active_preview = None;
@@ -908,7 +1209,9 @@ impl Orange {
 
     fn stop_watch(&mut self, index: usize) {
         if index < self.watches.len() {
-            self.watches.remove(index);
+            let mut watch = self.watches.remove(index);
+            watch.supervisor.stop();
+            collect_met_friends(&mut self.friend_offers, &watch.supervisor.status);
         }
         if self.watches.is_empty() && self.host.is_none() {
             self.thumbnail_job.cancel();
@@ -917,6 +1220,10 @@ impl Orange {
     }
 
     fn stop_all_watches(&mut self) {
+        for watch in &mut self.watches {
+            watch.supervisor.stop();
+            collect_met_friends(&mut self.friend_offers, &watch.supervisor.status);
+        }
         self.watches.clear();
         if self.host.is_none() {
             self.thumbnail_job.cancel();
@@ -1132,6 +1439,219 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn friend_test_app() -> Orange {
+        Orange {
+            client_available: false,
+            screen: Screen::Home,
+            session: Some(login_session()),
+            windows: Vec::new(),
+            thumbnails: Default::default(),
+            thumbnail_job: Default::default(),
+            avatar: None,
+            avatar_job: Default::default(),
+            quality: 1,
+            fps: 60,
+            active_target: None,
+            active_preview: None,
+            host: None,
+            watches: Vec::new(),
+            logging_in: None,
+            notice: None,
+            server: DEFAULT_SERVER.into(),
+            picker_scroll: gpui::ScrollHandle::new(),
+            settings_scroll: gpui::ScrollHandle::new(),
+            update_collapsed: false,
+            settings_open: [true; 3],
+            copied_at: None,
+            copied_code: None,
+            own_codes: Vec::new(),
+            viewers_seen: 0,
+            friends: Vec::new(),
+            friend_offers: Vec::new(),
+            friend_accounts: Default::default(),
+            legacy_friends: Vec::new(),
+            friend_sync: friends::Sync::default(),
+            requests_open: false,
+            presence: Default::default(),
+            presence_job: None,
+            presence_client: Default::default(),
+            presence_due: Instant::now(),
+            presence_error: None,
+            friend_avatars: Default::default(),
+            friend_avatar_job: Default::default(),
+            logo_epoch: 0,
+            animate: false,
+            updates: update::UpdateController::new(),
+        }
+    }
+
+    #[test]
+    fn sending_a_request_does_not_locally_create_a_friendship() {
+        // The first implementation immediately saved a one-sided friendship.
+        // Only the relay's accepted snapshot may now populate the roster.
+        let mut app = friend_test_app();
+        app.friend_sync.synced = true;
+        app.offer_friend_code("orange-friend:1:42:Friend");
+        let offered = app.pending_friend().unwrap();
+        app.add_friend(offered.clone());
+        assert!(app.friends.is_empty());
+        assert_eq!(app.pending_friend(), Some(offered.clone()));
+        assert!(app.friend_sync.busy());
+        assert!(app.watches.is_empty());
+        assert!(app.host.is_none());
+    }
+
+    #[test]
+    fn rejected_friend_sessions_sign_out_but_storage_outages_keep_the_login() {
+        // Automatic logout must clear the real CLI session file, but tests
+        // must never remove the developer's credentials or change APPDATA for
+        // concurrent tests in this process.
+        const CHILD: &str = "ORANGE_TEST_FRIEND_AUTH";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::rejected_friend_sessions_sign_out_but_storage_outages_keep_the_login",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("APPDATA", dir.path())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("friend auth child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let path = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .join("orange/session.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"id":"123","name":"Orange User","token":"token","avatar_url":null}"#,
+        )
+        .unwrap();
+        let server = background::tests::HttpServer::new(vec![
+            (503, b"storage unavailable".to_vec()),
+            (401, vec![]),
+        ]);
+        let mut app = friend_test_app();
+        app.server = server.url("/ws").replacen("http://", "ws://", 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.friend_sync.error.is_none() {
+            app.poll_friends();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.session.is_some());
+        assert!(session::load().unwrap().is_some());
+        app.friend_sync.refresh();
+        while app.session.is_some() {
+            app.poll_friends();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.screen == Screen::SignedOut);
+        assert!(session::load().unwrap().is_none());
+        assert!(!app.friend_sync.synced);
+        server.finish();
+    }
+
+    fn friend(id: &str) -> session::Friend {
+        session::Friend {
+            id: id.into(),
+            name: format!("Friend {id}"),
+            avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn stopping_children_keeps_their_last_friend_offer_available() {
+        // Exercise real stdout readers and each explicit teardown path. A
+        // mutex-only test cannot catch dropping the supervisor before draining
+        // its final output, including output from an already-exited child.
+        for mode in ["watch", "all", "host", "exited"] {
+            let mut app = friend_test_app();
+            let mut child = supervisor::friend_test_child(mode != "exited");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let running = child.running();
+                let ready = !child.status.lock().unwrap().met.is_empty();
+                if ready && (mode != "exited" || !running) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "friend child timed out in {mode}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if mode == "host" {
+                app.host = Some(child);
+                app.stop_host();
+            } else {
+                app.watches.push(WatchSession {
+                    code: "ABC-234".into(),
+                    supervisor: child,
+                });
+                if mode == "all" {
+                    app.stop_all_watches();
+                } else {
+                    app.stop_watch(0);
+                }
+            }
+            assert_eq!(
+                app.pending_friend().unwrap().id,
+                "42",
+                "lost offer in {mode}"
+            );
+            assert!(app.host.is_none());
+            assert!(app.watches.is_empty());
+            app.dismiss_friend_offer("42");
+            assert!(app.pending_friend().is_none());
+        }
+    }
+
+    #[test]
+    fn an_existing_friend_does_not_hide_another_streams_add_offer() {
+        // The old find_map selected the first host and only then filtered
+        // known friends, hiding every later unknown host and joining viewer.
+        let offers = vec![friend("self"), friend("known"), friend("new")];
+        let known = vec![friend("known")];
+        assert_eq!(
+            next_friend_offer(&offers, &known, Some("self")).unwrap().id,
+            "new"
+        );
+        assert!(next_friend_offer(&offers, &known, None).is_none());
+    }
+
+    #[test]
+    fn a_background_identity_changes_ui_state_and_survives_child_teardown() {
+        // Previously both digests read the already-updated child mutex, so an
+        // identity arriving before tick never caused a repaint. Child exit
+        // also destroyed the only copy before Home could offer it.
+        let mut offers = Vec::new();
+        let status = std::sync::Mutex::new(supervisor::StreamStatus::default());
+        status.lock().unwrap().met.push(friend("42"));
+        let before = next_friend_offer(&offers, &[], Some("self")).cloned();
+        collect_met_friends(&mut offers, &status);
+        assert!(status.lock().unwrap().met.is_empty());
+        drop(status);
+        let after = next_friend_offer(&offers, &[], Some("self")).cloned();
+        assert_ne!(before, after);
+        assert_eq!(after.unwrap().id, "42");
+    }
 
     #[test]
     fn reopening_the_picker_removes_old_selectable_targets_before_enumeration() {

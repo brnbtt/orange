@@ -31,6 +31,7 @@ static CONNECTIONS: LazyLock<Arc<Semaphore>> =
 pub struct AppState {
     pub rooms: Rooms,
     pub auth: Auth,
+    pub(crate) social: crate::social::Social,
 }
 
 pub async fn serve(addr: &str) -> Result<()> {
@@ -55,6 +56,7 @@ pub async fn serve(addr: &str) -> Result<()> {
     let state = AppState {
         rooms: Arc::new(Mutex::new(HashMap::new())),
         auth,
+        social: crate::social::Social::new(crate::store::TableStore::from_env()),
     };
 
     let app = router(state);
@@ -75,6 +77,12 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/auth/callback", get(auth_callback))
         .route("/auth/poll", get(auth_poll))
         .route("/presence", get(presence))
+        .route(
+            "/friends",
+            get(friends)
+                .post(change_friend)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/ws", get(ws_upgrade))
         .with_state(state)
 }
@@ -204,11 +212,13 @@ async fn presence(
     Query(params): Query<PresenceParams>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(token) = bearer_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    let _permit = match app.social.admit() {
+        Ok(permit) => permit,
+        Err(error) => return social_error(error),
     };
-    let Some(identity) = app.auth.identify(token).await else {
-        return (StatusCode::UNAUTHORIZED, "unknown or expired session").into_response();
+    let identity = match authenticated_identity(&app, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return *response,
     };
 
     let ids: Vec<String> = params
@@ -222,9 +232,51 @@ async fn presence(
         return (StatusCode::BAD_REQUEST, "too many ids").into_response();
     }
 
-    let friends = presence_for(&app.rooms, &identity.id, &ids)
+    if let Err(error) = app.social.admit_read(&identity.id).await {
+        return social_error(error);
+    }
+    let relationships = match app.social.relationships(&identity.id).await {
+        Ok(relationships) => relationships,
+        Err(error) => return social_error(error),
+    };
+    let states: HashMap<_, _> = relationships
+        .iter()
+        .map(|r| {
+            let other = if r.sender.id == identity.id {
+                &r.recipient.id
+            } else {
+                &r.sender.id
+            };
+            (other.as_str(), r.state)
+        })
+        .collect();
+    let accepted: Vec<_> = ids
+        .iter()
+        .filter(|id| states.get(id.as_str()) == Some(&crate::social::RelationshipState::Accepted))
+        .cloned()
+        .collect();
+    // A canonical row overrides the legacy room snapshot, including removal.
+    // Otherwise an old visible_to flag would keep sharing presence forever.
+    let legacy: Vec<_> = ids
+        .iter()
+        .filter(|id| !states.contains_key(id.as_str()))
+        .cloned()
+        .collect();
+    let mut found: HashMap<_, _> = presence_for(&app.rooms, &identity.id, &legacy)
         .await
         .into_iter()
+        .collect();
+    found.extend(crate::relay::presence_for_friends(&app.rooms, &accepted).await);
+    let friends = ids
+        .into_iter()
+        .map(|id| {
+            let value = found.remove(&id).unwrap_or(Found {
+                presence: crate::relay::Presence::Offline,
+                name: None,
+                avatar_url: None,
+            });
+            (id, value)
+        })
         .map(|(id, found)| {
             let Found {
                 presence,
@@ -240,6 +292,89 @@ async fn presence(
         })
         .collect();
     Json(PresenceBody { friends }).into_response()
+}
+
+async fn friends(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    let _permit = match app.social.admit() {
+        Ok(permit) => permit,
+        Err(error) => return social_error(error),
+    };
+    let identity = match authenticated_identity(&app, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+    if let Err(error) = app.social.admit_read(&identity.id).await {
+        return social_error(error);
+    }
+    match app.social.snapshot(&identity).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => social_error(error),
+    }
+}
+
+async fn change_friend(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(change): Json<crate::social::Change>,
+) -> Response {
+    let _permit = match app.social.admit() {
+        Ok(permit) => permit,
+        Err(error) => return social_error(error),
+    };
+    let identity = match authenticated_identity(&app, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+    match app.social.change(&identity, &change).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => social_error(error),
+    }
+}
+
+fn social_error(error: crate::social::Error) -> Response {
+    use crate::social::Error;
+    let (status, message) = match error {
+        Error::Invalid(message) => (StatusCode::BAD_REQUEST, message),
+        Error::Forbidden => (
+            StatusCode::FORBIDDEN,
+            "only the recipient can answer this request",
+        ),
+        Error::Conflict => (
+            StatusCode::CONFLICT,
+            "this request changed; refresh and try again",
+        ),
+        Error::NotFound => (
+            StatusCode::NOT_FOUND,
+            "friend or request not found; your friend may need to open the updated Orange once",
+        ),
+        Error::Capacity => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "friend or request limit reached",
+        ),
+        Error::Storage(error) => {
+            eprintln!("[friends] storage operation failed: {error:#}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not save or load friends; try again shortly",
+            )
+        }
+    };
+    (status, message).into_response()
+}
+
+async fn authenticated_identity(
+    app: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::Identity, Box<Response>> {
+    let token =
+        bearer_token(headers).ok_or_else(|| Box::new(StatusCode::UNAUTHORIZED.into_response()))?;
+    match app.auth.identify_checked(token).await {
+        Ok(Some(identity)) => Ok(identity),
+        Ok(None) => Err(Box::new(
+            (StatusCode::UNAUTHORIZED, "unknown or expired session").into_response(),
+        )),
+        Err(error) => Err(Box::new(social_error(crate::social::Error::Storage(error)))),
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -343,6 +478,7 @@ mod tests {
         let app = router(AppState {
             rooms: Default::default(),
             auth: crate::auth::Auth::new(None),
+            social: crate::social::Social::new(None),
         });
         let response = app
             .oneshot(
@@ -372,6 +508,7 @@ mod tests {
         let state = AppState {
             rooms: Default::default(),
             auth: Auth::new(None),
+            social: crate::social::Social::new(None),
         };
         state
             .auth
@@ -426,6 +563,7 @@ mod tests {
         let state = AppState {
             rooms: Default::default(),
             auth: Auth::new(None),
+            social: crate::social::Social::new(None),
         };
         state
             .auth
@@ -462,6 +600,7 @@ mod tests {
                 AppState {
                     rooms: Rooms::default(),
                     auth: Auth::new(None),
+                    social: crate::social::Social::new(None),
                 },
                 connections.clone(),
             ));

@@ -75,6 +75,25 @@ every stream with pasting one invite per friend, once. Someone not on the list
 is told the host is offline, which is deliberately the same answer as a host who
 genuinely is not streaming.
 
+To add friends without streaming, use **Copy my friend code** on Home. Your
+friend copies it, clicks **Add friend**, and sends a request. Open **Requests**
+to accept or decline; acceptance adds both accounts automatically. Sent
+requests show Pending and can be cancelled. Personal codes are separate from
+stream join codes. You can also send requests to people you meet while hosting
+or watching, even after closing that stream.
+
+Friendships and requests persist in the existing Azure Table Storage account,
+so requests can be accepted after either person returns online. The client
+checks for changes every 15 seconds; accepted friends can discover streams
+that are already running. Removing a friend updates both lists and revokes
+automatic discovery. Existing local-only friends become suggestions to send
+requests. Local caches are separated by Discord account.
+
+Existing valid Discord logins continue working after this update. Expired or
+rejected sessions automatically return to sign-in; network and Azure storage
+failures show a retryable error instead. Signing out closes that account's
+active streams and viewer windows.
+
 Relay OAuth sessions are stored in Azure Table Storage, so a restart, deploy or
 revision switch no longer signs users out. Rooms are still in memory and are
 still interrupted, because a room belongs to a connection either way.

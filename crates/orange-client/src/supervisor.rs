@@ -439,9 +439,9 @@ pub struct StreamStatus {
     /// to the viewer closing their own window. Both exit zero.
     pub ended: bool,
     /// Who this session put us in contact with, if they were signed in: the
-    /// host when watching, the newest viewer when hosting. The client offers to
+    /// host when watching, joining viewers when hosting. The client offers to
     /// keep them; it never adds them on its own.
-    pub met: Option<Friend>,
+    pub met: Vec<Friend>,
     viewer_labels: Vec<(String, String)>,
 }
 
@@ -577,6 +577,22 @@ impl Drop for Supervisor {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn friend_test_child(wait: bool) -> Supervisor {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "supervisor::tests::friend_profile_child",
+            "--nocapture",
+        ])
+        .env(
+            "ORANGE_TEST_FRIEND_CHILD",
+            if wait { "wait" } else { "exit" },
+        );
+    Supervisor::spawn(command).unwrap()
+}
+
 /// Printed by `orange watch` when the host stopped, mirroring the constant in
 /// `crates/orange/src/peer/watch.rs`. A watch child exits zero both when the
 /// stream ends and when the viewer closes their own window, so the exit code
@@ -635,7 +651,9 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
             return;
         };
-        status.met = parse_profile(&record).or(status.met.take());
+        if let Some(friend) = parse_profile(&record) {
+            crate::session::remember_friend(&mut status.met, friend);
+        }
     } else if let Some(record) = line.strip_prefix("[host-status] ") {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
             return;
@@ -653,7 +671,9 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
                 };
                 // Only an authenticated viewer carries an id, and only an id
                 // is worth offering to keep: `peer` is reassigned per session.
-                status.met = parse_profile(&record).or(status.met.take());
+                if let Some(friend) = parse_profile(&record) {
+                    crate::session::remember_friend(&mut status.met, friend);
+                }
                 if !status.viewer_labels.iter().any(|(id, _)| id == peer) {
                     status
                         .viewer_labels
@@ -974,7 +994,43 @@ mod tests {
         );
         parse_line(r#"[watch-host] {"name":"Anonymous Host"}"#, &status);
 
-        assert!(status.lock().unwrap().met.is_none());
+        assert!(status.lock().unwrap().met.is_empty());
+    }
+
+    #[test]
+    fn joining_viewers_do_not_overwrite_an_unreviewed_friend_offer() {
+        // Two authenticated viewers can arrive between UI ticks. A single
+        // `met` slot silently lost the first person before Add could appear.
+        let status = Arc::new(Mutex::new(StreamStatus::default()));
+        for (peer, id) in [("first", "42"), ("second", "77")] {
+            parse_line(
+                &format!(
+                    r#"[host-status] {{"event":"joined","peer":"{peer}","id":"{id}","label":"Friend"}}"#
+                ),
+                &status,
+            );
+        }
+        assert_eq!(
+            status
+                .lock()
+                .unwrap()
+                .met
+                .iter()
+                .map(|friend| friend.id.as_str())
+                .collect::<Vec<_>>(),
+            ["42", "77"]
+        );
+    }
+
+    #[test]
+    fn friend_profile_child() {
+        let Ok(mode) = std::env::var("ORANGE_TEST_FRIEND_CHILD") else {
+            return;
+        };
+        println!("\n[watch-host] {{\"id\":\"42\",\"name\":\"Friend\",\"avatar_url\":null}}");
+        if mode == "wait" {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
     }
 
     /// Both directions of a code join have to surface an identity, or only one
@@ -987,7 +1043,7 @@ mod tests {
             r#"[host-status] {"event":"joined","peer":"a","label":"Vee","id":"77","avatar_url":"https://cdn/v.png"}"#,
             &host_side,
         );
-        let met = host_side.lock().unwrap().met.clone().unwrap();
+        let met = host_side.lock().unwrap().met[0].clone();
         assert_eq!(met.id, "77");
         assert_eq!(met.name, "Vee");
         assert_eq!(met.avatar_url.as_deref(), Some("https://cdn/v.png"));
@@ -997,7 +1053,7 @@ mod tests {
             r#"[watch-host] {"id":"42","name":"Hoss","avatar_url":"https://cdn/h.png"}"#,
             &watch_side,
         );
-        let met = watch_side.lock().unwrap().met.clone().unwrap();
+        let met = watch_side.lock().unwrap().met[0].clone();
         assert_eq!(met.id, "42");
         assert_eq!(met.name, "Hoss");
         assert_eq!(met.avatar_url.as_deref(), Some("https://cdn/h.png"));

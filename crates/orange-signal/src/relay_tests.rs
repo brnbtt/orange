@@ -90,6 +90,7 @@ async fn repeated_host_command_cleans_the_original_room() {
     let app = server::router(server::AppState {
         rooms: rooms.clone(),
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -133,6 +134,7 @@ async fn sixty_four_sequential_host_connections_leave_no_rooms() {
     let app = server::router(server::AppState {
         rooms: rooms.clone(),
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -195,6 +197,7 @@ async fn viewer_rate_limit_counts_only_text_and_cleans_up_its_role() {
     let app = server::router(server::AppState {
         rooms: rooms.clone(),
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -318,6 +321,7 @@ async fn viewer_can_retry_after_a_full_room_on_the_same_socket() {
     let app = server::router(server::AppState {
         rooms: rooms.clone(),
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -400,6 +404,7 @@ async fn a_friend_is_handed_the_join_code_over_http_without_ever_being_told_it()
     let app = server::router(server::AppState {
         rooms: rooms.clone(),
         auth,
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -478,11 +483,176 @@ async fn a_friend_is_handed_the_join_code_over_http_without_ever_being_told_it()
 }
 
 #[tokio::test]
+async fn accepting_a_request_discovers_an_existing_stream_and_removal_revokes_it() {
+    // Acceptance must work against a room opened before the request, and a
+    // removed friendship must override even an older client's visible_to flag.
+    let auth = auth::Auth::new(None);
+    for id in ["1", "2", "3"] {
+        auth.insert_session_for_test(
+            id,
+            Identity {
+                id: id.into(),
+                name: format!("User {id}"),
+                avatar_url: None,
+            },
+        )
+        .await;
+    }
+    let rooms = Rooms::default();
+    let app = server::router(server::AppState {
+        rooms: rooms.clone(),
+        auth,
+        social: crate::social::Social::new(None),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = reqwest::Client::new();
+    let base = format!("http://{address}");
+    for id in ["1", "2"] {
+        assert!(http
+            .get(format!("{base}/friends"))
+            .bearer_auth(id)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+    let (mut host, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+        .await
+        .unwrap();
+    host.send(tokio_tungstenite::tungstenite::Message::Text(
+        Signal::Authenticate {
+            session: "1".into(),
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+    receive_signal(&mut host).await;
+    host.send(tokio_tungstenite::tungstenite::Message::Text(
+        Signal::Host { visible_to: vec![] }.to_json(),
+    ))
+    .await
+    .unwrap();
+    let Signal::Hosting { code, .. } = receive_signal(&mut host).await else {
+        panic!("no room");
+    };
+    let request = http
+        .post(format!("{base}/friends"))
+        .bearer_auth("2")
+        .json(&serde_json::json!({"action":"request","target_id":"1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(request.status(), reqwest::StatusCode::NO_CONTENT);
+    let before: serde_json::Value = http
+        .get(format!("{base}/presence?ids=1"))
+        .bearer_auth("2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["friends"][0]["state"], "offline");
+    let inbox: serde_json::Value = http
+        .get(format!("{base}/friends"))
+        .bearer_auth("1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let revision = inbox["incoming"][0]["revision"].as_str().unwrap();
+    // The sender cannot accept on the recipient's behalf.
+    let denied = http
+        .post(format!("{base}/friends"))
+        .bearer_auth("2")
+        .json(&serde_json::json!({"action":"accept","target_id":"1","revision":revision}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    let accepted = http
+        .post(format!("{base}/friends"))
+        .bearer_auth("1")
+        .json(&serde_json::json!({"action":"accept","target_id":"2","revision":revision}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::NO_CONTENT);
+    let after: serde_json::Value = http
+        .get(format!("{base}/presence?ids=1"))
+        .bearer_auth("2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["friends"][0]["code"], code);
+    let stranger: serde_json::Value = http
+        .get(format!("{base}/presence?ids=1"))
+        .bearer_auth("3")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stranger["friends"][0]["state"], "offline");
+    rooms
+        .lock()
+        .await
+        .values_mut()
+        .next()
+        .unwrap()
+        .visible_to
+        .push("2".into());
+    let removed = http
+        .post(format!("{base}/friends"))
+        .bearer_auth("2")
+        .json(&serde_json::json!({"action":"remove","target_id":"1","revision":revision}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::NO_CONTENT);
+    let after: serde_json::Value = http
+        .get(format!("{base}/presence?ids=1"))
+        .bearer_auth("2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["friends"][0]["state"], "offline");
+    for id in ["1", "2"] {
+        let snapshot: serde_json::Value = http
+            .get(format!("{base}/friends"))
+            .bearer_auth(id)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(snapshot["friends"], serde_json::json!([]));
+    }
+    drop(host);
+    relay.abort();
+}
+
+#[tokio::test]
 async fn abrupt_viewer_disconnect_notifies_host() {
     let rooms = Rooms::default();
     let app = server::router(server::AppState {
         rooms: rooms.clone(),
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -535,6 +705,7 @@ async fn expired_authentication_still_allows_anonymous_hosting() {
     let app = server::router(server::AppState {
         rooms,
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -573,6 +744,7 @@ async fn host_and_viewer_receive_same_opaque_diagnostic_session() {
     let app = server::router(server::AppState {
         rooms,
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -626,6 +798,7 @@ async fn abrupt_host_disconnect_notifies_existing_viewers() {
     let app = server::router(server::AppState {
         rooms: rooms.clone(),
         auth: auth::Auth::new(None),
+        social: crate::social::Social::new(None),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

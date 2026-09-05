@@ -99,6 +99,8 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/background.rs` | Owned discovery, thumbnail and avatar jobs; nonblocking cancellation, coalesced replacement, joined cleanup, bounded avatar download/decode and failed-avatar retry backoff |
 | `crates/orange-client/src/background_tests.rs` | Background-job ownership, cancellation, retry and HTTP reuse regression tests |
 | `crates/orange-client/src/presence.rs` | Throttled `/presence` polling off the UI thread with a reusable HTTP client, signed-out versus unreachable, decoding friend state and profile |
+| `crates/orange-client/src/friends.rs` | Serialized friend snapshot/mutation polling, cancellable account resets, request revision tracking |
+| `crates/orange-client/src/view/requests.rs` | Home request inbox, incoming Accept/Decline and outgoing Pending/Cancel |
 | `crates/orange-client/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
 | `crates/orange-client/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, bounds/cancels window enumeration and owns its output readers, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
 | `crates/orange-client/src/supervisor_list_tests.rs` | Real-child tests of enumeration output, cancellation, deadlines and errors |
@@ -165,6 +167,8 @@ animation gate as the grid and logo aura.
 | `crates/orange-signal/src/server.rs` | Axum routes, 512-connection semaphore, OAuth HTTP endpoints, `/ws` |
 | `crates/orange-signal/src/auth.rs` | Discord OAuth exchange, pending attempts, opaque sessions cached in memory over a durable store, expiration and capacities |
 | `crates/orange-signal/src/store.rs` | Azure Table Storage session rows: Shared Key Lite signing, hashed row keys, upsert/get/delete, optional configuration |
+| `crates/orange-signal/src/social.rs` | Canonical mutual relationships, request transitions, revisions and account admission bounds |
+| `crates/orange-signal/src/store/social.rs` | Profile and friendship entities in the existing table, ETag conditional writes and paginated queries |
 | `crates/orange-relay/src/main.rs` | Production relay entry, `PORT`, Ctrl-C shutdown selection |
 | `crates/orange-updater/src/main.rs` | Updater argument parser, parent wait, checksum, silent installer, restart/failure record |
 
@@ -178,19 +182,30 @@ unchanged; what changed is that the client can now obtain the code itself.
 host client            relay                       viewer client
     |                    |                              |
     |-- Host{visible_to} ->  Room{host_id, host_avatar,  |
-    |   (Discord ids from |       visible_to, code}      |
-    |    preferences.json)|                              |
+    |   (legacy fallback) |       visible_to, code}      |
     |                     |<-- GET /presence?ids= -------|  every 15 s, bearer
     |                     |                              |
-    |                     |--- per id, only if the room  |
-    |                         lists this caller:         |
+    |                     |--- per id, authorized by     |
+    |                         the mutual friendship:     |
     |                         offline | live{code} | full |
     |                                                    |
     |<========== ordinary code join with that code ======|
 ```
 
-- The roster is client-side, in `preferences.json`. The relay never stores a
-  friend graph; it only indexes what a host declares when it opens a room.
+- The relay owns the roster. `GET /friends` returns accepted friends and
+  incoming/outgoing requests. `POST /friends` takes an action, target id and
+  request revision; only the recipient can accept or decline, and only the
+  sender can cancel. Either friend can remove an accepted relationship.
+- The configured session table is reused: `profile` rows hold authenticated
+  Discord profiles; `friendship` rows hold one canonical sorted-id pair. A
+  single ETag-conditional transition makes acceptance mutual without a two-row
+  partial write. Repeated actions are idempotent; request revisions reject
+  stale Accept actions after cancellation and a new request.
+- Clients poll every 15 seconds and after mutations, using the existing HTTP
+  worker/connection pool. One worker serializes snapshots and mutations. Account
+  resets discard cancelled results. `preferences.json` caches roster and
+  suggestions by Discord account; legacy device-wide friends migrate once as
+  suggestions, never as accepted cloud friendships.
 - `visible_to` is not an access boundary on the room. Anyone holding the code
   can still join. It decides only who is *handed* the code without being told
   it, so the security model is unchanged and the discovery model is new.
@@ -198,15 +213,35 @@ host client            relay                       viewer client
   Reporting them differently would leak the fact hiding was meant to hide.
 - `full` is distinct from `live` because a viewer shown a join button that
   immediately fails on `ROOM_VIEWER_CAPACITY` was misled by the button.
-- A profile is only refreshed while its owner is streaming: `identify` returns
-  the caller's own Discord profile and nothing else, so opening a room is the
-  one moment the relay learns a host's name and avatar. The client caches the
-  last one it saw so an offline friend still has a face.
-- Friendships are created from a code join, in both directions, and only when
-  the user accepts. `StreamInfo` carries the host's identity to the viewer and
-  `ViewerJoined` carries the viewer's to the host; both are needed, because a
-  one-sided add produces a row that reads "Not streaming" while the person is
-  streaming. Adding is never automatic: codes get pasted into group chats.
+- Authenticated friends sync registers the caller's profile, reusing existing
+  valid sessions without another Discord login. A target must open the updated
+  client once to register. Relationship rows cache both profiles; live presence
+  can refresh the local display. Confirmed 401 responses clear the desktop
+  session and return to sign-in; Azure lookup failures remain 503, not signout.
+- Personal friend codes (`orange-friend:1:<Discord id>:<display name>`) allow
+  sending requests from Home without a stream. They carry a shared name,
+  not proof of identity, a session token, or an avatar download URL. The client
+  bounds and validates pasted codes and shows the profile before sending a
+  request. The server resolves the target from its authenticated profile row,
+  not from the name in the code.
+- Code joins also offer friendship: `StreamInfo` carries the host's identity
+  to the viewer and `ViewerJoined` carries the viewer's to the host. Child
+  status queues distinct profiles; the UI drains them inside its tick into a
+  bounded, in-memory offer list. Offers survive child teardown and appear on
+  Home, Watching, and Streaming until added, dismissed, or the app exits.
+  Keeping the offer state on the UI thread lets its before/after digest detect
+  arrivals rather than reading an already-updated child mutex twice.
+- Accepted relationships authorize discovery even for already-running rooms.
+  Pending and closed rows override `visible_to`, including removal tombstones.
+  Only pairs with no canonical row use the old room visibility list. Friend
+  removal does not evict existing viewers or invalidate a known room code.
+- Social HTTP requests have 32 shared permits, 60 reads/minute/account and 30
+  changes/minute/account. Active relationships cap at 256; pair history caps at
+  4,096 before inserting a new pair, preserving bounded complete reads. Queries
+  follow continuation tokens and fail rather than returning partial inboxes.
+  The single-replica relay serializes mutation admission to protect per-account
+  limits across distinct pair writes. Multi-replica writers would need atomic
+  account quotas. Filtered partition scans are deliberate at the current scale.
 
 ## Host Media Flow
 

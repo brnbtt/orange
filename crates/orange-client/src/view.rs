@@ -15,6 +15,7 @@
 mod chrome;
 mod home;
 mod pick;
+mod requests;
 mod settings;
 mod stream;
 mod toast;

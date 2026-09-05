@@ -29,11 +29,14 @@ impl Orange {
             .unwrap_or(false);
 
         div()
+            .id("streaming-content")
             .flex()
             .flex_col()
             .gap_3()
             .flex_1()
             .min_h(px(0.0))
+            .overflow_y_scroll()
+            .children(self.render_friend_offer(cx))
             .child(
                 div()
                     .flex()
@@ -172,8 +175,9 @@ impl Orange {
                     .flex()
                     .flex_col()
                     .gap_1p5()
-                    .flex_1()
-                    .min_h(px(0.0))
+                    // This section lives in the scrolling content. Shrinking
+                    // it to zero lets names overlap Back when an offer arrives.
+                    .flex_shrink_0()
                     .child(
                         label(
                             if viewers.is_empty() {
@@ -200,13 +204,16 @@ impl Orange {
                     ),
             )
             .child(
-                secondary("back-streaming", "Back").on_click(cx.listener(|this, _, _, cx| {
-                    this.screen = Screen::Home;
-                    cx.notify();
-                })),
+                secondary("back-streaming", "Back")
+                    .flex_shrink_0()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.screen = Screen::Home;
+                        cx.notify();
+                    })),
             )
             .child(
                 secondary("stop", "Stop streaming")
+                    .flex_shrink_0()
                     .text_color(rgb(DANGER))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.stop_host();
@@ -268,6 +275,7 @@ impl Orange {
                 ),
                 SUCCESS,
             ))
+            .children(self.render_friend_offer(cx))
             .child(
                 div()
                     .flex()

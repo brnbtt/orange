@@ -53,14 +53,14 @@ struct Body {
     friends: Vec<Entry>,
 }
 
-pub(crate) struct PresenceJob {
+pub(crate) struct PresenceJob<T = Vec<Entry>> {
     cancel: Arc<AtomicBool>,
     cancelled_at: Option<Instant>,
-    receiver: mpsc::Receiver<Result<Vec<Entry>, PresenceError>>,
+    receiver: mpsc::Receiver<Result<T, PresenceError>>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl PresenceJob {
+impl<T> PresenceJob<T> {
     pub(crate) fn is_finished(&self) -> bool {
         let finished = self.worker.as_ref().is_none_or(JoinHandle::is_finished);
         if !finished {
@@ -78,7 +78,7 @@ impl PresenceJob {
         self.cancelled_at.get_or_insert_with(Instant::now);
     }
 
-    pub(crate) fn take_result(&self) -> Option<Result<Vec<Entry>, PresenceError>> {
+    pub(crate) fn take_result(&self) -> Option<Result<T, PresenceError>> {
         // Signout can race a completed send. Cancellation is checked by the
         // consumer too, not just immediately before the worker sends.
         if self.cancel.load(Ordering::Acquire) {
@@ -94,7 +94,7 @@ impl PresenceJob {
     }
 }
 
-impl Drop for PresenceJob {
+impl<T> Drop for PresenceJob<T> {
     fn drop(&mut self) {
         self.cancel();
         self.join();
@@ -152,6 +152,17 @@ pub(crate) fn start(
         return;
     }
     let ids: Vec<String> = friends.iter().map(|friend| friend.id.clone()).collect();
+    *job = Some(start_job(client, move |client| {
+        fetch(&client, &url, &token, &ids)
+    }));
+}
+
+/// Friend snapshots and mutations use the same cancellable HTTP worker as
+/// presence, including the consumer-side check for results queued at signout.
+pub(crate) fn start_job<T: Send + 'static>(
+    client: PresenceClient,
+    request: impl FnOnce(reqwest::blocking::Client) -> Result<T, PresenceError> + Send + 'static,
+) -> PresenceJob<T> {
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let (sender, receiver) = mpsc::channel();
@@ -159,20 +170,18 @@ pub(crate) fn start(
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
-        let result = client
-            .client()
-            .and_then(|client| fetch(&client, &url, &token, &ids));
+        let result = client.client().and_then(request);
         if worker_cancel.load(Ordering::Acquire) {
             return;
         }
         let _ = sender.send(result);
     });
-    *job = Some(PresenceJob {
+    PresenceJob {
         cancel,
         cancelled_at: None,
         receiver,
         worker: Some(worker),
-    });
+    }
 }
 
 /// Why a poll failed, when the difference changes what the user should do.

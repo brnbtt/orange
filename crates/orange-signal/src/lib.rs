@@ -14,6 +14,7 @@ mod client;
 mod protocol;
 mod relay;
 mod server;
+mod social;
 mod store;
 
 pub use client::{connect, SignalClient};

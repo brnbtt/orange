@@ -151,6 +151,13 @@ pub struct Auth {
 
 impl Auth {
     pub fn new(config: Option<DiscordConfig>) -> Self {
+        Self::with_store(config, crate::store::TableStore::from_env())
+    }
+
+    pub(crate) fn with_store(
+        config: Option<DiscordConfig>,
+        store: Option<crate::store::TableStore>,
+    ) -> Self {
         Self {
             config,
             state: Arc::new(Mutex::new(AuthState::default())),
@@ -159,7 +166,7 @@ impl Auth {
                 .timeout(DISCORD_REQUEST_TIMEOUT)
                 .build()
                 .expect("constant Discord HTTP client configuration is valid"),
-            store: crate::store::TableStore::from_env(),
+            store,
         }
     }
 
@@ -343,35 +350,41 @@ impl Auth {
     /// miss, so a warm relay never touches it and a cold one pays a single
     /// lookup per returning user.
     pub async fn identify(&self, session: &str) -> Option<Identity> {
+        match self.identify_checked(session).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                eprintln!("[auth] session lookup failed: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// HTTP clients clear rejected credentials. Preserve storage failures so
+    /// a cold relay cannot turn an Azure outage into a mass signout.
+    pub(crate) async fn identify_checked(&self, session: &str) -> Result<Option<Identity>> {
         {
             let mut auth = self.state.lock().await;
             auth.expire_session(session, SystemTime::now());
             if let Some(stored) = auth.sessions.get(session) {
-                return Some(stored.identity.clone());
+                return Ok(Some(stored.identity.clone()));
             }
         }
 
-        let store = self.store.as_ref()?;
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
         // The lock is released across this await on purpose: a table round
         // trip while holding it would serialise every other authentication.
-        let found = match store.get_session(session).await {
-            Ok(found) => found,
-            Err(error) => {
-                // Unreachable storage is not proof of a missing session, and
-                // treating it as one would sign everyone out during exactly
-                // the incident this store exists to survive.
-                eprintln!("[auth] session lookup failed: {error:#}");
-                return None;
-            }
+        let Some((identity, created_at)) = store.get_session(session).await? else {
+            return Ok(None);
         };
-        let (identity, created_at) = found?;
         if SystemTime::now()
             .duration_since(created_at)
             .unwrap_or_default()
             >= SESSION_TTL
         {
             let _ = store.delete_session(session).await;
-            return None;
+            return Ok(None);
         }
 
         self.state.lock().await.cache_session(
@@ -381,7 +394,7 @@ impl Auth {
                 created_at,
             },
         );
-        Some(identity)
+        Ok(Some(identity))
     }
 
     /// Mint a session without a round trip to Discord, so tests of things that

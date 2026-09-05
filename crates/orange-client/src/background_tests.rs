@@ -333,6 +333,7 @@ impl HttpServer {
                         Err(error) => panic!("request: {error}"),
                     }
                     let mut request = line;
+                    let mut content_length = 0;
                     loop {
                         let mut header = String::new();
                         connection.as_mut().unwrap().read_line(&mut header).unwrap();
@@ -340,7 +341,19 @@ impl HttpServer {
                             break;
                         }
                         assert!(!header.is_empty(), "incomplete headers");
+                        if let Some((name, value)) = header.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse::<usize>().unwrap();
+                            }
+                        }
                         request.push_str(&header);
+                    }
+                    if content_length > 0 {
+                        assert!(content_length <= 4096, "unexpectedly large test request");
+                        let mut body = vec![0; content_length];
+                        std::io::Read::read_exact(connection.as_mut().unwrap(), &mut body).unwrap();
+                        request.push_str("\r\n");
+                        request.push_str(std::str::from_utf8(&body).unwrap());
                     }
                     break request;
                 };
