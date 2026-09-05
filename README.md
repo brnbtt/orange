@@ -167,6 +167,9 @@ or a cross-vendor performance guarantee.
 
 ## Install
 
+Download the latest Windows beta from the [Orange website](https://orangealpha0d8d5893e69a3.z15.web.core.windows.net/).
+Website source and deployment instructions live in [website/README.md](website/README.md).
+
 The beta uses a one-click per-user installer. Open
 `orange-setup-<version>.exe`; it installs Orange under
 `%LOCALAPPDATA%\Programs\orange`, creates a Start menu shortcut, and opens the

@@ -22,6 +22,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  website:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: download manifest behavior
+        run: node --test website/release.test.mjs
+
   gate:
     runs-on: ubuntu-latest
     steps:
