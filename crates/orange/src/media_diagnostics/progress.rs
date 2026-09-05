@@ -63,7 +63,7 @@ pub(crate) struct MediaSnapshot {
     audio_depay: StageSnapshot,
     audio_decoded: StageSnapshot,
     audio_sink_input: StageSnapshot,
-    /// How far ahead of the audio the picture is, at the two sinks.
+    /// Difference of the last sink-input PTS values, not physical lip-sync.
     av_offset_ms: Option<i64>,
     keyframes: u64,
     queue_overruns: u64,
@@ -166,17 +166,13 @@ impl MediaProgress {
     }
 }
 
-/// How far ahead of the audio the picture is, measured at the two sinks.
+/// Compare progress at the inputs, not what the viewer sees and hears.
 ///
-/// Positive means video is newer than the sound playing beside it, which is
-/// what "audio plays later" looks like from inside the pipeline. Both
-/// timestamps come from the same sender timeline, so their difference is the
-/// offset itself and not either branch's own latency.
-///
-/// The two probes fire independently, so this carries up to one buffer of
-/// sampling noise - about 10 ms of audio against one video frame. That is far
-/// below the offsets worth chasing and well above zero, so do not read a small
-/// non-zero value as a fault.
+/// A 500ms-late audio marker can reach these probes before it is played. RTP
+/// reconstructs timestamps at the receiver, segments may have different starts,
+/// and a stalled branch leaves an old PTS here. Consequently this value neither
+/// measures device buffering nor proves A/V synchronization. Keep the field for
+/// diagnostic compatibility; playout uses segment running time and the clock.
 fn av_offset_ms(video: &StageSnapshot, audio: &StageSnapshot) -> Option<i64> {
     let video = i64::try_from(video.pts_ms?).ok()?;
     let audio = i64::try_from(audio.pts_ms?).ok()?;
@@ -205,8 +201,8 @@ pub(crate) fn track_pad(pad: &gst::Pad, stage: MediaStage, progress: Arc<MediaPr
     });
 }
 
-/// A buffer with no PTS contributes nothing: it cannot place the stream on the
-/// sender's timeline, so the previous timestamp stays as the better answer.
+/// Preserve the last observed PTS when this buffer has none. Its age is not
+/// bounded by the newest buffer's silent_ms, so it is only progress telemetry.
 fn buffer_pts_ms(buffer: &gst::BufferRef) -> Option<u64> {
     Some(buffer.pts()?.mseconds())
 }

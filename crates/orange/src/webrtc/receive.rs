@@ -4,7 +4,7 @@ use gstreamer as gst;
 use gstreamer_video::prelude::VideoOverlayExtManual;
 use std::sync::Arc;
 
-use super::{workers::AudioControlWorker, ReceiveOutput};
+use super::{workers::AudioControlWorker, LivePlayout, ReceiveOutput};
 use crate::media_diagnostics::{
     measure_operation, track_pad, MediaProgress, MediaStage, Operation,
 };
@@ -202,11 +202,14 @@ fn build_av1_depayloader(diagnostic_role: &str) -> Result<ReceiveElement> {
 }
 
 fn build_live_video_queue(diagnostic_role: &str) -> Result<ReceiveElement> {
-    build_receive_element(diagnostic_role, "video-presentation-queue", "queue", || {
+    build_receive_element(diagnostic_role, "video-playout-queue", "queue", || {
         gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 1u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 0u64)
+            .property("max-size-buffers", 0u32)
+            .property("max-size-bytes", 16_000_000u32)
+            .property(
+                "max-size-time",
+                super::playout::MAX_CORRECTION_NS + 500_000_000,
+            )
             .property_from_str("leaky", "downstream")
             .build()
             .context("video presentation queue is unavailable")
@@ -217,7 +220,9 @@ fn build_video_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
     build_receive_element(diagnostic_role, "video-sink", "d3d11videosink", || {
         gst::ElementFactory::make("d3d11videosink")
             .property("async", false)
-            .property("sync", false)
+            .property("sync", true)
+            .property("show-preroll-frame", false)
+            .property("max-lateness", 40_000_000i64)
             .property("force-aspect-ratio", true)
             .build()
             .context("d3d11videosink is unavailable")
@@ -246,7 +251,7 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
         || {
             gst::ElementFactory::make("wasapi2sink")
                 .property("async", false)
-                .property("sync", false)
+                .property("sync", true)
                 .property("buffer-time", 40_000i64)
                 .property("latency-time", 10_000i64)
                 .build()
@@ -261,7 +266,7 @@ fn build_audio_sink(diagnostic_role: &str) -> Result<ReceiveElement> {
         Err(_) => build_receive_element(diagnostic_role, "audio-sink", "wasapisink", || {
             gst::ElementFactory::make("wasapisink")
                 .property("async", false)
-                .property("sync", false)
+                .property("sync", true)
                 .property("buffer-time", 40_000i64)
                 .property("latency-time", 10_000i64)
                 .build()
@@ -291,6 +296,7 @@ pub fn build_receive_branch(
     pad: &gst::Pad,
     output: ReceiveOutput,
     progress: Option<Arc<MediaProgress>>,
+    playout: &Arc<LivePlayout>,
     diagnostic_role: &str,
 ) -> Result<()> {
     let window_playback = match &output {
@@ -340,7 +346,7 @@ pub fn build_receive_branch(
         );
         track_pad(&decoded_pad, MediaStage::Decoded, progress.clone());
     }
-    if let Some(playback) = window_playback {
+    if let Some(playback) = window_playback.clone() {
         notify_on_first_buffer(&decoded_pad, move || {
             playback.connection_event(crate::connection::ConnectionEvent::FirstVideoFrame);
         })?;
@@ -366,13 +372,11 @@ pub fn build_receive_branch(
                 },
             )?;
             crate::overlay::attach(&composition.element, &playback)?;
-            let queue = build_live_video_queue(diagnostic_role)?;
-
             let sink = build_video_sink(diagnostic_role)?;
+            playout.attach(&sink.element, false, diagnostic_role)?;
             attach_video_sink_to_playback(&sink, &playback)?;
-            // Probed at the sink rather than at the decoder, so the timestamp
-            // pairs with the audio sink's and their difference is the offset a
-            // viewer actually perceives.
+            // This measures sink input, before clock scheduling and device
+            // buffering. It is progress telemetry, not acoustic lip-sync.
             if let Some(progress) = &progress {
                 track_pad(
                     &sink
@@ -384,7 +388,7 @@ pub fn build_receive_branch(
                 );
             }
 
-            vec![queue, composition, sink]
+            vec![composition, sink]
         }
         ReceiveOutput::File { path, encoder } => {
             // Re-encode only because writing raw frames to disk is impractical.
@@ -414,7 +418,13 @@ pub fn build_receive_branch(
         }
     };
 
-    let mut all = vec![depay, parse, dec];
+    let mut all = vec![depay, parse];
+    if window_playback.is_some() {
+        // Clocked presentation needs a reservoir. Queue compressed access
+        // units so waiting for audio does not retain a pile of GPU surfaces.
+        all.push(build_live_video_queue(diagnostic_role)?);
+    }
+    all.push(dec);
     all.extend(tail);
 
     attach_receive_elements(
@@ -440,6 +450,7 @@ pub(crate) fn build_audio_branch(
     pad: &gst::Pad,
     overlay: Option<crate::overlay::SharedOverlay>,
     progress: Option<Arc<MediaProgress>>,
+    playout: &Arc<LivePlayout>,
     diagnostic_role: &str,
 ) -> Result<Option<AudioControlWorker>> {
     let initial_volume = overlay
@@ -467,6 +478,7 @@ pub(crate) fn build_audio_branch(
             .build()?)
     })?;
     let sink = build_audio_sink(diagnostic_role)?;
+    playout.attach(&sink.element, true, diagnostic_role)?;
 
     if let Some(progress) = progress {
         track_pad(
@@ -524,10 +536,76 @@ pub(crate) fn build_audio_branch(
 }
 
 #[cfg(test)]
+#[path = "receive_playout_tests.rs"]
+mod playout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::{build_video_payloader, rtp_caps};
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn live_video_does_not_present_a_frame_before_its_timestamp() {
+        // The old sink presented immediately, even while the matching audio
+        // was still scheduled in the sound device. Observe D3D presentation,
+        // rather than a sink-input probe which runs before clock scheduling.
+        gst::init().unwrap();
+        let owner = crate::window::PlaybackWindow::spawn(
+            "orange presentation timing test",
+            crate::window::PlaybackProfile::FriendViewer { cascade: 0 },
+        )
+        .unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.use_clock(Some(&gst::SystemClock::obtain()));
+        let source = gst::ElementFactory::make("appsrc")
+            .property("is-live", true)
+            .property_from_str("format", "time")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("format", "BGRA")
+                    .field("width", 64i32)
+                    .field("height", 64i32)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let sink = build_video_sink("test").unwrap();
+        sink.element.set_property("emit-present", true);
+        sink.element.set_property("show-preroll-frame", false);
+        attach_video_sink_to_playback(&sink, &owner.handle()).unwrap();
+        pipeline.add_many([&source, &sink.element]).unwrap();
+        source.link(&sink.element).unwrap();
+        let (presented, received) = std::sync::mpsc::sync_channel(4);
+        let weak = pipeline.downgrade();
+        sink.element.connect("present", false, move |_| {
+            if let Some(now) = weak
+                .upgrade()
+                .and_then(|pipeline| pipeline.current_running_time())
+            {
+                let _ = presented.try_send(now);
+            }
+            None
+        });
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let timestamp =
+            pipeline.current_running_time().unwrap() + gst::ClockTime::from_mseconds(500);
+        let mut buffer = gst::Buffer::with_size(64 * 64 * 4).unwrap();
+        buffer.get_mut().unwrap().set_pts(timestamp);
+        assert_eq!(
+            source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&buffer]),
+            gst::FlowReturn::Ok
+        );
+        let presentation = received.recv_timeout(std::time::Duration::from_secs(2));
+        pipeline.set_state(gst::State::Null).unwrap();
+        let presentation = presentation.expect("video was never presented");
+        assert!(
+            presentation >= timestamp,
+            "frame due at {timestamp} presented at {presentation}"
+        );
+    }
 
     #[test]
     fn rtp_caps_advertise_the_configured_frame_rate() {
@@ -630,13 +708,16 @@ mod tests {
     }
 
     #[test]
-    fn presentation_queue_keeps_only_the_live_decoded_frame() {
+    fn playout_queue_bounds_compressed_media_while_waiting_for_audio() {
         gst::init().unwrap();
         let queue = build_live_video_queue("test").unwrap();
 
-        assert_eq!(queue.element.property::<u32>("max-size-buffers"), 1);
-        assert_eq!(queue.element.property::<u32>("max-size-bytes"), 0);
-        assert_eq!(queue.element.property::<u64>("max-size-time"), 0);
+        assert_eq!(queue.element.property::<u32>("max-size-buffers"), 0);
+        assert_eq!(queue.element.property::<u32>("max-size-bytes"), 16_000_000);
+        assert_eq!(
+            queue.element.property::<u64>("max-size-time"),
+            1_500_000_000
+        );
     }
 
     #[test]
@@ -646,9 +727,9 @@ mod tests {
         let audio = build_audio_sink("test").unwrap();
 
         assert!(!video.element.property::<bool>("async"));
-        assert!(!video.element.property::<bool>("sync"));
+        assert!(video.element.property::<bool>("sync"));
         assert!(!audio.element.property::<bool>("async"));
-        assert!(!audio.element.property::<bool>("sync"));
+        assert!(audio.element.property::<bool>("sync"));
         assert_eq!(audio.element.property::<i64>("buffer-time"), 40_000);
         assert_eq!(audio.element.property::<i64>("latency-time"), 10_000);
     }

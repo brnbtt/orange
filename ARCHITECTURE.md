@@ -133,6 +133,8 @@ animation gate as the grid and logo aura.
 | `crates/orange/src/peer/watch.rs` | Viewer join, offer/answer handling, dynamic receive pads, playback ownership, receive teardown |
 | `crates/orange/src/webrtc.rs` | WebRTC facade, loopback graph, payloaders, output ownership split, accepted-pad dispatch |
 | `crates/orange/src/webrtc/receive.rs` | Transactional dynamic video/audio receive branches, decoder/sink construction, rollback |
+| `crates/orange/src/webrtc/playout.rs` | Shared live playout correction, segment-to-running-time deadlines, audio resynchronization and expired-timeline failure |
+| `crates/orange/src/webrtc/receive_playout_tests.rs`, `crates/orange/src/webrtc/playout_webrtc_tests.rs` | Hardware marker tests comparing D3D presentation with actual process-loopback audio output, through direct RTP and two WebRTC peers |
 | `crates/orange/src/webrtc/workers.rs` | First audio/video pad claims, audio-control and bitrate workers, cancellation, probe removal, joining |
 | `crates/orange/src/webrtc/transport.rs` | RTP payload/caps constants and live jitterbuffer policy |
 | `crates/orange/src/window.rs` | Playback owner versus passive handle, dedicated window thread, DPI/refresh helpers, bounded shutdown policy |
@@ -284,8 +286,8 @@ Window capture supplies its process PID and excludes other applications; whole-s
 
 ```text
 webrtcbin RTP pad
-  -> rtph265depay -> h265parse -> d3d11h265dec
-  -> one-buffer leaky queue -> overlaycomposition -> d3d11videosink -> owned HWND
+  -> rtph265depay -> h265parse -> bounded compressed queue -> d3d11h265dec
+  -> overlaycomposition -> clocked d3d11videosink -> owned HWND
 
 webrtcbin OPUS pad
   -> rtpopusdepay -> opusdec -> audioconvert -> audioresample
@@ -296,6 +298,18 @@ webrtcbin OPUS pad
 - Dynamic receive construction blocks the pad, links and synchronizes all elements, then removes the probe; failure unlinks, sets Null, removes elements, and removes the probe.
 - Live receive latency is 100 ms. Video/RTX jitterbuffers drop at the live edge;
   Opus does not silently drop late packets and uses decoder packet-loss concealment.
+- Live outputs use `sync=true`, `async=false`, and one fixed system clock.
+  If media arrives too late for its scheduled playback, both sinks receive the
+  same positive `ts-offset` correction and the next real audio buffer receives
+  `RESYNC`. The correction leaves 60 ms of scheduling headroom and is capped at
+  one second. Isolated expired buffers are discarded; one second of continuously
+  expired input reports a playback error instead of staying silently connected.
+  The video reservoir is before decode, bounded to 1.5 seconds / 16 MB of
+  compressed access units, rather than retaining decoded GPU surfaces.
+- `media-progress.av_offset_ms` subtracts the last sink-input PTS values. It
+  precedes rendering and device buffering and is not a perceptual lip-sync
+  measurement. `playout-correction` records the observed running time, buffer
+  running time, configured sink latency and shared correction when it changes.
 - Overlay composition cache hits hash borrowed metadata and displayed numeric
   buckets without formatting labels. One connection-stage snapshot supplies
   the key and any labels drawn on a miss; collapsed status skips unused text.
@@ -410,6 +424,11 @@ cargo test --locked --workspace --all-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo build --locked --release --workspace --all-features
+
+# Hardware A/V acceptance: quiet audio markers captured from Windows loopback,
+# D3D presentation, 60/120 fps, and two WebRTC peers including high-bitrate H.265.
+cargo test --locked -p orange delayed_audio_is_audible -- --ignored --nocapture --test-threads=1
+cargo test --locked -p orange webrtc_audio_is_audible -- --ignored --nocapture --test-threads=1
 
 # Builds and validates the per-user installer; requires Inno Setup 6.
 .\package.ps1
