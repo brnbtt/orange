@@ -6,6 +6,8 @@
 #
 # Re-running overwrites the public assets and adds CORS only if needed.
 # The index is uploaded last so its dependencies exist before it becomes live.
+# Each deploy snapshots the public beta download into a temporary index, leaving
+# the checked-in preview fallback untouched.
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -40,6 +42,9 @@ $uploads = @(
     @{ Source = 'website/screenshots/home.png'; Name = 'screenshots/home.png'; Type = 'image/png' }
     @{ Source = 'website/screenshots/pick.png'; Name = 'screenshots/pick.png'; Type = 'image/png' }
     @{ Source = 'website/screenshots/streaming.png'; Name = 'screenshots/streaming.png'; Type = 'image/png' }
+    @{ Source = 'website/screenshots/add-friend.png'; Name = 'screenshots/add-friend.png'; Type = 'image/png' }
+    @{ Source = 'website/screenshots/requests.png'; Name = 'screenshots/requests.png'; Type = 'image/png' }
+    @{ Source = 'website/screenshots/requests-incoming.png'; Name = 'screenshots/requests-incoming.png'; Type = 'image/png' }
     @{ Source = 'website/404.html'; Name = '404.html'; Type = 'text/html; charset=utf-8' }
     @{ Source = 'assets/logo.png'; Name = 'logo.png'; Type = 'image/png' }
     @{ Source = 'website/index.html'; Name = 'index.html'; Type = 'text/html; charset=utf-8' }
@@ -52,56 +57,93 @@ foreach ($upload in $uploads) {
 }
 Get-Command az -ErrorAction Stop | Out-Null
 
-Invoke-WebsiteAzure @(
-    'storage', 'blob', 'service-properties', 'update',
-    '--account-name', $storageAccount, '--auth-mode', 'key',
-    '--static-website', 'true', '--index-document', 'index.html', '--404-document', '404.html'
-) | Out-Null
-
-# Azure assigns a regional web endpoint; it cannot be derived from the blob URL.
-$account = Invoke-WebsiteAzure @(
-    'storage', 'account', 'show', '--name', $storageAccount, '--resource-group', $resourceGroup
-)
-$endpoint = [string]$account.primaryEndpoints.web
-$uri = $null
-if (-not [Uri]::TryCreate($endpoint, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
-    throw 'Azure did not return an HTTPS static website endpoint'
+# GitHub releases are private. Fetch the public manifest before any mutation so
+# a failed release lookup cannot replace the site's working download snapshot.
+$releaseBase = 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/'
+$release = Invoke-RestMethod -Uri "${releaseBase}orange-beta.json" -Method Get -TimeoutSec 20
+$versionPattern = '(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
+if ($null -eq $release -or $release -is [Array] -or
+    ($release.schema -isnot [int] -and $release.schema -isnot [long]) -or $release.schema -ne 1 -or
+    $release.channel -cne 'beta' -or $release.version -isnot [string] -or
+    $release.version -cnotmatch "\A$versionPattern\z" -or
+    $release.installer_url -isnot [string] -or
+    $release.installer_url -cne "${releaseBase}orange-setup-$($release.version).exe") {
+    throw 'Invalid public beta release manifest'
 }
-$origin = $uri.GetLeftPart([UriPartial]::Authority)
 
-$properties = Invoke-WebsiteAzure @(
-    'storage', 'blob', 'service-properties', 'show', '--account-name', $storageAccount, '--auth-mode', 'key'
-)
-if ($null -eq $properties -or $null -eq $properties.PSObject.Properties['cors']) {
-    throw 'Azure did not return blob service CORS properties'
+$indexUpload = $uploads[-1]
+$html = [IO.File]::ReadAllText($indexUpload.Path)
+$downloadPattern = '(?<=\shref=")' + [Regex]::Escape($releaseBase) + 'orange-setup-' + $versionPattern + '\.exe(?=")'
+$fallbackPattern = '(?<=<span data-fallback-version>)' + $versionPattern + '(?=</span>)'
+if ([Regex]::Matches($html, $downloadPattern).Count -ne 2 -or
+    [Regex]::Matches($html, $fallbackPattern).Count -ne 1) {
+    throw 'Website index must contain exactly two trusted installer hrefs and one fallback version span'
 }
-$allowsRead = $false
-foreach ($rule in $properties.cors) {
-    # CLI versions serialize these fields as lists or comma-separated strings.
-    $methods = @($rule.allowedMethods) -join ','
-    if (($methods -split ',' | ForEach-Object { $_.Trim() }) -notcontains 'GET') { continue }
-    foreach ($allowedOrigin in ((@($rule.allowedOrigins) -join ',') -split ',')) {
-        # Storage supports both a full wildcard and wildcard subdomain origins.
-        $pattern = '^' + [Regex]::Escape($allowedOrigin.Trim()).Replace('\*', '.*') + '$'
-        if ([Regex]::IsMatch($origin, $pattern)) { $allowsRead = $true; break }
+$html = [Regex]::Replace($html, $downloadPattern, $release.installer_url)
+$html = [Regex]::Replace($html, $fallbackPattern, $release.version)
+
+$stagedIndex = $null
+try {
+    $stagedIndex = [IO.Path]::GetTempFileName()
+    [IO.File]::WriteAllText($stagedIndex, $html, (New-Object Text.UTF8Encoding($false)))
+    $indexUpload.Path = $stagedIndex
+
+    Invoke-WebsiteAzure @(
+        'storage', 'blob', 'service-properties', 'update',
+        '--account-name', $storageAccount, '--auth-mode', 'key',
+        '--static-website', 'true', '--index-document', 'index.html', '--404-document', '404.html'
+    ) | Out-Null
+
+    # Azure assigns a regional web endpoint; it cannot be derived from the blob URL.
+    $account = Invoke-WebsiteAzure @(
+        'storage', 'account', 'show', '--name', $storageAccount, '--resource-group', $resourceGroup
+    )
+    $endpoint = [string]$account.primaryEndpoints.web
+    $uri = $null
+    if (-not [Uri]::TryCreate($endpoint, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
+        throw 'Azure did not return an HTTPS static website endpoint'
     }
-    if ($allowsRead) { break }
-}
-if (-not $allowsRead) {
-    # cors add preserves unrelated rules. Unlike blob commands, it has no
-    # --auth-mode parameter and obtains the account key through the CLI login.
-    Invoke-WebsiteAzure @(
-        'storage', 'cors', 'add', '--account-name', $storageAccount,
-        '--services', 'b', '--methods', 'GET', 'HEAD', '--origins', $origin, '--max-age', '3600'
-    ) | Out-Null
-}
+    $origin = $uri.GetLeftPart([UriPartial]::Authority)
 
-foreach ($upload in $uploads) {
-    Invoke-WebsiteAzure @(
-        'storage', 'blob', 'upload', '--account-name', $storageAccount, '--auth-mode', 'key',
-        '--container-name', '$web', '--name', $upload.Name, '--file', $upload.Path,
-        '--overwrite', 'true', '--content-type', $upload.Type, '--content-cache-control', 'no-cache', '--no-progress'
-    ) | Out-Null
-}
+    $properties = Invoke-WebsiteAzure @(
+        'storage', 'blob', 'service-properties', 'show', '--account-name', $storageAccount, '--auth-mode', 'key'
+    )
+    if ($null -eq $properties -or $null -eq $properties.PSObject.Properties['cors']) {
+        throw 'Azure did not return blob service CORS properties'
+    }
+    $allowsRead = $false
+    foreach ($rule in $properties.cors) {
+        # CLI versions serialize these fields as lists or comma-separated strings.
+        $methods = @($rule.allowedMethods) -join ','
+        if (($methods -split ',' | ForEach-Object { $_.Trim() }) -notcontains 'GET') { continue }
+        foreach ($allowedOrigin in ((@($rule.allowedOrigins) -join ',') -split ',')) {
+            # Storage supports both a full wildcard and wildcard subdomain origins.
+            $pattern = '^' + [Regex]::Escape($allowedOrigin.Trim()).Replace('\*', '.*') + '$'
+            if ([Regex]::IsMatch($origin, $pattern)) { $allowsRead = $true; break }
+        }
+        if ($allowsRead) { break }
+    }
+    if (-not $allowsRead) {
+        # cors add preserves unrelated rules. Unlike blob commands, it has no
+        # --auth-mode parameter and obtains the account key through the CLI login.
+        Invoke-WebsiteAzure @(
+            'storage', 'cors', 'add', '--account-name', $storageAccount,
+            '--services', 'b', '--methods', 'GET', 'HEAD', '--origins', $origin, '--max-age', '3600'
+        ) | Out-Null
+    }
 
-Write-Host "Website deployed: $endpoint" -ForegroundColor Green
+    foreach ($upload in $uploads) {
+        Invoke-WebsiteAzure @(
+            'storage', 'blob', 'upload', '--account-name', $storageAccount, '--auth-mode', 'key',
+            '--container-name', '$web', '--name', $upload.Name, '--file', $upload.Path,
+            '--overwrite', 'true', '--content-type', $upload.Type, '--content-cache-control', 'no-cache', '--no-progress'
+        ) | Out-Null
+    }
+
+    Write-Host "Website deployed: $endpoint" -ForegroundColor Green
+}
+finally {
+    if ($null -ne $stagedIndex -and (Test-Path -LiteralPath $stagedIndex)) {
+        Remove-Item -LiteralPath $stagedIndex -Force
+    }
+}

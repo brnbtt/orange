@@ -1,6 +1,8 @@
 (async () => {
   const base = 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/';
   const status = document.getElementById('release-status');
+  const links = document.querySelectorAll('[data-download]');
+  const fallbackVersion = links[0].href.match(/orange-setup-(\d+\.\d+\.\d+)\.exe$/)?.[1];
   try {
     const response = await fetch(`${base}orange-beta.json`, {
       cache: 'no-store',
@@ -15,17 +17,17 @@
         release.installer_url !== `${base}orange-setup-${release.version}.exe`) {
       throw new Error('Invalid release');
     }
-    for (const link of document.querySelectorAll('[data-download]')) {
+    for (const link of links) {
       link.href = release.installer_url;
       link.textContent = 'Download for Windows';
     }
-    status.textContent = `Version ${release.version} · Beta · Windows 10 / 11 · 64-bit`;
+    status.textContent = `Version ${release.version} · Windows 10 / 11 · 64-bit`;
     if (typeof release.notes === 'string') {
       document.getElementById('release-notes').textContent = release.notes;
     }
   } catch {
-    // The HTML already links to all releases, including prereleases. GitHub's
-    // /latest endpoint would skip the beta channel we actually publish.
-    status.textContent = 'Windows 10 / 11 · 64-bit · Get the latest beta on GitHub.';
+    // The repository is private. Deploy bakes a public, immutable installer
+    // into the HTML so a failed check still leaves a usable download.
+    status.textContent = `Update check unavailable. Download ${fallbackVersion || 'the saved release'} above, or reload to check again.`;
   }
 })();

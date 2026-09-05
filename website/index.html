@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0d0d10">
-  <meta name="description" content="Orange is a free Windows app for peer-to-peer game and window streaming. Hardware-encoded video, app audio, and a native player. Download the latest beta.">
+  <meta name="description" content="Stream your games directly to friends with Orange for Windows. GPU encoding, game audio, and a native player. Add your squad with personal friend codes.">
   <meta property="og:title" content="ORANGE / Peer-to-peer game streaming">
-  <meta property="og:description" content="Share a game, a window, or your whole display directly with friends. Free and open source. Windows 10 / 11.">
+  <meta property="og:description" content="Share your game and game audio directly with friends. Add your squad, see who's streaming, and join from Orange. Windows 10 / 11.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://orangealpha0d8d5893e69a3.z15.web.core.windows.net/">
   <meta property="og:image" content="https://orangealpha0d8d5893e69a3.z15.web.core.windows.net/screenshots/streaming.png">
@@ -24,7 +24,7 @@
       <a class="brand" href="/" aria-label="Orange home"><img src="/logo.png" alt="" width="36" height="36"><span>ORANGE</span></a>
       <nav aria-label="Main navigation">
         <a class="nav-detail" href="#how-it-works">The app</a>
-        <a class="nav-detail" href="https://github.com/brnbtt/orange">Source <span aria-hidden="true">↗</span></a>
+        <a class="nav-detail" href="#friends">Add friends</a>
         <a class="nav-download" href="#download">Download <span aria-hidden="true">↓</span></a>
       </nav>
     </header>
@@ -32,58 +32,76 @@
     <main id="main">
       <section class="hero" aria-labelledby="hero-title">
         <div class="hero-copy">
-          <div class="hero-identity"><img src="/logo.png" width="104" height="104" alt=""><div><span class="wordmark">ORANGE</span><span class="eyebrow">Windows / Screen sharing</span></div></div>
+          <div class="hero-identity"><img src="/logo.png" width="104" height="104" alt=""><div><span class="wordmark">ORANGE</span><span class="eyebrow">Windows / Game streaming</span></div></div>
           <h1 id="hero-title">Stream games.<br><span>Peer to peer.</span></h1>
-          <p class="hero-description">Share a game, a window, or your whole display. Your GPU encodes the video; your friends watch it in a native Windows player.</p>
+          <p class="hero-description">Share your game window and game audio. Your GPU encodes the video; your squad watches in a native Windows player.</p>
           <div class="hero-actions">
-            <a class="button" data-download href="https://github.com/brnbtt/orange/releases">Get Orange for Windows</a>
+            <a class="button" data-download href="https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-1.0.0.exe">Download for Windows</a>
             <a class="text-link" href="#how-it-works">See how it works <span aria-hidden="true">↓</span></a>
           </div>
-          <p class="fine-print">Windows 10 / 11 · 64-bit · Free &amp; open source</p>
+          <p class="fine-print">Windows 10 / 11 · 64-bit</p>
           <div class="hero-spec"><span class="crosshair" aria-hidden="true"></span><span>One host encode.<br>A direct connection to each viewer.</span></div>
         </div>
         <figure class="hero-capture">
           <div class="capture-label"><span>Client / Streaming</span><span>01</span></div>
           <a class="capture-frame" href="/screenshots/streaming.png" target="_blank" rel="noopener" aria-label="Open the Orange streaming screenshot at full size">
-            <img src="/screenshots/streaming.png" width="720" height="990" fetchpriority="high" alt="Orange's streaming screen showing the shared window, a room code, and two fictional viewers.">
+            <img src="/screenshots/streaming.png" width="720" height="990" fetchpriority="high" alt="Orange streaming a demo FPS match with a room code and gaming handles in the viewer list.">
           </a>
-          <figcaption>Actual app capture. Demo source and session data.<br><span>Open image for full size <span aria-hidden="true">↗</span></span></figcaption>
+          <figcaption>Native app capture. Demo gameplay and player data.<br><span>Open image for full size <span aria-hidden="true">↗</span></span></figcaption>
         </figure>
       </section>
 
       <dl class="spec-strip" aria-label="Streaming features">
         <div><dt>Video</dt><dd>H.265 / H.264<span>Hardware encoding</span></dd></div>
         <div><dt>Transport</dt><dd>Peer to peer<span>No server-side re-encode</span></dd></div>
-        <div><dt>Audio</dt><dd>Window or system<span>Matches what you share</span></dd></div>
+        <div><dt>Audio</dt><dd>Your game's sound<span>App-scoped window audio</span></dd></div>
       </dl>
 
       <section class="workflow" id="how-it-works" aria-labelledby="workflow-title">
-        <div class="section-heading"><div><p class="eyebrow"><span>02</span> / The app</p><h2 id="workflow-title">Pick a window.<br>Share the code.</h2></div><p>Install Orange on both PCs. Sign in with Discord for names and friends, or join by code without an account.</p></div>
-        <div class="workflow-grid">
+        <div class="section-heading"><div><p class="eyebrow"><span>02</span> / Start streaming</p><h2 id="workflow-title">Pick your game.<br>Share the match.</h2></div><p>Install Orange on both PCs. You can join a room by code without signing in, or sign in with Discord to add friends.</p></div>
+        <div class="workflow-grid workflow-pair">
           <article class="workflow-step">
-            <div class="step-heading"><span class="step-number">01</span><h3>Choose a source</h3></div>
-            <p>Open <strong>Start streaming</strong>, choose your quality, then click a window preview. Whole-display sharing is a separate option.</p>
-            <a class="screenshot-link" href="/screenshots/pick.png" target="_blank" rel="noopener" aria-label="Open the source picker screenshot at full size"><img src="/screenshots/pick.png" width="720" height="990" loading="lazy" alt="The actual Orange source picker with staged window thumbnails, a whole-display option, and quality settings."></a>
+            <div class="step-heading"><span class="step-number">01</span><h3>Select the game</h3></div>
+            <p>Open <strong>Start streaming</strong>, choose your quality, then click your game's preview. Use <strong>Entire display</strong> if you want to share everything on screen.</p>
+            <a class="screenshot-link" href="/screenshots/pick.png" target="_blank" rel="noopener" aria-label="Open the game picker screenshot at full size"><img src="/screenshots/pick.png" width="720" height="990" loading="lazy" alt="Orange's source picker with demo FPS, racing, and RPG game windows and quality settings."></a>
             <div class="screen-note"><span class="note-marker" aria-hidden="true">└</span> Click a preview to start sharing.</div>
           </article>
           <article class="workflow-step">
             <div class="step-heading"><span class="step-number">02</span><h3>Send the code</h3></div>
             <p>Send a friend the room code. They copy it to their clipboard, then click <strong>Join with a code</strong> in Orange.</p>
-            <a class="screenshot-link" href="/screenshots/streaming.png" target="_blank" rel="noopener" aria-label="Open the streaming screen screenshot at full size"><img src="/screenshots/streaming.png" width="720" height="990" loading="lazy" alt="Orange's streaming screen with a staged source preview, room code, and fictional viewers."></a>
+            <a class="screenshot-link" href="/screenshots/streaming.png" target="_blank" rel="noopener" aria-label="Open the streaming screen screenshot at full size"><img src="/screenshots/streaming.png" width="720" height="990" loading="lazy" alt="A demo FPS match in Orange's source preview, with the room code and fictional players watching."></a>
             <div class="screen-note"><span class="note-marker" aria-hidden="true">└</span> Click the room code to copy it.</div>
           </article>
+        </div>
+      </section>
+
+      <section class="workflow friends-section" id="friends" aria-labelledby="friends-title">
+        <div class="section-heading"><div><p class="eyebrow"><span>03</span> / Friend setup · 1.0</p><h2 id="friends-title">Add your squad.<br>No stream required.</h2></div><p>Both players sign in with Discord. Use a personal friend code to send a request, or a room code to join an active stream.</p></div>
+        <div class="workflow-grid">
           <article class="workflow-step">
-            <div class="step-heading"><span class="step-number">03</span><h3>Keep your friends</h3></div>
-            <p>Add each other after joining. Next time they're live, their stream appears in your friends list with a <strong>Join</strong> button.</p>
-            <a class="screenshot-link" href="/screenshots/home.png" target="_blank" rel="noopener" aria-label="Open the friends list screenshot at full size"><img src="/screenshots/home.png" width="720" height="990" loading="lazy" alt="The home screen's friends list: Maya is streaming with a Join action, while Jules is offline."></a>
-            <div class="screen-note"><span class="note-marker" aria-hidden="true">└</span> Join a friend's stream from the list.</div>
+            <div class="step-heading"><span class="step-number">01</span><h3>Send a request</h3></div>
+            <p>Ask your friend to click <strong>Copy my friend code</strong> and send it to you. Copy it, click <strong>Add friend</strong>, check the profile, then choose <strong>Send request</strong>.</p>
+            <a class="screenshot-link" href="/screenshots/add-friend.png" target="_blank" rel="noopener" aria-label="Open the friend request confirmation screenshot at full size"><img src="/screenshots/add-friend.png" width="720" height="990" loading="lazy" alt="Orange showing a demo player's profile after Add friend, with Send request and Dismiss actions."></a>
+            <div class="screen-note"><span class="note-marker" aria-hidden="true">└</span> Add friend reads your clipboard.</div>
+          </article>
+          <article class="workflow-step">
+            <div class="step-heading"><span class="step-number">02</span><h3>Accept in Requests</h3></div>
+            <p>The recipient opens <strong>Requests</strong> and clicks <strong>Accept</strong>. One acceptance adds both players. Incoming requests can be declined; sent requests can be cancelled.</p>
+            <a class="screenshot-link" href="/screenshots/requests-incoming.png" target="_blank" rel="noopener" aria-label="Open the incoming Requests screenshot at full size"><img src="/screenshots/requests-incoming.png" width="720" height="990" loading="lazy" alt="Orange's Requests tab showing an incoming request from respawned with Accept and Decline actions."></a>
+            <div class="screen-note"><span class="note-marker" aria-hidden="true">└</span> Pending is not an accepted friendship.<br><a class="text-link" href="/screenshots/requests.png" target="_blank" rel="noopener">View sent requests <span aria-hidden="true">↗</span></a></div>
+          </article>
+          <article class="workflow-step">
+            <div class="step-heading"><span class="step-number">03</span><h3>Join when they're live</h3></div>
+            <p>Once accepted, you're in each other's <strong>Friends</strong> list. When your friend streams, click <strong>Join</strong>. You don't need to send another room code.</p>
+            <a class="screenshot-link" href="/screenshots/home.png" target="_blank" rel="noopener" aria-label="Open the gaming friends list screenshot at full size"><img src="/screenshots/home.png" width="720" height="990" loading="lazy" alt="Orange's Friends tab with fragbyte streaming and a Join button, while nightshift is offline."></a>
+            <div class="screen-note"><span class="note-marker" aria-hidden="true">└</span> Accepted friendships survive app restarts.</div>
           </article>
         </div>
-        <p class="capture-disclosure">Screenshots from the Windows app, populated with demo profiles, sources, and session data. Select any screenshot to inspect the full-size UI.</p>
+        <p class="capture-disclosure">Native Windows app captures with fictional player handles and original demo game scenes. Select any image for the full-size UI.</p>
       </section>
 
       <section class="media-section" aria-labelledby="media-title">
-        <div class="section-heading"><div><p class="eyebrow"><span>03</span> / Under the hood</p><h2 id="media-title">Your PC does<br>the streaming.</h2></div><p>The relay helps the PCs connect. Video and audio travel directly between them.</p></div>
+        <div class="section-heading"><div><p class="eyebrow"><span>04</span> / Under the hood</p><h2 id="media-title">Your PC does<br>the streaming.</h2></div><p>The relay helps the PCs connect. Video and audio travel directly between them.</p></div>
         <div class="signal-path" aria-label="Media flow: capture, hardware encode, direct connection, native player">
           <div><span>01 / YOUR PC</span><strong>Capture</strong><p>Game, window, or display</p></div><span class="path-arrow" aria-hidden="true">→</span>
           <div><span>02 / YOUR GPU</span><strong>Encode once</strong><p>H.265 or H.264</p></div><span class="path-arrow" aria-hidden="true">→</span>
@@ -94,26 +112,27 @@
       </section>
 
       <section class="faq-section" aria-labelledby="faq-title">
-        <div><p class="eyebrow"><span>04</span> / Details</p><h2 id="faq-title">Before installing.</h2></div>
+        <div><p class="eyebrow"><span>05</span> / Details</p><h2 id="faq-title">Before installing.</h2></div>
         <div class="questions">
           <details><summary>What hardware do I need?</summary><p>A 64-bit Windows 10 or Windows 11 PC. Sharing requires a compatible hardware H.265 or H.264 encoder. Keep your graphics drivers current; hardware and Windows version affect feature support.</p></details>
-          <details><summary>Do I need a Discord account?</summary><p>No. You can host and join with a room code without signing in. Discord sign-in adds your name, avatar, and friend discovery. Orange is independent of Discord.</p></details>
+          <details><summary>Do I need a Discord account?</summary><p>You can host and join with a room code without signing in. Both players need Discord sign-in to exchange friend requests and use the synced friends list. Orange is independent of Discord.</p></details>
+          <details><summary>Is a friend code the same as a room code?</summary><p>No. A personal friend code identifies a player so you can send them a request. A room code joins an active stream. Use <strong>Add friend</strong> for the first and <strong>Join with a code</strong> for the second.</p></details>
           <details><summary>Who can join my stream?</summary><p>Anyone who has your room code can join and can pass it on. The friends list controls who can discover your stream; it doesn't restrict access to people with the code.</p></details>
-          <details><summary>What's the status of the beta?</summary><p>Orange is in active development. The installer isn't code-signed yet, so Windows may display an unrecognized-app warning. Download from the official release links and report problems on <a href="https://github.com/brnbtt/orange/issues">GitHub</a>.</p></details>
+          <details><summary>What does the installer include?</summary><p>The Windows app and its media runtime. It installs for your user and creates a Start menu shortcut. Download buttons on this site link directly to Orange's Azure release storage.</p></details>
         </div>
       </section>
 
       <section class="download-section" id="download" aria-labelledby="download-title">
-        <div class="download-copy"><img src="/logo.png" width="88" height="88" alt=""><div><p class="eyebrow">Windows / Beta</p><h2 id="download-title">Download Orange.</h2><p>Free, open source, and installed per user.</p></div></div>
+        <div class="download-copy"><img src="/logo.png" width="88" height="88" alt=""><div><p class="eyebrow">Windows / Latest release</p><h2 id="download-title">Download Orange.</h2><p>Game streaming. Direct to your friends.</p></div></div>
         <div class="download-action">
-          <a class="button" data-download href="https://github.com/brnbtt/orange/releases">Get Orange for Windows</a>
-          <p id="release-status" class="fine-print" role="status">Windows 10 / 11 · 64-bit · Latest beta on GitHub</p>
+          <a class="button" data-download href="https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-1.0.0.exe">Download for Windows</a>
+          <p id="release-status" class="fine-print" role="status">Windows 10 / 11 · 64-bit</p>
           <p id="release-notes" class="release-notes"></p>
-          <a class="text-link" href="https://github.com/brnbtt/orange/releases">Release history <span aria-hidden="true">↗</span></a>
+          <noscript><p class="fine-print">JavaScript is off. These buttons download version <span data-fallback-version>1.0.0</span>, current when this page was published.</p></noscript>
         </div>
       </section>
     </main>
-    <footer class="site-footer"><a class="brand" href="/" aria-label="Orange home"><img src="/logo.png" width="28" height="28" alt=""><span>ORANGE</span></a><p>Peer-to-peer streaming / MIT licensed</p><div><a href="https://github.com/brnbtt/orange">Source code</a><a href="https://github.com/brnbtt/orange/issues">Report an issue <span aria-hidden="true">↗</span></a></div></footer>
+    <footer class="site-footer"><a class="brand" href="/" aria-label="Orange home"><img src="/logo.png" width="28" height="28" alt=""><span>ORANGE</span></a><p>Peer-to-peer game streaming</p><div><a href="#friends">Friend setup</a><a href="#download">Download <span aria-hidden="true">↑</span></a></div></footer>
   </div>
 </body>
 </html>

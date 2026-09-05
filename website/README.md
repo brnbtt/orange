@@ -12,11 +12,18 @@ IBM Plex Mono, charcoal and sand, orange accents, hairline grids, open corner
 brackets, and registration marks. Copy describes actual actions and media flow;
 avoid slogans or claims that are not supported by the app.
 
+Orange's source-availability and licensing policy is undecided. The public site
+must not describe the app as open source or advertise a source-code license.
+Third-party font notices apply only to those fonts.
+
 Fonts are self-hosted. Their sources and licenses are in `fonts/README.md`.
-The three screenshots are actual GPUI client renders with staged data, not
+The six screenshots are actual GPUI client renders with staged data, not
 HTML recreations of the app or images from the early concept boards. See
 `screenshots/README.md` for capture provenance. Screenshots link to their full
 resolution, and the page labels their demo data explicitly.
+Demo content uses gaming handles and original FPS, racing, and RPG scenes.
+The 1.0 walkthrough distinguishes room codes from personal friend codes and
+shows request confirmation, acceptance, and joining an accepted friend's stream.
 
 ## Hosting and cost
 
@@ -42,9 +49,11 @@ node --test website/release.test.mjs
 .\deploy\website.ps1
 ```
 
-The script checks all twelve source assets, enables static hosting, discovers the
+The script checks all fifteen source assets, fetches and validates the public
+release manifest, and stages an index with that installer as its fallback. It
+then enables static hosting, discovers the
 web endpoint, and adds a Blob-service GET/HEAD CORS rule for that origin if one
-does not already allow reads. Existing CORS rules are preserved. Only twelve
+does not already allow reads. Existing CORS rules are preserved. Only fifteen
 explicit public files are uploaded, with correct MIME types and `no-cache`
 revalidation; the index is uploaded last. Re-running deploy updates these files.
 The script does not deploy the relay or publish an app release.
@@ -59,13 +68,19 @@ also holds installers and sessions.
 clients use, with `cache: 'no-store'` and an eight-second timeout. After checking
 the schema, beta channel, version and exact installer URL, it updates both
 download buttons, the version label, and release notes. Notes are inserted as
-text, not HTML. New app releases require **no website deployment**.
+text, not HTML. With JavaScript enabled, new app releases require **no website
+deployment**. The distribution manifest still uses the `beta` channel internally;
+the website displays its actual version rather than inferring stability from it.
 
 The publisher already uploads and verifies the installer before updating that
-manifest. The website does not keep a second release pointer. If JavaScript is
-disabled, the network fails, or the manifest is invalid, links still reach
-GitHub's releases page. `/releases/latest` is intentionally avoided because it
-excludes the prereleases that Orange currently publishes.
+manifest. Public users cannot access the private repository's GitHub releases
+(anonymous requests return HTTP 404). Every site deployment therefore snapshots
+the public Azure installer URL into both HTML buttons. JavaScript failures leave
+those immutable links working; the failure message names the saved version.
+With JavaScript disabled, a note identifies the version current when the site
+was deployed. Redeploy to refresh that fallback snapshot. The checked-in preview
+uses the existing 1.0.0 installer; the deployed HTML is generated in a temporary
+file and does not modify it.
 
 CORS is configured on the **Blob endpoint** serving the manifest, not on the
 static website endpoint (which does not support CORS). Changing the website's
@@ -86,10 +101,10 @@ npx --yes http-server $preview -p 4173 -c-1
 ```
 
 Open `http://localhost:4173`. The local origin is not permitted to read the
-production manifest, so the GitHub fallback is expected locally. Do not broaden
+production manifest, so the saved Azure installer fallback is expected locally. Do not broaden
 production CORS for a preview. Node tests cover successful and rejected
 manifests and network errors without contacting Azure; the PowerShell tests
-replace only the Azure boundary and verify real script behavior.
+replace public HTTP and Azure boundaries and verify real script behavior.
 
 Before deploying, check 320px, 375px, tablet and desktop widths, keyboard focus,
 FAQ expansion, reduced motion, and the no-JavaScript fallback. After deployment,

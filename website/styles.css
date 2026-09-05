@@ -83,10 +83,13 @@ h2 { font-size: 30px; letter-spacing: -.02em; }
 .section-heading h2 { margin-top: 14px; }
 .section-heading > p { color: var(--muted); max-width: 440px; font-size: 13px; }
 .workflow-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; }
+.workflow-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: 900px; margin: auto; gap: 48px; }
+.friends-section { border-top: 1px solid var(--border); }
 .step-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
 .step-number { color: var(--orange); font-size: 12px; }
 h3 { font-size: 16px; }
 .workflow-step > p { color: var(--muted); font-size: 12px; min-height: 106px; margin-bottom: 24px; }
+.friends-section .workflow-step > p { min-height: 150px; }
 .screenshot-link { display: block; border: 1px solid #3b3430; background: var(--ink); transition: border-color 180ms ease; }
 .screenshot-link img { width: 100%; }
 .screenshot-link:hover { border-color: var(--orange); }
@@ -157,6 +160,7 @@ details p a { color: var(--text); }
   .section-heading > p { margin-top: 20px; max-width: 580px; }
   .workflow-grid { grid-template-columns: 1fr; gap: 48px; max-width: 480px; margin: auto; }
   .workflow-step > p { min-height: 0; font-size: 14px; }
+  .friends-section .workflow-step > p { min-height: 0; }
   h3 { font-size: 19px; }
   .screen-note { font-size: 12px; }
   .signal-path { grid-template-columns: 1fr auto 1fr; gap: 28px 16px; }

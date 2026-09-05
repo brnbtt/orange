@@ -1,27 +1,28 @@
-# Reproduce the native screenshots
+# Reproduce the native 1.0.0 captures
 
-This is local capture tooling, **not website content to deploy**. It adds a
-temporary Rust fixture only to a separate disposable worktree. The website
-checkout's production crates are never patched.
+Local capture tooling, **not website content to deploy**. It patches only a
+separate disposable linked worktree; the website checkout's production crates
+and all renderer files remain untouched.
 
-Requirements: Windows desktop session, the Orange Rust/GStreamer development
+Requirements: Windows desktop session, Orange's Rust/GStreamer development
 environment, Python 3 with Pillow, and a clean worktree at
-`5a767a02f436a82eeb21fe8624399aee40e0c0da` (Orange 0.9.2).
+`b5c4584964dc3d8468317b992dfdcde02179776a` (**Orange 1.0.0**). This includes
+the mutual-friend implementation and the fixed streaming controls.
 
 1. Fetch `origin/main` and create a separate worktree following `AGENTS.md`.
-   Check the revision above if reproducing these exact screenshots.
-2. In the clean worktree, run `. .\dev.ps1` then
+   For exact reproduction, pin it to the revision above.
+2. In that clean worktree, run `. .\dev.ps1` followed by
    `cargo test --locked -p orange-client`.
-3. From this directory, run:
+3. From this capture-tool directory, run:
 
    ```powershell
    python prepare.py C:\path\to\disposable-worktree
    ```
 
-   This copies `fixture.rs` into the temporary client source, redirects its
-   entry point, seeds `code()` / `viewers()`, and creates original artwork in
-   `capture-art/`. It deliberately refuses to patch the website checkout.
-   Run once against clean source.
+   This copies `fixture.rs` into temporary client source, redirects its entry
+   point, seeds `code()` / `viewers()`, and invokes `game_art.py` to create
+   original demo-game frames in `capture-art/`. Run once against clean source.
+   The preparation script rejects the website checkout and main checkouts.
 
 4. Build from the disposable worktree:
 
@@ -31,23 +32,34 @@ environment, Python 3 with Pillow, and a clean worktree at
    cargo build --locked -p orange-client
    ```
 
-5. With Windows display scaling set to 150%, run from this directory:
+5. With Windows display scaling at 150%, run from this tool directory:
 
    ```powershell
    python capture.py C:\path\to\disposable-worktree
    ```
 
-   The script launches three isolated fixture processes, waits for the native
-   windows to paint, captures their client areas with Win32 `PrintWindow`, and
-   terminates only those processes. It hovers Coastline in the picker to match
-   the next screen, then restores the pointer. Output defaults to
-   `../screenshots/`; use `--output PATH` to save elsewhere.
+The script launches five isolated native fixture processes: Home, picker,
+Streaming, profile confirmation, and Requests. It waits for paint, captures
+the client area with Win32 `PrintWindow`, and terminates only those processes.
+Output defaults to `../screenshots/`; use `--output PATH` for another directory.
 
-The fixture bypasses the normal startup/polling paths; account directories are
-isolated; session tokens are empty; the configured signalling address is local
-and unused. There is no active capture, media child or network session.
-`view.rs`, `view/`, `ui.rs`, and `ui/` are untouched, including animations and
-hover rendering. Animation timing can cause tiny pixel differences on reruns.
+The pointer hovers Vector Arena in the picker to match the subsequent Streaming
+screen. Requests produces two direct captures: the initial incoming-focused
+`requests-incoming.png`, then `requests.png` after a real mouse-wheel scroll
+reveals Pending/Cancel while retaining Accept/Decline. The pointer is restored.
+No stitching or resizing occurs. Animation timing can cause small differences
+between runs.
 
-Recorded verification: clean client baseline **95 passed, 2 ignored**; fixture
-build succeeded; all three 720 × 990 final captures visually inspected.
+`fixture.rs` seeds the real mutual-friend coordinator through its existing
+public `snapshot` and `synced` fields; no helper or modification to `friends.rs`
+is needed. The request is offered to aimassist before becoming outgoing Pending;
+respawned is incoming; fragbyte and nightshift are already mutual friends.
+
+The fixture bypasses normal startup/polling, isolates account directories, uses
+empty session tokens, and configures an unused loopback signalling address.
+There is no active capture, media child or network session. `game_art.py` draws
+only fictional game-preview pixels, never the Orange interface.
+
+Recorded verification: clean 1.0.0 client baseline **109 passed, 2 ignored**;
+fixture build succeeded; renderer and friend-coordinator diffs are empty;
+all six final 720 × 990 PNGs visually inspected.

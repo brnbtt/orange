@@ -16,6 +16,7 @@ fn preview(name: &str) -> std::sync::Arc<gpui::RenderImage> {
 }
 
 fn state() -> Orange {
+    let capture_screen = std::env::var("ORANGE_CAPTURE_SCREEN").unwrap_or_default();
     let screen = match std::env::var("ORANGE_CAPTURE_SCREEN").as_deref() {
         Ok("pick") => Screen::PickWindow,
         Ok("streaming") => Screen::Streaming,
@@ -23,10 +24,10 @@ fn state() -> Orange {
     };
     let windows: Vec<_> = [
         (0, "Entire display", "display.exe"),
-        (1, "Coastline - evening session", "coastline.exe"),
-        (2, "Weekend ideas", "canvas.exe"),
-        (3, "Little orbit - prototype", "editor.exe"),
-        (4, "Sunday mix", "music.exe"),
+        (1, "Vector Arena - Control", "vectorarena.exe"),
+        (2, "Night Circuit - Time trial", "nightcircuit.exe"),
+        (3, "Blocklands - Survival", "blocklands.exe"),
+        (4, "Runevale - Inventory", "runevale.exe"),
     ]
     .into_iter()
     .map(|(hwnd, title, process)| WindowTarget {
@@ -39,29 +40,56 @@ fn state() -> Orange {
     .collect();
     let thumbnails = [
         (0, "desktop.png"),
-        (1, "coastline.png"),
-        (2, "canvas.png"),
-        (3, "editor.png"),
-        (4, "music.png"),
+        (1, "arena.png"),
+        (2, "racing.png"),
+        (3, "voxel.png"),
+        (4, "rpg.png"),
     ]
     .into_iter()
     .map(|(id, file)| (id, preview(file)))
     .collect();
     let active_target = Some(windows[1].clone());
-    let friends = ["Maya", "Jules"]
+    let friends: Vec<_> = ["fragbyte", "nightshift"]
         .into_iter()
         .map(|name| session::Friend {
-            id: format!("fictional-{}", name.to_lowercase()),
+            id: format!("demo-{name}"),
             name: name.into(),
             avatar_url: None,
         })
         .collect();
+    let contact = |name: &str, id: &str| friends::Contact {
+        profile: session::Friend {
+            id: id.into(),
+            name: name.into(),
+            avatar_url: None,
+        },
+        revision: "demo-request-revision".into(),
+    };
+    let mut friend_sync = friends::Sync::default();
+    friend_sync.synced = true;
+    friend_sync.snapshot.friends = friends
+        .iter()
+        .cloned()
+        .map(|profile| friends::Contact {
+            profile,
+            revision: "demo-mutual-friend".into(),
+        })
+        .collect();
+    friend_sync.snapshot.incoming = vec![contact("respawned", "100000000000000004")];
+    if capture_screen == "requests" {
+        friend_sync.snapshot.outgoing = vec![contact("aimassist", "100000000000000005")];
+    }
+    let friend_offers = if capture_screen == "add-friend" {
+        vec![contact("aimassist", "100000000000000005").profile]
+    } else {
+        Vec::new()
+    };
     Orange {
         client_available: true,
         screen,
         session: Some(session::Session {
-            name: "Alex".into(),
-            id: "fictional-alex".into(),
+            name: "pixelpilot".into(),
+            id: "100000000000000001".into(),
             avatar_url: None,
             token: String::new(),
         }),
@@ -73,7 +101,7 @@ fn state() -> Orange {
         quality: 1,
         fps: 60,
         active_target,
-        active_preview: Some(preview("coastline.png")),
+        active_preview: Some(preview("arena.png")),
         host: None,
         watches: Vec::new(),
         logging_in: None,
@@ -88,14 +116,19 @@ fn state() -> Orange {
         own_codes: Vec::new(),
         viewers_seen: 2,
         friends,
+        friend_offers,
+        friend_accounts: std::collections::HashMap::new(),
+        legacy_friends: Vec::new(),
+        friend_sync,
+        requests_open: capture_screen == "requests",
         presence: [
             (
-                "fictional-maya".into(),
+                "demo-fragbyte".into(),
                 presence::Presence::Live {
-                    code: "SUN-SET".into(),
+                    code: "GG-WP".into(),
                 },
             ),
-            ("fictional-jules".into(), presence::Presence::Offline),
+            ("demo-nightshift".into(), presence::Presence::Offline),
         ]
         .into_iter()
         .collect(),

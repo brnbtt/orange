@@ -17,15 +17,32 @@ function Reset-Azure {
         failAt = 0
         failureMode = "exit"
         endpoint = "https://fixture.z99.web.core.windows.net/"
+        requests = New-Object System.Collections.Generic.List[object]
+        manifest = ('{"schema":1,"channel":"beta","version":"1.0.0","installer_url":"https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-1.0.0.exe"}' | ConvertFrom-Json)
+        httpError = $false
+        uploadedIndex = $null
+        stagedPath = $null
     }
 }
 
-# Only the Azure boundary is replaced: the real script resolves its own files,
-# parses CLI JSON, decides whether to add CORS, and performs ordered uploads.
+# Public HTTP and Azure are the only replaced boundaries; fixture files and
+# staging stay real so stale fallbacks and leaked staging files are observable.
+function Invoke-RestMethod {
+    param([string]$Uri, [string]$Method, [int]$TimeoutSec)
+    $state = $global:OrangeWebsiteTestState
+    $state.requests.Add(@{ Uri = $Uri; Method = $Method; TimeoutSec = $TimeoutSec; AzureCalls = $state.calls.Count })
+    if ($state.httpError) { throw 'Fixture public manifest request failed' }
+    return $state.manifest
+}
+
 function az {
     $arguments = [string[]]$args
     $state = $global:OrangeWebsiteTestState
     $state.calls.Add($arguments)
+    if ((Option $arguments '--name') -eq 'index.html') {
+        $state.stagedPath = Option $arguments '--file'
+        $state.uploadedIndex = [IO.File]::ReadAllText($state.stagedPath)
+    }
     $global:LASTEXITCODE = 0
     if ($state.failAt -eq $state.calls.Count) {
         if ($state.failureMode -like "exit*") { $global:LASTEXITCODE = 23 }
@@ -55,35 +72,108 @@ Assert (Test-Path -LiteralPath $scriptPath -PathType Leaf) 'Website deployment s
 $fixture = Join-Path $env:LOCALAPPDATA "Temp\opencode\website-test-$([Guid]::NewGuid().ToString('N'))"
 $savedExitCode = $global:LASTEXITCODE
 $savedTestState = $global:OrangeWebsiteTestState
+$savedTemp = $env:TEMP
+$savedTmp = $env:TMP
 try {
-    New-Item -ItemType Directory -Path "$fixture\deploy", "$fixture\website\fonts", "$fixture\website\screenshots", "$fixture\assets" -Force | Out-Null
+    New-Item -ItemType Directory -Path "$fixture\deploy", "$fixture\website\fonts", "$fixture\website\screenshots", "$fixture\assets", "$fixture\temp" -Force | Out-Null
+    $env:TEMP = "$fixture\temp"
+    $env:TMP = "$fixture\temp"
     Copy-Item -LiteralPath $scriptPath -Destination "$fixture\deploy\website.ps1"
     $deploy = "$fixture\deploy\website.ps1"
     $assets = @(
         'website/index.html', 'website/styles.css', 'website/release.js', 'website/404.html', 'assets/logo.png',
         'website/fonts/orbitron-latin-700.woff2', 'website/fonts/ibm-plex-mono-latin-400.woff2',
         'website/fonts/orbitron-OFL.txt', 'website/fonts/ibm-plex-mono-OFL.txt',
-        'website/screenshots/home.png', 'website/screenshots/pick.png', 'website/screenshots/streaming.png'
+        'website/screenshots/home.png', 'website/screenshots/pick.png', 'website/screenshots/streaming.png',
+        'website/screenshots/add-friend.png', 'website/screenshots/requests.png', 'website/screenshots/requests-incoming.png'
     )
     foreach ($asset in $assets) { Set-Content -LiteralPath (Join-Path $fixture $asset) -Value 'fixture' }
+    $sourceIndex = @'
+<!doctype html>
+<a href="https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.9.2.exe" data-download>Download for Windows</a>
+<a data-download href="https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.9.2.exe">Download for Windows</a>
+<noscript>Snapshot version <span data-fallback-version>0.9.2</span></noscript>
+<p>Keep unrelated version 0.9.2 and https://example.com/orange-setup-0.9.2.exe intact.</p>
+'@
+    $indexPath = "$fixture\website\index.html"
+    [IO.File]::WriteAllText($indexPath, $sourceIndex)
     Set-Content -LiteralPath "$fixture\website\private.txt" -Value 'must never upload'
 
     # Missing even the final asset must stop before enabling hosting or CORS.
     foreach ($asset in $assets) {
         Reset-Azure
         $path = Join-Path $fixture $asset
+        $originalBytes = [IO.File]::ReadAllBytes($path)
         Remove-Item -LiteralPath $path
         $caught = $null
         try { & $deploy | Out-Null } catch { $caught = $_ }
         Assert ($null -ne $caught) "Missing $asset must fail preflight"
         Assert ($global:OrangeWebsiteTestState.calls.Count -eq 0) "Missing $asset must fail before any Azure command"
-        Set-Content -LiteralPath $path -Value 'fixture'
+        Assert ($global:OrangeWebsiteTestState.requests.Count -eq 0) "Missing $asset must fail before fetching the manifest"
+        [IO.File]::WriteAllBytes($path, $originalBytes)
     }
     Write-Host 'PASS: All local assets are checked before Azure is changed'
+
+    # The private GitHub release returned anonymous 404. An unavailable or
+    # untrusted public snapshot must not replace a working deployed download.
+    foreach ($case in @(
+        @{ field = 'schema'; value = 2 }, @{ field = 'schema'; value = '1' },
+        @{ field = 'schema'; value = $true }, @{ field = 'schema'; value = $null },
+        @{ field = 'channel'; value = 'stable' }, @{ field = 'channel'; value = 'BETA' },
+        @{ field = 'version'; value = '1.0.0-beta.1' }, @{ field = 'version'; value = '01.0.0' },
+        @{ field = 'version'; value = "1.0.0`n" }, @{ field = 'version'; value = 1 },
+        @{ field = 'installer_url'; value = 'https://example.com/orange-setup-1.0.0.exe' },
+        @{ field = 'installer_url'; value = 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.9.2.exe' },
+        @{ field = 'installer_url'; value = 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-1.0.0.exe?token=unexpected' },
+        @{ field = 'installer_url'; value = 'http://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-1.0.0.exe' },
+        @{ field = 'installer_url'; value = 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/ORANGE-SETUP-1.0.0.exe' },
+        @{ field = 'empty' }, @{ field = 'http-error' }
+    )) {
+        Reset-Azure
+        if ($case.field -eq 'empty') { $global:OrangeWebsiteTestState.manifest = $null }
+        elseif ($case.field -eq 'http-error') { $global:OrangeWebsiteTestState.httpError = $true }
+        else { $global:OrangeWebsiteTestState.manifest.($case.field) = $case.value }
+        $caught = $null
+        try { & $deploy | Out-Null } catch { $caught = $_ }
+        Assert ($null -ne $caught) "Invalid/unavailable manifest ($($case.field)) must fail deployment"
+        Assert ($global:OrangeWebsiteTestState.calls.Count -eq 0) 'Invalid/unavailable manifest must fail before Azure mutation'
+        Assert ([IO.File]::ReadAllText($indexPath) -ceq $sourceIndex) 'Manifest failure must leave source HTML untouched'
+        Assert (@(Get-ChildItem -LiteralPath "$fixture\temp" -Force).Count -eq 0) 'Manifest failure must leave no staging files'
+    }
+    Write-Host 'PASS: Unavailable or invalid public manifests fail before Azure is changed'
+
+    foreach ($html in @(
+        $sourceIndex.Replace('<span data-fallback-version>0.9.2</span>', ''),
+        ($sourceIndex + '<span data-fallback-version>0.9.2</span>'),
+        $sourceIndex.Replace('data-download href=', 'data-download data-old-href='),
+        ($sourceIndex + '<a href="https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.9.2.exe">Extra</a>')
+    )) {
+        Reset-Azure
+        [IO.File]::WriteAllText($indexPath, $html)
+        $caught = $null
+        try { & $deploy | Out-Null } catch { $caught = $_ }
+        Assert ($null -ne $caught) 'An ambiguous or missing HTML replacement target must fail deployment'
+        Assert ($global:OrangeWebsiteTestState.calls.Count -eq 0) 'HTML snapshot validation must precede Azure mutation'
+        Assert ([IO.File]::ReadAllText($indexPath) -ceq $html) 'HTML validation must leave its source untouched'
+        Assert (@(Get-ChildItem -LiteralPath "$fixture\temp" -Force).Count -eq 0) 'HTML validation failure must leave no staging files'
+    }
+    [IO.File]::WriteAllText($indexPath, $sourceIndex)
+    Write-Host 'PASS: Exactly two trusted href targets and one fallback version marker are required'
 
     Reset-Azure
     & $deploy | Out-Null
     $firstCalls = @($global:OrangeWebsiteTestState.calls.ToArray())
+    $requests = $global:OrangeWebsiteTestState.requests
+    Assert ($requests.Count -eq 1) 'Every deployment must fetch one current public manifest'
+    Assert ($requests[0].AzureCalls -eq 0) 'The public manifest must be fetched before any Azure command'
+    Assert ($requests[0].Uri -ceq 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-beta.json') 'Manifest must come from the fixed public release URL'
+    Assert ($requests[0].Method -eq 'Get' -and $requests[0].TimeoutSec -eq 20) 'Public manifest GET must time out after twenty seconds'
+    $expectedIndex = $sourceIndex.Replace('https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-0.9.2.exe', 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-1.0.0.exe').Replace('<span data-fallback-version>0.9.2</span>', '<span data-fallback-version>1.0.0</span>')
+    Assert ($global:OrangeWebsiteTestState.uploadedIndex -ceq $expectedIndex) 'Uploaded HTML must snapshot the current public installer and matching fallback version only'
+    Assert ([IO.File]::ReadAllText($indexPath) -ceq $sourceIndex) 'Successful deployment must leave source HTML untouched'
+    Assert (-not (Test-Path -LiteralPath $global:OrangeWebsiteTestState.stagedPath)) 'Successful deployment must clean up its staged index'
+    Assert (@(Get-ChildItem -LiteralPath "$fixture\temp" -Force).Count -eq 0) 'Successful deployment must leave no staging files'
+    Write-Host 'PASS: Deployment uploads a current public download snapshot without changing source HTML or leaving staging files'
     $enable = @($firstCalls | Where-Object { ($_ | Select-Object -First 4) -join ' ' -eq 'storage blob service-properties update' })
     Assert ($enable.Count -eq 1) 'Static hosting must be enabled once per deployment'
     Assert ((Option $enable[0] '--static-website') -eq 'true') 'Static hosting must be enabled'
@@ -110,22 +200,29 @@ try {
         'screenshots/home.png' = @('website/screenshots/home.png', 'image/png')
         'screenshots/pick.png' = @('website/screenshots/pick.png', 'image/png')
         'screenshots/streaming.png' = @('website/screenshots/streaming.png', 'image/png')
+        'screenshots/add-friend.png' = @('website/screenshots/add-friend.png', 'image/png')
+        'screenshots/requests.png' = @('website/screenshots/requests.png', 'image/png')
+        'screenshots/requests-incoming.png' = @('website/screenshots/requests-incoming.png', 'image/png')
     }
     $uploads = @($firstCalls | Where-Object { ($_ | Select-Object -First 3) -join ' ' -eq 'storage blob upload' })
-    Assert ($uploads.Count -eq 12) 'Only the twelve public assets may be uploaded'
+    Assert ($uploads.Count -eq 15) 'Only the fifteen public assets may be uploaded'
     $names = @()
     foreach ($upload in $uploads) {
         $name = Option $upload '--name'
         Assert ($expected.ContainsKey($name)) "Unexpected public file: $name"
         $names += $name
         Assert ((Option $upload '--container-name') -ceq '$web') 'Uploads must target the literal $web container'
-        Assert ((Option $upload '--file') -eq (Join-Path $fixture $expected[$name][0])) "Wrong source for $name"
+        if ($name -eq 'index.html') {
+            Assert ((Option $upload '--file') -ne $indexPath) 'Index upload must use a staged file'
+        } else {
+            Assert ((Option $upload '--file') -eq (Join-Path $fixture $expected[$name][0])) "Wrong source for $name"
+        }
         Assert ((Option $upload '--content-type') -eq $expected[$name][1]) "Wrong MIME type for $name"
         Assert ((Option $upload '--content-cache-control') -eq 'no-cache') "Mutable $name must be revalidated"
         Assert ((Option $upload '--overwrite') -eq 'true') "Repeat deployment must overwrite $name"
         Assert ((Option $upload '--auth-mode') -eq 'key') 'Uploads must use key authentication'
     }
-    Assert (@($names | Select-Object -Unique).Count -eq 12) 'Each public asset must be uploaded once'
+    Assert (@($names | Select-Object -Unique).Count -eq 15) 'Each public asset must be uploaded once'
     Assert ($names[-1] -eq 'index.html') 'Index must be uploaded after its dependencies'
     foreach ($call in $firstCalls) {
         if ($call[1] -eq 'account') {
@@ -137,9 +234,14 @@ try {
     }
     Write-Host 'PASS: Deployment enables hosting and uploads only the public assets with correct headers and index last'
 
+    $global:OrangeWebsiteTestState.manifest.version = '1.0.1'
+    $global:OrangeWebsiteTestState.manifest.installer_url = 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-setup-1.0.1.exe'
     & $deploy | Out-Null
     Assert ($global:OrangeWebsiteTestState.cors.Count -eq 1) 'Repeating deployment must not duplicate CORS'
-    Write-Host 'PASS: Repeating deployment does not duplicate CORS'
+    Assert ($global:OrangeWebsiteTestState.requests.Count -eq 2) 'Repeating deployment must fetch a fresh manifest'
+    Assert ($global:OrangeWebsiteTestState.requests[1].AzureCalls -eq $firstCalls.Count) 'Repeated deployment must fetch before its first Azure command'
+    Assert ($global:OrangeWebsiteTestState.uploadedIndex -ceq $expectedIndex.Replace('1.0.0', '1.0.1')) 'Repeated deployment must snapshot the newly published version'
+    Write-Host 'PASS: Repeating deployment refreshes the snapshot without duplicating CORS'
 
     # A shared account may already serve other origins. Replacing its rule list
     # or testing an origin without its methods would break those consumers.
@@ -171,12 +273,16 @@ try {
             try { & $deploy | Out-Null } catch { $caught = $_ }
             Assert ($null -ne $caught) "Azure $mode failure at command $i must fail deployment"
             Assert ($global:OrangeWebsiteTestState.calls.Count -eq $i) "Azure $mode failure at command $i must prevent subsequent commands"
+            Assert ([IO.File]::ReadAllText($indexPath) -ceq $sourceIndex) 'Azure failure must leave source HTML untouched'
+            Assert (@(Get-ChildItem -LiteralPath "$fixture\temp" -Force).Count -eq 0) "Azure $mode failure at command $i must clean up its staged index"
         }
     }
     Write-Host 'PASS: Native exits, error JSON, and malformed JSON stop every subsequent mutation'
     Write-Host 'RESULT: Website deployment checks passed'
 }
 finally {
+    $env:TEMP = $savedTemp
+    $env:TMP = $savedTmp
     $global:LASTEXITCODE = $savedExitCode
     $global:OrangeWebsiteTestState = $savedTestState
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }

@@ -4,11 +4,11 @@ import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 
 const base = 'https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/';
-const fallback = 'https://github.com/brnbtt/orange/releases';
+const fallback = `${base}orange-setup-0.9.2.exe`;
 const manifest = {
-  schema: 1, channel: 'beta', version: '0.9.2',
-  installer_url: `${base}orange-setup-0.9.2.exe`,
-  notes: 'Smoother viewer controls.',
+  schema: 1, channel: 'beta', version: '1.0.0',
+  installer_url: `${base}orange-setup-1.0.0.exe`,
+  notes: 'Mutual friend requests and synchronized media playback.',
 };
 
 async function render(fetch) {
@@ -36,13 +36,13 @@ test('every download follows the published version and revalidates the manifest'
     return { ok: true, json: async () => manifest };
   });
   assert.ok(result.links.every((link) => link.href === manifest.installer_url));
-  assert.match(result.status.textContent, /0\.9\.2/);
+  assert.match(result.status.textContent, /1\.0\.0/);
   assert.equal(result.notes.textContent, manifest.notes);
 });
 
 // A malformed public response must never turn the site's main action into an
 // arbitrary URL or a download from a different release channel.
-test('untrusted manifests retain a working releases fallback', async () => {
+test('untrusted manifests retain the public Azure installer snapshot', async () => {
   for (const bad of [null, {}, { ...manifest, channel: 'stable' },
     { ...manifest, schema: 2 }, { ...manifest, version: '../file' },
     { ...manifest, installer_url: 'https://example.com/installer.exe' },
@@ -50,7 +50,8 @@ test('untrusted manifests retain a working releases fallback', async () => {
     { ...manifest, installer_url: `${base}orange-setup-0.9.1.exe` }]) {
     const result = await render(async () => ({ ok: true, json: async () => bad }));
     assert.ok(result.links.every((link) => link.href === fallback));
-    assert.match(result.status.textContent, /GitHub/);
+    assert.match(result.status.textContent, /0\.9\.2/);
+    assert.doesNotMatch(result.status.textContent, /GitHub/);
   }
 });
 
@@ -60,6 +61,6 @@ test('network and HTTP failures leave downloads reachable', async () => {
     async () => ({ ok: true, json: async () => { throw new Error('Invalid JSON'); } })]) {
     const result = await render(fetch);
     assert.ok(result.links.every((link) => link.href === fallback));
-    assert.match(result.status.textContent, /GitHub/);
+    assert.match(result.status.textContent, /0\.9\.2/);
   }
 });

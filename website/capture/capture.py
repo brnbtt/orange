@@ -26,6 +26,8 @@ u.SetCursorPos.argtypes=[C.c_int,C.c_int]
 u.GetCursorPos.argtypes=[C.POINTER(W.POINT)]
 u.ClientToScreen.argtypes=[W.HWND,C.POINTER(W.POINT)]
 u.PrintWindow.argtypes=[W.HWND,W.HDC,W.UINT];u.PrintWindow.restype=W.BOOL
+u.SendMessageW.argtypes=[W.HWND,W.UINT,W.WPARAM,W.LPARAM]
+u.SendMessageW.restype=C.c_ssize_t
 g.CreateCompatibleDC.argtypes=[W.HDC];g.CreateCompatibleDC.restype=W.HDC
 g.CreateCompatibleBitmap.argtypes=[W.HDC,C.c_int,C.c_int];g.CreateCompatibleBitmap.restype=W.HBITMAP
 g.SelectObject.argtypes=[W.HDC,W.HANDLE];g.SelectObject.restype=W.HANDLE
@@ -75,7 +77,7 @@ env["LOCALAPPDATA"]=str(args.worktree.resolve()/"capture-local")
 env["ORANGE_SERVER"]="ws://127.0.0.1:9/ws"
 original_cursor=W.POINT()
 u.GetCursorPos(C.byref(original_cursor))
-for screen in ["home","pick","streaming"]:
+for screen in ["home","pick","streaming","add-friend","requests"]:
     env["ORANGE_CAPTURE_SCREEN"]=screen
     process=subprocess.Popen([str(args.worktree.resolve()/"target/debug/orange-tray.exe")],env=env,cwd=args.worktree)
     try:
@@ -96,6 +98,18 @@ for screen in ["home","pick","streaming"]:
         else:
             u.SetCursorPos(0,0)
         time.sleep(3)
+        if screen == "requests":
+            capture(hwnd,args.output/"requests-incoming.png")
+            # The native fixed-size list scrolls; reveal the outgoing actions
+            # without modifying or stitching the GPUI layout.
+            rect=W.RECT();u.GetClientRect(hwnd,C.byref(rect))
+            point=W.POINT(int(240*rect.right/480),int(340*rect.bottom/660))
+            u.ClientToScreen(hwnd,C.byref(point))
+            u.SetCursorPos(point.x,point.y)
+            u.SendMessageW(hwnd,0x020A,(-240 & 0xffff)<<16,(point.x & 0xffff)|((point.y & 0xffff)<<16))
+            time.sleep(1)
+            u.SetCursorPos(0,0)
+            time.sleep(.3)
         capture(hwnd,args.output/f"{screen}.png")
     finally:
         process.terminate()
