@@ -15,12 +15,15 @@ mod history;
 mod logs;
 mod upload;
 
-const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
+const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 const CHECK_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const UPLOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+const REPAIR_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+const MAX_REPAIR_OUTPUT_BYTES: u64 = 16 * 1024;
 const MAX_DETAIL_CHARS: usize = 240;
 const CHECKS_REQUIRED: usize = 7;
+const CHECKS_REQUIRED_SCHEMA2: usize = 9;
 
 const CHILD_FAILURE_DETAIL: &str =
     "Media diagnostic process failed to start or finish; repair or reinstall orange, then run Troubleshoot again.";
@@ -62,10 +65,12 @@ enum CheckId {
     Audio,
     Signalling,
     Stun,
+    Ice,
+    Firewall,
 }
 
 impl CheckId {
-    const ORDER: [Self; CHECKS_REQUIRED] = [
+    const LEGACY_ORDER: [Self; CHECKS_REQUIRED] = [
         Self::Runtime,
         Self::Capture,
         Self::Encoder,
@@ -73,6 +78,18 @@ impl CheckId {
         Self::Audio,
         Self::Signalling,
         Self::Stun,
+    ];
+
+    const ORDER: [Self; CHECKS_REQUIRED_SCHEMA2] = [
+        Self::Runtime,
+        Self::Capture,
+        Self::Encoder,
+        Self::Decoder,
+        Self::Audio,
+        Self::Signalling,
+        Self::Stun,
+        Self::Ice,
+        Self::Firewall,
     ];
 
     fn wire(self) -> &'static str {
@@ -84,6 +101,8 @@ impl CheckId {
             Self::Audio => "audio",
             Self::Signalling => "signalling",
             Self::Stun => "stun",
+            Self::Ice => "ice",
+            Self::Firewall => "firewall",
         }
     }
 
@@ -96,6 +115,8 @@ impl CheckId {
             Self::Audio => "Sound",
             Self::Signalling => "Orange connection",
             Self::Stun => "Network check",
+            Self::Ice => "Connection options",
+            Self::Firewall => "Windows connection settings",
         }
     }
 
@@ -108,6 +129,8 @@ impl CheckId {
             "audio" => Some(Self::Audio),
             "signalling" => Some(Self::Signalling),
             "stun" => Some(Self::Stun),
+            "ice" => Some(Self::Ice),
+            "firewall" => Some(Self::Firewall),
             _ => None,
         }
     }
@@ -119,6 +142,7 @@ pub(super) struct CheckResult {
     pub(super) id: &'static str,
     pub(super) status: CheckStatus,
     pub(super) detail: String,
+    pub(super) repairable: bool,
 }
 
 impl CheckResult {
@@ -130,6 +154,7 @@ impl CheckResult {
                 id: id.wire(),
                 status: CheckStatus::Inconclusive,
                 detail: detail.to_string(),
+                repairable: false,
             })
             .collect()
     }
@@ -138,12 +163,25 @@ impl CheckResult {
 #[derive(Debug, Clone)]
 struct CompletedRun {
     checks: Vec<CheckResult>,
-    history: Vec<String>,
+    history: history::Summary,
+    repair_note: Option<String>,
     generated_at_unix_ms: u128,
 }
 
 impl CompletedRun {
     fn summary(&self) -> &'static str {
+        if self
+            .checks
+            .iter()
+            .all(|check| check.status == CheckStatus::Pass)
+            && self
+                .history
+                .latest
+                .as_ref()
+                .is_some_and(|latest| latest.outcome == history::RecentConnectionOutcome::Failed)
+        {
+            return "Basic checks passed. Your last connection needs attention.";
+        }
         if self
             .checks
             .iter()
@@ -163,10 +201,35 @@ impl CompletedRun {
 }
 
 struct TroubleshootJob {
+    kind: JobKind,
     cancel: Arc<AtomicBool>,
     cancelled_at: Option<Instant>,
-    receiver: mpsc::Receiver<CompletedRun>,
+    receiver: mpsc::Receiver<JobOutcome>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Diagnose,
+    Repair,
+}
+
+enum JobOutcome {
+    Checks(CompletedRun),
+    Repair(RepairOutcome),
+}
+
+enum RepairOutcome {
+    Completed {
+        run: CompletedRun,
+        ui: &'static str,
+        success: bool,
+    },
+    Message {
+        ui: &'static str,
+        success: bool,
+        note: &'static str,
+    },
 }
 
 impl TroubleshootJob {
@@ -269,6 +332,14 @@ pub(super) struct FriendlyCheck {
     pub(super) status: CheckStatus,
     pub(super) state_text: &'static str,
     pub(super) action_text: &'static str,
+    pub(super) repairable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LastConnectionStatus {
+    Connected,
+    Failed,
+    Unknown,
 }
 
 impl Drop for TroubleshootJob {
@@ -285,6 +356,8 @@ pub(super) struct TroubleshootState {
     completed: Option<CompletedRun>,
     upload_state: UploadUiState,
     receipt_id: Option<String>,
+    repair_message: Option<(&'static str, bool)>,
+    repair_note: Option<String>,
     report_revision: u64,
     generation: u64,
 }
@@ -299,6 +372,8 @@ impl TroubleshootState {
             Err(_) => {
                 self.upload_state = UploadUiState::Idle;
                 self.receipt_id = None;
+                self.repair_message = None;
+                self.repair_note = None;
                 self.report_revision = self.report_revision.wrapping_add(1);
                 self.completed = Some(failed_run(CHILD_FAILURE_DETAIL));
                 self.generation = self.generation.wrapping_add(1);
@@ -309,6 +384,45 @@ impl TroubleshootState {
         self.start_with_command(command, diagnostics)
     }
 
+    pub(super) fn start_repair(&mut self, server: &str, diagnostics: Option<PathBuf>) -> bool {
+        if self.job.is_some() || self.upload_job.is_some() {
+            return false;
+        }
+        let Some(firewall) = self
+            .checks()
+            .iter()
+            .find(|check| check.id == "firewall" && check.status == CheckStatus::Fail)
+        else {
+            return false;
+        };
+        if !firewall.repairable {
+            return false;
+        }
+        let mut repair_command = match supervisor::orange_command() {
+            Ok(command) => command,
+            Err(_) => {
+                self.repair_message =
+                    Some(("Could not start the repair. Please try again.", false));
+                self.generation = self.generation.wrapping_add(1);
+                return false;
+            }
+        };
+        repair_command.arg("repair-network");
+        let mut check_command = match supervisor::orange_command() {
+            Ok(command) => command,
+            Err(_) => {
+                self.repair_message = Some((
+                    "Could not run verification checks. Please try again.",
+                    false,
+                ));
+                self.generation = self.generation.wrapping_add(1);
+                return false;
+            }
+        };
+        check_command.arg("troubleshoot").args(["--server", server]);
+        self.start_repair_with_command(repair_command, check_command, diagnostics)
+    }
+
     fn start_with_command(&mut self, command: Command, diagnostics: Option<PathBuf>) -> bool {
         if self.job.is_some() || self.upload_job.is_some() {
             return false;
@@ -316,6 +430,8 @@ impl TroubleshootState {
         self.completed = None;
         self.upload_state = UploadUiState::Hidden;
         self.receipt_id = None;
+        self.repair_message = None;
+        self.repair_note = None;
         self.report_revision = self.report_revision.wrapping_add(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -328,22 +444,146 @@ impl TroubleshootState {
             let history = diagnostics
                 .as_deref()
                 .map(|path| history::summarize(path, &worker_cancel))
-                .unwrap_or_else(|| {
-                    vec!["No recent local diagnostics were found for this install.".to_string()]
+                .unwrap_or_else(|| history::Summary {
+                    lines: vec![
+                        "No recent local diagnostics were found for this install.".to_string()
+                    ],
+                    latest: None,
                 });
             if worker_cancel.load(Ordering::Acquire) {
                 return;
             }
-            let _ = sender.send(CompletedRun {
+            let _ = sender.send(JobOutcome::Checks(CompletedRun {
                 checks,
                 history,
+                repair_note: None,
                 generated_at_unix_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|duration| duration.as_millis())
                     .unwrap_or_default(),
-            });
+            }));
         });
         self.job = Some(TroubleshootJob {
+            kind: JobKind::Diagnose,
+            cancel,
+            cancelled_at: None,
+            receiver,
+            worker: Some(worker),
+        });
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+
+    fn start_repair_with_command(
+        &mut self,
+        repair_command: Command,
+        check_command: Command,
+        diagnostics: Option<PathBuf>,
+    ) -> bool {
+        if self.job.is_some() || self.upload_job.is_some() {
+            return false;
+        }
+        self.repair_message = None;
+        self.repair_note = None;
+        self.report_revision = self.report_revision.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = run_repair(repair_command, &worker_cancel);
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let should_rerun = matches!(
+                outcome,
+                RepairCommandOutcome::Updated
+                    | RepairCommandOutcome::NoChange
+                    | RepairCommandOutcome::NotLocallyRepairable
+                    | RepairCommandOutcome::Failed
+                    | RepairCommandOutcome::CommandError
+            );
+            let outcome = if should_rerun {
+                let checks =
+                    run_checks(check_command, &worker_cancel).unwrap_or_else(CheckResult::failure);
+                if worker_cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let history = diagnostics
+                    .as_deref()
+                    .map(|path| history::summarize(path, &worker_cancel))
+                    .unwrap_or_else(|| history::Summary {
+                        lines: vec![
+                            "No recent local diagnostics were found for this install.".to_string()
+                        ],
+                        latest: None,
+                    });
+                if worker_cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let (note, ui, success) = match outcome {
+                        RepairCommandOutcome::Updated => (
+                            "Repair action: orange repair-network reported Windows settings changed and verified.",
+                            "Windows settings updated. Try your stream again.",
+                            true,
+                        ),
+                        RepairCommandOutcome::NoChange => (
+                            "Repair action: orange repair-network reported no local setting changes were needed.",
+                            "No Windows changes were needed. Try your stream again.",
+                            true,
+                        ),
+                        RepairCommandOutcome::NotLocallyRepairable => (
+                            "Repair action: orange repair-network reported this device is not locally repairable or is managed by policy; verification checks were rerun.",
+                            "This PC could not apply that Windows setting. You can still try Troubleshoot again.",
+                            false,
+                        ),
+                        RepairCommandOutcome::Failed => (
+                            "Repair action: orange repair-network reported an incomplete repair attempt; verification checks were rerun.",
+                            "The repair did not complete. Please try Fix connection again.",
+                            false,
+                        ),
+                        RepairCommandOutcome::CommandError => (
+                            "Repair action: orange repair-network did not complete cleanly; verification checks were rerun.",
+                            "Could not run the repair. Please try again.",
+                            false,
+                        ),
+                        RepairCommandOutcome::PermissionDeclined
+                        | RepairCommandOutcome::Cancelled => unreachable!(),
+                    };
+                JobOutcome::Repair(RepairOutcome::Completed {
+                    run: CompletedRun {
+                        checks,
+                        history,
+                        repair_note: Some(note.to_string()),
+                        generated_at_unix_ms: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|duration| duration.as_millis())
+                            .unwrap_or_default(),
+                    },
+                    ui,
+                    success,
+                })
+            } else {
+                match outcome {
+                    RepairCommandOutcome::PermissionDeclined => {
+                        JobOutcome::Repair(RepairOutcome::Message {
+                            ui: "Windows permission was declined. Please try Fix connection again.",
+                            success: false,
+                            note: "Repair action: orange repair-network reported Windows permission was declined.",
+                        })
+                    }
+                    RepairCommandOutcome::Cancelled => JobOutcome::Repair(RepairOutcome::Message {
+                        ui: "The repair was cancelled. Please try Fix connection again.",
+                        success: false,
+                        note: "Repair action: orange repair-network was cancelled before completion; rerun Troubleshoot to verify current settings.",
+                    }),
+                    _ => unreachable!(),
+                }
+            };
+            let _ = sender.send(outcome);
+        });
+
+        self.job = Some(TroubleshootJob {
+            kind: JobKind::Repair,
             cancel,
             cancelled_at: None,
             receiver,
@@ -364,17 +604,40 @@ impl TroubleshootState {
         }
         job.join();
         let cancelled = job.cancel.load(Ordering::Acquire);
-        let completed = if cancelled {
+        let outcome = if cancelled {
             None
         } else {
             job.receiver.try_recv().ok()
         };
         self.job = None;
-        self.completed =
-            completed.or_else(|| (!cancelled).then(|| failed_run(CHILD_FAILURE_DETAIL)));
-        if self.completed.is_some() {
+        if let Some(outcome) = outcome {
+            match outcome {
+                JobOutcome::Checks(run) => {
+                    self.completed = Some(run);
+                    self.upload_state = UploadUiState::Idle;
+                    self.receipt_id = None;
+                    self.repair_message = None;
+                    self.repair_note = None;
+                }
+                JobOutcome::Repair(RepairOutcome::Completed { run, ui, success }) => {
+                    let repair_note = run.repair_note.clone();
+                    self.completed = Some(run);
+                    self.upload_state = UploadUiState::Idle;
+                    self.receipt_id = None;
+                    self.repair_note = repair_note;
+                    self.repair_message = Some((ui, success));
+                }
+                JobOutcome::Repair(RepairOutcome::Message { ui, success, note }) => {
+                    self.repair_message = Some((ui, success));
+                    self.repair_note = Some(note.to_string());
+                }
+            }
+        } else if !cancelled {
+            self.completed = Some(failed_run(CHILD_FAILURE_DETAIL));
             self.upload_state = UploadUiState::Idle;
             self.receipt_id = None;
+            self.repair_message = None;
+            self.repair_note = None;
         }
         self.report_revision = self.report_revision.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
@@ -424,10 +687,11 @@ impl TroubleshootState {
     }
 
     pub(super) fn cancel(&mut self) {
+        let mut changed = false;
         if let Some(job) = self.job.as_mut() {
             job.cancel();
+            changed = true;
         }
-        let mut changed = false;
         if let Some(job) = self.upload_job.as_mut() {
             job.cancel();
             self.upload_state = UploadUiState::Cancelling;
@@ -444,6 +708,8 @@ impl TroubleshootState {
         self.completed = None;
         self.upload_state = UploadUiState::Hidden;
         self.receipt_id = None;
+        self.repair_message = None;
+        self.repair_note = None;
         self.report_revision = self.report_revision.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
     }
@@ -461,7 +727,15 @@ impl TroubleshootState {
     }
 
     pub(super) fn headline(&self) -> &'static str {
-        if self.job.is_some() {
+        if self.is_cancelling() {
+            "Stopping…"
+        } else if self
+            .job
+            .as_ref()
+            .is_some_and(|job| job.kind == JobKind::Repair)
+        {
+            "Fixing Windows connection settings…"
+        } else if self.job.is_some() {
             "Checking Orange and your connection…"
         } else if self.completed.is_some() {
             "Here’s what we found:"
@@ -476,6 +750,10 @@ impl TroubleshootState {
             .map(|check| {
                 let (state_text, action_text) = match check.status {
                     CheckStatus::Pass => ("Looks good", ""),
+                    CheckStatus::Fail if check.id == "firewall" && check.repairable => (
+                        "Needs attention",
+                        "Select Fix connection to check and update Windows settings.",
+                    ),
                     CheckStatus::Fail => ("Needs attention", fail_action(check.id)),
                     CheckStatus::Inconclusive => ("Could not check", inconclusive_action(check.id)),
                 };
@@ -484,9 +762,45 @@ impl TroubleshootState {
                     status: check.status,
                     state_text,
                     action_text,
+                    repairable: check.id == "firewall"
+                        && check.status == CheckStatus::Fail
+                        && check.repairable,
                 }
             })
             .collect()
+    }
+
+    pub(super) fn latest_connection(&self) -> Option<(LastConnectionStatus, String)> {
+        let run = self.completed.as_ref()?;
+        let latest = run.history.latest.as_ref()?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let age = latest.friendly_age(now_ms);
+        let status = match latest.outcome {
+            history::RecentConnectionOutcome::Connected => LastConnectionStatus::Connected,
+            history::RecentConnectionOutcome::Failed => LastConnectionStatus::Failed,
+            history::RecentConnectionOutcome::Unknown => LastConnectionStatus::Unknown,
+        };
+        Some((status, age))
+    }
+
+    pub(super) fn repair_message(&self) -> Option<(&'static str, bool)> {
+        self.repair_message
+    }
+
+    pub(super) fn is_repair_running(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.kind == JobKind::Repair)
+    }
+
+    pub(super) fn is_cancelling(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.cancelled_at.is_some())
+            || self.upload_state == UploadUiState::Cancelling
     }
 
     pub(super) fn upload_state(&self) -> UploadUiState {
@@ -509,7 +823,8 @@ impl TroubleshootState {
         version: &str,
         build: &str,
     ) -> bool {
-        if self.upload_job.is_some()
+        if self.job.is_some()
+            || self.upload_job.is_some()
             || self.completed.is_none()
             || self.upload_state == UploadUiState::Sent
         {
@@ -591,6 +906,11 @@ impl TroubleshootState {
         lines.push(String::new());
         lines.push(format!("Summary: {}", run.summary()));
         lines.push(String::new());
+        if let Some(note) = self.repair_note.as_ref().or(run.repair_note.as_ref()) {
+            lines.push("Repair action".to_string());
+            lines.push(format!("- {note}"));
+            lines.push(String::new());
+        }
         lines.push("Current checks".to_string());
         for check in &run.checks {
             lines.push(format!(
@@ -603,10 +923,10 @@ impl TroubleshootState {
         }
         lines.push(String::new());
         lines.push("Recent diagnostics".to_string());
-        if run.history.is_empty() {
+        if run.history.lines.is_empty() {
             lines.push("- No recent local diagnostics were found for this install.".to_string());
         } else {
-            lines.extend(run.history.iter().map(|line| format!("- {line}")));
+            lines.extend(run.history.lines.iter().map(|line| format!("- {line}")));
         }
         lines.push(String::new());
         lines.push(
@@ -626,6 +946,8 @@ fn fail_action(check_id: &str) -> &'static str {
         "encoder" | "decoder" => "Try reinstalling Orange or updating your graphics driver.",
         "signalling" => "Check your internet connection, then try again.",
         "stun" => "Try again, or try another network.",
+        "ice" => "Try again, or try another network.",
+        "firewall" => "Your Windows settings need attention. Send a report for help.",
         _ => "Try again.",
     }
 }
@@ -633,6 +955,8 @@ fn fail_action(check_id: &str) -> &'static str {
 fn inconclusive_action(check_id: &str) -> &'static str {
     match check_id {
         "stun" => "Try again, or try another network.",
+        "ice" => "Try again, or try another network.",
+        "firewall" => "Windows settings could not be verified. Send a report for help.",
         _ => "Try this check again in a moment.",
     }
 }
@@ -640,7 +964,11 @@ fn inconclusive_action(check_id: &str) -> &'static str {
 fn failed_run(detail: &'static str) -> CompletedRun {
     CompletedRun {
         checks: CheckResult::failure(detail),
-        history: Vec::new(),
+        history: history::Summary {
+            lines: Vec::new(),
+            latest: None,
+        },
+        repair_note: None,
         generated_at_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
@@ -663,6 +991,49 @@ fn run_checks(command: Command, cancel: &AtomicBool) -> Result<Vec<CheckResult>,
     parse_checks(&output.stdout).map_err(|_| OUTPUT_INVALID_DETAIL)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairCommandOutcome {
+    Updated,
+    NoChange,
+    NotLocallyRepairable,
+    PermissionDeclined,
+    Failed,
+    Cancelled,
+    CommandError,
+}
+
+fn run_repair(command: Command, cancel: &AtomicBool) -> RepairCommandOutcome {
+    let output = match supervisor::run_bounded_command(
+        command,
+        cancel,
+        REPAIR_TIMEOUT,
+        MAX_REPAIR_OUTPUT_BYTES,
+        "repair-network command",
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let message = error.to_string().to_ascii_lowercase();
+            if message.contains("cancel") {
+                return RepairCommandOutcome::Cancelled;
+            }
+            if message.contains("timed out") {
+                return RepairCommandOutcome::Failed;
+            }
+            return RepairCommandOutcome::CommandError;
+        }
+    };
+
+    match output.status.code() {
+        Some(0) => RepairCommandOutcome::Updated,
+        Some(2) => RepairCommandOutcome::NoChange,
+        Some(3) => RepairCommandOutcome::NotLocallyRepairable,
+        Some(4) => RepairCommandOutcome::PermissionDeclined,
+        Some(5) => RepairCommandOutcome::Failed,
+        Some(6) => RepairCommandOutcome::Cancelled,
+        _ => RepairCommandOutcome::Failed,
+    }
+}
+
 #[derive(Deserialize)]
 struct WireReport {
     schema: u64,
@@ -674,6 +1045,7 @@ struct WireCheck {
     id: String,
     status: String,
     detail: String,
+    repairable: Option<bool>,
 }
 
 fn parse_checks(bytes: &[u8]) -> anyhow::Result<Vec<CheckResult>> {
@@ -684,9 +1056,14 @@ fn parse_checks(bytes: &[u8]) -> anyhow::Result<Vec<CheckResult>> {
         .find(|line| line.trim_start().starts_with('{'))
         .context("no troubleshoot json object")?;
     let report: WireReport = serde_json::from_str(json_line)?;
-    anyhow::ensure!(report.schema == 1, "unsupported troubleshoot schema");
+    let schema = report.schema;
+    let (expected_ids, expected_len) = match schema {
+        1 => (&CheckId::LEGACY_ORDER[..], CHECKS_REQUIRED),
+        2 => (&CheckId::ORDER[..], CHECKS_REQUIRED_SCHEMA2),
+        _ => anyhow::bail!("unsupported troubleshoot schema"),
+    };
     anyhow::ensure!(
-        report.checks.len() == CHECKS_REQUIRED,
+        report.checks.len() == expected_len,
         "unexpected check count"
     );
 
@@ -694,6 +1071,18 @@ fn parse_checks(bytes: &[u8]) -> anyhow::Result<Vec<CheckResult>> {
     for check in report.checks {
         let id = CheckId::from_wire(&check.id).context("unknown check id")?;
         let status = CheckStatus::from_wire(&check.status).context("unknown check status")?;
+        let repairable = check.repairable.unwrap_or(false);
+        if repairable {
+            anyhow::ensure!(schema == 2, "repairable requires schema 2");
+            anyhow::ensure!(
+                id == CheckId::Firewall,
+                "repairable only supported for firewall"
+            );
+            anyhow::ensure!(
+                status == CheckStatus::Fail,
+                "repairable only supported on firewall fail"
+            );
+        }
         anyhow::ensure!(!by_id.contains_key(&id), "duplicate check id");
         by_id.insert(
             id,
@@ -702,11 +1091,12 @@ fn parse_checks(bytes: &[u8]) -> anyhow::Result<Vec<CheckResult>> {
                 id: id.wire(),
                 status,
                 detail: sanitize_detail(&check.detail).context("invalid detail")?,
+                repairable,
             },
         );
     }
-    anyhow::ensure!(by_id.len() == CHECKS_REQUIRED, "missing check id");
-    Ok(CheckId::ORDER
+    anyhow::ensure!(by_id.len() == expected_len, "missing check id");
+    Ok(expected_ids
         .iter()
         .filter_map(|id| by_id.remove(id))
         .collect())
@@ -737,6 +1127,26 @@ fn sanitize_detail(detail: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn firewall_guidance_does_not_offer_a_repair_that_is_unavailable() {
+        // Managed or unreadable Windows policy cannot offer the local repair
+        // button; guidance must not tell the user to click a missing action.
+        for status in [CheckStatus::Fail, CheckStatus::Inconclusive] {
+            let mut run = failed_run("fixture");
+            run.checks = vec![CheckResult {
+                label: "Windows connection settings",
+                id: "firewall",
+                status,
+                detail: "fixture".into(),
+                repairable: false,
+            }];
+            let state = state_with_completed(run.checks, run.history);
+            let checks = state.friendly_checks();
+            assert!(!checks[0].repairable);
+            assert!(!checks[0].action_text.contains("Fix connection"));
+        }
+    }
+
     const CHILD_MODE: &str = "ORANGE_TEST_TROUBLESHOOT_CHILD";
 
     fn fixture_command(mode: &str) -> Command {
@@ -752,6 +1162,43 @@ mod tests {
 
     fn valid_report_json() -> &'static str {
         r#"{"schema":1,"checks":[{"id":"runtime","status":"pass","detail":"Runtime available"},{"id":"capture","status":"pass","detail":"Capture API available"},{"id":"encoder","status":"pass","detail":"Automatic encoder selected"},{"id":"decoder","status":"pass","detail":"Decoder factory available"},{"id":"audio","status":"pass","detail":"Audio output sink available"},{"id":"signalling","status":"pass","detail":"Signalling endpoint reachable"},{"id":"stun","status":"pass","detail":"STUN UDP response received"}]}"#
+    }
+
+    fn valid_schema2_report_json() -> &'static str {
+        r#"{"schema":2,"checks":[{"id":"runtime","status":"pass","detail":"Runtime available"},{"id":"capture","status":"pass","detail":"Capture API available"},{"id":"encoder","status":"pass","detail":"Automatic encoder selected"},{"id":"decoder","status":"pass","detail":"Decoder factory available"},{"id":"audio","status":"pass","detail":"Audio output sink available"},{"id":"signalling","status":"pass","detail":"Signalling endpoint reachable"},{"id":"stun","status":"pass","detail":"STUN UDP response received"},{"id":"ice","status":"pass","detail":"Gathered candidates for each component"},{"id":"firewall","status":"pass","detail":"Windows firewall check completed"}]}"#
+    }
+
+    fn valid_schema2_repairable_firewall_fail_json() -> String {
+        valid_schema2_report_json().replace(
+            "\"firewall\",\"status\":\"pass\"",
+            "\"firewall\",\"status\":\"fail\",\"repairable\":true",
+        )
+    }
+
+    fn state_with_completed(
+        checks: Vec<CheckResult>,
+        history: history::Summary,
+    ) -> TroubleshootState {
+        TroubleshootState {
+            completed: Some(CompletedRun {
+                checks,
+                history,
+                repair_note: None,
+                generated_at_unix_ms: 1,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn state_with_completed_and_sent_receipt(
+        checks: Vec<CheckResult>,
+        history: history::Summary,
+    ) -> TroubleshootState {
+        TroubleshootState {
+            upload_state: UploadUiState::Sent,
+            receipt_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..state_with_completed(checks, history)
+        }
     }
 
     #[test]
@@ -775,6 +1222,18 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_secs(30));
             }
+            "repair-0" => std::process::exit(0),
+            "repair-2" => std::process::exit(2),
+            "repair-3" => std::process::exit(3),
+            "repair-4" => std::process::exit(4),
+            "repair-5" => std::process::exit(5),
+            "repair-6" => std::process::exit(6),
+            "repair-wait" => {
+                if let Ok(ready) = std::env::var("ORANGE_TEST_TROUBLESHOOT_READY") {
+                    std::fs::write(ready, "ready").unwrap();
+                }
+                std::thread::sleep(Duration::from_secs(30));
+            }
             _ => panic!("unknown troubleshoot fixture mode"),
         }
     }
@@ -788,18 +1247,51 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_or_unknown_check_contracts_cannot_be_reported_as_passed() {
+    fn schema_contract_validation_rejects_incomplete_and_invalid_checks() {
         // An empty array would otherwise make an all-pass summary vacuously
         // true; old/new incompatible binaries must not claim a successful run.
         for json in [
             r#"{"schema":1,"checks":[]}"#.to_string(),
-            valid_report_json().replace("\"schema\":1", "\"schema\":2"),
             valid_report_json().replace("\"pass\"", "\"unknown\""),
             valid_report_json().replace("\"runtime\"", "\"unknown\""),
             valid_report_json().replace("Runtime available", ""),
+            valid_schema2_report_json().replace("\"schema\":2", "\"schema\":3"),
+            valid_schema2_report_json().replace("\"ice\"", "\"unknown\""),
+            valid_schema2_report_json().replace(
+                "\"firewall\",\"status\":\"pass\"",
+                "\"firewall\",\"status\":\"pass\",\"repairable\":true",
+            ),
+            valid_schema2_report_json().replace(
+                "\"capture\",\"status\":\"pass\"",
+                "\"capture\",\"status\":\"pass\",\"repairable\":true",
+            ),
+            valid_report_json().replace(
+                "\"capture\",\"status\":\"pass\"",
+                "\"capture\",\"status\":\"pass\",\"repairable\":true",
+            ),
         ] {
             assert!(parse_checks(json.as_bytes()).is_err());
         }
+
+        let explicit_false = parse_checks(
+            valid_schema2_report_json()
+                .replace(
+                    "\"capture\",\"status\":\"pass\"",
+                    "\"capture\",\"status\":\"pass\",\"repairable\":false",
+                )
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(!explicit_false[1].repairable);
+
+        let checks = parse_checks(valid_schema2_report_json().as_bytes()).unwrap();
+        assert_eq!(checks.len(), CHECKS_REQUIRED_SCHEMA2);
+        assert_eq!(checks[7].id, "ice");
+        assert_eq!(checks[8].id, "firewall");
+
+        let repairable =
+            parse_checks(valid_schema2_repairable_firewall_fail_json().as_bytes()).unwrap();
+        assert!(repairable[8].repairable);
     }
 
     #[test]
@@ -923,7 +1415,11 @@ mod tests {
         let state = TroubleshootState {
             completed: Some(CompletedRun {
                 checks,
-                history: Vec::new(),
+                history: history::Summary {
+                    lines: Vec::new(),
+                    latest: None,
+                },
+                repair_note: None,
                 generated_at_unix_ms: 1,
             }),
             ..Default::default()
@@ -986,45 +1482,56 @@ mod tests {
                         id: "runtime",
                         status: CheckStatus::Fail,
                         detail: "x".into(),
+                        repairable: false,
                     },
                     CheckResult {
                         label: "Screen sharing",
                         id: "capture",
                         status: CheckStatus::Fail,
                         detail: "x".into(),
+                        repairable: false,
                     },
                     CheckResult {
                         label: "Sending video",
                         id: "encoder",
                         status: CheckStatus::Fail,
                         detail: "x".into(),
+                        repairable: false,
                     },
                     CheckResult {
                         label: "Playing video",
                         id: "decoder",
                         status: CheckStatus::Fail,
                         detail: "x".into(),
+                        repairable: false,
                     },
                     CheckResult {
                         label: "Sound",
                         id: "audio",
                         status: CheckStatus::Fail,
                         detail: "x".into(),
+                        repairable: false,
                     },
                     CheckResult {
                         label: "Orange connection",
                         id: "signalling",
                         status: CheckStatus::Fail,
                         detail: "x".into(),
+                        repairable: false,
                     },
                     CheckResult {
                         label: "Network check",
                         id: "stun",
                         status: CheckStatus::Fail,
                         detail: "x".into(),
+                        repairable: false,
                     },
                 ],
-                history: Vec::new(),
+                history: history::Summary {
+                    lines: Vec::new(),
+                    latest: None,
+                },
+                repair_note: None,
                 generated_at_unix_ms: 1,
             }),
             ..Default::default()
@@ -1067,6 +1574,276 @@ mod tests {
                 "unexpected claim {claim}: {ui_text}"
             );
         }
+    }
+
+    #[test]
+    fn passing_checks_with_latest_failed_connection_gets_attention_summary() {
+        let state = TroubleshootState {
+            completed: Some(CompletedRun {
+                checks: parse_checks(valid_schema2_report_json().as_bytes()).unwrap(),
+                history: history::Summary {
+                    lines: Vec::new(),
+                    latest: Some(history::RecentConnection {
+                        at_unix_ms: 1,
+                        outcome: history::RecentConnectionOutcome::Failed,
+                    }),
+                },
+                repair_note: None,
+                generated_at_unix_ms: 1,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            state.summary(),
+            Some("Basic checks passed. Your last connection needs attention.")
+        );
+        assert!(matches!(
+            state.latest_connection(),
+            Some((LastConnectionStatus::Failed, _))
+        ));
+    }
+
+    #[test]
+    fn repair_updated_and_no_change_have_distinct_success_messages() {
+        for (mode, expected_message, expected_note) in [
+            (
+                "repair-0",
+                "Windows settings updated. Try your stream again.",
+                "orange repair-network reported Windows settings changed and verified",
+            ),
+            (
+                "repair-2",
+                "No Windows changes were needed. Try your stream again.",
+                "orange repair-network reported no local setting changes were needed",
+            ),
+        ] {
+            let mut state = state_with_completed_and_sent_receipt(
+                parse_checks(valid_schema2_repairable_firewall_fail_json().as_bytes()).unwrap(),
+                history::Summary {
+                    lines: Vec::new(),
+                    latest: None,
+                },
+            );
+
+            assert!(state.start_repair_with_command(
+                fixture_command(mode),
+                fixture_command("ok"),
+                None,
+            ));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while state.is_running() {
+                state.poll();
+                assert!(Instant::now() < deadline, "repair did not finish");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            assert_eq!(state.upload_state(), UploadUiState::Idle);
+            assert!(state.receipt_id.is_none());
+            assert_eq!(state.repair_message(), Some((expected_message, true)));
+            let report = state.report_text("1.0.0", "build").unwrap();
+            assert!(report.contains("Repair action"));
+            assert!(report.contains(expected_note));
+            assert!(!report.contains("0x"), "report leaked raw detail: {report}");
+        }
+    }
+
+    #[test]
+    fn failed_or_managed_repair_reruns_checks_and_records_report_note() {
+        let original_checks =
+            parse_checks(valid_schema2_repairable_firewall_fail_json().as_bytes()).unwrap();
+        for (mode, expected_message, expected_note) in [
+            (
+                "repair-3",
+                "This PC could not apply that Windows setting. You can still try Troubleshoot again.",
+                "not locally repairable or is managed by policy",
+            ),
+            (
+                "repair-5",
+                "The repair did not complete. Please try Fix connection again.",
+                "incomplete repair attempt; verification checks were rerun",
+            ),
+        ] {
+            let mut state = state_with_completed(
+                original_checks.clone(),
+                history::Summary {
+                    lines: vec!["history".into()],
+                    latest: None,
+                },
+            );
+            assert!(state.start_repair_with_command(
+                fixture_command(mode),
+                fixture_command("ok"),
+                None,
+            ));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while state.is_running() {
+                state.poll();
+                assert!(Instant::now() < deadline, "repair mode {mode} did not finish");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_ne!(state.checks(), original_checks.as_slice());
+            assert_eq!(state.repair_message(), Some((expected_message, false)));
+            let report = state.report_text("1.0.0", "build").unwrap();
+            assert!(report.contains(expected_note), "{report}");
+        }
+    }
+
+    #[test]
+    fn repair_declined_or_cancelled_keeps_existing_checks_and_adds_report_note() {
+        let mut state = state_with_completed_and_sent_receipt(
+            parse_checks(valid_schema2_repairable_firewall_fail_json().as_bytes()).unwrap(),
+            history::Summary {
+                lines: Vec::new(),
+                latest: None,
+            },
+        );
+
+        let original_checks = state.checks().to_vec();
+        for (mode, expected_message, expected_note) in [
+            (
+                "repair-4",
+                "Windows permission was declined. Please try Fix connection again.",
+                "Windows permission was declined",
+            ),
+            (
+                "repair-6",
+                "The repair was cancelled. Please try Fix connection again.",
+                "rerun Troubleshoot to verify current settings",
+            ),
+        ] {
+            assert!(state.start_repair_with_command(
+                fixture_command(mode),
+                fixture_command("ok"),
+                None,
+            ));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while state.is_running() {
+                state.poll();
+                assert!(
+                    Instant::now() < deadline,
+                    "repair mode {mode} did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(state.checks(), original_checks.as_slice());
+            assert_eq!(state.repair_message(), Some((expected_message, false)));
+            assert_eq!(state.upload_state(), UploadUiState::Sent);
+            let report = state.report_text("1.0.0", "build").unwrap();
+            assert!(
+                report.contains("Support reference: 0123456789abcdef0123456789abcdef"),
+                "{report}"
+            );
+            assert!(report.contains(expected_note), "{report}");
+        }
+    }
+
+    #[test]
+    fn repair_job_blocks_duplicate_actions_and_clear_suppresses_stale_completion() {
+        let mut state = state_with_completed_and_sent_receipt(
+            parse_checks(valid_schema2_repairable_firewall_fail_json().as_bytes()).unwrap(),
+            history::Summary {
+                lines: Vec::new(),
+                latest: None,
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let mut repair = fixture_command("repair-wait");
+        repair.env("ORANGE_TEST_TROUBLESHOOT_READY", &ready);
+        assert!(state.start_repair_with_command(repair, fixture_command("ok"), None));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "repair fixture did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(!state.start_with_command(fixture_command("ok"), None));
+        assert!(!state.start_repair_with_command(
+            fixture_command("repair-0"),
+            fixture_command("ok"),
+            None,
+        ));
+        assert!(!state.send_report("ws://127.0.0.1:9/ws", Some("token"), None, "1.0.0", "build"));
+
+        state.clear();
+        assert!(!state.has_result());
+        let reap_deadline = Instant::now() + Duration::from_secs(3);
+        while state.is_running() {
+            state.poll();
+            assert!(
+                Instant::now() < reap_deadline,
+                "repair worker was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!state.has_result());
+        assert!(state.repair_message().is_none());
+        assert!(state.report_text("1.0.0", "build").is_none());
+    }
+
+    #[test]
+    fn repair_headline_and_stopping_state_follow_job_kind_and_cancel() {
+        let mut state = state_with_completed(
+            parse_checks(valid_schema2_repairable_firewall_fail_json().as_bytes()).unwrap(),
+            history::Summary {
+                lines: Vec::new(),
+                latest: None,
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let mut repair = fixture_command("repair-wait");
+        repair.env("ORANGE_TEST_TROUBLESHOOT_READY", &ready);
+        assert!(state.start_repair_with_command(repair, fixture_command("ok"), None));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "repair fixture did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(state.headline(), "Fixing Windows connection settings…");
+        state.cancel();
+        assert!(state.is_cancelling());
+        assert_eq!(state.headline(), "Stopping…");
+
+        let reap_deadline = Instant::now() + Duration::from_secs(3);
+        while state.is_running() {
+            state.poll();
+            assert!(
+                Instant::now() < reap_deadline,
+                "repair worker was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn command_error_repair_reruns_checks_and_records_note() {
+        let mut state = state_with_completed(
+            parse_checks(valid_schema2_repairable_firewall_fail_json().as_bytes()).unwrap(),
+            history::Summary {
+                lines: Vec::new(),
+                latest: None,
+            },
+        );
+        let repair = Command::new("orange-test-missing-repair-command");
+        assert!(state.start_repair_with_command(repair, fixture_command("ok"), None));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.is_running() {
+            state.poll();
+            assert!(Instant::now() < deadline, "repair did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            state.repair_message(),
+            Some(("Could not run the repair. Please try again.", false))
+        );
+        let report = state.report_text("1.0.0", "build").unwrap();
+        assert!(
+            report.contains("did not complete cleanly; verification checks were rerun"),
+            "{report}"
+        );
     }
 
     #[test]

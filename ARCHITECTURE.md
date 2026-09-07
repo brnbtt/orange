@@ -104,7 +104,7 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
 | `crates/orange-client/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, bounds/cancels window enumeration and owns its output readers, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
 | `crates/orange-client/src/supervisor_list_tests.rs` | Real-child tests of enumeration output, cancellation, deadlines and errors |
-| `crates/orange-client/src/troubleshoot.rs` | On-demand Settings checks, owned diagnostic child job, report validation and copyable results |
+| `crates/orange-client/src/troubleshoot.rs` | On-demand Settings checks, owned diagnostic and repair child jobs, schema 1/2 report validation, last-connection summary and copyable results |
 | `crates/orange-client/src/troubleshoot/history.rs` | Bounded recent JSONL tails, per-connection historical outcomes and sanitized build/timestamp evidence |
 | `crates/orange-client/src/troubleshoot/logs.rs` | Explicit-upload log attachments: bounded tails, preserved session correlation, allowlisted metadata and payloads |
 | `crates/orange-client/src/troubleshoot/upload.rs` | Authenticated support report POST, transport/body/receipt bounds and fixed error classification |
@@ -157,7 +157,9 @@ animation gate as the grid and logo aura.
 | `crates/orange/src/targets.rs` | Capturable-window enumeration/filtering, HWND-to-PID lookup, late-join redraw request |
 | `crates/orange/src/text.rs` | System font loading and glyph rasterization for the video overlay |
 | `crates/orange/src/connection.rs` | Privacy-safe connection progress stages and failures shared by signalling, WebRTC and playback |
-| `crates/orange/src/troubleshoot.rs` | Diagnostic command: media component availability, signalling WebSocket and bounded UDP STUN checks |
+| `crates/orange/src/troubleshoot.rs` | Diagnostic command: media component availability, signalling, STUN, isolated ICE gathering and Windows firewall inspection |
+| `crates/orange/src/network_diagnostics.rs` | Bounded metadata-only candidate lifecycle events, selected-route stats correlation, native runtime version and isolated ICE gathering probe |
+| `crates/orange/src/firewall.rs` | Windows application-policy inspection and scoped local repair through a separately elevated process |
 | `crates/orange/src/window/connection_surface.rs` | What the viewer window draws before media arrives: connection stage, close hit test |
 | `crates/orange/src/encoder_characterization.rs` | Developer-only `characterize-bitrate` subcommand. It sits outside `media_diagnostics/` on purpose: that tree instruments live sessions, this one benchmarks encoders in a throwaway process and never runs for a user |
 | `crates/orange/src/test_support.rs` | `#[cfg(test)]` only: runs a test in a deadline-bounded child process |
@@ -386,7 +388,7 @@ are named in the test that owns them.
 | `GET /presence?ids=` request, bearer auth, and `{friends:[{id,name,avatar_url,state,code}]}` reply; optional `wait`/`since` opt into bounded waiting and a response `revision` | producer: `crates/orange-signal/src/server.rs`; consumer: `crates/orange-client/src/presence.rs` |
 | Host stdout markers `Share this code:` and `[host-status] <json>`, whose `joined` event carries `id` and `avatar_url` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
 | Automatic bitrate cap marker `[quality-status] <json>` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
-| Watch stdout markers `[watch-status] ended` and `[watch-host] <json>` | producer: `crates/orange/src/peer/watch.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
+| Watch stdout markers `[watch-status] ended`, `[watch-host] <json>` and exact `[watch] ice: Failed/Connected/Completed` lines; normal exit 1 qualifies initial ICE failure for one client retry | producer: `crates/orange/src/peer.rs`, `peer/watch.rs`; consumer: `crates/orange-client/src/supervisor.rs` and `main.rs` |
 | `ORANGE_TABLE_ACCOUNT`, `ORANGE_TABLE_KEY`, `ORANGE_TABLE_NAME`, and the session row schema | producer: `deploy/azure.ps1`; consumer: `crates/orange-signal/src/store.rs` |
 | `ORANGE_UI_PID`, so whole-screen capture can exclude the client's own cues | producer: `crates/orange-client/src/supervisor.rs`; consumer: `crates/orange/src/peer/host.rs` |
 | Session file `%APPDATA%\orange\session.json` | writer: `crates/orange/src/auth.rs`; reader: `crates/orange-client/src/session.rs` |
@@ -395,7 +397,8 @@ are named in the test that owns them.
 | Updater flags `--installer --sha256 --parent --install-dir` | producer: `crates/orange-client/src/update.rs`; consumer: `crates/orange-updater/src/main.rs` |
 | RTP video payload 96, RTX 97, Opus 111, clocks and 100 ms receive latency | `crates/orange/src/webrtc/transport.rs` |
 | Local diagnostic JSONL fields and `ORANGE_*` metadata | producer: `crates/orange/src/media_diagnostics/writer.rs`; consumer: a human, via Settings -> Diagnostics -> Open folder |
-| `orange troubleshoot --server <url>` JSON (`schema: 1`, seven unique check IDs, `pass`/`fail`/`inconclusive` statuses and sanitized detail) | producer: `crates/orange/src/troubleshoot.rs`; consumer: `crates/orange-client/src/troubleshoot.rs` |
+| `orange troubleshoot --server <url>` JSON (`schema: 2`, nine unique check IDs, `pass`/`fail`/`inconclusive` statuses and sanitized detail; optional true `repairable` only on a failed firewall check). Desktop also accepts legacy schema 1's exact seven-check set | producer: `crates/orange/src/troubleshoot.rs`; consumer: `crates/orange-client/src/troubleshoot.rs` |
+| `orange repair-network`, with internal `--elevated --requester <pid> --requester-created <FILETIME>` dispatch; fixed exit codes 0 changed/verified, 2 no change, 3 not locally repairable, 4 permission declined, 5 failed, 6 cancelled | producer: `crates/orange-client/src/troubleshoot.rs`; consumer: `crates/orange/src/main.rs`, `firewall.rs` |
 | `POST /diagnostics`, bearer auth, `{schema:1, report, logs:[{name,contents,truncated}]}`; HTTP 201 `{report_id}` | desktop producer: `troubleshoot/upload.rs`; relay consumer: `orange-signal/src/server.rs` and `diagnostics.rs` |
 
 ## Where Do I Change...?

@@ -3,7 +3,9 @@
 mod auth;
 mod connection;
 mod encoder_characterization;
+mod firewall;
 mod media_diagnostics;
+mod network_diagnostics;
 mod overlay;
 mod peer;
 mod pipeline;
@@ -128,6 +130,15 @@ enum Command {
     Troubleshoot {
         #[arg(long, default_value = "ws://127.0.0.1:9000/ws", env = "ORANGE_SERVER")]
         server: String,
+    },
+    /// Repair a detected local Windows firewall block for Orange.
+    RepairNetwork {
+        #[arg(long, hide = true)]
+        elevated: bool,
+        #[arg(long, hide = true)]
+        requester: Option<u32>,
+        #[arg(long, hide = true)]
+        requester_created: Option<u64>,
     },
     /// Open the viewer window with a synthetic stream. Design harness.
     ///
@@ -287,7 +298,10 @@ fn entry() -> Result<()> {
         eprintln!("[window] could not set taskbar identity: {error}");
     }
     let cli = Cli::parse();
-    let _diagnostics = media_diagnostics::DiagnosticWriter::new();
+    // An elevated repair must not write to a diagnostics path inherited from
+    // the caller's environment. It returns only the fixed repair exit code.
+    let _diagnostics = (!matches!(&cli.command, Command::RepairNetwork { .. }))
+        .then(media_diagnostics::DiagnosticWriter::new);
     run(cli)
 }
 
@@ -398,6 +412,13 @@ fn run(cli: Cli) -> Result<()> {
             runtime()?.block_on(peer::run_watch(&code, &server, output))
         }
         Command::Troubleshoot { server } => runtime()?.block_on(troubleshoot::run(&server)),
+        Command::RepairNetwork {
+            elevated,
+            requester,
+            requester_created,
+        } => {
+            std::process::exit(firewall::repair(elevated, requester, requester_created));
+        }
         Command::Preview {
             size,
             window: window_size,

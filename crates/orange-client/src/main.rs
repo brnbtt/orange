@@ -58,8 +58,17 @@ enum Screen {
 
 struct WatchSession {
     code: String,
+    server: String,
+    cascade: usize,
+    retry_budget: u8,
+    retried_after_initial_ice_failure: bool,
     supervisor: Supervisor,
 }
+
+const WATCH_RETRY_BUDGET: u8 = 1;
+const WATCH_RETRY_NOTICE: &str = "Trying another connection…";
+const WATCH_RETRY_FAILED: &str =
+    "Could not connect. Open Settings > Troubleshooting to check your connection.";
 
 struct Notice {
     text: String,
@@ -1023,37 +1032,7 @@ impl Orange {
             };
         }
 
-        let mut watch_error = None;
-        let mut watch_ended = false;
-        self.watches.retain_mut(|watch| {
-            let running = watch.supervisor.running();
-            collect_met_friends(&mut self.friend_offers, &watch.supervisor.status);
-            if running {
-                true
-            } else {
-                if let Ok(status) = watch.supervisor.status.lock() {
-                    watch_error = status.error.clone().or(watch_error.take());
-                    watch_ended |= status.ended;
-                }
-                false
-            }
-        });
-        self.collect_friend_offers();
-        if self.session.is_none() {
-            self.friend_offers.clear();
-        }
-        if let Some(error) = watch_error {
-            self.show_error(error);
-        } else if watch_ended {
-            // The host stopping is the ordinary way to stop watching. Said
-            // plainly, in the same voice as everything else, because there is
-            // nothing here for anyone to fix.
-            sound::play(sound::Cue::Ended);
-            self.show_notice(NoticeKind::Ordinary, "Stream ended");
-        }
-        if self.screen == Screen::Watching && self.watches.is_empty() {
-            self.screen = Screen::Home;
-        }
+        self.poll_watch_lifecycle_with(Supervisor::watch);
 
         // Viewers arriving and leaving is the one thing that happens entirely
         // while the user is looking at their game, so it is the moment sound
@@ -1460,6 +1439,88 @@ impl Orange {
         }
     }
 
+    fn initial_ice_failure_retry_eligible(status: &supervisor::StreamStatus) -> bool {
+        status.exit_code == Some(1)
+            && status.watch_ice_failed
+            && !status.watch_ice_connected_or_completed
+            && !status.ended
+            && status.error.is_some()
+    }
+
+    fn poll_watch_lifecycle_with(
+        &mut self,
+        mut start_watch: impl FnMut(&str, &str, usize) -> anyhow::Result<Supervisor>,
+    ) {
+        let mut survivors = Vec::with_capacity(self.watches.len());
+        let mut watch_error = None;
+        let mut watch_ended = false;
+
+        for mut watch in std::mem::take(&mut self.watches) {
+            let running = watch.supervisor.running();
+            collect_met_friends(&mut self.friend_offers, &watch.supervisor.status);
+            if running {
+                survivors.push(watch);
+                continue;
+            }
+            let status = watch
+                .supervisor
+                .status
+                .lock()
+                .ok()
+                .map(|status| status.clone())
+                .unwrap_or_default();
+
+            if watch.retry_budget > 0 && Self::initial_ice_failure_retry_eligible(&status) {
+                match start_watch(&watch.code, &watch.server, watch.cascade) {
+                    Ok(supervisor) => {
+                        watch.retry_budget -= 1;
+                        watch.retried_after_initial_ice_failure = true;
+                        watch.supervisor = supervisor;
+                        self.show_notice(NoticeKind::Ordinary, WATCH_RETRY_NOTICE);
+                        survivors.push(watch);
+                    }
+                    Err(_) => {
+                        watch_error = Some(WATCH_RETRY_FAILED.to_string());
+                    }
+                }
+                continue;
+            }
+
+            if status.ended {
+                watch_ended = true;
+                continue;
+            }
+            if status.error.is_some() {
+                let error = if watch.retried_after_initial_ice_failure
+                    && Self::initial_ice_failure_retry_eligible(&status)
+                {
+                    WATCH_RETRY_FAILED.to_string()
+                } else {
+                    status
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "watch failed".to_string())
+                };
+                watch_error = Some(error);
+            }
+        }
+
+        self.watches = survivors;
+        self.collect_friend_offers();
+        if self.session.is_none() {
+            self.friend_offers.clear();
+        }
+        if let Some(error) = watch_error {
+            self.show_error(error);
+        } else if watch_ended {
+            sound::play(sound::Cue::Ended);
+            self.show_notice(NoticeKind::Ordinary, "Stream ended");
+        }
+        if self.screen == Screen::Watching && self.watches.is_empty() {
+            self.screen = Screen::Home;
+        }
+    }
+
     fn join(&mut self, code: String) {
         let code = code.trim().to_ascii_uppercase();
         if code.is_empty() {
@@ -1478,10 +1539,15 @@ impl Orange {
             self.show_error(supervisor::MEDIA_RUNTIME_MISSING.to_string());
             return;
         }
-        match Supervisor::watch(&code, &self.server, self.watches.len()) {
+        let cascade = self.watches.len();
+        match Supervisor::watch(&code, &self.server, cascade) {
             Ok(stream) => {
                 self.watches.push(WatchSession {
                     code,
+                    server: self.server.clone(),
+                    cascade,
+                    retry_budget: WATCH_RETRY_BUDGET,
+                    retried_after_initial_ice_failure: false,
                     supervisor: stream,
                 });
                 if self.host.is_none() && self.screen != Screen::Home {
@@ -1909,6 +1975,224 @@ mod tests {
         }
     }
 
+    fn fixture_watch_session(mode: &str) -> WatchSession {
+        WatchSession {
+            code: "ABC-123".into(),
+            server: DEFAULT_SERVER.into(),
+            cascade: 0,
+            retry_budget: WATCH_RETRY_BUDGET,
+            retried_after_initial_ice_failure: false,
+            supervisor: supervisor::watch_test_child(mode),
+        }
+    }
+
+    fn watch_spawner_for_modes(
+        modes: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<&'static str>>>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String, usize)>>>,
+    ) -> impl FnMut(&str, &str, usize) -> anyhow::Result<Supervisor> {
+        move |code, server, cascade| {
+            calls
+                .lock()
+                .unwrap()
+                .push((code.to_string(), server.to_string(), cascade));
+            let mode = modes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("retry attempted more times than configured");
+            Ok(supervisor::watch_test_child(mode))
+        }
+    }
+
+    fn poll_watches_until(
+        app: &mut Orange,
+        mut spawn: impl FnMut(&str, &str, usize) -> anyhow::Result<Supervisor>,
+        mut done: impl FnMut(&Orange) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll_watch_lifecycle_with(&mut spawn);
+            if done(app) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "watch lifecycle did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn initial_ice_failure_retries_once_then_surfaces_a_friendly_error() {
+        let mut app = friend_test_app();
+        app.watches.push(fixture_watch_session("ice-failed-exit1"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            "ice-failed-exit1",
+        ])));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+
+        let mut saw_retry_notice = false;
+        poll_watches_until(&mut app, &mut spawn, |app| {
+            saw_retry_notice |= app.notice.as_ref().is_some_and(|notice| {
+                notice.text == WATCH_RETRY_NOTICE && notice.kind == NoticeKind::Ordinary
+            });
+            app.watches.is_empty()
+        });
+
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some(WATCH_RETRY_FAILED)
+        );
+        assert!(saw_retry_notice, "first failure did not show retry notice");
+        assert!(matches!(
+            app.notice.as_ref().map(|notice| notice.kind),
+            Some(NoticeKind::Failure)
+        ));
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "retry budget must allow only one respawn");
+        assert_eq!(
+            calls[0],
+            ("ABC-123".to_string(), DEFAULT_SERVER.to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn a_watch_that_connected_before_failing_does_not_retry() {
+        let mut app = friend_test_app();
+        app.watches
+            .push(fixture_watch_session("ice-connected-then-failed-exit1"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+
+        poll_watches_until(&mut app, &mut spawn, |app| app.watches.is_empty());
+
+        assert!(calls.lock().unwrap().is_empty());
+        assert_ne!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some(WATCH_RETRY_FAILED)
+        );
+    }
+
+    #[test]
+    fn a_retried_connection_that_later_connects_does_not_report_initial_ice_failure() {
+        // Once the fresh attempt connects, a later stream error must not be
+        // mislabeled as another failed initial connection.
+        let mut app = friend_test_app();
+        app.watches.push(fixture_watch_session("ice-failed-exit1"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            "ice-connected-then-failed-exit1",
+        ])));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+        poll_watches_until(&mut app, &mut spawn, |app| app.watches.is_empty());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(app.notice.is_some());
+        assert_ne!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some(WATCH_RETRY_FAILED)
+        );
+    }
+
+    #[test]
+    fn watch_end_marker_exits_without_retry() {
+        let mut app = friend_test_app();
+        app.watches.push(fixture_watch_session("ended-exit0"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+
+        poll_watches_until(&mut app, &mut spawn, |app| app.watches.is_empty());
+
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some("Stream ended")
+        );
+    }
+
+    #[test]
+    fn clean_exit_with_failed_ice_marker_does_not_retry() {
+        let mut app = friend_test_app();
+        app.watches.push(fixture_watch_session("ice-failed-exit0"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+
+        poll_watches_until(&mut app, &mut spawn, |app| app.watches.is_empty());
+
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn retry_waits_for_stdout_and_reuses_the_same_watch_metadata() {
+        let mut app = friend_test_app();
+        app.watches
+            .push(fixture_watch_session("ice-failed-with-host-exit1"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            "wait",
+        ])));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+
+        poll_watches_until(&mut app, &mut spawn, |app| {
+            app.pending_friend().is_some()
+                && app
+                    .watches
+                    .first()
+                    .is_some_and(|watch| watch.retried_after_initial_ice_failure)
+        });
+
+        assert_eq!(
+            app.pending_friend()
+                .as_ref()
+                .map(|friend| friend.id.as_str()),
+            Some("42")
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            ("ABC-123".to_string(), DEFAULT_SERVER.to_string(), 0)
+        );
+        app.stop_all_watches();
+    }
+
+    #[test]
+    fn manually_stopping_watches_never_recreates_them() {
+        let mut app = friend_test_app();
+        app.watches.push(fixture_watch_session("ice-failed-exit1"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            "ice-failed-exit1",
+        ])));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+
+        app.stop_all_watches();
+        app.poll_watch_lifecycle_with(&mut spawn);
+
+        assert!(app.watches.is_empty());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reject_session_clears_watches_before_any_retry_attempt() {
+        let mut app = friend_test_app();
+        app.watches.push(fixture_watch_session("ice-failed-exit1"));
+        let modes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            "ice-failed-exit1",
+        ])));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn = watch_spawner_for_modes(modes, calls.clone());
+
+        app.reject_session();
+        app.poll_watch_lifecycle_with(&mut spawn);
+
+        assert!(app.watches.is_empty());
+        assert!(app.screen == Screen::SignedOut);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn stopping_children_keeps_their_last_friend_offer_available() {
         // Exercise real stdout readers and each explicit teardown path. A
@@ -1936,6 +2220,10 @@ mod tests {
             } else {
                 app.watches.push(WatchSession {
                     code: "ABC-234".into(),
+                    server: app.server.clone(),
+                    cascade: 0,
+                    retry_budget: WATCH_RETRY_BUDGET,
+                    retried_after_initial_ice_failure: false,
                     supervisor: child,
                 });
                 if mode == "all" {

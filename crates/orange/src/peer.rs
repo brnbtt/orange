@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::{ConnectionEvent, ConnectionFailure as ViewerConnectionFailure};
 use crate::media_diagnostics::emit_diagnostic;
+use crate::network_diagnostics::{classify_candidate, IceAction, IceDirection, IceEventTracker};
 use orange_signal::Signal;
 
 mod host;
@@ -186,10 +187,13 @@ fn watch_connection(
     bin: &gst::Element,
     label: String,
     diagnostic_role: String,
+    ice_diagnostics: IceEventTracker,
     on_connected: Option<ConnectionReadyHandler>,
     on_failure: Option<ConnectionFailureHandler>,
     playback: Option<crate::window::PlaybackWindowHandle>,
 ) {
+    ice_diagnostics.emit_runtime_once();
+
     let l = label.clone();
     let role = diagnostic_role.clone();
     let playback_for_ice = playback.clone();
@@ -257,19 +261,96 @@ fn check_promise_reply<'a>(
 }
 
 /// Forward locally-gathered ICE candidates to the other peer.
-fn forward_ice(bin: &gst::Element, out: mpsc::UnboundedSender<Signal>, peer: String) {
+fn forward_ice(
+    bin: &gst::Element,
+    out: mpsc::UnboundedSender<Signal>,
+    peer: String,
+    diagnostics: IceEventTracker,
+) {
     bin.connect("on-ice-candidate", false, move |values| {
         let (Ok(mline), Ok(candidate)) = (values[1].get::<u32>(), values[2].get::<String>()) else {
             eprintln!("[webrtc] malformed ICE candidate callback");
             return None;
         };
-        let _ = out.send(Signal::Ice {
-            peer: peer.clone(),
+        let class = classify_candidate(&candidate);
+        match class {
+            crate::network_diagnostics::CandidateClass::Candidate(_) => {
+                diagnostics.emit(IceDirection::Local, IceAction::Gathered, mline, class);
+            }
+            crate::network_diagnostics::CandidateClass::EndOfCandidates => {
+                diagnostics.emit(
+                    IceDirection::Local,
+                    IceAction::EndOfCandidates,
+                    mline,
+                    class,
+                );
+            }
+            crate::network_diagnostics::CandidateClass::Invalid => {
+                diagnostics.emit(IceDirection::Local, IceAction::Invalid, mline, class);
+            }
+        }
+        let signalled = out
+            .send(Signal::Ice {
+                peer: peer.clone(),
+                mline,
+                candidate,
+            })
+            .is_ok();
+        diagnostics.emit(
+            IceDirection::Local,
+            if signalled {
+                IceAction::Signalled
+            } else {
+                IceAction::SignallingClosed
+            },
             mline,
-            candidate,
-        });
+            class,
+        );
         None
     });
+}
+
+fn add_remote_candidate(
+    bin: &gst::Element,
+    mline: u32,
+    candidate: String,
+    diagnostics: &IceEventTracker,
+) {
+    let diagnostics = diagnostics.clone();
+    let class = classify_candidate(&candidate);
+    match class {
+        crate::network_diagnostics::CandidateClass::Candidate(_) => {
+            diagnostics.emit(IceDirection::Remote, IceAction::Signalled, mline, class);
+        }
+        crate::network_diagnostics::CandidateClass::EndOfCandidates => {
+            diagnostics.emit(
+                IceDirection::Remote,
+                IceAction::EndOfCandidates,
+                mline,
+                class,
+            );
+        }
+        crate::network_diagnostics::CandidateClass::Invalid => {
+            diagnostics.emit(IceDirection::Remote, IceAction::Invalid, mline, class);
+            return;
+        }
+    }
+    diagnostics.emit(IceDirection::Remote, IceAction::Submitted, mline, class);
+    let diagnostics_for_promise = diagnostics.clone();
+    let candidate_class_for_promise = class;
+    let promise = gst::Promise::with_change_func(move |reply| {
+        diagnostics_for_promise.emit(
+            IceDirection::Remote,
+            if check_promise_reply(reply, "submitting remote ICE candidate").is_ok() {
+                IceAction::SubmissionCompleted
+            } else {
+                IceAction::SubmissionFailed
+            },
+            mline,
+            candidate_class_for_promise,
+        );
+    });
+    bin.emit_by_name::<()>("add-ice-candidate-full", &[&mline, &candidate, &promise]);
 }
 
 fn parse_sdp(kind: &str, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescription> {

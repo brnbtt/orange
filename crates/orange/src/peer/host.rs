@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::media_diagnostics::emit_diagnostic;
+use crate::network_diagnostics::IceEventTracker;
 use crate::pipeline::{
     build_audio_chain, build_capture_chain, check_audio_elements, check_elements,
     configure_encoder, set_encoder_gop, CaptureSettings,
@@ -15,8 +16,12 @@ use crate::pipeline::{
 use crate::webrtc::audio_rtp_caps;
 use orange_signal::{connect, Signal};
 
-use super::host_branch::{add_viewer, force_key_unit, ViewerBranch, ViewerTeardown};
-use super::{check_promise_reply, combine_session_and_cleanup, parse_sdp, watch_bus};
+use super::host_branch::{
+    add_viewer, force_key_unit, next_diagnostic_role, ViewerBranch, ViewerTeardown,
+};
+use super::{
+    add_remote_candidate, check_promise_reply, combine_session_and_cleanup, parse_sdp, watch_bus,
+};
 
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_AFTER: Duration = Duration::from_millis(100);
@@ -155,6 +160,7 @@ pub(crate) async fn run_host(
 
     // One peer connection per viewer, keyed by the relay's peer id.
     let mut viewers: HashMap<String, ViewerBranch> = HashMap::new();
+    let mut viewer_ice: HashMap<String, IceEventTracker> = HashMap::new();
     let mut idle_redraw = tokio::time::interval(IDLE_REDRAW_INTERVAL);
     idle_redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut recovery_keyframe = tokio::time::interval(RECOVERY_KEYFRAME_INTERVAL);
@@ -216,6 +222,7 @@ pub(crate) async fn run_host(
                     }
                     Some((peer, error)) = failed_viewers.recv() => {
                         if let Some(branch) = viewers.remove(&peer) {
+                            viewer_ice.remove(&peer);
                             let label = branch.label.clone();
                             viewer_teardown.enqueue(branch).await?;
                             suspend_idle_host(&viewer_teardown, viewers.len(), &mut pipeline_started).await?;
@@ -254,6 +261,8 @@ pub(crate) async fn run_host(
                             recovery_keyframe.reset();
                         }
                         let label = name.unwrap_or_else(|| format!("viewer {peer}"));
+                        let diagnostic_role = next_diagnostic_role();
+                        let ice_diagnostics = IceEventTracker::new(diagnostic_role.clone());
                         match add_viewer(
                             &pipeline,
                             &tee,
@@ -262,11 +271,14 @@ pub(crate) async fn run_host(
                             label.clone(),
                             settings.codec,
                             settings.fps,
+                            diagnostic_role,
+                            ice_diagnostics.clone(),
                             client.outgoing.clone(),
                             viewer_failures.clone(),
                         ) {
                             Ok(branch) => {
                                 viewers.insert(peer.clone(), branch);
+                                viewer_ice.insert(peer.clone(), ice_diagnostics);
                                 if !pipeline_started {
                                     pipeline.set_state(gst::State::Playing)?;
                                     pipeline_started = true;
@@ -280,6 +292,7 @@ pub(crate) async fn run_host(
                     }
                     Signal::ViewerLeft { peer } => {
                         if let Some(branch) = viewers.remove(&peer) {
+                            viewer_ice.remove(&peer);
                             let label = branch.label.clone();
                             viewer_teardown.enqueue(branch).await?;
                             suspend_idle_host(&viewer_teardown, viewers.len(), &mut pipeline_started).await?;
@@ -324,10 +337,10 @@ pub(crate) async fn run_host(
                         mline,
                         candidate,
                     } => {
-                        if let Some(branch) = viewers.get(&peer) {
-                            branch
-                                .bin
-                                .emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
+                        if let (Some(branch), Some(diagnostics)) =
+                            (viewers.get(&peer), viewer_ice.get(&peer))
+                        {
+                            add_remote_candidate(&branch.bin, mline, candidate, diagnostics);
                         }
                     }
                     Signal::Authenticated { name } => println!("[host] signed in as {name}"),
@@ -347,6 +360,7 @@ pub(crate) async fn run_host(
             }
         }
     }
+    viewer_ice.clear();
     let teardown_result = viewer_teardown.finish().await;
     let stop_result = pipeline
         .set_state(gst::State::Null)

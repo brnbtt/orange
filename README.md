@@ -44,6 +44,15 @@ watching is not working. Each item has a short explanation: green means the
 check passed; red means it needs attention or could not finish. Try a stream
 with a friend to check picture and sound.
 
+Orange checks its connection options and Windows connection settings as well
+as basic server access. **Last connection** shows the outcome of the most recent
+recorded stream separately from those checks. If a repairable Windows setting
+is found, choose **Fix connection** and approve Windows' permission prompt.
+Orange checks the settings again afterward; try your stream to confirm it works.
+
+When an initial direct connection fails, Orange automatically tries one fresh
+connection before showing a troubleshooting message.
+
 Choose **Send report** to send the detailed results and recent Orange logs to
 our team. You need to be signed in. Nothing is uploaded automatically, and the
 app confirms when the report has been sent. If sending is unavailable, use

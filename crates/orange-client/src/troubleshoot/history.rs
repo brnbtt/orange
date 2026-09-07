@@ -13,6 +13,40 @@ use std::{
 const TAIL_BYTES: u64 = 128 * 1024;
 const MAX_FILES: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecentConnectionOutcome {
+    Connected,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RecentConnection {
+    pub(super) at_unix_ms: u64,
+    pub(super) outcome: RecentConnectionOutcome,
+}
+
+impl RecentConnection {
+    pub(super) fn friendly_age(&self, now_unix_ms: u128) -> String {
+        if now_unix_ms < u128::from(self.at_unix_ms) {
+            return "recorded with a future clock".into();
+        }
+        let seconds = (now_unix_ms - u128::from(self.at_unix_ms)) / 1000;
+        match seconds {
+            0..60 => "less than a minute ago".into(),
+            60..3600 => format!("{} min ago", seconds / 60),
+            3600..86400 => format!("{} h ago", seconds / 3600),
+            _ => format!("{} days ago", seconds / 86400),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Summary {
+    pub(super) lines: Vec<String>,
+    pub(super) latest: Option<RecentConnection>,
+}
+
 #[derive(Default)]
 struct Observation {
     at: u64,
@@ -41,23 +75,44 @@ impl Observation {
             "No terminal connection outcome in the inspected log tail. The attempt may still be running, may have been closed, or may be incomplete. Reproduce the issue and run Troubleshoot again."
         }
     }
+
+    fn outcome(&self) -> RecentConnectionOutcome {
+        if self.ice_failed || self.peer_failed || self.failure.is_some() {
+            RecentConnectionOutcome::Failed
+        } else if self.video_rtp || self.peer_connected {
+            RecentConnectionOutcome::Connected
+        } else {
+            RecentConnectionOutcome::Unknown
+        }
+    }
 }
 
 /// Historical evidence never contributes a current readiness verdict.
-pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String> {
+pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Summary {
     if cancelled.load(Ordering::Acquire) {
-        return Vec::new();
+        return Summary {
+            lines: Vec::new(),
+            latest: None,
+        };
     }
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return vec!["No session logs yet. Try a stream, then run Troubleshoot again.".into()];
+            return Summary {
+                lines: vec![
+                    "No session logs yet. Try a stream, then run Troubleshoot again.".into(),
+                ],
+                latest: None,
+            };
         }
         Err(_) => {
-            return vec![
-                "Session logs could not be read. Use Diagnostics > Open folder to check access."
-                    .into(),
-            ]
+            return Summary {
+                lines: vec![
+                    "Session logs could not be read. Use Diagnostics > Open folder to check access."
+                        .into(),
+                ],
+                latest: None,
+            };
         }
     };
     let mut files = Vec::new();
@@ -65,7 +120,10 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
     let mut unreadable = false;
     for (index, entry) in entries.take(257).enumerate() {
         if cancelled.load(Ordering::Acquire) {
-            return Vec::new();
+            return Summary {
+                lines: Vec::new(),
+                latest: None,
+            };
         }
         if index == 256 {
             limited = true;
@@ -94,7 +152,10 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
     let mut observations = Vec::new();
     for (_, path) in files.into_iter().take(MAX_FILES) {
         if cancelled.load(Ordering::Acquire) {
-            return Vec::new();
+            return Summary {
+                lines: Vec::new(),
+                latest: None,
+            };
         }
         match read_tail(&path) {
             Ok((bytes, _)) => observations.extend(observe(&bytes, cancelled)),
@@ -102,13 +163,20 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
         }
     }
     if cancelled.load(Ordering::Acquire) {
-        return Vec::new();
+        return Summary {
+            lines: Vec::new(),
+            latest: None,
+        };
     }
     observations.sort_by_key(|observation| std::cmp::Reverse(observation.at));
     let now_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+    let latest = observations.first().map(|observation| RecentConnection {
+        at_unix_ms: observation.at,
+        outcome: observation.outcome(),
+    });
     let mut lines: Vec<_> = observations
         .into_iter()
         .take(3)
@@ -118,17 +186,11 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
             } else {
                 "Host connection"
             };
-            let age = if now_ms < u128::from(o.at) {
-                "recorded with a future clock".into()
-            } else {
-                let seconds = (now_ms - u128::from(o.at)) / 1000;
-                match seconds {
-                    0..60 => "less than a minute ago".into(),
-                    60..3600 => format!("{} min ago", seconds / 60),
-                    3600..86400 => format!("{} h ago", seconds / 3600),
-                    _ => format!("{} days ago", seconds / 86400),
-                }
-            };
+            let age = RecentConnection {
+                at_unix_ms: o.at,
+                outcome: o.outcome(),
+            }
+            .friendly_age(now_ms);
             format!(
                 "{role} — {age}; event Unix ms {}; build {}: {}",
                 o.at,
@@ -149,7 +211,7 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
                 .into(),
         );
     }
-    lines
+    Summary { lines, latest }
 }
 
 pub(super) fn valid_log_name(name: &str) -> bool {
@@ -260,7 +322,12 @@ mod tests {
             "{\"at_unix_ms\":11000,\"build\":\"20ba4ee\",\"role\":\"watch\",\"event\":\"ice-state\",\"payload\":\"Failed\"}\n",
             "{\"at_unix_ms\":11002,\"build\":\"20ba4ee\",\"role\":\"watch\",\"event\":\"peer-connection-state\",\"payload\":\"Failed\"}\n"
         )).unwrap();
-        let result = summarize(dir.path(), &AtomicBool::new(false)).join("\n");
+        let result = summarize(dir.path(), &AtomicBool::new(false));
+        assert_eq!(
+            result.latest.as_ref().map(|latest| latest.outcome),
+            Some(RecentConnectionOutcome::Failed)
+        );
+        let result = result.lines.join("\n");
         assert!(
             result.contains("ICE connectivity checks failed"),
             "{result}"
@@ -280,7 +347,12 @@ mod tests {
             "{\"at_unix_ms\":12001,\"build\":\"secret-build-token\",\"role\":\"watch\",\"event\":\"arbitrary\",\"payload\":\"secret-payload 203.0.113.42 room-secret\"}\n",
             "{\"incomplete\":"
         )).unwrap();
-        let result = summarize(dir.path(), &AtomicBool::new(false)).join("\n");
+        let result = summarize(dir.path(), &AtomicBool::new(false));
+        assert_eq!(
+            result.latest.as_ref().map(|latest| latest.outcome),
+            Some(RecentConnectionOutcome::Connected)
+        );
+        let result = result.lines.join("\n");
         assert!(result.contains("Peer connected"), "{result}");
         assert!(result.contains("media delivery is not confirmed"));
         for secret in ["secret", "203.0.113", "Ready"] {
@@ -298,8 +370,12 @@ mod tests {
             "{\"at_unix_ms\":2000,\"build\":\"20ba4ee\",\"role\":\"host-viewer-2\",\"event\":\"peer-connection-state\",\"payload\":\"Connected\"}\n"
         )).unwrap();
         let result = summarize(dir.path(), &AtomicBool::new(false));
-        assert!(result[0].contains("Peer connected"), "{result:?}");
-        assert!(result[1].contains("ICE connectivity checks failed"));
+        assert_eq!(
+            result.latest.as_ref().map(|latest| latest.outcome),
+            Some(RecentConnectionOutcome::Connected)
+        );
+        assert!(result.lines[0].contains("Peer connected"), "{result:?}");
+        assert!(result.lines[1].contains("ICE connectivity checks failed"));
     }
 
     // A valid later record remains usable after a partial/oversized first line
@@ -310,7 +386,12 @@ mod tests {
         let mut bytes = vec![b'x'; 300_000];
         bytes.extend_from_slice(b"\n{\"at_unix_ms\":3000,\"build\":\"20ba4ee\",\"role\":\"watch\",\"event\":\"media-progress\",\"payload\":{\"progress\":{\"rtp\":{\"buffers\":5},\"decoded\":{\"buffers\":0}}}}\n");
         fs::write(dir.path().join("orange-media-8.jsonl"), bytes).unwrap();
-        let result = summarize(dir.path(), &AtomicBool::new(false)).join("\n");
+        let result = summarize(dir.path(), &AtomicBool::new(false));
+        assert_eq!(
+            result.latest.as_ref().map(|latest| latest.outcome),
+            Some(RecentConnectionOutcome::Connected)
+        );
+        let result = result.lines.join("\n");
         assert!(result.contains("Video RTP arrived"), "{result}");
         assert!(result.contains("physical playback is not verified"));
     }
@@ -318,6 +399,27 @@ mod tests {
     #[test]
     fn a_cancelled_scan_produces_no_stale_history() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(summarize(dir.path(), &AtomicBool::new(true)).is_empty());
+        let summary = summarize(dir.path(), &AtomicBool::new(true));
+        assert!(summary.lines.is_empty());
+        assert!(summary.latest.is_none());
+    }
+
+    #[test]
+    fn a_new_unknown_attempt_suppresses_older_failure_in_latest_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("orange-media-99.jsonl"),
+            concat!(
+                "{\"at_unix_ms\":1000,\"build\":\"20ba4ee\",\"role\":\"watch\",\"event\":\"ice-state\",\"payload\":\"Failed\"}\n",
+                "{\"at_unix_ms\":2000,\"build\":\"20ba4ee\",\"role\":\"watch\",\"event\":\"connection-stage\",\"payload\":{\"event\":\"watch-started\"}}\n",
+                "{\"at_unix_ms\":2001,\"build\":\"20ba4ee\",\"role\":\"watch\",\"event\":\"ice-state\",\"payload\":\"Checking\"}\n"
+            ),
+        )
+        .unwrap();
+        let summary = summarize(dir.path(), &AtomicBool::new(false));
+        assert_eq!(
+            summary.latest.as_ref().map(|latest| latest.outcome),
+            Some(RecentConnectionOutcome::Unknown)
+        );
     }
 }

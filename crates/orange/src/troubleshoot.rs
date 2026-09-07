@@ -3,7 +3,7 @@
 //! This command reports plugin/runtime/network readiness only. It does not
 //! start capture, decode to screen, or play audio.
 
-use crate::{peer, pipeline};
+use crate::{firewall, network_diagnostics, peer, pipeline};
 use anyhow::Result;
 use gstreamer as gst;
 use serde::Serialize;
@@ -11,9 +11,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
-const SCHEMA: u8 = 1;
+const SCHEMA: u8 = 2;
 const DETAIL_LIMIT: usize = 240;
-const CHECK_IDS: [&str; 7] = [
+const CHECK_IDS: [&str; 9] = [
     "runtime",
     "capture",
     "encoder",
@@ -21,6 +21,8 @@ const CHECK_IDS: [&str; 7] = [
     "audio",
     "signalling",
     "stun",
+    "ice",
+    "firewall",
 ];
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(3);
 const STUN_TOTAL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -60,6 +62,8 @@ struct CheckResult {
     id: &'static str,
     status: CheckStatus,
     detail: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    repairable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,7 +75,12 @@ struct TroubleshootReport {
 fn check(id: &'static str, status: CheckStatus, detail: impl Into<String>) -> CheckResult {
     let detail = detail.into();
     debug_assert!(detail.len() <= DETAIL_LIMIT, "detail too long for {id}");
-    CheckResult { id, status, detail }
+    CheckResult {
+        id,
+        status,
+        detail,
+        repairable: false,
+    }
 }
 
 fn missing_required<'a>(
@@ -110,14 +119,22 @@ pub(crate) async fn run(server: &str) -> Result<()> {
 async fn collect(server: &str) -> TroubleshootReport {
     let runtime = runtime_check();
     let runtime_ready = runtime.status == CheckStatus::Pass;
+    let (signalling, stun, ice, firewall) = tokio::join!(
+        signalling_check(server),
+        stun_check(),
+        ice_check(runtime_ready),
+        firewall_check(),
+    );
     let checks = vec![
         runtime,
         capture_check(runtime_ready),
         encoder_check(runtime_ready),
         decoder_check(runtime_ready),
         audio_check(runtime_ready),
-        signalling_check(server).await,
-        stun_check().await,
+        signalling,
+        stun,
+        ice,
+        firewall,
     ];
 
     debug_assert_eq!(checks.len(), CHECK_IDS.len());
@@ -130,6 +147,49 @@ async fn collect(server: &str) -> TroubleshootReport {
         schema: SCHEMA,
         checks,
     }
+}
+
+async fn ice_check(runtime_ready: bool) -> CheckResult {
+    if !runtime_ready {
+        return skipped_due_to_runtime("ice");
+    }
+    let report = network_diagnostics::probe().await;
+    let status = match report.outcome {
+        network_diagnostics::ProbeOutcome::Complete if report.candidates.total() > 0 => {
+            CheckStatus::Pass
+        }
+        network_diagnostics::ProbeOutcome::Complete | network_diagnostics::ProbeOutcome::Failed => {
+            CheckStatus::Fail
+        }
+        network_diagnostics::ProbeOutcome::TimedOut => CheckStatus::Inconclusive,
+    };
+    check(
+        "ice",
+        status,
+        format!("{}; peer connectivity untested.", report.detail()),
+    )
+}
+
+async fn firewall_check() -> CheckResult {
+    // Windows policy inspection can wait on the firewall service. The child
+    // stays bounded by its supervisor; don't stall the other network probes.
+    let Ok(inspection) = tokio::task::spawn_blocking(firewall::inspect).await else {
+        return check(
+            "firewall",
+            CheckStatus::Inconclusive,
+            "Windows connection settings could not be inspected.",
+        );
+    };
+    let status = match inspection.status {
+        firewall::FirewallStatus::Clear => CheckStatus::Pass,
+        firewall::FirewallStatus::Blocked => CheckStatus::Fail,
+        firewall::FirewallStatus::Managed | firewall::FirewallStatus::Unknown => {
+            CheckStatus::Inconclusive
+        }
+    };
+    let mut result = check("firewall", status, inspection.detail);
+    result.repairable = inspection.repairable && status == CheckStatus::Fail;
+    result
 }
 
 fn runtime_check() -> CheckResult {
@@ -663,6 +723,21 @@ fn validate_stun_binding_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn networking_checks_include_real_gathering_and_windows_policy_evidence() {
+        // A successful standalone STUN response previously left support with
+        // no evidence about ICE gathering or this application's firewall rules.
+        let report = collect("ws://127.0.0.1:9/ws").await;
+        let value = serde_json::to_value(report).unwrap();
+        let checks = value["checks"].as_array().unwrap();
+        assert!(checks.iter().any(|check| check["id"] == "ice"));
+        assert!(checks.iter().any(|check| check["id"] == "firewall"));
+        assert_eq!(value["schema"], 2);
+        for check in checks {
+            assert!(check["detail"].as_str().unwrap().len() <= 240);
+        }
+    }
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};

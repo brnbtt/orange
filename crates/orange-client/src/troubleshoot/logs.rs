@@ -174,6 +174,9 @@ fn sanitize_record(record: &Value) -> Option<Value> {
             | "operation-finished"
             | "pad-added"
             | "receive-branch-ready"
+            | "ice-candidate"
+            | "ice-route"
+            | "ice-runtime"
     ) {
         return None;
     }
@@ -218,6 +221,8 @@ fn sanitize_record(record: &Value) -> Option<Value> {
             return None;
         }
         json!(state)
+    } else if matches!(event, "ice-candidate" | "ice-route" | "ice-runtime") {
+        network_payload(event, &record["payload"])?
     } else {
         clean_payload(&record["payload"], "", 0)?
     };
@@ -227,6 +232,65 @@ fn sanitize_record(record: &Value) -> Option<Value> {
         safe["elapsed_ms"] = elapsed.into();
     }
     Some(safe)
+}
+
+fn network_token<'a>(value: &'a Value, key: &str, allowed: &[&str]) -> Option<&'a str> {
+    value[key].as_str().filter(|text| allowed.contains(text))
+}
+
+fn network_descriptor(value: &Value) -> Option<Value> {
+    Some(json!({
+        "kind":network_token(value, "kind", &["host", "srflx", "prflx", "relay", "unknown"] )?,
+        "transport":network_token(value, "transport", &["udp", "tcp", "unknown"] )?,
+        "family":network_token(value, "family", &["ipv4", "ipv6", "mdns", "unknown"] )?,
+        "scope":network_token(value, "scope", &["public", "private", "shared", "link-local", "loopback", "unknown"] )?,
+    }))
+}
+
+fn network_payload(event: &str, value: &Value) -> Option<Value> {
+    // These records describe candidate addresses without exporting them. Use
+    // finite values and typed numbers, not the general nested-field filter.
+    match event {
+        "ice-candidate" => {
+            let mut safe = network_descriptor(value)?;
+            safe["direction"] = network_token(value, "direction", &["local", "remote"])?.into();
+            safe["action"] = network_token(
+                value,
+                "action",
+                &[
+                    "gathered",
+                    "signalled",
+                    "signalling-closed",
+                    "submitted",
+                    "submission-completed",
+                    "submission-failed",
+                    "end-of-candidates",
+                    "invalid",
+                ],
+            )?
+            .into();
+            safe["mline"] = u32::try_from(value["mline"].as_u64()?).ok()?.into();
+            Some(safe)
+        }
+        "ice-route" => {
+            let selected = value["selected"].as_bool()?;
+            if selected {
+                Some(
+                    json!({"selected":true, "local":network_descriptor(&value["local"] )?, "remote":network_descriptor(&value["remote"] )?}),
+                )
+            } else {
+                Some(json!({"selected":false}))
+            }
+        }
+        "ice-runtime" => {
+            let mut safe = Map::new();
+            for key in ["gst_major", "gst_minor", "gst_micro", "gst_nano"] {
+                safe.insert(key.into(), u32::try_from(value[key].as_u64()?).ok()?.into());
+            }
+            Some(Value::Object(safe))
+        }
+        _ => None,
+    }
 }
 
 // Export only known diagnostic fields. A blacklist would miss a newly-added
@@ -380,6 +444,87 @@ mod tests {
 
     fn write(dir: &Path, name: &str, value: &Value) {
         fs::write(dir.join(name), format!("{value}\n")).unwrap();
+    }
+
+    #[test]
+    fn support_uploads_keep_candidate_lifecycle_and_selected_route_without_addresses() {
+        // The first real support report showed failed ICE but discarded the
+        // evidence needed to distinguish gathering from submission problems.
+        let dir = tempfile::tempdir().unwrap();
+        let records = [
+            record(
+                1,
+                "ice-candidate",
+                json!({
+                    "direction":"remote", "action":"submission-completed", "kind":"srflx",
+                    "family":"ipv4", "transport":"udp", "scope":"shared", "mline":0,
+                    "address":"198.51.100.4", "candidate":"secret-candidate", "ufrag":"secret-ufrag"
+                }),
+            ),
+            record(
+                2,
+                "ice-route",
+                json!({"selected":true,
+                    "local":{"kind":"host","transport":"udp","family":"ipv6","scope":"public","address":"2001:db8::1"},
+                    "remote":{"kind":"host","transport":"udp","family":"ipv6","scope":"public","port":4242},
+                    "selected_pair_id":"secret-pair"
+                }),
+            ),
+            record(
+                3,
+                "ice-runtime",
+                json!({"gst_major":1,"gst_minor":28,"gst_micro":6,"gst_nano":0,"path":"secret-path"}),
+            ),
+        ];
+        fs::write(
+            dir.path().join("orange-media-42.jsonl"),
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let logs = collect(dir.path(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(logs.len(), 1, "network evidence must be attached");
+        let rows: Vec<Value> = logs[0]
+            .contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["payload"]["action"], "submission-completed");
+        assert_eq!(rows[0]["payload"]["scope"], "shared");
+        assert_eq!(rows[1]["payload"]["remote"]["family"], "ipv6");
+        assert_eq!(rows[2]["payload"]["gst_micro"], 6);
+        for private in ["secret-", "198.51.100.4", "2001:db8::1", "4242"] {
+            assert!(!logs[0].contents.contains(private));
+        }
+    }
+
+    #[test]
+    fn network_report_fields_require_known_values_and_numeric_version_fields() {
+        // A field allowlist alone still leaks arbitrary strings under a known
+        // key. Types and finite enum values must survive the same boundary.
+        let invalid = [
+            record(
+                1,
+                "ice-candidate",
+                json!({"direction":"remote","action":"secret-token","kind":"host","transport":"udp","family":"ipv4","scope":"private","mline":0}),
+            ),
+            record(2, "ice-route", json!({"selected":"secret-token"})),
+            record(
+                3,
+                "ice-runtime",
+                json!({"gst_major":"secret-token","gst_minor":28,"gst_micro":6,"gst_nano":0}),
+            ),
+        ];
+        for record in invalid {
+            assert!(sanitize_record(&record).is_none());
+        }
+        let safe = sanitize_record(&record(
+            4,
+            "ice-route",
+            json!({"selected":false,"error":"secret-error"}),
+        ))
+        .unwrap();
+        assert_eq!(safe["payload"], json!({"selected":false}));
     }
 
     #[test]

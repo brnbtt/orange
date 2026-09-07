@@ -21,6 +21,7 @@ use super::{
     check_promise_reply, enable_nack, forward_ice, make_webrtcbin, watch_connection,
     ConnectionFailureHandler, ConnectionReadyHandler,
 };
+use crate::network_diagnostics::IceEventTracker;
 
 const AUDIO_BRANCH_MAX_PACKETS: u32 = 10;
 const STARTUP_KEYFRAME_DELAYS: [Duration; 3] = [
@@ -368,6 +369,8 @@ pub(super) fn add_viewer(
     label: String,
     codec: Codec,
     frame_rate: u32,
+    diagnostic_role: String,
+    ice_diagnostics: IceEventTracker,
     out: mpsc::UnboundedSender<Signal>,
     failures: mpsc::UnboundedSender<(String, String)>,
 ) -> Result<ViewerBranch> {
@@ -434,10 +437,7 @@ pub(super) fn add_viewer(
         }
     };
 
-    let diagnostic_label = format!(
-        "host-viewer-{}",
-        NEXT_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed)
-    );
+    let diagnostic_label = diagnostic_role;
     let failed_peer = peer.to_string();
     let connection_failures = failures.clone();
     let on_connection_failure: ConnectionFailureHandler = Arc::new(move |error| {
@@ -450,15 +450,23 @@ pub(super) fn add_viewer(
         &branch.bin,
         format!("host->{peer}"),
         diagnostic_label.clone(),
+        ice_diagnostics.clone(),
         Some(on_connected),
         Some(on_connection_failure),
         None,
     );
     branch.diagnostics = start_webrtc_diagnostics(&branch.bin, diagnostic_label, progress, None);
-    forward_ice(&branch.bin, out.clone(), peer.to_string());
+    forward_ice(&branch.bin, out.clone(), peer.to_string(), ice_diagnostics);
 
     create_offer(&branch.bin, out, failures, peer.to_string());
     Ok(branch)
+}
+
+pub(super) fn next_diagnostic_role() -> String {
+    format!(
+        "host-viewer-{}",
+        NEXT_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn shutdown_startup_then(worker: &mut StartupKeyframeWorker, teardown: impl FnOnce()) {

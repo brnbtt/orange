@@ -9,6 +9,7 @@ use crate::media_diagnostics::{
     diagnostics_enabled, emit_diagnostic, start_webrtc_diagnostics, track_pad, DiagnosticsHandle,
     MediaProgress, MediaStage,
 };
+use crate::network_diagnostics::IceEventTracker;
 use crate::webrtc::{
     accept_receive_pad, build_audio_branch, build_receive_branch, configure_receive_transport,
     encoding_name, watch_incoming_bitrate, AcceptedReceivePad, LivePlayout, Output, ReceiveOutput,
@@ -17,8 +18,9 @@ use crate::webrtc::{
 use orange_signal::{connect, Signal};
 
 use super::{
-    check_promise_reply, combine_session_and_cleanup, enable_nack, forward_ice, make_webrtcbin,
-    parse_sdp, watch_bus, watch_connection, ConnectionFailureHandler, PipelineError,
+    add_remote_candidate, check_promise_reply, combine_session_and_cleanup, enable_nack,
+    forward_ice, make_webrtcbin, parse_sdp, watch_bus, watch_connection, ConnectionFailureHandler,
+    PipelineError,
 };
 
 /// Printed when a stream we were watching finishes normally.
@@ -200,16 +202,23 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
             message: error,
         });
     });
+    let ice_diagnostics = IceEventTracker::new("watch");
     watch_connection(
         &bin,
         "watch".to_string(),
         "watch".to_string(),
+        ice_diagnostics.clone(),
         None,
         Some(on_connection_failure),
         viewer_playback.clone(),
     );
     enable_incoming_video_nack(&bin);
-    forward_ice(&bin, client.outgoing.clone(), String::new());
+    forward_ice(
+        &bin,
+        client.outgoing.clone(),
+        String::new(),
+        ice_diagnostics.clone(),
+    );
 
     // Media arrives as separate pads: one for video, one for audio. Only the
     // video pad consumes the output target.
@@ -426,7 +435,7 @@ pub(crate) async fn run_watch(code: &str, url: &str, output: Output) -> Result<(
                 Signal::Ice {
                     mline, candidate, ..
                 } => {
-                    bin.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
+                    add_remote_candidate(&bin, mline, candidate, &ice_diagnostics);
                 }
                 Signal::StreamInfo {
                     host_name,

@@ -2,7 +2,7 @@
 
 use crate::{
     supervisor::{FRAME_RATES, QUALITIES},
-    troubleshoot::{CheckStatus, UploadUiState},
+    troubleshoot::{CheckStatus, LastConnectionStatus, UploadUiState},
     ui::*,
     update, Orange, Screen,
 };
@@ -176,10 +176,11 @@ impl Orange {
 
     fn settings_troubleshoot_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let running = self.troubleshoot.is_running();
+        let repair_running = self.troubleshoot.is_repair_running();
         let has_result = self.troubleshoot.has_result();
         let sending = self.troubleshoot.is_uploading();
         let upload_state = self.troubleshoot.upload_state();
-        let cancelling = upload_state == UploadUiState::Cancelling;
+        let cancelling = self.troubleshoot.is_cancelling();
         let sent = upload_state == UploadUiState::Sent;
         let action_label = if cancelling {
             "Stopping…"
@@ -201,6 +202,8 @@ impl Orange {
                 .cursor_default()
                 .into_any_element()
         } else {
+            // GPUI emits keyboard clicks for this focusable control. A second
+            // key handler started a check and immediately cancelled it on Space.
             action
                 .on_click(cx.listener(|this, _, _, cx| {
                     if this.troubleshoot.is_running() || this.troubleshoot.is_uploading() {
@@ -209,17 +212,6 @@ impl Orange {
                         this.start_troubleshoot();
                     }
                     cx.notify();
-                }))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        if this.troubleshoot.is_running() || this.troubleshoot.is_uploading() {
-                            this.cancel_troubleshoot();
-                        } else {
-                            this.start_troubleshoot();
-                        }
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
                 }))
                 .into_any_element()
         };
@@ -250,6 +242,35 @@ impl Orange {
                 .text_xs(),
             );
 
+            content = content.child(micro("LAST CONNECTION", MUTED));
+            let (last_connection, last_connection_detail, color) = match self
+                .troubleshoot
+                .latest_connection()
+            {
+                Some((LastConnectionStatus::Failed, age)) => (
+                    "The last stream had a problem",
+                    format!("{age}. This was the last recorded attempt. Try your stream again."),
+                    DANGER,
+                ),
+                Some((LastConnectionStatus::Connected, age)) => {
+                    ("Connection established", format!("{age}."), SUCCESS)
+                }
+                Some((LastConnectionStatus::Unknown, age)) => (
+                    "No completed connection check yet",
+                    format!("{age}."),
+                    MUTED,
+                ),
+                None => (
+                    "No completed connection check yet",
+                    "Try a stream, then run Troubleshoot again.".to_string(),
+                    MUTED,
+                ),
+            };
+            content = content
+                .child(label(last_connection, color).text_xs())
+                .child(label(last_connection_detail, MUTED).text_xs());
+
+            content = content.child(micro("CURRENT CHECKS", MUTED));
             for check in self.troubleshoot.friendly_checks() {
                 let color = match check.status {
                     CheckStatus::Pass => SUCCESS,
@@ -271,8 +292,73 @@ impl Orange {
                         .children(
                             (!check.action_text.is_empty())
                                 .then(|| label(check.action_text, MUTED).text_xs()),
-                        ),
+                        )
+                        .children(check.repairable.then(|| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(label("Windows may ask for permission.", MUTED).text_xs())
+                                .child(
+                                    {
+                                        let button = quiet(
+                                            "repair-network",
+                                            if cancelling {
+                                                "Stopping…"
+                                            } else if repair_running {
+                                                "Fixing…"
+                                            } else {
+                                                "Fix connection"
+                                            },
+                                        )
+                                        .tab_index(0)
+                                        .focus(|style| {
+                                            style
+                                                .border_color(rgb(ORANGE_DIM))
+                                                .text_color(rgb(TEXT))
+                                        });
+                                        if running || sending || cancelling {
+                                            button
+                                                .text_color(rgb(FAINT))
+                                                .border_color(rgb(BORDER_DIM))
+                                                .cursor_default()
+                                                .into_any_element()
+                                        } else {
+                                            button
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.troubleshoot.start_repair(
+                                                        &this.server,
+                                                        crate::supervisor::diagnostics_directory(),
+                                                    );
+                                                    cx.notify();
+                                                }))
+                                                .on_key_down(cx.listener(
+                                                    |this, event: &KeyDownEvent, _, cx| {
+                                                        if matches!(
+                                                            event.keystroke.key.as_str(),
+                                                            "enter" | "space"
+                                                        ) {
+                                                            this.troubleshoot.start_repair(
+                                                                &this.server,
+                                                                crate::supervisor::diagnostics_directory(),
+                                                            );
+                                                            cx.stop_propagation();
+                                                            cx.notify();
+                                                        }
+                                                    },
+                                                ))
+                                                .into_any_element()
+                                        }
+                                    },
+                                )
+                                .into_any_element()
+                        })),
                 );
+            }
+
+            if let Some((message, success)) = self.troubleshoot.repair_message() {
+                content =
+                    content.child(label(message, if success { SUCCESS } else { DANGER }).text_xs());
             }
 
             content = content.child(
@@ -298,7 +384,7 @@ impl Orange {
             .tab_index(0)
             .focus(|style| style.border_color(rgb(ORANGE_DIM)).text_color(rgb(TEXT)));
 
-            content = content.child(if sending || sent || cancelling {
+            content = content.child(if running || sending || sent || cancelling {
                 send_button
                     .text_color(rgb(FAINT))
                     .border_color(rgb(BORDER_DIM))

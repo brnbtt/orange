@@ -7,6 +7,8 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::network_diagnostics::selected_ice_route;
+
 use super::progress::MediaProgress;
 use super::writer::{diagnostic_sink, emit_diagnostic};
 
@@ -243,6 +245,7 @@ pub(crate) fn start_webrtc_diagnostics(
                     if let Ok(Some(stats)) = reply {
                         let report = parse_webrtc_stats(stats);
                         emit_diagnostic("webrtc-stats", &label_for_reply, report);
+                        emit_diagnostic("ice-route", &label_for_reply, selected_ice_route(stats));
                     }
                 }
                 in_flight_for_reply.store(false, Ordering::Release);

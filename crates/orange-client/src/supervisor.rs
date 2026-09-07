@@ -474,6 +474,12 @@ pub struct StreamStatus {
     /// host when watching, joining viewers when hosting. The client offers to
     /// keep them; it never adds them on its own.
     pub met: Vec<Friend>,
+    /// Exact watcher ICE marker seen on stdout before exit.
+    pub watch_ice_failed: bool,
+    /// Set once ICE reached Connected or Completed.
+    pub watch_ice_connected_or_completed: bool,
+    /// Process exit code observed when the child stopped.
+    pub exit_code: Option<i32>,
     viewer_labels: Vec<(String, String)>,
 }
 
@@ -571,6 +577,9 @@ impl Supervisor {
             Ok(None) => true,
             Ok(Some(status)) => {
                 self.finish_readers();
+                if let Ok(mut stream) = self.status.lock() {
+                    stream.exit_code = status.code();
+                }
                 if !status.success() {
                     if let Ok(mut stream) = self.status.lock() {
                         if stream.error.is_none() {
@@ -625,11 +634,27 @@ pub(crate) fn friend_test_child(wait: bool) -> Supervisor {
     Supervisor::spawn(command).unwrap()
 }
 
+#[cfg(test)]
+pub(crate) fn watch_test_child(mode: &str) -> Supervisor {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "supervisor::tests::watch_retry_child",
+            "--nocapture",
+        ])
+        .env("ORANGE_TEST_WATCH_CHILD", mode);
+    Supervisor::spawn(command).unwrap()
+}
+
 /// Printed by `orange watch` when the host stopped, mirroring the constant in
 /// `crates/orange/src/peer/watch.rs`. A watch child exits zero both when the
 /// stream ends and when the viewer closes their own window, so the exit code
 /// cannot tell them apart and this line has to.
 const WATCH_ENDED: &str = "[watch-status] ended";
+const WATCH_ICE_FAILED: &str = "[watch] ice: Failed";
+const WATCH_ICE_CONNECTED: &str = "[watch] ice: Connected";
+const WATCH_ICE_COMPLETED: &str = "[watch] ice: Completed";
 
 /// The Discord identity of whoever this session put us in contact with: the
 /// host when watching, the newest viewer when hosting.
@@ -667,6 +692,10 @@ fn parse_line(line: &str, status: &Arc<Mutex<StreamStatus>>) {
         status.code = Some(rest.trim().to_string());
     } else if line == WATCH_ENDED {
         status.ended = true;
+    } else if line == WATCH_ICE_FAILED {
+        status.watch_ice_failed = true;
+    } else if line == WATCH_ICE_CONNECTED || line == WATCH_ICE_COMPLETED {
+        status.watch_ice_connected_or_completed = true;
     } else if let Some(record) = line.strip_prefix("[quality-status] ") {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(record) else {
             return;
@@ -1063,6 +1092,54 @@ mod tests {
         if mode == "wait" {
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
+    }
+
+    #[test]
+    fn watch_retry_child() {
+        let Ok(mode) = std::env::var("ORANGE_TEST_WATCH_CHILD") else {
+            return;
+        };
+        // libtest can prefix the first stdout line without a newline. Emit an
+        // empty line so exact marker parsing still sees whole lines.
+        println!();
+        match mode.as_str() {
+            "ice-failed-exit1" => {
+                println!("{WATCH_ICE_FAILED}");
+                std::process::exit(1);
+            }
+            "ice-failed-exit0" => {
+                println!("{WATCH_ICE_FAILED}");
+            }
+            "ice-connected-then-failed-exit1" => {
+                println!("{WATCH_ICE_CONNECTED}");
+                println!("{WATCH_ICE_FAILED}");
+                std::process::exit(1);
+            }
+            "ended-exit0" => {
+                println!("{WATCH_ENDED}");
+            }
+            "ice-failed-with-host-exit1" => {
+                println!("[watch-host] {{\"id\":\"42\",\"name\":\"Friend\",\"avatar_url\":null}}");
+                println!("{WATCH_ICE_FAILED}");
+                std::process::exit(1);
+            }
+            "wait" => std::thread::sleep(std::time::Duration::from_secs(60)),
+            _ => panic!("unknown watch child mode: {mode}"),
+        }
+    }
+
+    #[test]
+    fn watch_ice_markers_require_exact_matches() {
+        let status = Arc::new(Mutex::new(StreamStatus::default()));
+
+        parse_line("[watch] ice: Failed to gather", &status);
+        assert!(!status.lock().unwrap().watch_ice_failed);
+
+        parse_line(WATCH_ICE_FAILED, &status);
+        assert!(status.lock().unwrap().watch_ice_failed);
+
+        parse_line(WATCH_ICE_CONNECTED, &status);
+        assert!(status.lock().unwrap().watch_ice_connected_or_completed);
     }
 
     /// Both directions of a code join have to surface an identity, or only one
