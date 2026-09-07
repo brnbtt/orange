@@ -61,6 +61,12 @@ empty session tokens, and configures an unused loopback signalling address.
 There is no active capture, media child or network session. `game_art.py` draws
 only fictional game-preview pixels, never the Orange interface.
 
+`ORANGE_CAPTURE_SCREEN=settings` opens the real Settings renderer with System
+expanded. This fixture polls only its troubleshooting job, so Troubleshoot,
+Cancel, Run again and Copy report can be exercised without account polling or
+starting a stream. The diagnostic child uses the ordinary runtime lookup; its
+signalling check deliberately fails against the fixture's unused loopback port.
+
 Recorded verification: polished client **112 passed, 2 ignored**;
 fixture build succeeded; renderers match the source worktree verbatim;
 all six final 720 × 990 PNGs visually inspected.

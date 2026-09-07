@@ -37,6 +37,23 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for process boundaries, crate and source
 maps, media flows, teardown rules, compatibility contracts, limits, and the
 authoritative validation commands.
 
+## Troubleshooting
+
+Open **Settings > System > Troubleshooting > Troubleshoot** to check the local
+media runtime and available capture/codec/audio components, the configured
+signalling WebSocket, and UDP STUN reachability. The check runs in the background
+and can be cancelled. Use **Copy report** to share its results with support.
+
+The report also summarizes recent session logs with their build and timestamp.
+An ICE failure is reported as a failed connection stage; it does not by itself
+identify a firewall, NAT restriction, or missing candidate. **Basic checks
+passed** means the measured checks passed, not that every friend is reachable.
+Actual capture, picture and sound, and a connection to the intended friend
+still need a real streaming test. Networks requiring TURN remain unsupported.
+
+For a command-line report, run `orange troubleshoot --server <WebSocket URL>`.
+The report omits raw addresses, room codes, account identities and tokens.
+
 ## Identity And Access
 
 Discord identity is optional in the signalling protocol and CLI. It adds names

@@ -104,6 +104,8 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
 | `crates/orange-client/src/supervisor.rs` | Finds GStreamer (bundled copy first), launches `orange.exe`, bounds/cancels window enumeration and owns its output readers, parses child stdout/stderr, resolution/frame-rate choices, diagnostic retention |
 | `crates/orange-client/src/supervisor_list_tests.rs` | Real-child tests of enumeration output, cancellation, deadlines and errors |
+| `crates/orange-client/src/troubleshoot.rs` | On-demand Settings checks, owned diagnostic child job, report validation and copyable results |
+| `crates/orange-client/src/troubleshoot/history.rs` | Bounded recent JSONL tails, per-connection historical outcomes and sanitized build/timestamp evidence |
 | `crates/orange-client/src/session.rs` | Reads CLI session JSON including the relay token; atomically reads/writes client preferences and the friend roster |
 | `crates/orange-client/src/client.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-client/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
@@ -153,6 +155,7 @@ animation gate as the grid and logo aura.
 | `crates/orange/src/targets.rs` | Capturable-window enumeration/filtering, HWND-to-PID lookup, late-join redraw request |
 | `crates/orange/src/text.rs` | System font loading and glyph rasterization for the video overlay |
 | `crates/orange/src/connection.rs` | Privacy-safe connection progress stages and failures shared by signalling, WebRTC and playback |
+| `crates/orange/src/troubleshoot.rs` | Diagnostic command: media component availability, signalling WebSocket and bounded UDP STUN checks |
 | `crates/orange/src/window/connection_surface.rs` | What the viewer window draws before media arrives: connection stage, close hit test |
 | `crates/orange/src/encoder_characterization.rs` | Developer-only `characterize-bitrate` subcommand. It sits outside `media_diagnostics/` on purpose: that tree instruments live sessions, this one benchmarks encoders in a throwaway process and never runs for a user |
 | `crates/orange/src/test_support.rs` | `#[cfg(test)]` only: runs a test in a deadline-bounded child process |
@@ -372,6 +375,7 @@ are named in the test that owns them.
 | Updater flags `--installer --sha256 --parent --install-dir` | producer: `crates/orange-client/src/update.rs`; consumer: `crates/orange-updater/src/main.rs` |
 | RTP video payload 96, RTX 97, Opus 111, clocks and 100 ms receive latency | `crates/orange/src/webrtc/transport.rs` |
 | Local diagnostic JSONL fields and `ORANGE_*` metadata | producer: `crates/orange/src/media_diagnostics/writer.rs`; consumer: a human, via Settings -> Diagnostics -> Open folder |
+| `orange troubleshoot --server <url>` JSON (`schema: 1`, seven unique check IDs, `pass`/`fail`/`inconclusive` statuses and sanitized detail) | producer: `crates/orange/src/troubleshoot.rs`; consumer: `crates/orange-client/src/troubleshoot.rs` |
 
 ## Where Do I Change...?
 
@@ -410,6 +414,13 @@ are named in the test that owns them.
 | Public website and live Windows download | `website/`, `deploy/website.ps1`; hosting and preview instructions in `website/README.md` |
 
 ## Validation
+
+Settings troubleshooting is an on-demand, cancellable diagnostic child rather
+than a readiness gate for normal use. Factory/link compatibility checks do not
+start screen capture or physical playback. A signalling handshake and a STUN
+response do not establish ICE connectivity to a particular friend. Historical
+log findings are separate from current checks and carry their originating build
+and record timestamp; no raw candidate, address, token or identity is copied.
 
 For client chrome changes, also run `website/capture/test-chrome.py` against a
 prepared disposable capture fixture (see `website/capture/README.md`). This

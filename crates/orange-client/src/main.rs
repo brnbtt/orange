@@ -16,6 +16,7 @@ mod presence;
 mod session;
 mod sound;
 mod supervisor;
+mod troubleshoot;
 mod ui;
 mod update;
 mod view;
@@ -224,6 +225,7 @@ struct Orange {
     /// refreshes on activation change and has no public observer for it.
     animate: bool,
     updates: update::UpdateController,
+    troubleshoot: troubleshoot::TroubleshootState,
 }
 
 /// The parts of the app the view can actually see.
@@ -278,6 +280,8 @@ struct Digest {
         bool,
     ),
     friend_menu: Option<String>,
+    troubleshoot_running: bool,
+    troubleshoot_generation: u64,
 }
 
 impl Orange {
@@ -558,6 +562,8 @@ impl Orange {
                 self.friend_sync.busy(),
             ),
             friend_menu: self.friend_menu_target().map(|friend| friend.id.clone()),
+            troubleshoot_running: self.troubleshoot.is_running(),
+            troubleshoot_generation: self.troubleshoot.generation(),
         }
     }
 
@@ -775,6 +781,7 @@ impl Orange {
             // Corrected on the first render, before anything is painted.
             animate: false,
             updates,
+            troubleshoot: troubleshoot::TroubleshootState::default(),
         }
     }
 
@@ -788,6 +795,7 @@ impl Orange {
         self.poll_friends();
         self.poll_presence();
         self.poll_friend_avatars();
+        self.troubleshoot.poll();
         if let Some(pixels) = self.avatar_job.poll() {
             self.avatar = capture::to_image(pixels);
         }
@@ -802,6 +810,7 @@ impl Orange {
                     {
                         self.stop_host();
                         self.stop_all_watches();
+                        self.troubleshoot.clear();
                         self.save_preferences();
                     }
                     // Reauthentication can finish after old child events have
@@ -991,6 +1000,32 @@ impl Orange {
         }
     }
 
+    fn start_troubleshoot(&mut self) {
+        if self
+            .troubleshoot
+            .start(&self.server, supervisor::diagnostics_directory())
+        {
+            self.clear_error();
+        }
+    }
+
+    fn cancel_troubleshoot(&mut self) {
+        self.troubleshoot.cancel();
+    }
+
+    fn troubleshoot_report(&self) -> Option<String> {
+        self.troubleshoot
+            .report_text(update::current_version(), update::build_label())
+    }
+
+    fn copy_troubleshoot_report(&mut self, cx: &mut Context<Self>) {
+        let Some(report) = self.troubleshoot_report() else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(report));
+        self.show_notice(NoticeKind::Ordinary, "Troubleshooting report copied.");
+    }
+
     /// Offers belong to the UI, not to a playback process that may already
     /// have exited by the time the user comes back to Home.
     fn pending_friend(&self) -> Option<session::Friend> {
@@ -1151,6 +1186,7 @@ impl Orange {
         if let Some(destination) = destination {
             self.screen = destination;
         }
+        self.troubleshoot.clear();
     }
 
     fn reject_session(&mut self) {
@@ -1363,6 +1399,7 @@ impl Drop for Orange {
         if let Some(job) = self.presence_job.as_mut() {
             job.cancel();
         }
+        self.troubleshoot.cancel();
     }
 }
 
@@ -1587,6 +1624,7 @@ mod tests {
             logo_epoch: 0,
             animate: false,
             updates: update::UpdateController::new(),
+            troubleshoot: troubleshoot::TroubleshootState::default(),
         }
     }
 

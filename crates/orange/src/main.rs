@@ -11,6 +11,7 @@ mod targets;
 #[cfg(test)]
 mod test_support;
 mod text;
+mod troubleshoot;
 mod webrtc;
 mod window;
 
@@ -122,6 +123,11 @@ enum Command {
         /// Playback behavior for an ordinary viewer or the local live monitor.
         #[arg(long, value_enum, default_value_t = PlaybackKind::Friend)]
         profile: PlaybackKind,
+    },
+    /// Run local troubleshooting checks without joining a room.
+    Troubleshoot {
+        #[arg(long, default_value = "ws://127.0.0.1:9000/ws", env = "ORANGE_SERVER")]
+        server: String,
     },
     /// Open the viewer window with a synthetic stream. Design harness.
     ///
@@ -288,7 +294,6 @@ fn entry() -> Result<()> {
 fn run(cli: Cli) -> Result<()> {
     // Before anything creates a window or asks Windows about the screen.
     window::set_dpi_aware();
-    gst::init()?;
 
     match cli.command {
         Command::List { json } => cmd_list(json),
@@ -298,6 +303,7 @@ fn run(cli: Cli) -> Result<()> {
             quality,
             seconds,
         } => {
+            gst::init()?;
             let settings = quality.settings(hwnd)?;
             println!(
                 "Recording hwnd {hwnd} as {:?} at {} kbps / {} fps -> {out}",
@@ -314,6 +320,7 @@ fn run(cli: Cli) -> Result<()> {
             quality,
             seconds,
         } => {
+            gst::init()?;
             let settings = quality.settings(hwnd)?;
             println!(
                 "Loopback hwnd {hwnd} as {:?} at {} kbps / {} fps",
@@ -336,9 +343,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::CharacterizeBitrate { encoder } => {
+            gst::init()?;
             encoder_characterization::run(encoder.as_deref())
         }
         Command::CharacterizeBitrateWorker { encoder } => {
+            gst::init()?;
             encoder_characterization::run_worker(&encoder)
         }
         Command::Serve { addr } => runtime()?.block_on(signal::serve(&addr)),
@@ -358,6 +367,7 @@ fn run(cli: Cli) -> Result<()> {
             visible_to,
             quality,
         } => {
+            gst::init()?;
             let settings = quality.settings(hwnd)?;
             println!(
                 "Hosting hwnd {hwnd} as {:?} at {} kbps / {} fps",
@@ -372,6 +382,7 @@ fn run(cli: Cli) -> Result<()> {
             cascade,
             profile,
         } => {
+            gst::init()?;
             let output = match out {
                 Some(path) => webrtc::Output::File(path),
                 None => {
@@ -386,6 +397,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             runtime()?.block_on(peer::run_watch(&code, &server, output))
         }
+        Command::Troubleshoot { server } => runtime()?.block_on(troubleshoot::run(&server)),
         Command::Preview {
             size,
             window: window_size,
@@ -394,6 +406,7 @@ fn run(cli: Cli) -> Result<()> {
             fps,
             pin,
         } => {
+            gst::init()?;
             let (vw, vh) = parse_scale(&size)?;
             let (ww, wh) = parse_scale(&window_size)?;
             if fps == 0 {

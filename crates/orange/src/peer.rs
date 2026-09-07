@@ -28,7 +28,7 @@ pub(crate) use watch::run_watch;
 
 /// Public STUN lets peers discover their external address. Without it, two
 /// machines behind different routers will never find each other.
-const STUN: &str = "stun://stun.l.google.com:19302";
+pub(crate) const STUN: &str = "stun://stun.l.google.com:19302";
 
 struct PipelineError {
     source: String,

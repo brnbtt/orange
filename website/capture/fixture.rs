@@ -20,6 +20,7 @@ fn state() -> Orange {
     let screen = match std::env::var("ORANGE_CAPTURE_SCREEN").as_deref() {
         Ok("pick") => Screen::PickWindow,
         Ok("streaming") => Screen::Streaming,
+        Ok("settings") => Screen::Settings,
         _ => Screen::Home,
     };
     let windows: Vec<_> = [
@@ -112,7 +113,11 @@ fn state() -> Orange {
         settings_scroll: gpui::ScrollHandle::new(),
         friends_scroll: gpui::ScrollHandle::new(),
         update_collapsed: false,
-        settings_open: [true; 3],
+        settings_open: if capture_screen == "settings" {
+            [false, false, true]
+        } else {
+            [true; 3]
+        },
         copied_at: None,
         copied_code: None,
         own_codes: Vec::new(),
@@ -144,6 +149,7 @@ fn state() -> Orange {
         logo_epoch: 0,
         animate: false,
         updates: update::UpdateController::new(),
+        troubleshoot: troubleshoot::TroubleshootState::default(),
     }
 }
 
@@ -161,7 +167,29 @@ pub(crate) fn run() {
                 is_resizable: false,
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| state()),
+            |_, cx| {
+                cx.new(|cx| {
+                    // The settings fixture exercises the real background check
+                    // without starting account/presence polling or live streams.
+                    if std::env::var("ORANGE_CAPTURE_SCREEN").as_deref() == Ok("settings") {
+                        cx.spawn(async move |this, cx| loop {
+                            Timer::after(Duration::from_millis(100)).await;
+                            if this
+                                .update(cx, |this: &mut Orange, cx| {
+                                    if this.troubleshoot.poll() {
+                                        cx.notify();
+                                    }
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        })
+                        .detach();
+                    }
+                    state()
+                })
+            },
         )
         .expect("capture window");
         cx.activate(true);

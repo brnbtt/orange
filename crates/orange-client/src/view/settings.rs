@@ -2,11 +2,12 @@
 
 use crate::{
     supervisor::{FRAME_RATES, QUALITIES},
+    troubleshoot::CheckStatus,
     ui::*,
     update, Orange, Screen,
 };
 
-use gpui::{div, prelude::*, px, rgb, Context, SharedString};
+use gpui::{div, prelude::*, px, rgb, Context, KeyDownEvent, SharedString};
 
 /// Indices into `Orange::settings_open`.
 const SECTION_ACCOUNT: usize = 0;
@@ -173,6 +174,128 @@ impl Orange {
         .into_any_element()
     }
 
+    fn settings_troubleshoot_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let running = self.troubleshoot.is_running();
+        let has_result = self.troubleshoot.has_result();
+        let action_label = if running {
+            "Cancel"
+        } else if has_result {
+            "Run again"
+        } else {
+            "Troubleshoot"
+        };
+
+        let action = quiet("run-troubleshoot", action_label)
+            .tab_index(0)
+            .focus(|style| style.border_color(rgb(ORANGE_DIM)).text_color(rgb(TEXT)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.troubleshoot.is_running() {
+                    this.cancel_troubleshoot();
+                } else {
+                    this.start_troubleshoot();
+                }
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    if this.troubleshoot.is_running() {
+                        this.cancel_troubleshoot();
+                    } else {
+                        this.start_troubleshoot();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }));
+
+        let mut content = card()
+            .w_full()
+            .min_w(px(0.0))
+            .flex_shrink_0()
+            .gap_2()
+            .child(
+                setting_row(
+                    "Troubleshooting",
+                    if running {
+                        "Running basic checks now"
+                    } else {
+                        "Run basic runtime and connectivity checks"
+                    },
+                    action.into_any_element(),
+                )
+                .p_0()
+                .border_0()
+                .bg(rgb(SURFACE)),
+            );
+
+        if running {
+            content = content.child(label("Running…", MUTED).text_xs());
+        }
+
+        if let Some(summary) = self.troubleshoot.summary() {
+            content = content.child(micro("LAST RUN", MUTED));
+            content = content.child(
+                label(
+                    summary,
+                    if summary == "Basic checks passed" {
+                        SUCCESS
+                    } else {
+                        DANGER
+                    },
+                )
+                .text_xs(),
+            );
+            // Keep sharing accessible before the report grows beyond the
+            // viewport; failed users should not have to find its bottom.
+            content = content.child(
+                quiet("copy-troubleshoot", "Copy report")
+                    .tab_index(0)
+                    .focus(|style| style.border_color(rgb(ORANGE_DIM)).text_color(rgb(TEXT)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.copy_troubleshoot_report(cx);
+                        cx.notify();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.copy_troubleshoot_report(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    })),
+            );
+            for check in self.troubleshoot.checks() {
+                let color = match check.status {
+                    CheckStatus::Pass => SUCCESS,
+                    CheckStatus::Fail => DANGER,
+                    CheckStatus::Inconclusive => MUTED,
+                };
+                content = content.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .gap_0p5()
+                        .child(
+                            label(format!("{} · {}", check.label, check.status.label()), color)
+                                .text_xs(),
+                        )
+                        .child(label(check.detail.clone(), MUTED).text_xs()),
+                );
+            }
+            if !self.troubleshoot.history().is_empty() {
+                content = content.child(micro("RECENT DIAGNOSTICS", MUTED));
+                for line in self.troubleshoot.history() {
+                    content = content.child(label(line.clone(), MUTED).text_xs());
+                }
+            }
+        }
+
+        content
+            .child(label("These checks do not verify real capture content, physical playback output, or a successful connection to your intended friend.", MUTED).text_xs())
+            .child(label("Orange currently has no TURN fallback; some networks cannot connect directly.", MUTED).text_xs())
+            .into_any_element()
+    }
+
     /// A heading plus its cards, folded away when the heading is clicked.
     fn settings_section(
         &mut self,
@@ -210,6 +333,7 @@ impl Orange {
         let frame_rate = self.settings_frame_rate_card(cx);
         let updates = self.settings_updates_card(cx);
         let diagnostics = self.settings_diagnostics_card(cx);
+        let troubleshoot = self.settings_troubleshoot_card(cx);
 
         let account = self.settings_section(
             SECTION_ACCOUNT,
@@ -237,7 +361,7 @@ impl Orange {
             "section-system",
             "SYSTEM",
             None,
-            vec![updates, diagnostics],
+            vec![updates, diagnostics, troubleshoot],
             cx,
         );
 

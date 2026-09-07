@@ -105,7 +105,7 @@ fn gstreamer_bin() -> Option<std::path::PathBuf> {
 }
 
 /// Build a command for the `orange` binary with GStreamer reachable.
-fn orange_command() -> Result<Command> {
+pub(super) fn orange_command() -> Result<Command> {
     let mut command = Command::new(orange_exe()?);
 
     if let Some(bin) = gstreamer_bin() {
@@ -234,62 +234,80 @@ pub(super) fn picker_windows(cancel: &AtomicBool) -> Result<Vec<WindowTarget>> {
     Ok(windows)
 }
 
-// Only orange list needs a short deadline. Its owner always kills/reaps the
-// child and joins both pipe readers, including cancellation and parse failures.
-struct WindowListChild {
+// Bounded command owner: cancellation/timeout kills and reaps the child, and
+// always joins both pipe readers before returning.
+struct BoundedCommandChild {
     child: Child,
     readers: Vec<std::thread::JoinHandle<()>>,
+    output_name: &'static str,
+    reap_name: &'static str,
 }
 
-impl WindowListChild {
+impl BoundedCommandChild {
     fn finish_readers(&mut self) {
         for reader in self.readers.drain(..) {
             crate::background::join_background_worker(
                 reader,
                 Duration::from_secs(5),
-                "window list output",
+                self.output_name,
             );
         }
     }
 }
 
-impl Drop for WindowListChild {
+impl Drop for BoundedCommandChild {
     fn drop(&mut self) {
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
             let _ = self.child.kill();
             if let Err(error) = self.child.wait() {
-                crate::client::fail_fast("could not reap window list child", &error.into());
+                crate::client::fail_fast(self.reap_name, &error.into());
             }
         }
         self.finish_readers();
     }
 }
 
-fn list_windows_command(
+#[derive(Debug)]
+pub(super) struct BoundedCommandOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+pub(super) fn run_bounded_command(
     mut command: Command,
     cancel: &AtomicBool,
     timeout: Duration,
-) -> Result<Vec<WindowTarget>> {
-    const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
+    max_output: u64,
+    label: &'static str,
+) -> Result<BoundedCommandOutput> {
     let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("could not run `orange list`")?;
-    let mut owner = WindowListChild {
+        .with_context(|| format!("could not run {label}"))?;
+    let mut owner = BoundedCommandChild {
         child,
         readers: Vec::new(),
+        output_name: label,
+        reap_name: "could not reap bounded child",
     };
     let (sender, receiver) = mpsc::channel();
-    // Read simultaneously: waiting first can deadlock if a large list fills
-    // stdout, or a loader failure fills stderr. Each buffer is capped.
-    let stdout = owner.child.stdout.take().context("missing list stdout")?;
-    let stderr = owner.child.stderr.take().context("missing list stderr")?;
+    let stdout = owner
+        .child
+        .stdout
+        .take()
+        .context("missing command stdout")?;
+    let stderr = owner
+        .child
+        .stderr
+        .take()
+        .context("missing command stderr")?;
     let out_sender = sender.clone();
     owner.readers.push(std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stdout
-            .take(MAX_OUTPUT + 1)
+            .take(max_output + 1)
             .read_to_end(&mut bytes)
             .map(|_| bytes);
         let _ = out_sender.send((true, result));
@@ -297,18 +315,15 @@ fn list_windows_command(
     owner.readers.push(std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stderr
-            .take(MAX_OUTPUT + 1)
+            .take(max_output + 1)
             .read_to_end(&mut bytes)
             .map(|_| bytes);
         let _ = sender.send((false, result));
     }));
     let deadline = Instant::now() + timeout;
     let status = loop {
-        anyhow::ensure!(
-            !cancel.load(Ordering::Acquire),
-            "window enumeration cancelled"
-        );
-        anyhow::ensure!(Instant::now() < deadline, "window enumeration timed out");
+        anyhow::ensure!(!cancel.load(Ordering::Acquire), "{label} cancelled");
+        anyhow::ensure!(Instant::now() < deadline, "{label} timed out");
         if let Some(status) = owner.child.try_wait()? {
             break status;
         }
@@ -319,21 +334,38 @@ fn list_windows_command(
     let mut stderr = Vec::new();
     for (is_stdout, result) in receiver {
         let bytes = result?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= MAX_OUTPUT,
-            "window enumeration output too large"
-        );
+        anyhow::ensure!(bytes.len() as u64 <= max_output, "{label} output too large");
         if is_stdout {
             stdout = bytes;
         } else {
             stderr = bytes;
         }
     }
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
-        anyhow::bail!("`orange list` exited with {}: {}", status, stderr.trim());
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn list_windows_command(
+    command: Command,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<Vec<WindowTarget>> {
+    const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
+    // Read simultaneously: waiting first can deadlock if a large list fills
+    // stdout, or a loader failure fills stderr. Each buffer is capped.
+    let output = run_bounded_command(command, cancel, timeout, MAX_OUTPUT, "window enumeration")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`orange list` exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
     }
-    let text = String::from_utf8_lossy(&stdout);
+    let text = String::from_utf8_lossy(&output.stdout);
     // The binary prints nothing else on stdout in JSON mode, but be forgiving.
     let json = text
         .lines()
