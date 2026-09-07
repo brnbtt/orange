@@ -64,3 +64,19 @@ only fictional game-preview pixels, never the Orange interface.
 Recorded verification: polished client **112 passed, 2 ignored**;
 fixture build succeeded; renderers match the source worktree verbatim;
 all six final 720 × 990 PNGs visually inspected.
+
+## Window chrome regression
+
+Prepare and build a disposable fixture from the current source for this check,
+rather than the `v1.0.1` screenshot revision (which intentionally fails). Run:
+
+```powershell
+python test-chrome.py C:\path\to\disposable-worktree
+```
+
+Use `--binary PATH` if its executable is in a shared build cache. This check
+moves only the fixture process's window, restores the cursor, and terminates
+the fixture afterward. It verifies that dragging the brand and empty titlebar
+actually moves the HWND, while settings and body drags do not. In 1.0.1 both
+titlebar regions still returned `HTCAPTION`, but GPUI's root focus handler
+prevented the native mouse-down default; hit-test assertions alone missed it.

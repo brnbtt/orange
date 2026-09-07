@@ -85,10 +85,6 @@ impl Render for Orange {
 
         div()
             .id("orange-app")
-            .track_focus(&root_focus)
-            // This focus handle is a keyboard fallback. Child controls have
-            // already handled the click; blank space must not steal focus.
-            .on_any_mouse_down(|_, window, _| window.prevent_default())
             .relative()
             .flex()
             .flex_col()
@@ -118,6 +114,11 @@ impl Render for Orange {
             .child(self.render_titlebar(cx))
             .child(
                 div()
+                    // GPUI also uses prevent_default to cancel Windows'
+                    // non-client mouse-down. Keep fallback focus and its
+                    // mouse handler below the titlebar so OS dragging survives.
+                    .track_focus(&root_focus)
+                    .on_any_mouse_down(|_, window, _| window.prevent_default())
                     .relative()
                     .flex()
                     .flex_col()

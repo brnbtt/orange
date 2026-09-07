@@ -411,6 +411,11 @@ are named in the test that owns them.
 
 ## Validation
 
+For client chrome changes, also run `website/capture/test-chrome.py` against a
+prepared disposable capture fixture (see `website/capture/README.md`). This
+Windows desktop check uses real mouse input and measures window movement:
+`HTCAPTION` alone still passed when the 1.0.1 focus handler blocked dragging.
+
 Run from a PowerShell prompt at the repository root:
 
 ```powershell
