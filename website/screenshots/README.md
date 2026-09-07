@@ -1,9 +1,10 @@
-# Native Orange 1.0.0 screenshots
+# Native Orange 1.0.1 interface
 
-Captured from the actual **Orange 1.0.0 GPUI Windows client**, revision
-`b5c4584964dc3d8468317b992dfdcde02179776a`, on 2026-09-05. This includes the
-mutual-friend flow and `2e718da`'s fixed streaming controls. Cargo's version at
-this revision is 1.0.0; no capture-specific version bump was made.
+Captured from the actual **GPUI Windows client** on 2026-09-06, using the
+home-polish source accompanying these images (based on `5e68835`). These captures
+show the interface shipped in **1.0.1**: compact social controls, contextual friend
+actions, screen-share/join icons and a softer ambient backdrop. Capture preceded
+the release version bump; the renderer is the same code shipped in 1.0.1.
 
 Every PNG is **720 × 990 native pixels**: the normal 480 × 660 logical-pixel
 window rendered at Windows 150% DPI, captured with
@@ -12,18 +13,17 @@ stitching or retouching was applied. All final images were visually inspected.
 
 | Asset | Staged native state |
 | --- | --- |
-| `home.png` | pixelpilot signed in; mutual friends fragbyte live and nightshift offline |
+| `home.png` | pixelpilot signed in; fragbyte live and nightshift offline; compact tabs, options menus and icon-labelled streaming actions |
 | `pick.png` | Four original demo-game sources; Vector Arena hovered; 1080p selected |
 | `streaming.png` | Vector Arena FPS preview; 1080p / 60 fps; `ORA-NGE`; fragbyte and nightshift watching |
 | `add-friend.png` | aimassist's profile confirmation, fictional numeric Discord ID, **Send request** |
-| `requests.png` | Native Requests list scrolled down: incoming **Accept / Decline**, aimassist **Request pending / Cancel** |
-| `requests-incoming.png` | Supplementary unscrolled view showing respawned's name and **Accept / Decline** |
+| `requests.png` | Full inbox after a wheel input: respawned **Accept / Decline**, aimassist **Request pending / Cancel** |
+| `requests-incoming.png` | Initial inbox view, with both incoming and sent requests visible |
 
-The fixed-height Requests list cannot show both full cards simultaneously.
-`requests.png` faithfully captures its scrolled state, with the incoming name
-above the viewport. `requests-incoming.png` preserves that context separately.
-Similarly, adding the confirmation card makes the Home friend list scroll;
-the native screenshot keeps the complete confirmation and primary controls.
+The compact header and bottom action row now leave enough space for both
+request cards. Both inbox assets retain their existing URLs; a wheel input
+does not move this short list. The add-friend capture also fits the confirmation
+and both friend rows without clipping the primary actions.
 
 ## What is mocked
 
@@ -41,7 +41,7 @@ also an original game-only composition. No personal desktop or licensed game
 artwork was used.
 
 The actual Orange `view.rs`, `view/`, `ui.rs`, `ui/` and `friends.rs` source files
-are unchanged. A disposable worktree entry point seeds the existing `Orange`
+are copied verbatim from the home-polish worktree. A disposable entry point seeds the existing `Orange`
 and `friends::Sync` state, bypassing normal startup/polling. No real account,
 friends, OAuth token, production network or active media stream was used.
 Updates were disabled with `ORANGE_UPDATE_CHANNEL=capture` when building.

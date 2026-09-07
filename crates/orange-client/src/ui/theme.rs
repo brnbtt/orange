@@ -43,9 +43,8 @@ pub(crate) const DANGER_EDGE: u32 = 0x4a1e1c;
 /// Only the close button turns red under the cursor, so it is the one control
 /// that says what it does before it is clicked.
 pub(crate) const DANGER_HOVER: u32 = 0x9a2e2e;
-/// The ambient grid. Warm rather than neutral, and only just above the
-/// background: it is meant to be felt at the edge of vision rather than read.
-pub(crate) const GRID: u32 = 0x191317;
+/// Neutral hairlines under the warm ambient light; faded further by decor.
+pub(crate) const GRID: u32 = 0x242127;
 /// The viewfinder brackets and registration marks framing a screen.
 pub(crate) const FRAME: u32 = 0x40180c;
 
@@ -162,12 +161,8 @@ pub(crate) mod motion {
     pub const STAGGER: Duration = Duration::from_millis(60);
     /// One breath of the live indicator.
     pub const BREATH: Duration = Duration::from_millis(1_600);
-    /// One cell of the background grid's drift.
-    ///
-    /// An order of magnitude slower than anything else in the app, because it
-    /// is the only animation with no event behind it. Fast enough to notice
-    /// and it becomes a thing happening rather than a room you are in.
-    pub const DRIFT: Duration = Duration::from_millis(12_000);
+    /// A shallow lighting cycle, slow enough to stay behind the content.
+    pub const AMBIENT: Duration = Duration::from_secs(24);
 }
 
 /// Fade an element in on the shared entrance curve.

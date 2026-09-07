@@ -6,7 +6,10 @@ use crate::{
     Orange, Screen,
 };
 
-use gpui::{div, prelude::*, px, rgb, Context, FontWeight, SharedString};
+use gpui::{
+    anchored, deferred, div, prelude::*, px, rgb, AnchoredPositionMode, ClickEvent, Context,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, SharedString,
+};
 
 impl Orange {
     pub(super) fn render_signed_out(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -98,7 +101,7 @@ impl Orange {
         let (status, status_color) = match (&state, polled) {
             (Some(Presence::Live { .. }), _) => ("Streaming now", SUCCESS),
             (Some(Presence::Full), _) => ("Stream is full", MUTED),
-            (Some(Presence::Offline), _) | (None, true) => ("Not streaming", FAINT),
+            (Some(Presence::Offline), _) | (None, true) => ("Not streaming", MUTED),
             (None, false) => ("Checking\u{2026}", FAINT),
         };
         let joinable = match &state {
@@ -108,18 +111,48 @@ impl Orange {
         let already_watching = joinable
             .as_ref()
             .is_some_and(|code| self.watches.iter().any(|watch| &watch.code == code));
-        let id = friend.id.clone();
-
-        card()
+        let friend_id = friend.id.clone();
+        let friend_for_menu = friend.clone();
+        div()
+            .id(SharedString::from(format!("friend-row-{}", friend.id)))
+            .flex()
             .flex_row()
+            .flex_shrink_0()
             .items_center()
             .justify_between()
-            .gap_3()
+            .gap_2()
+            .min_h(px(60.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .hover(|style| style.border_color(rgb(BORDER_HOVER)))
+            // Tab changes focus on key-down in the frame. Key-up reaches the
+            // newly focused row, including rows outside the current viewport.
+            .on_key_up(cx.listener(move |this, event: &gpui::KeyUpEvent, _, cx| {
+                if event.keystroke.key == "tab" {
+                    this.friends_scroll.scroll_to_item(index);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let friend_for_menu = friend_for_menu.clone();
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        this.open_friend_menu(&friend_for_menu, event.position, window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2p5()
+                    .gap_2()
                     .min_w(px(0.0))
                     .child(avatar(
                         self.friend_avatars.get(&friend.id).cloned(),
@@ -141,7 +174,7 @@ impl Orange {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_1p5()
+                                    .gap_1()
                                     .child(if matches!(state, Some(Presence::Live { .. })) {
                                         live_dot(self.animate).into_any_element()
                                     } else {
@@ -160,7 +193,8 @@ impl Orange {
                     .child(match (joinable, already_watching) {
                         (Some(_), true) => label("Watching", FAINT).text_xs().into_any_element(),
                         (Some(code), false) => div()
-                            .id(SharedString::from(format!("join-friend-{index}")))
+                            .id(SharedString::from(format!("join-friend-{}", friend_id)))
+                            .tab_index(0)
                             .px_3()
                             .py_1p5()
                             .rounded_md()
@@ -170,6 +204,7 @@ impl Orange {
                             .font_weight(FontWeight::SEMIBOLD)
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(ORANGE_HOT)))
+                            .focus(|style| style.bg(rgb(ORANGE_HOT)))
                             .child("Join")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.join(code.clone());
@@ -179,22 +214,113 @@ impl Orange {
                         (None, _) => div().into_any_element(),
                     })
                     .child(
-                        // Removing has to be as easy as adding: a roster you
-                        // cannot prune only ever grows, and every name on it
-                        // can see when you go live.
                         div()
-                            .id(SharedString::from(format!("remove-friend-{index}")))
-                            .text_xs()
-                            .text_color(rgb(FAINT))
+                            .id(SharedString::from(format!("friend-row-more-{}", friend_id)))
+                            .tab_index(0)
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_color(rgb(MUTED))
+                            .text_sm()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .cursor_pointer()
-                            .hover(|style| style.text_color(rgb(DANGER)))
-                            .child("Remove")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_friend(&id);
-                                cx.notify();
+                            .hover(|style| {
+                                style
+                                    .bg(rgb(SURFACE_HOVER))
+                                    .border_color(rgb(BORDER_HOVER))
+                                    .text_color(rgb(TEXT))
+                            })
+                            .focus(|style| {
+                                style
+                                    .border_color(rgb(ORANGE))
+                                    .text_color(rgb(TEXT))
+                                    .bg(rgb(SURFACE_HOVER))
+                            })
+                            .child("\u{22EF}")
+                            .on_click(cx.listener({
+                                move |this, event: &ClickEvent, window, cx| {
+                                    this.open_friend_menu(
+                                        &friend_for_menu,
+                                        event.position(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
                             })),
                     ),
             )
+    }
+
+    fn render_friend_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Deferred> {
+        let menu = self.friend_menu.as_ref()?;
+        self.friend_menu_target()?;
+        let friend_name = menu.friend_name.clone();
+        let remove = div()
+            .id("friend-menu-remove")
+            .flex()
+            .items_center()
+            .px_2()
+            .h(px(30.0))
+            .rounded_md()
+            .text_color(rgb(DANGER))
+            .text_xs()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(DANGER_WASH)))
+            .focus(|style| style.bg(rgb(DANGER_WASH)))
+            .child("Remove friend")
+            .on_click(cx.listener(|this, _, window, cx| {
+                if let Some(focus) = this.remove_friend_from_menu() {
+                    focus.focus(window);
+                }
+                cx.notify();
+            }));
+        let remove = if let Some(menu_focus) = menu.menu_focus.clone() {
+            remove.track_focus(&menu_focus)
+        } else {
+            remove
+        };
+        let menu_card = card()
+            .id("friend-context-menu")
+            .occlude()
+            .w(px(184.0))
+            .p_1()
+            .gap_1()
+            .shadow_md()
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.close_friend_menu_and_restore_focus(window);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close_friend_menu_and_restore_focus(window);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(
+                label(friend_name, MUTED)
+                    .text_xs()
+                    .px_2()
+                    .py_1()
+                    .text_ellipsis(),
+            )
+            .child(remove);
+        Some(
+            deferred(
+                anchored()
+                    .position(menu.anchor)
+                    .position_mode(AnchoredPositionMode::Window)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_card),
+            )
+            .with_priority(1),
+        )
     }
 
     pub(super) fn render_friend_offer(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -314,26 +440,68 @@ impl Orange {
 
         let friend_tools = card()
             .flex_shrink_0()
-            .gap_2()
-            .child(div().flex().items_center().justify_between()
-                .child(micro("FRIENDS", MUTED))
-                .child(ghost("paste-friend", "Add friend").tab_index(0).focus(|style| style.border_color(rgb(ORANGE))).on_click(cx.listener(|this, _, _, cx| {
-                    let code = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
-                    this.offer_friend_code(&code);
-                    cx.notify();
-                })))
-                .child(quiet("copy-friend", "Copy my friend code").tab_index(0).focus(|style| style.border_color(rgb(ORANGE))).on_click(cx.listener(|this, _, _, cx| {
-                    match this.session.as_ref().map(|session| session.friend_code()) {
-                        Some(Ok(code)) => {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
-                            this.show_notice(crate::NoticeKind::Ordinary, "Friend code copied. Send it to your friend so they can add you.");
-                        }
-                        Some(Err(error)) => this.show_error(format!("Could not copy friend code: {error}")),
-                        None => this.show_error("Sign in with Discord to share your friend code."),
-                    }
-                    cx.notify();
-                }))))
-            .child(label("Copy their code, then click Add friend. When they accept, you both become friends.", MUTED).text_xs());
+            .py_2()
+            .gap_1p5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(micro("FRIENDS", MUTED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                ghost("paste-friend", "Add friend")
+                                    .tab_index(0)
+                                    .focus(|style| style.border_color(rgb(ORANGE)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let code = cx
+                                            .read_from_clipboard()
+                                            .and_then(|item| item.text())
+                                            .unwrap_or_default();
+                                        this.offer_friend_code(&code);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                quiet("copy-friend", "Copy my code")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(30.0))
+                                    .px_3()
+                                    .tab_index(0)
+                                    .focus(|style| style.border_color(rgb(ORANGE)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        match this.session.as_ref().map(|session| session.friend_code()) {
+                                            Some(Ok(code)) => {
+                                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
+                                                this.show_notice(
+                                                    crate::NoticeKind::Ordinary,
+                                                    "Friend code copied. Send it to your friend so they can add you.",
+                                                );
+                                            }
+                                            Some(Err(error)) => {
+                                                this.show_error(format!("Could not copy friend code: {error}"))
+                                            }
+                                            None => this.show_error("Sign in with Discord to share your friend code."),
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                label(
+                    "Copy their friend code, then choose Add friend.",
+                    MUTED,
+                )
+                .text_xs(),
+            );
 
         div()
             .flex()
@@ -369,32 +537,103 @@ impl Orange {
                 )
             })
             .children(self.session.is_some().then(|| {
+                let incoming = self.friend_sync.snapshot.incoming.len();
+                let friends = self.friends.len();
+                let tab = |id: &'static str,
+                           title: &'static str,
+                           count: usize,
+                           active: bool,
+                           accent_badge: bool| {
+                    div()
+                        .id(id)
+                        .tab_index(0)
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if active { BORDER_HOVER } else { BORDER }))
+                        .bg(rgb(if active { SURFACE } else { BG }))
+                        .text_color(rgb(if active { TEXT } else { MUTED }))
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(rgb(TEXT)))
+                        .focus(|style| {
+                            style
+                                .border_color(rgb(ORANGE_DIM))
+                                .text_color(rgb(TEXT))
+                                .bg(rgb(SURFACE_HOVER))
+                        })
+                        .child(label(title, if active { TEXT } else { MUTED }).text_xs())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .px_1p5()
+                                .h(px(16.0))
+                                .rounded_full()
+                                .bg(rgb(if accent_badge {
+                                    ORANGE_WASH
+                                } else {
+                                    SURFACE_HOVER
+                                }))
+                                .text_color(rgb(if accent_badge { ORANGE } else { MUTED }))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(count.to_string()),
+                        )
+                };
+
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .flex_shrink_0()
                     .child(
-                        quiet("friends-tab", format!("Friends ({})", self.friends.len()))
-                            .tab_index(0)
-                            .focus(|style| style.border_color(rgb(ORANGE)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.requests_open = false;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        ghost(
-                            "requests-tab",
-                            format!("Requests ({})", self.friend_sync.snapshot.incoming.len()),
-                        )
-                        .tab_index(0)
-                        .focus(|style| style.border_color(rgb(ORANGE)))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.requests_open = true;
-                            this.friend_sync.refresh();
-                            cx.notify();
-                        })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .p_0p5()
+                            .rounded_md()
+                            .bg(rgb(BG))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .child(
+                                tab(
+                                    "friends-tab",
+                                    "Friends",
+                                    friends,
+                                    !self.requests_open,
+                                    false,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.requests_open = false;
+                                        this.close_friend_menu();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                tab(
+                                    "requests-tab",
+                                    "Requests",
+                                    incoming,
+                                    self.requests_open,
+                                    incoming > 0,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.requests_open = true;
+                                        this.close_friend_menu();
+                                        this.friend_sync.refresh();
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
                     )
                     .child(
                         label(
@@ -593,6 +832,7 @@ impl Orange {
                     .child(
                         div()
                             .id("friend-list")
+                            .track_scroll(&self.friends_scroll)
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -604,45 +844,73 @@ impl Orange {
                     .into_any_element()
             })
             .child(
-                action_card(
-                    "start",
-                    broadcast_mark(20.0, ORANGE),
-                    if hosting {
-                        "VIEW ACTIVE STREAM"
-                    } else {
-                        "START STREAMING"
-                    },
-                    if hosting {
-                        "Your stream is running now."
-                    } else {
-                        "Go live and share your game, desktop or app."
-                    },
-                    true,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if hosting {
-                        this.screen = Screen::Streaming;
-                    } else {
-                        this.refresh_windows();
-                        this.screen = Screen::PickWindow;
-                    }
-                    cx.notify();
-                })),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(
+                        primary(
+                            "start",
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(share_icon(INK))
+                                .child(if hosting {
+                                    "View active stream"
+                                } else {
+                                    "Start streaming"
+                                }),
+                            false,
+                        )
+                        .h(px(40.0))
+                        .px_3()
+                        .border_1()
+                        .border_color(rgb(ORANGE_HOT))
+                        .tab_index(0)
+                        .focus(|style| style.bg(rgb(ORANGE_HOT)))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if hosting {
+                                this.screen = Screen::Streaming;
+                            } else {
+                                this.refresh_windows();
+                                this.screen = Screen::PickWindow;
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        secondary(
+                            "join-code",
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(join_icon(TEXT))
+                                .child("Join with a code"),
+                        )
+                        .h(px(40.0))
+                        .px_3()
+                        .w(px(180.0))
+                        .flex_shrink_0()
+                        .tab_index(0)
+                        .focus(|style| style.border_color(rgb(ORANGE)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // A room code opens video; a personal code only adds a
+                            // friend. Keep the clipboard actions distinct.
+                            let code = cx
+                                .read_from_clipboard()
+                                .and_then(|item| item.text())
+                                .unwrap_or_default();
+                            this.join(code);
+                            cx.notify();
+                        })),
+                    ),
             )
-            .child(
-                secondary("join-code", "Join with a code").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        // A room code opens video; a personal code only adds a
-                        // friend. Keep the clipboard actions distinct.
-                        let code = cx
-                            .read_from_clipboard()
-                            .and_then(|item| item.text())
-                            .unwrap_or_default();
-                        this.join(code);
-                        cx.notify();
-                    },
-                )),
-            )
+            .children(self.render_friend_menu(cx))
             .child(
                 div()
                     .flex()

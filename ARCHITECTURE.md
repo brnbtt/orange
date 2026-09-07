@@ -83,10 +83,10 @@ reopen the older one, which would find the same update waiting and loop.
 | File | Authoritative responsibility |
 | --- | --- |
 | `crates/orange-client/src/main.rs` | Application state machine, GPUI startup, polling, child lifecycle, picker actions, update handoff, top-level notification-icon ownership |
-| `crates/orange-client/src/view.rs` | The shared frame, the entry animation, and the dispatch from `Screen` to its renderer |
+| `crates/orange-client/src/view.rs` | The shared frame, Tab/Shift-Tab focus traversal, the entry animation, and the dispatch from `Screen` to its renderer |
 | `crates/orange-client/src/view/chrome.rs` | Custom titlebar, breadcrumb, window controls |
 | `crates/orange-client/src/view/toast.rs` | The floating notice layer: update banner and error toast |
-| `crates/orange-client/src/view/home.rs` | Signed-out screen, home screen, friend rows |
+| `crates/orange-client/src/view/home.rs` | Signed-out screen, home screen, friend rows and contextual actions |
 | `crates/orange-client/src/view/pick.rs` | Share picker: quality choice, whole-display row, window cards |
 | `crates/orange-client/src/view/stream.rs` | Streaming and watching screens |
 | `crates/orange-client/src/view/settings.rs` | Settings sections and the cards inside them |
@@ -94,7 +94,7 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/ui/theme.rs` | Design tokens: colour, type, metrics, motion. No elements |
 | `crates/orange-client/src/ui/controls.rs` | Reusable GPUI controls: buttons, pills, cards, rows, titlebar |
 | `crates/orange-client/src/ui/mark.rs` | The logo, its states, and the glow behind it |
-| `crates/orange-client/src/ui/decor.rs` | Ambient layer: drifting grid, viewfinder brackets, registration marks |
+| `crates/orange-client/src/ui/decor.rs` | Ambient layer: faint stationary grid, slow warm lighting, viewfinder brackets, registration marks |
 | `crates/orange-client/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
 | `crates/orange-client/src/background.rs` | Owned discovery, thumbnail and avatar jobs; nonblocking cancellation, coalesced replacement, joined cleanup, bounded avatar download/decode and failed-avatar retry backoff |
 | `crates/orange-client/src/background_tests.rs` | Background-job ownership, cancellation, retry and HTTP reuse regression tests |

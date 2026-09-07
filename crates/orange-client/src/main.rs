@@ -22,8 +22,8 @@ mod view;
 
 use background::{AvatarJobs, FriendAvatarJobs, PickerEvent, PickerJobs};
 use gpui::{
-    prelude::*, px, size, App, Application, Bounds, Context, Timer, TitlebarOptions, WindowBounds,
-    WindowOptions,
+    prelude::*, px, size, App, Application, Bounds, Context, FocusHandle, Pixels, Point, Timer,
+    TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -64,6 +64,14 @@ struct Notice {
     text: String,
     kind: NoticeKind,
     expires_at: Instant,
+}
+
+struct FriendMenu {
+    friend_id: String,
+    friend_name: String,
+    anchor: Point<Pixels>,
+    return_focus: Option<FocusHandle>,
+    menu_focus: Option<FocusHandle>,
 }
 
 /// Whether a notice is reporting a failure or just saying what happened.
@@ -135,6 +143,8 @@ fn next_friend_offer<'a>(
 
 struct Orange {
     client_available: bool,
+    /// Receives keyboard navigation before a control has been focused.
+    root_focus: Option<FocusHandle>,
     screen: Screen,
     session: Option<session::Session>,
     windows: Vec<WindowTarget>,
@@ -160,6 +170,8 @@ struct Orange {
     picker_scroll: gpui::ScrollHandle,
     /// The same, for the settings list.
     settings_scroll: gpui::ScrollHandle,
+    /// Keep the newly focused friend visible when tabbing through a long roster.
+    friends_scroll: gpui::ScrollHandle,
     /// Whether the update toast is collapsed to its heading. The toast cannot
     /// be dismissed, only folded away: an available update stays actionable.
     update_collapsed: bool,
@@ -183,6 +195,7 @@ struct Orange {
     legacy_friends: Vec<session::Friend>,
     friend_sync: friends::Sync,
     requests_open: bool,
+    friend_menu: Option<FriendMenu>,
     /// Last answer from the relay, keyed by Discord id. Absent means "not
     /// asked yet or the poll failed", which the view renders differently from
     /// a friend who is genuinely offline.
@@ -264,10 +277,12 @@ struct Digest {
         bool,
         bool,
     ),
+    friend_menu: Option<String>,
 }
 
 impl Orange {
     fn load_friend_account(&mut self, id: &str) {
+        self.close_friend_menu();
         let account = self.friend_accounts.entry(id.to_string()).or_default();
         for friend in self.legacy_friends.drain(..) {
             session::remember_friend(&mut account.suggestions, friend);
@@ -338,6 +353,88 @@ impl Orange {
                     "Wait for friends to sync, then try again."
                 },
             );
+        }
+    }
+
+    fn open_friend_menu(
+        &mut self,
+        friend: &session::Friend,
+        anchor: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let return_focus = window.focused(cx);
+        let menu_focus = cx.focus_handle().tab_stop(true);
+        menu_focus.focus(window);
+        self.friend_menu = Some(FriendMenu {
+            friend_id: friend.id.clone(),
+            friend_name: friend.name.clone(),
+            anchor,
+            return_focus,
+            menu_focus: Some(menu_focus),
+        });
+    }
+
+    fn close_friend_menu(&mut self) {
+        self.friend_menu = None;
+    }
+
+    fn close_friend_menu_and_restore_focus(&mut self, window: &mut Window) {
+        let focus = self
+            .friend_menu
+            .as_ref()
+            .and_then(|menu| menu.return_focus.as_ref())
+            .cloned();
+        self.close_friend_menu();
+        if let Some(focus) = focus {
+            focus.focus(window);
+        }
+    }
+
+    fn friend_menu_target(&self) -> Option<&session::Friend> {
+        let id = self.friend_menu.as_ref()?.friend_id.as_str();
+        self.friends.iter().find(|friend| friend.id == id)
+    }
+
+    fn remove_friend_from_menu(&mut self) -> Option<FocusHandle> {
+        let id = self.friend_menu_target().map(|friend| friend.id.clone());
+        let return_focus = self
+            .friend_menu
+            .as_ref()
+            .and_then(|menu| menu.return_focus.clone());
+        self.close_friend_menu();
+        if let Some(id) = id {
+            self.remove_friend(&id);
+        }
+        return_focus
+    }
+
+    fn dismiss_friend_menu_for_state(&mut self) {
+        if self.screen != Screen::Home || self.requests_open || self.session.is_none() {
+            self.close_friend_menu();
+            return;
+        }
+        if self.friend_menu_target().is_none() {
+            self.close_friend_menu();
+        }
+    }
+
+    fn dismiss_friend_menu_if_focus_left(&mut self, window: &mut Window, cx: &App) {
+        let Some(menu) = self.friend_menu.as_ref() else {
+            return;
+        };
+        let keep_open = window.is_window_active()
+            && menu
+                .menu_focus
+                .as_ref()
+                .is_some_and(|handle| handle.contains_focused(window, cx));
+        if !keep_open {
+            if window.is_window_active() {
+                // Another control already owns focus; keep the user's place.
+                self.close_friend_menu();
+            } else {
+                self.close_friend_menu_and_restore_focus(window);
+            }
         }
     }
 
@@ -460,6 +557,7 @@ impl Orange {
                 self.friend_sync.synced,
                 self.friend_sync.busy(),
             ),
+            friend_menu: self.friend_menu_target().map(|friend| friend.id.clone()),
         }
     }
 
@@ -623,6 +721,7 @@ impl Orange {
             .unwrap_or_default();
         Self {
             client_available,
+            root_focus: None,
             screen: if session.is_some() {
                 Screen::Home
             } else {
@@ -649,6 +748,7 @@ impl Orange {
             server: std::env::var("ORANGE_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string()),
             picker_scroll: gpui::ScrollHandle::new(),
             settings_scroll: gpui::ScrollHandle::new(),
+            friends_scroll: gpui::ScrollHandle::new(),
             update_collapsed: false,
             settings_open: [true; 3],
             copied_at: None,
@@ -661,6 +761,7 @@ impl Orange {
             legacy_friends: preferences.friends,
             friend_sync: friends::Sync::default(),
             requests_open: false,
+            friend_menu: None,
             presence: std::collections::HashMap::new(),
             presence_job: None,
             presence_client: presence::PresenceClient::default(),
@@ -1443,6 +1544,7 @@ mod tests {
     fn friend_test_app() -> Orange {
         Orange {
             client_available: false,
+            root_focus: None,
             screen: Screen::Home,
             session: Some(login_session()),
             windows: Vec::new(),
@@ -1461,6 +1563,7 @@ mod tests {
             server: DEFAULT_SERVER.into(),
             picker_scroll: gpui::ScrollHandle::new(),
             settings_scroll: gpui::ScrollHandle::new(),
+            friends_scroll: gpui::ScrollHandle::new(),
             update_collapsed: false,
             settings_open: [true; 3],
             copied_at: None,
@@ -1473,6 +1576,7 @@ mod tests {
             legacy_friends: Vec::new(),
             friend_sync: friends::Sync::default(),
             requests_open: false,
+            friend_menu: None,
             presence: Default::default(),
             presence_job: None,
             presence_client: Default::default(),
@@ -1634,6 +1738,73 @@ mod tests {
             "new"
         );
         assert!(next_friend_offer(&offers, &known, None).is_none());
+    }
+
+    #[test]
+    fn friend_menu_stays_bound_to_id_when_list_order_changes() {
+        // A poll can reorder rows while their contextual action is open.
+        let mut app = friend_test_app();
+        app.friends = vec![friend("a"), friend("b")];
+        app.friend_menu = Some(FriendMenu {
+            friend_id: "a".into(),
+            friend_name: "Friend a".into(),
+            anchor: gpui::point(px(40.0), px(40.0)),
+            return_focus: None,
+            menu_focus: None,
+        });
+
+        app.friends.swap(0, 1);
+
+        assert_eq!(
+            app.friend_menu_target().map(|friend| friend.id.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn friend_menu_dismisses_when_target_no_longer_exists() {
+        // Removal on another device must retire an already-open menu here.
+        let mut app = friend_test_app();
+        app.friends = vec![friend("a")];
+        app.friend_menu = Some(FriendMenu {
+            friend_id: "a".into(),
+            friend_name: "Friend a".into(),
+            anchor: gpui::point(px(40.0), px(40.0)),
+            return_focus: None,
+            menu_focus: None,
+        });
+
+        app.friends.clear();
+        app.dismiss_friend_menu_for_state();
+
+        assert!(app.friend_menu.is_none());
+    }
+
+    #[test]
+    fn removing_from_friend_menu_uses_selected_id_and_closes_the_menu() {
+        // Only the selected friend has a server revision; targeting the other
+        // row after a reorder would fail to enqueue this removal.
+        let mut app = friend_test_app();
+        let selected = friend("a");
+        app.friends = vec![selected.clone(), friend("b")];
+        app.friend_sync.synced = true;
+        app.friend_sync.snapshot.friends = vec![friends::Contact {
+            profile: selected,
+            revision: "rev-a".into(),
+        }];
+        app.friend_menu = Some(FriendMenu {
+            friend_id: "a".into(),
+            friend_name: "Friend a".into(),
+            anchor: gpui::point(px(40.0), px(40.0)),
+            return_focus: None,
+            menu_focus: None,
+        });
+
+        app.friends.swap(0, 1);
+        let _ = app.remove_friend_from_menu();
+
+        assert!(app.friend_menu.is_none());
+        assert!(app.friend_sync.busy());
     }
 
     #[test]

@@ -56,11 +56,20 @@ impl Screen {
 
 impl Render for Orange {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let root_focus = self
+            .root_focus
+            .get_or_insert_with(|| cx.focus_handle().tab_stop(false))
+            .clone();
+        if window.focused(cx).is_none() {
+            root_focus.focus(window);
+        }
         // Decoration runs only while this window is the one you are looking
         // at. GPUI refreshes the window when activation changes, so reading it
         // here is enough to start and stop the ambient layer.
         self.animate = window.is_window_active();
         let animate = self.animate;
+        self.dismiss_friend_menu_for_state();
+        self.dismiss_friend_menu_if_focus_left(window, cx);
 
         let key = self.screen.animation_key();
 
@@ -75,6 +84,11 @@ impl Render for Orange {
         let toasts = self.render_toasts(cx);
 
         div()
+            .id("orange-app")
+            .track_focus(&root_focus)
+            // This focus handle is a keyboard fallback. Child controls have
+            // already handled the click; blank space must not steal focus.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
             .relative()
             .flex()
             .flex_col()
@@ -82,6 +96,25 @@ impl Render for Orange {
             .bg(rgb(BG))
             .text_sm()
             .font_family("Segoe UI")
+            // GPUI records tab stops but does not bind Tab itself. Without
+            // this, the options button could only gain focus with the mouse.
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if event.keystroke.key == "tab"
+                    && !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.platform
+                {
+                    this.close_friend_menu_and_restore_focus(window);
+                    if modifiers.shift {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(self.render_titlebar(cx))
             .child(
                 div()
@@ -98,7 +131,7 @@ impl Render for Orange {
                     // Behind everything, and first, so it never takes a hit
                     // test. One instance for the whole app rather than one per
                     // screen: it is the room, and the room does not restart
-                    // its drift because you opened settings.
+                    // its lighting cycle because you opened settings.
                     .child(grid(animate))
                     .child(
                         div()

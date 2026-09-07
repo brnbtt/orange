@@ -100,8 +100,8 @@ for screen in ["home","pick","streaming","add-friend","requests"]:
         time.sleep(3)
         if screen == "requests":
             capture(hwnd,args.output/"requests-incoming.png")
-            # The native fixed-size list scrolls; reveal the outgoing actions
-            # without modifying or stitching the GPUI layout.
+            # Keep the supplemental inbox capture after a native wheel input.
+            # Both cards now fit, so this fixture no longer needs to scroll.
             rect=W.RECT();u.GetClientRect(hwnd,C.byref(rect))
             point=W.POINT(int(240*rect.right/480),int(340*rect.bottom/660))
             u.ClientToScreen(hwnd,C.byref(point))

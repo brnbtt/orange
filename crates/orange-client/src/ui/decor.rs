@@ -1,108 +1,81 @@
 //! The ambient layer: the things behind the content rather than in it.
 //!
 //! Everything here is decoration and none of it is interactive, so it all
-//! renders underneath and never takes a hit test. Two rules keep it from
-//! becoming noise: it is drawn from the palette's dimmest values, and there is
-//! exactly one thing moving at a time.
+//! renders underneath and never takes a hit test. The grid stays still; only
+//! the soft lighting changes, so the backdrop never competes with the list.
 
 use super::theme::*;
 use gpui::{div, prelude::*, px, rgb, Animation, AnimationExt, SharedString};
 
-/// Spacing of the grid, and the distance it travels before repeating.
-const CELL: f32 = 32.0;
-/// How far the field is drawn past the window on every side.
-///
-/// The grid drifts, so it has to be oversized or the leading edge would walk
-/// into view as a bare strip. One cell of overscan is exactly enough for a
-/// drift of one cell.
-const OVERSCAN: f32 = CELL;
-/// The field is pinned to the left edge and never moves horizontally, so it
-/// only has to reach the far side. Vertically it starts one overscan high and
-/// drifts down by a cell, so at the start of every loop its bottom sits
-/// `OVERSCAN` short of `FIELD_H` - which is the case the height has to cover.
-///
-/// Derived rather than written down. These were 640 and 760, chosen to clear
-/// the largest of the four window sizes the app used to have, and they had to
-/// be revisited by hand every time one of those changed.
-const FIELD_W: f32 = WINDOW_WIDTH;
-const FIELD_H: f32 = WINDOW_HEIGHT + OVERSCAN;
+const CELL: f32 = 64.0;
 
 /// A hairline. Width or height of one, depending which way it runs.
 const HAIR: f32 = 1.0;
 
-// The drift is only seamless if the field is drawn at least as far oversize as
-// it travels. Get this wrong and a bare strip walks in from the edge once per
-// loop, which is the kind of thing nobody notices until they cannot stop
-// noticing it. Checked here rather than in a test because both sides are
-// constants: a runtime assertion could only ever fail after shipping.
-//
-// The other two conditions - that the field is as wide and as tall as the
-// window - used to be assertions against hand-written screen dimensions. They
-// are now how `FIELD_W` and `FIELD_H` are defined, so there is nothing left to
-// check.
-const _: () = assert!(OVERSCAN >= CELL);
-
-/// The grid: a field of hairlines that drifts by exactly one cell and repeats.
-///
-/// Drift rather than a pulse. A pulsing grid draws the eye on every beat,
-/// which is the opposite of what a background is for; a drift of one cell over
-/// twelve seconds is never caught moving but is never quite still either.
-///
-/// Because the travel is exactly `CELL` and the field is drawn a cell oversize,
-/// the loop point is seamless - the line that walks off the bottom is standing
-/// where its neighbour began.
-///
-/// `moving` is false whenever the window is not the active one. Any running
-/// animation costs a full repaint at 60fps, which on this window measures
-/// around 12% of a CPU core - a price worth paying while somebody is looking
-/// at it and pure waste the moment they alt-tab away.
+/// A wide, stationary grid fading into ink, with slow light from the corner.
+/// Only opacity animates: no moving hairlines or blurred shadows on each frame.
+/// `moving` remains false on inactive windows to avoid full-window repaints.
 pub(crate) fn grid(moving: bool) -> impl IntoElement {
-    let mut field = div().absolute().w(px(FIELD_W)).h(px(FIELD_H));
+    let mut field = div().absolute().inset_0();
 
-    let mut x = 0.0;
-    while x <= FIELD_W {
+    let mut x = CELL / 2.0;
+    while x < WINDOW_WIDTH {
         field = field.child(
             div()
                 .absolute()
                 .left(px(x))
                 .top(px(0.0))
                 .w(px(HAIR))
-                .h(px(FIELD_H))
+                .h_full()
                 .bg(rgb(GRID)),
         );
         x += CELL;
     }
-    let mut y = 0.0;
-    while y <= FIELD_H {
+    let mut y = CELL / 2.0;
+    while y < WINDOW_HEIGHT {
         field = field.child(
             div()
                 .absolute()
                 .top(px(y))
                 .left(px(0.0))
-                .w(px(FIELD_W))
+                .w_full()
                 .h(px(HAIR))
                 .bg(rgb(GRID)),
         );
         y += CELL;
     }
 
-    // The clip is the window; the field inside it is what moves. Animating the
-    // clip instead would move the hole rather than the contents.
-    let field = field.top(px(-OVERSCAN));
+    let ink: gpui::Hsla = rgb(BG).into();
+    let warm: gpui::Hsla = rgb(ORANGE).into();
+    let light = div().absolute().inset_0().bg(gpui::linear_gradient(
+        135.0,
+        gpui::linear_color_stop(warm.opacity(0.065), 0.0),
+        gpui::linear_color_stop(warm.opacity(0.0), 0.8),
+    ));
     div()
         .absolute()
         .inset_0()
         .overflow_hidden()
+        .child(field.opacity(0.45))
+        // The old full-contrast grid continued through every gap and the
+        // account footer. Fade it away so content owns the centre of the app.
+        .child(div().absolute().inset_0().bg(gpui::linear_gradient(
+            180.0,
+            gpui::linear_color_stop(ink.opacity(0.0), 0.0),
+            gpui::linear_color_stop(ink, 0.85),
+        )))
         .child(if moving {
-            field
+            light
                 .with_animation(
-                    SharedString::from("grid-drift"),
-                    Animation::new(motion::DRIFT).repeat(),
-                    |element, delta| element.top(px(-OVERSCAN + delta * CELL)),
+                    SharedString::from("ambient-light"),
+                    Animation::new(motion::AMBIENT)
+                        .repeat()
+                        .with_easing(gpui::pulsating_between(0.45, 0.85)),
+                    |element, delta| element.opacity(delta),
                 )
                 .into_any_element()
         } else {
-            field.into_any_element()
+            light.opacity(0.65).into_any_element()
         })
 }
 

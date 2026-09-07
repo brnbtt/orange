@@ -86,6 +86,7 @@ fn state() -> Orange {
     };
     Orange {
         client_available: true,
+        root_focus: None,
         screen,
         session: Some(session::Session {
             name: "pixelpilot".into(),
@@ -109,6 +110,7 @@ fn state() -> Orange {
         server: "ws://127.0.0.1:9/ws".into(),
         picker_scroll: gpui::ScrollHandle::new(),
         settings_scroll: gpui::ScrollHandle::new(),
+        friends_scroll: gpui::ScrollHandle::new(),
         update_collapsed: false,
         settings_open: [true; 3],
         copied_at: None,
@@ -121,6 +123,7 @@ fn state() -> Orange {
         legacy_friends: Vec::new(),
         friend_sync,
         requests_open: capture_screen == "requests",
+        friend_menu: None,
         presence: [
             (
                 "demo-fragbyte".into(),

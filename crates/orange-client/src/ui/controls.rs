@@ -89,7 +89,7 @@ pub(crate) fn card() -> gpui::Div {
 /// in - stay centred and arrowless, so the arrow keeps meaning "next".
 pub(crate) fn primary(
     id: &'static str,
-    text: impl Into<SharedString>,
+    content: impl IntoElement,
     arrow: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -114,18 +114,15 @@ pub(crate) fn primary(
             if arrow {
                 element
                     .justify_between()
-                    .child(text.into())
+                    .child(content)
                     .child(div().text_size(px(14.0)).child("\u{2192}"))
             } else {
-                element.justify_center().child(text.into())
+                element.justify_center().child(content)
             }
         })
 }
 
-pub(crate) fn secondary(
-    id: &'static str,
-    text: impl Into<SharedString>,
-) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn secondary(id: &'static str, content: impl IntoElement) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -144,7 +141,63 @@ pub(crate) fn secondary(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(BORDER_HOVER)))
         .active(|s| s.bg(rgb(BG)))
-        .child(text.into())
+        .child(content)
+}
+
+/// Screen sharing and entering a stream use distinct, literal silhouettes.
+/// Vector strokes stay sharp at Windows DPI scales without an icon-font fallback.
+pub(crate) fn share_icon(color: u32) -> impl IntoElement {
+    action_icon(
+        &[
+            &[
+                (3.0, 5.0),
+                (21.0, 5.0),
+                (21.0, 17.0),
+                (3.0, 17.0),
+                (3.0, 5.0),
+            ],
+            &[(12.0, 17.0), (12.0, 21.0)],
+            &[(8.0, 21.0), (16.0, 21.0)],
+            &[(9.0, 11.0), (12.0, 8.0), (15.0, 11.0)],
+            &[(12.0, 8.0), (12.0, 14.0)],
+        ],
+        color,
+    )
+}
+
+pub(crate) fn join_icon(color: u32) -> impl IntoElement {
+    action_icon(
+        &[
+            &[(12.0, 4.0), (20.0, 4.0), (20.0, 20.0), (12.0, 20.0)],
+            &[(3.0, 12.0), (15.0, 12.0)],
+            &[(10.0, 7.0), (15.0, 12.0), (10.0, 17.0)],
+        ],
+        color,
+    )
+}
+
+fn action_icon(lines: &'static [&'static [(f32, f32)]], color: u32) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let mut path = gpui::PathBuilder::stroke(px(1.5));
+            for line in lines {
+                for (index, &(x, y)) in line.iter().enumerate() {
+                    let point = bounds.origin + gpui::point(px(x * 0.75), px(y * 0.75));
+                    if index == 0 {
+                        path.move_to(point);
+                    } else {
+                        path.line_to(point);
+                    }
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(color));
+            }
+        },
+    )
+    .size(px(18.0))
+    .flex_shrink_0()
 }
 
 /// A named exit: Sign out, Refresh, Back, Done.
@@ -423,43 +476,6 @@ pub(crate) fn option_pill(
         .child(text.into())
 }
 
-/// A concentric broadcast mark: a lit centre with two rings around it.
-///
-/// Built from three divs rather than set as a glyph. The titlebar can lean on
-/// Segoe UI Symbol because its three glyphs are ancient and universal; a
-/// broadcast icon is neither, and a missing one falls back to a tofu box in
-/// the most prominent control on the screen.
-pub(crate) fn broadcast_mark(size: f32, color: u32) -> gpui::Div {
-    let ring = |diameter: f32, alpha_color: u32| {
-        div()
-            .absolute()
-            .w(px(diameter))
-            .h(px(diameter))
-            .left(px((size - diameter) / 2.0))
-            .top(px((size - diameter) / 2.0))
-            .rounded_full()
-            .border_1()
-            .border_color(rgb(alpha_color))
-    };
-    div()
-        .relative()
-        .w(px(size))
-        .h(px(size))
-        .flex_shrink_0()
-        .child(ring(size, color))
-        .child(ring(size * 0.62, color))
-        .child(
-            div()
-                .absolute()
-                .w(px(size * 0.24))
-                .h(px(size * 0.24))
-                .left(px(size * 0.38))
-                .top(px(size * 0.38))
-                .rounded_full()
-                .bg(rgb(color)),
-        )
-}
-
 /// Two figures: somebody else's stream.
 ///
 /// A head and a pair of shoulders each, rather than two rings. Two circles
@@ -508,86 +524,6 @@ pub(crate) fn people_mark(size: f32, color: u32) -> gpui::Div {
         // The smaller figure first, so the nearer one overlaps it.
         .child(figure(size * 0.42, 0.82))
         .child(figure(0.0, 1.0))
-}
-
-/// The rounded well a mark sits in on an action card.
-pub(crate) fn icon_tile(mark: gpui::Div, border: u32) -> gpui::Div {
-    div()
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .justify_center()
-        .w(px(46.0))
-        .h(px(46.0))
-        .rounded_md()
-        .bg(rgb(SURFACE))
-        .border_1()
-        .border_color(rgb(border))
-        .child(mark)
-}
-
-/// A whole route as one target: mark, title, what it does, and an arrow.
-///
-/// This replaces a stack of bare buttons whose labels had to carry all the
-/// meaning on their own. The supporting line is the point - "Start streaming"
-/// and "Join a stream" are indistinguishable to somebody opening the app for
-/// the first time, and a caption costs nothing but a row of height.
-///
-/// `accent` marks the one the screen is actually for. Exactly one card per
-/// screen may set it, or the accent stops meaning anything.
-pub(crate) fn action_card(
-    id: &'static str,
-    mark: gpui::Div,
-    title: &'static str,
-    detail: &'static str,
-    accent: bool,
-) -> gpui::Stateful<gpui::Div> {
-    let edge = if accent { ORANGE_DIM } else { BORDER };
-    let group = SharedString::from(format!("action-{id}"));
-    div()
-        .id(id)
-        .group(group.clone())
-        .flex()
-        .items_center()
-        .gap_3()
-        .w_full()
-        .flex_shrink_0()
-        .p_3()
-        .rounded_md()
-        .bg(rgb(if accent { ORANGE_WASH } else { SURFACE }))
-        .border_1()
-        .border_color(rgb(edge))
-        .cursor_pointer()
-        .hover(|style| style.border_color(rgb(if accent { ORANGE } else { BORDER_HOVER })))
-        .active(|style| style.bg(rgb(BG)))
-        .child(icon_tile(mark, edge))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .flex_1()
-                .min_w(px(0.0))
-                .child(
-                    label(title, if accent { ORANGE } else { TEXT })
-                        .font_family("Bahnschrift")
-                        .text_size(px(14.0))
-                        .font_weight(FontWeight::SEMIBOLD),
-                )
-                .child(label(detail, MUTED).text_xs()),
-        )
-        .child(
-            // Slides a couple of pixels on hover. The only motion in the card,
-            // so it reads as the card acknowledging the cursor rather than as
-            // decoration.
-            div()
-                .flex_shrink_0()
-                .text_size(px(15.0))
-                .text_color(rgb(if accent { ORANGE } else { FAINT }))
-                .pr_1()
-                .group_hover(group, |style| style.pr_0().text_color(rgb(ORANGE)))
-                .child("\u{2192}"),
-        )
 }
 
 /// Who you are signed in as: portrait, a rule, and the name.

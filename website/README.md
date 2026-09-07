@@ -8,8 +8,8 @@ dependencies. The desktop scanline mark in `assets/logo.png` is reused as-is.
 ## Identity and app captures
 
 The site follows the original identity boards: tracked uppercase Orbitron,
-IBM Plex Mono, charcoal and sand, orange accents, hairline grids, open corner
-brackets, and registration marks. Copy describes actual actions and media flow;
+IBM Plex Mono, charcoal and sand, orange accents, faint wide grids, soft warm
+lighting, open corner brackets, and registration marks. Copy describes actual actions and media flow;
 avoid slogans or claims that are not supported by the app.
 
 Orange's source-availability and licensing policy is undecided. The public site
@@ -17,7 +17,7 @@ must not describe the app as open source or advertise a source-code license.
 Third-party font notices apply only to those fonts.
 
 Fonts are self-hosted. Their sources and licenses are in `fonts/README.md`.
-The six screenshots are actual GPUI client renders with staged data, not
+The six screenshots show the refreshed interface introduced in 1.0.1. They are actual GPUI client renders with staged data, not
 HTML recreations of the app or images from the early concept boards. See
 `screenshots/README.md` for capture provenance. Screenshots link to their full
 resolution, and the page labels their demo data explicitly.
