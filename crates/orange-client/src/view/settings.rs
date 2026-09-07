@@ -2,7 +2,7 @@
 
 use crate::{
     supervisor::{FRAME_RATES, QUALITIES},
-    troubleshoot::CheckStatus,
+    troubleshoot::{CheckStatus, UploadUiState},
     ui::*,
     update, Orange, Screen,
 };
@@ -177,7 +177,13 @@ impl Orange {
     fn settings_troubleshoot_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let running = self.troubleshoot.is_running();
         let has_result = self.troubleshoot.has_result();
-        let action_label = if running {
+        let sending = self.troubleshoot.is_uploading();
+        let upload_state = self.troubleshoot.upload_state();
+        let cancelling = upload_state == UploadUiState::Cancelling;
+        let sent = upload_state == UploadUiState::Sent;
+        let action_label = if cancelling {
+            "Stopping…"
+        } else if running || sending {
             "Cancel"
         } else if has_result {
             "Run again"
@@ -187,26 +193,36 @@ impl Orange {
 
         let action = quiet("run-troubleshoot", action_label)
             .tab_index(0)
-            .focus(|style| style.border_color(rgb(ORANGE_DIM)).text_color(rgb(TEXT)))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.troubleshoot.is_running() {
-                    this.cancel_troubleshoot();
-                } else {
-                    this.start_troubleshoot();
-                }
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    if this.troubleshoot.is_running() {
+            .focus(|style| style.border_color(rgb(ORANGE_DIM)).text_color(rgb(TEXT)));
+        let action = if cancelling {
+            action
+                .text_color(rgb(FAINT))
+                .border_color(rgb(BORDER_DIM))
+                .cursor_default()
+                .into_any_element()
+        } else {
+            action
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.troubleshoot.is_running() || this.troubleshoot.is_uploading() {
                         this.cancel_troubleshoot();
                     } else {
                         this.start_troubleshoot();
                     }
-                    cx.stop_propagation();
                     cx.notify();
-                }
-            }));
+                }))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        if this.troubleshoot.is_running() || this.troubleshoot.is_uploading() {
+                            this.cancel_troubleshoot();
+                        } else {
+                            this.start_troubleshoot();
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .into_any_element()
+        };
 
         let mut content = card()
             .w_full()
@@ -214,30 +230,18 @@ impl Orange {
             .flex_shrink_0()
             .gap_2()
             .child(
-                setting_row(
-                    "Troubleshooting",
-                    if running {
-                        "Running basic checks now"
-                    } else {
-                        "Run basic runtime and connectivity checks"
-                    },
-                    action.into_any_element(),
-                )
-                .p_0()
-                .border_0()
-                .bg(rgb(SURFACE)),
+                setting_row("Troubleshooting", self.troubleshoot.headline(), action)
+                    .p_0()
+                    .border_0()
+                    .bg(rgb(SURFACE)),
             );
-
-        if running {
-            content = content.child(label("Running…", MUTED).text_xs());
-        }
 
         if let Some(summary) = self.troubleshoot.summary() {
             content = content.child(micro("LAST RUN", MUTED));
             content = content.child(
                 label(
                     summary,
-                    if summary == "Basic checks passed" {
+                    if summary == "Everything checked looks good." {
                         SUCCESS
                     } else {
                         DANGER
@@ -245,8 +249,87 @@ impl Orange {
                 )
                 .text_xs(),
             );
-            // Keep sharing accessible before the report grows beyond the
-            // viewport; failed users should not have to find its bottom.
+
+            for check in self.troubleshoot.friendly_checks() {
+                let color = match check.status {
+                    CheckStatus::Pass => SUCCESS,
+                    CheckStatus::Fail => DANGER,
+                    CheckStatus::Inconclusive => DANGER,
+                };
+                content = content.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .gap_0p5()
+                        .child(
+                            div().flex().items_center().gap_2().child(dot(color)).child(
+                                label(format!("{} · {}", check.label, check.state_text), color)
+                                    .text_xs(),
+                            ),
+                        )
+                        .children(
+                            (!check.action_text.is_empty())
+                                .then(|| label(check.action_text, MUTED).text_xs()),
+                        ),
+                );
+            }
+
+            content = content.child(
+                label(
+                    "Sends these results and recent Orange logs to our team.",
+                    MUTED,
+                )
+                .text_xs(),
+            );
+
+            let send_button = quiet(
+                "send-troubleshoot-report",
+                if cancelling {
+                    "Stopping…"
+                } else if sending {
+                    "Sending…"
+                } else if sent {
+                    "Sent"
+                } else {
+                    "Send report"
+                },
+            )
+            .tab_index(0)
+            .focus(|style| style.border_color(rgb(ORANGE_DIM)).text_color(rgb(TEXT)));
+
+            content = content.child(if sending || sent || cancelling {
+                send_button
+                    .text_color(rgb(FAINT))
+                    .border_color(rgb(BORDER_DIM))
+                    .cursor_default()
+                    .into_any_element()
+            } else {
+                send_button
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.send_troubleshoot_report();
+                        cx.notify();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.send_troubleshoot_report();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .into_any_element()
+            });
+
+            if let Some(message) = upload_state.message() {
+                let color = match upload_state {
+                    UploadUiState::Sent => SUCCESS,
+                    UploadUiState::Retry | UploadUiState::SignInRequired => DANGER,
+                    _ => MUTED,
+                };
+                content = content.child(label(message, color).text_xs());
+            }
+
+            // Keep copy as an offline fallback, after the send path.
             content = content.child(
                 quiet("copy-troubleshoot", "Copy report")
                     .tab_index(0)
@@ -263,36 +346,16 @@ impl Orange {
                         }
                     })),
             );
-            for check in self.troubleshoot.checks() {
-                let color = match check.status {
-                    CheckStatus::Pass => SUCCESS,
-                    CheckStatus::Fail => DANGER,
-                    CheckStatus::Inconclusive => MUTED,
-                };
-                content = content.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .min_w(px(0.0))
-                        .gap_0p5()
-                        .child(
-                            label(format!("{} · {}", check.label, check.status.label()), color)
-                                .text_xs(),
-                        )
-                        .child(label(check.detail.clone(), MUTED).text_xs()),
-                );
-            }
-            if !self.troubleshoot.history().is_empty() {
-                content = content.child(micro("RECENT DIAGNOSTICS", MUTED));
-                for line in self.troubleshoot.history() {
-                    content = content.child(label(line.clone(), MUTED).text_xs());
-                }
-            }
         }
 
         content
-            .child(label("These checks do not verify real capture content, physical playback output, or a successful connection to your intended friend.", MUTED).text_xs())
-            .child(label("Orange currently has no TURN fallback; some networks cannot connect directly.", MUTED).text_xs())
+            .child(
+                label(
+                    "Try a stream with a friend to check picture and sound.",
+                    MUTED,
+                )
+                .text_xs(),
+            )
             .into_any_element()
     }
 

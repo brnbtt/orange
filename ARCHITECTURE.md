@@ -106,6 +106,8 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/supervisor_list_tests.rs` | Real-child tests of enumeration output, cancellation, deadlines and errors |
 | `crates/orange-client/src/troubleshoot.rs` | On-demand Settings checks, owned diagnostic child job, report validation and copyable results |
 | `crates/orange-client/src/troubleshoot/history.rs` | Bounded recent JSONL tails, per-connection historical outcomes and sanitized build/timestamp evidence |
+| `crates/orange-client/src/troubleshoot/logs.rs` | Explicit-upload log attachments: bounded tails, preserved session correlation, allowlisted metadata and payloads |
+| `crates/orange-client/src/troubleshoot/upload.rs` | Authenticated support report POST, transport/body/receipt bounds and fixed error classification |
 | `crates/orange-client/src/session.rs` | Reads CLI session JSON including the relay token; atomically reads/writes client preferences and the friend roster |
 | `crates/orange-client/src/client.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-client/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
@@ -172,6 +174,7 @@ animation gate as the grid and logo aura.
 | `crates/orange-signal/src/server.rs` | Axum routes, 512-connection semaphore, OAuth HTTP endpoints, `/ws` |
 | `crates/orange-signal/src/auth.rs` | Discord OAuth exchange, pending attempts, opaque sessions cached in memory over a durable store, expiration and capacities |
 | `crates/orange-signal/src/store.rs` | Azure Table Storage session rows: Shared Key Lite signing, hashed row keys, upsert/get/delete, optional configuration |
+| `crates/orange-signal/src/diagnostics.rs`, `crates/orange-signal/src/store/diagnostics.rs` | Support upload validation/admission and private Azure Blob persistence using server-only account credentials |
 | `crates/orange-signal/src/social.rs` | Canonical mutual relationships, request transitions, revisions and account admission bounds |
 | `crates/orange-signal/src/store/social.rs` | Profile and friendship entities in the existing table, ETag conditional writes and paginated queries |
 | `crates/orange-relay/src/main.rs` | Production relay entry, `PORT`, Ctrl-C shutdown selection |
@@ -369,6 +372,7 @@ are named in the test that owns them.
 | `ORANGE_AV1_DECODER` | `crates/orange/src/webrtc/receive.rs` | `software` selects dav1d for live AV1 diagnostic comparisons. File output and every other value keep the D3D11 decoder |
 | `ORANGE_UPDATE_CHANNEL` | `crates/orange-client/src/update.rs` (compile time) | `beta` enables update checks. Baked in by `package.ps1`, so a local build never checks |
 | `ORANGE_TABLE_ACCOUNT`, `ORANGE_TABLE_KEY`, `ORANGE_TABLE_NAME` | `crates/orange-signal/src/store.rs` | Azure Table Storage for durable sessions. All three absent runs the relay with memory-only sessions |
+| `ORANGE_DIAGNOSTICS_CONTAINER` | `crates/orange-signal/src/store/diagnostics.rs` | Enables private support report uploads using the same `ORANGE_TABLE_ACCOUNT` and `ORANGE_TABLE_KEY`; provisioned as `diagnostics` by `deploy/azure.ps1` |
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_REDIRECT_URI` | `crates/orange-signal/src/auth.rs` | Discord OAuth. Absent leaves identity off and peers anonymous |
 | `PORT` | `crates/orange-relay/src/main.rs` | Listen port, injected by Container Apps. Defaults to 9000 |
 
@@ -392,6 +396,7 @@ are named in the test that owns them.
 | RTP video payload 96, RTX 97, Opus 111, clocks and 100 ms receive latency | `crates/orange/src/webrtc/transport.rs` |
 | Local diagnostic JSONL fields and `ORANGE_*` metadata | producer: `crates/orange/src/media_diagnostics/writer.rs`; consumer: a human, via Settings -> Diagnostics -> Open folder |
 | `orange troubleshoot --server <url>` JSON (`schema: 1`, seven unique check IDs, `pass`/`fail`/`inconclusive` statuses and sanitized detail) | producer: `crates/orange/src/troubleshoot.rs`; consumer: `crates/orange-client/src/troubleshoot.rs` |
+| `POST /diagnostics`, bearer auth, `{schema:1, report, logs:[{name,contents,truncated}]}`; HTTP 201 `{report_id}` | desktop producer: `troubleshoot/upload.rs`; relay consumer: `orange-signal/src/server.rs` and `diagnostics.rs` |
 
 ## Where Do I Change...?
 
@@ -430,6 +435,28 @@ are named in the test that owns them.
 | Public website and live Windows download | `website/`, `deploy/website.ps1`; hosting and preview instructions in `website/README.md` |
 
 ## Validation
+
+Settings presents friendly green/red check results; the technical report and
+historical evidence are retained for Copy report or explicit Send report.
+Upload collection inspects bounded log tails, retains up to three attachments
+of 128 KiB each and preserves the initial opaque diagnostic-session ID when
+tailing a longer file. Export allowlists exclude credentials, raw SDP/candidates,
+network addresses and optional device/run metadata. Invalid/truncated records
+are omitted. The report itself is bounded to 32 KiB.
+
+The upload worker uses an authenticated HTTPS POST to the configured relay
+(HTTP loopback is allowed for development), disables redirects and bounds the
+response to 4 KiB. Uploads have a separate 20-second cleanup deadline covering
+the 15-second HTTP timeout. Signing out clears UI results immediately and retains
+the cancelled worker until it can be reaped; old receipts cannot update a new run.
+
+The relay accepts at most four concurrent uploads and three per minute per
+account, bounds the body to 2 MiB, and returns a receipt only after Blob storage
+accepts the write. Support objects live at `diagnostics/reports/<report_id>.json`
+in the existing Azure account, with a receipt timestamp and hashed authenticated
+account ID. There is no public report download endpoint. The deployment script
+creates the private container and enables the route's storage configuration;
+an unconfigured relay returns 503 without affecting normal streaming.
 
 Settings troubleshooting is an on-demand, cancellable diagnostic child rather
 than a readiness gate for normal use. Factory/link compatibility checks do not

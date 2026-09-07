@@ -233,6 +233,10 @@ returning *nothing* is a failure, not a success, when you meant to keep some.
   `CommandNotFoundException` until you prepend MinGit:
   `$env:PATH = "$(Split-Path $git);$env:PATH"`. That failure is the environment,
   not the change.
+- Run each PowerShell contract test in its own `powershell.exe -NoProfile
+  -ExecutionPolicy Bypass -File <script>` process when combining checks.
+  Calling `test-installer.ps1` directly stopped a four-test shell sequence at
+  its `exit 0`; the other three tests never ran despite the successful exit.
 - Tests are named as sentences describing the behaviour they protect, and carry
   a comment explaining the real failure that motivated them.
 

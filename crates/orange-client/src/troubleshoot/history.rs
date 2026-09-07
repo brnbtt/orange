@@ -77,13 +77,7 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
         };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pid) = name
-            .strip_prefix("orange-media-")
-            .and_then(|s| s.strip_suffix(".jsonl"))
-        else {
-            continue;
-        };
-        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        if !valid_log_name(name) {
             continue;
         }
         if !entry.file_type().is_ok_and(|t| t.is_file()) {
@@ -103,7 +97,7 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
             return Vec::new();
         }
         match read_tail(&path) {
-            Ok(bytes) => observations.extend(observe(&bytes, cancelled)),
+            Ok((bytes, _)) => observations.extend(observe(&bytes, cancelled)),
             Err(_) => unreadable = true,
         }
     }
@@ -158,7 +152,18 @@ pub(super) fn summarize(directory: &Path, cancelled: &AtomicBool) -> Vec<String>
     lines
 }
 
-fn read_tail(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(super) fn valid_log_name(name: &str) -> bool {
+    name.strip_prefix("orange-media-")
+        .and_then(|s| s.strip_suffix(".jsonl"))
+        .is_some_and(|pid| {
+            !pid.starts_with('0')
+                && pid.len() <= 10
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && pid.parse::<u32>().is_ok_and(|value| value > 0)
+        })
+}
+
+pub(super) fn read_tail(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     let mut file = File::open(path)?;
     // Open NTFS writers can report zero directory-entry bytes despite flushed
     // records. Query the actual stream end rather than skipping by metadata.
@@ -174,7 +179,7 @@ fn read_tail(path: &Path) -> std::io::Result<Vec<u8>> {
             .map_or(bytes.len(), |i| i + 1);
         bytes.drain(..skip);
     }
-    Ok(bytes)
+    Ok((bytes, start != 0))
 }
 
 fn observe(bytes: &[u8], cancelled: &AtomicBool) -> Vec<Observation> {

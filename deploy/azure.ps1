@@ -25,7 +25,9 @@ param(
     # historical; the alpha channel is gone.
     [string]$ReleaseStorageAccount = "orangealpha0d8d5893e69a3",
     # Sessions live here so a deploy stops signing everyone out.
-    [string]$SessionTable = "sessions"
+    [string]$SessionTable = "sessions",
+    # Private support uploads from Settings troubleshooting.
+    [string]$DiagnosticsContainer = "diagnostics"
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +42,15 @@ Write-Host "Subscription: $($account.name)" -ForegroundColor DarkGray
 
 if ($ReleaseStorageAccount -cnotmatch '^[a-z0-9]{3,24}$') {
     throw "ReleaseStorageAccount must contain 3-24 lowercase letters or digits"
+}
+if ($DiagnosticsContainer -cnotmatch '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$') {
+    throw "DiagnosticsContainer must be a valid lowercase Azure blob container name"
+}
+if ($DiagnosticsContainer -match '--') {
+    throw "DiagnosticsContainer must not contain consecutive hyphens"
+}
+if ($DiagnosticsContainer -in @('releases', '$web')) {
+    throw "DiagnosticsContainer cannot be a reserved or public content container"
 }
 
 Step "Ensuring the containerapp extension is present"
@@ -85,6 +96,22 @@ az storage table create `
     --only-show-errors | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "session table provisioning failed" }
 
+Step "Diagnostics container $DiagnosticsContainer (private)"
+az storage container create `
+    --name $DiagnosticsContainer `
+    --account-name $ReleaseStorageAccount `
+    --auth-mode key `
+    --public-access off `
+    --only-show-errors | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "diagnostics container provisioning failed" }
+az storage container set-permission `
+    --name $DiagnosticsContainer `
+    --account-name $ReleaseStorageAccount `
+    --auth-mode key `
+    --public-access off `
+    --only-show-errors | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "diagnostics container permissions update failed" }
+
 $storageKey = az storage account keys list `
     --account-name $ReleaseStorageAccount `
     --resource-group $ResourceGroup `
@@ -126,6 +153,7 @@ az containerapp update `
         "ORANGE_TABLE_ACCOUNT=$ReleaseStorageAccount" `
         "ORANGE_TABLE_NAME=$SessionTable" `
         "ORANGE_TABLE_KEY=secretref:table-key" `
+        "ORANGE_DIAGNOSTICS_CONTAINER=$DiagnosticsContainer" `
     --only-show-errors | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "session storage configuration failed" }
 

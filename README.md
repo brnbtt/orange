@@ -39,17 +39,15 @@ authoritative validation commands.
 
 ## Troubleshooting
 
-Open **Settings > System > Troubleshooting > Troubleshoot** to check the local
-media runtime and available capture/codec/audio components, the configured
-signalling WebSocket, and UDP STUN reachability. The check runs in the background
-and can be cancelled. Use **Copy report** to share its results with support.
+Open **Settings > System > Troubleshooting > Troubleshoot** if sharing or
+watching is not working. Each item has a short explanation: green means the
+check passed; red means it needs attention or could not finish. Try a stream
+with a friend to check picture and sound.
 
-The report also summarizes recent session logs with their build and timestamp.
-An ICE failure is reported as a failed connection stage; it does not by itself
-identify a firewall, NAT restriction, or missing candidate. **Basic checks
-passed** means the measured checks passed, not that every friend is reachable.
-Actual capture, picture and sound, and a connection to the intended friend
-still need a real streaming test. Networks requiring TURN remain unsupported.
+Choose **Send report** to send the detailed results and recent Orange logs to
+our team. You need to be signed in. Nothing is uploaded automatically, and the
+app confirms when the report has been sent. If sending is unavailable, use
+**Copy report** to share the details another way.
 
 For a command-line report, run `orange troubleshoot --server <WebSocket URL>`.
 The report omits raw addresses, room codes, account identities and tokens.
@@ -57,7 +55,7 @@ The report omits raw addresses, room codes, account identities and tokens.
 ## Identity And Access
 
 Discord identity is optional in the signalling protocol and CLI. It adds names
-and avatars and authorizes alpha diagnostic uploads; anonymous peers can still
+and avatars and authorizes support report uploads; anonymous peers can still
 host and watch when the relay is not configured for Discord.
 
 ```text

@@ -57,7 +57,7 @@ is needed. The request is offered to aimassist before becoming outgoing Pending;
 respawned is incoming; fragbyte and nightshift are already mutual friends.
 
 The fixture bypasses normal startup/polling, isolates account directories, uses
-empty session tokens, and configures an unused loopback signalling address.
+empty session tokens (a fixed fake token for Settings), and configures an unused loopback signalling address.
 There is no active capture, media child or network session. `game_art.py` draws
 only fictional game-preview pixels, never the Orange interface.
 
@@ -66,6 +66,9 @@ expanded. This fixture polls only its troubleshooting job, so Troubleshoot,
 Cancel, Run again and Copy report can be exercised without account polling or
 starting a stream. The diagnostic child uses the ordinary runtime lookup; its
 signalling check deliberately fails against the fixture's unused loopback port.
+Set `ORANGE_CAPTURE_REPORT_SERVER` to a disposable loopback HTTP test server's
+`ws://.../ws` URL to exercise Send report with the fake `capture-support-token`.
+No real account credentials are loaded by this fixture.
 
 Recorded verification: polished client **112 passed, 2 ignored**;
 fixture build succeeded; renderers match the source worktree verbatim;

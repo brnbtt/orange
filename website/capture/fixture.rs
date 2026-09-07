@@ -93,7 +93,11 @@ fn state() -> Orange {
             name: "pixelpilot".into(),
             id: "100000000000000001".into(),
             avatar_url: None,
-            token: String::new(),
+            token: if capture_screen == "settings" {
+                "capture-support-token".into()
+            } else {
+                String::new()
+            },
         }),
         windows,
         thumbnails,
@@ -108,7 +112,8 @@ fn state() -> Orange {
         watches: Vec::new(),
         logging_in: None,
         notice: None,
-        server: "ws://127.0.0.1:9/ws".into(),
+        server: std::env::var("ORANGE_CAPTURE_REPORT_SERVER")
+            .unwrap_or_else(|_| "ws://127.0.0.1:9/ws".into()),
         picker_scroll: gpui::ScrollHandle::new(),
         settings_scroll: gpui::ScrollHandle::new(),
         friends_scroll: gpui::ScrollHandle::new(),

@@ -18,9 +18,11 @@
 //! dependency for the Discord exchange.
 
 use crate::auth::Identity;
+mod diagnostics;
 mod social;
 use anyhow::{Context, Result};
 use base64::Engine;
+pub(crate) use diagnostics::DiagnosticsStore;
 use hmac::{Mac, SimpleHmac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

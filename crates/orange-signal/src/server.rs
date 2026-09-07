@@ -4,16 +4,18 @@
 //! ingress. `axum` handles the routing and the WebSocket upgrade.
 
 use crate::auth::{Auth, DiscordConfig, PollResult};
+use crate::diagnostics::{DiagnosticsUploadRequest, BODY_READ_TIMEOUT, MAX_BODY_BYTES};
 use crate::relay::{handle_peer, presence_for, Found, Rooms};
 use anyhow::{Context, Result};
 use axum::{
+    body::{to_bytes, Body, Bytes},
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
-        Query, State,
+        Query, Request, State,
     },
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,13 @@ pub async fn serve(addr: &str) -> Result<()> {
 }
 
 pub(crate) fn router(state: AppState) -> Router {
+    router_with_diagnostics(state, crate::diagnostics::Diagnostics::from_env())
+}
+
+fn router_with_diagnostics(
+    state: AppState,
+    diagnostics: crate::diagnostics::Diagnostics,
+) -> Router {
     Router::new()
         .route("/", get(|| async { "orange relay" }))
         .route("/health", get(|| async { "ok" }))
@@ -84,8 +93,133 @@ pub(crate) fn router(state: AppState) -> Router {
                 .post(change_friend)
                 .layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
+        .route(
+            "/diagnostics",
+            post(move |state, request| post_diagnostics(state, request, diagnostics.clone())),
+        )
         .route("/ws", get(ws_upgrade))
         .with_state(state)
+}
+
+#[derive(Serialize)]
+struct DiagnosticsReceipt {
+    report_id: String,
+}
+
+async fn post_diagnostics(
+    State(app): State<AppState>,
+    request: Request,
+    diagnostics: crate::diagnostics::Diagnostics,
+) -> Response {
+    let Some(_permit) = diagnostics.admit_request() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many diagnostics uploads; try again shortly",
+        )
+            .into_response();
+    };
+    let (parts, body) = request.into_parts();
+    let identity = match authenticated_identity(&app, &parts.headers).await {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+
+    if diagnostics.admit_account(&identity.id).await.is_err() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "diagnostics upload limit reached; try again shortly",
+        )
+            .into_response();
+    }
+    if !diagnostics.enabled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "diagnostics uploads are temporarily unavailable",
+        )
+            .into_response();
+    }
+
+    let bytes = match read_diagnostics_body(body, &parts.headers).await {
+        Ok(bytes) => bytes,
+        Err(error) => return error.into_response(),
+    };
+    let request: DiagnosticsUploadRequest = match serde_json::from_slice(&bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid diagnostics upload payload",
+            )
+                .into_response()
+        }
+    };
+    if crate::diagnostics::validate(&request).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid diagnostics upload payload",
+        )
+            .into_response();
+    }
+
+    let report_id = crate::diagnostics::random_report_id();
+    if let Err(error) = diagnostics.upload(&report_id, &identity.id, &request).await {
+        eprintln!("[diagnostics] upload failed: {error:#}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "diagnostics uploads are temporarily unavailable",
+        )
+            .into_response();
+    }
+
+    (StatusCode::CREATED, Json(DiagnosticsReceipt { report_id })).into_response()
+}
+
+async fn read_diagnostics_body(
+    body: Body,
+    headers: &HeaderMap,
+) -> std::result::Result<Bytes, (StatusCode, &'static str)> {
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_BODY_BYTES)
+    {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "diagnostics upload exceeds the size limit",
+        ));
+    }
+
+    match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_BODY_BYTES)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Err(_) => Err((
+            StatusCode::REQUEST_TIMEOUT,
+            "diagnostics upload timed out; try again",
+        )),
+        Ok(Err(error)) if is_length_limit_error(&error) => Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "diagnostics upload exceeds the size limit",
+        )),
+        Ok(Err(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            "invalid diagnostics upload payload",
+        )),
+    }
+}
+
+fn is_length_limit_error(error: &axum::Error) -> bool {
+    let mut current = Some(error as &(dyn std::error::Error + 'static));
+    while let Some(err) = current {
+        if err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("length limit")
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 #[derive(Serialize)]
@@ -633,11 +767,82 @@ fn escape_html(value: &str) -> String {
 mod tests {
     use super::*;
     use axum::{
-        body::{to_bytes, Body},
+        body::{to_bytes, Body, Bytes},
+        extract::State,
         http::{header, Request, StatusCode},
+        response::IntoResponse,
+        routing::put,
+        Router,
     };
+    use base64::Engine;
+    use futures_util::stream;
+    use serde_json::json;
     use serde_json::Value;
+    use std::sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc,
+    };
+    use tokio::sync::Mutex as AsyncMutex;
     use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct BlobCapture {
+        status: Arc<AtomicU16>,
+        paths: Arc<AsyncMutex<Vec<String>>>,
+        bodies: Arc<AsyncMutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Default for BlobCapture {
+        fn default() -> Self {
+            Self {
+                status: Arc::new(AtomicU16::new(StatusCode::CREATED.as_u16())),
+                paths: Arc::new(AsyncMutex::new(Vec::new())),
+                bodies: Arc::new(AsyncMutex::new(Vec::new())),
+            }
+        }
+    }
+
+    async fn fake_blob(
+        State(capture): State<BlobCapture>,
+        request: Request<Body>,
+    ) -> impl IntoResponse {
+        capture
+            .paths
+            .lock()
+            .await
+            .push(request.uri().path().to_string());
+        capture.bodies.lock().await.push(
+            to_bytes(request.into_body(), 3 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        );
+        StatusCode::from_u16(capture.status.load(Ordering::Relaxed)).unwrap()
+    }
+
+    async fn diagnostics_router_for_test(
+        diagnostics: crate::diagnostics::Diagnostics,
+    ) -> (Router, Auth) {
+        let auth = Auth::new(None);
+        auth.insert_session_for_test(
+            "good-token",
+            crate::auth::Identity {
+                id: "42".into(),
+                name: "Me".into(),
+                avatar_url: None,
+            },
+        )
+        .await;
+        let app = router_with_diagnostics(
+            AppState {
+                rooms: Default::default(),
+                auth: auth.clone(),
+                social: crate::social::Social::new(None),
+            },
+            diagnostics,
+        );
+        (app, auth)
+    }
 
     async fn limited_ws_upgrade(
         ws: WebSocketUpgrade,
@@ -670,6 +875,313 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_requires_a_valid_bearer_session() {
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(None);
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+        for authorization in [None, Some("Bearer expired"), Some("good-token")] {
+            let mut request = Request::post("/diagnostics")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"schema":1,"report":"ok","logs":[]}"#))
+                .unwrap();
+            if let Some(value) = authorization {
+                request.headers_mut().insert(
+                    header::AUTHORIZATION,
+                    header::HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            let expected = if authorization == Some("Bearer good-token") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_returns_201_and_persists_the_envelope_after_a_successful_upload() {
+        let capture = BlobCapture::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let blob_app = Router::new()
+            .route("/*path", put(fake_blob))
+            .with_state(capture.clone());
+        let blob_server =
+            tokio::spawn(async move { axum::serve(listener, blob_app).await.unwrap() });
+
+        let store = crate::store::DiagnosticsStore::for_test(
+            "acct",
+            &base64::engine::general_purpose::STANDARD.encode(b"key"),
+            "diagnostics",
+            &endpoint,
+        );
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(Some(store));
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+        let response = app
+            .oneshot(
+                Request::post("/diagnostics")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"schema":1,"report":"full report","logs":[{"name":"orange-media-123.jsonl","contents":"{}","truncated":true}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        let report_id = body
+            .get("report_id")
+            .and_then(Value::as_str)
+            .expect("report_id should be present");
+        assert_eq!(report_id.len(), 32);
+        assert!(report_id
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+
+        let paths = capture.paths.lock().await.clone();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], format!("/diagnostics/reports/{report_id}.json"));
+
+        let bodies = capture.bodies.lock().await.clone();
+        let envelope: Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert!(envelope["received_at_unix_ms"].as_u64().is_some());
+        assert_eq!(
+            envelope["account_id_hash"].as_str().unwrap(),
+            format!("{:x}", sha2::Sha256::digest(b"42"))
+        );
+        assert_eq!(
+            envelope["request"],
+            json!({"schema":1,"report":"full report","logs":[{"name":"orange-media-123.jsonl","contents":"{}","truncated":true}]})
+        );
+
+        blob_server.abort();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_rejects_invalid_json_schema_and_filenames() {
+        let capture = BlobCapture::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let blob_app = Router::new()
+            .route("/*path", put(fake_blob))
+            .with_state(capture.clone());
+        let blob_server =
+            tokio::spawn(async move { axum::serve(listener, blob_app).await.unwrap() });
+        let store = crate::store::DiagnosticsStore::for_test(
+            "acct",
+            &base64::engine::general_purpose::STANDARD.encode(b"key"),
+            "diagnostics",
+            &endpoint,
+        );
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(Some(store));
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+
+        let invalid_cases = [
+            r#"{"schema":2,"report":"ok","logs":[]}"#,
+            r#"{"schema":1,"report":"ok","logs":[{"name":"bad.jsonl","contents":"x","truncated":false}]}"#,
+            "{",
+        ];
+        for body in invalid_cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/diagnostics")
+                        .header(header::AUTHORIZATION, "Bearer good-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        assert!(capture.paths.lock().await.is_empty());
+        blob_server.abort();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_rejects_requests_larger_than_two_mebibytes() {
+        let capture = BlobCapture::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let blob_app = Router::new()
+            .route("/*path", put(fake_blob))
+            .with_state(capture.clone());
+        let blob_server =
+            tokio::spawn(async move { axum::serve(listener, blob_app).await.unwrap() });
+        let store = crate::store::DiagnosticsStore::for_test(
+            "acct",
+            &base64::engine::general_purpose::STANDARD.encode(b"key"),
+            "diagnostics",
+            &endpoint,
+        );
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(Some(store));
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+
+        let too_large = vec![b'x'; crate::diagnostics::MAX_BODY_BYTES + 1];
+        let response = app
+            .oneshot(
+                Request::post("/diagnostics")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(too_large))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(capture.paths.lock().await.is_empty());
+        blob_server.abort();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_body_read_timeout_returns_408_instead_of_guessing_size() {
+        let capture = BlobCapture::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let blob_app = Router::new()
+            .route("/*path", put(fake_blob))
+            .with_state(capture);
+        let blob_server =
+            tokio::spawn(async move { axum::serve(listener, blob_app).await.unwrap() });
+        let store = crate::store::DiagnosticsStore::for_test(
+            "acct",
+            &base64::engine::general_purpose::STANDARD.encode(b"key"),
+            "diagnostics",
+            &endpoint,
+        );
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(Some(store));
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+        let delayed_body = Body::from_stream(stream::once(async {
+            tokio::time::sleep(BODY_READ_TIMEOUT + Duration::from_millis(200)).await;
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                br#"{"schema":1,"report":"ok","logs":[]}"#,
+            ))
+        }));
+        let response = app
+            .oneshot(
+                Request::post("/diagnostics")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(delayed_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        blob_server.abort();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_malformed_stream_body_returns_400() {
+        let capture = BlobCapture::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let blob_app = Router::new()
+            .route("/*path", put(fake_blob))
+            .with_state(capture);
+        let blob_server =
+            tokio::spawn(async move { axum::serve(listener, blob_app).await.unwrap() });
+        let store = crate::store::DiagnosticsStore::for_test(
+            "acct",
+            &base64::engine::general_purpose::STANDARD.encode(b"key"),
+            "diagnostics",
+            &endpoint,
+        );
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(Some(store));
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+        let broken_body = Body::from_stream(stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::other("broken body"))
+        }));
+        let response = app
+            .oneshot(
+                Request::post("/diagnostics")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(broken_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        blob_server.abort();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_rate_limited_to_three_uploads_per_minute_per_account() {
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(None);
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/diagnostics")
+                        .header(header::AUTHORIZATION, "Bearer good-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"schema":1,"report":"ok","logs":[]}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        let fourth = app
+            .oneshot(
+                Request::post("/diagnostics")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"schema":1,"report":"ok","logs":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fourth.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_return_service_unavailable_when_storage_upload_fails() {
+        let capture = BlobCapture::default();
+        capture
+            .status
+            .store(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Ordering::Relaxed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let blob_app = Router::new()
+            .route("/*path", put(fake_blob))
+            .with_state(capture.clone());
+        let blob_server =
+            tokio::spawn(async move { axum::serve(listener, blob_app).await.unwrap() });
+        let store = crate::store::DiagnosticsStore::for_test(
+            "acct",
+            &base64::engine::general_purpose::STANDARD.encode(b"key"),
+            "diagnostics",
+            &endpoint,
+        );
+        let diagnostics = crate::diagnostics::Diagnostics::for_test(Some(store));
+        let (app, _) = diagnostics_router_for_test(diagnostics).await;
+
+        let response = app
+            .oneshot(
+                Request::post("/diagnostics")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"schema":1,"report":"ok","logs":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        blob_server.abort();
     }
 
     /// `/ws` deliberately accepts anonymous peers, so it would be easy to give

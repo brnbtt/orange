@@ -12,9 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[allow(clippy::unnecessary_sort_by)]
 mod history;
+mod logs;
+mod upload;
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
-const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const CHECK_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const UPLOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 const MAX_DETAIL_CHARS: usize = 240;
 const CHECKS_REQUIRED: usize = 7;
@@ -86,13 +89,13 @@ impl CheckId {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Runtime => "Runtime",
-            Self::Capture => "Capture",
-            Self::Encoder => "Encoder",
-            Self::Decoder => "Decoder",
-            Self::Audio => "Audio",
-            Self::Signalling => "Signalling",
-            Self::Stun => "STUN",
+            Self::Runtime => "Orange setup",
+            Self::Capture => "Screen sharing",
+            Self::Encoder => "Sending video",
+            Self::Decoder => "Playing video",
+            Self::Audio => "Sound",
+            Self::Signalling => "Orange connection",
+            Self::Stun => "Network check",
         }
     }
 
@@ -146,9 +149,15 @@ impl CompletedRun {
             .iter()
             .all(|check| check.status == CheckStatus::Pass)
         {
-            "Basic checks passed"
+            "Everything checked looks good."
+        } else if self
+            .checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Fail)
+        {
+            "Some checks need attention."
         } else {
-            "Checks need attention"
+            "Some checks could not be completed."
         }
     }
 }
@@ -171,7 +180,7 @@ impl TroubleshootJob {
         if !finished {
             background::check_cancel_deadline(
                 self.cancelled_at,
-                JOIN_TIMEOUT,
+                CHECK_JOIN_TIMEOUT,
                 "troubleshoot worker",
             );
         }
@@ -180,9 +189,86 @@ impl TroubleshootJob {
 
     fn join(&mut self) {
         if let Some(worker) = self.worker.take() {
-            background::join_background_worker(worker, JOIN_TIMEOUT, "troubleshoot worker");
+            background::join_background_worker(worker, CHECK_JOIN_TIMEOUT, "troubleshoot worker");
         }
     }
+}
+
+struct UploadJob {
+    cancel: Arc<AtomicBool>,
+    cancelled_at: Option<Instant>,
+    receiver: mpsc::Receiver<Result<String, upload::UploadError>>,
+    worker: Option<JoinHandle<()>>,
+    report_revision: u64,
+}
+
+impl UploadJob {
+    fn cancel(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.cancelled_at.get_or_insert_with(Instant::now);
+    }
+
+    fn is_finished(&self) -> bool {
+        let finished = self.worker.as_ref().is_none_or(JoinHandle::is_finished);
+        if !finished {
+            background::check_cancel_deadline(
+                self.cancelled_at,
+                UPLOAD_JOIN_TIMEOUT,
+                "troubleshoot upload worker",
+            );
+        }
+        finished
+    }
+
+    fn join(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            background::join_background_worker(
+                worker,
+                UPLOAD_JOIN_TIMEOUT,
+                "troubleshoot upload worker",
+            );
+        }
+    }
+}
+
+impl Drop for UploadJob {
+    fn drop(&mut self) {
+        self.cancel();
+        self.join();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) enum UploadUiState {
+    #[default]
+    Hidden,
+    Idle,
+    Sending,
+    Cancelling,
+    Sent,
+    Retry,
+    SignInRequired,
+}
+
+impl UploadUiState {
+    pub(super) fn message(&self) -> Option<&'static str> {
+        match self {
+            Self::Hidden | Self::Idle => None,
+            Self::Sending => Some("Sending…"),
+            Self::Cancelling => Some("Stopping…"),
+            Self::Sent => Some("Report sent. Thank you!"),
+            Self::Retry => Some("Could not send the report. Please try again."),
+            Self::SignInRequired => Some("Sign in to send a report."),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FriendlyCheck {
+    pub(super) label: &'static str,
+    pub(super) status: CheckStatus,
+    pub(super) state_text: &'static str,
+    pub(super) action_text: &'static str,
 }
 
 impl Drop for TroubleshootJob {
@@ -195,18 +281,25 @@ impl Drop for TroubleshootJob {
 #[derive(Default)]
 pub(super) struct TroubleshootState {
     job: Option<TroubleshootJob>,
+    upload_job: Option<UploadJob>,
     completed: Option<CompletedRun>,
+    upload_state: UploadUiState,
+    receipt_id: Option<String>,
+    report_revision: u64,
     generation: u64,
 }
 
 impl TroubleshootState {
     pub(super) fn start(&mut self, server: &str, diagnostics: Option<PathBuf>) -> bool {
-        if self.job.is_some() {
+        if self.job.is_some() || self.upload_job.is_some() {
             return false;
         }
         let mut command = match supervisor::orange_command() {
             Ok(command) => command,
             Err(_) => {
+                self.upload_state = UploadUiState::Idle;
+                self.receipt_id = None;
+                self.report_revision = self.report_revision.wrapping_add(1);
                 self.completed = Some(failed_run(CHILD_FAILURE_DETAIL));
                 self.generation = self.generation.wrapping_add(1);
                 return false;
@@ -217,10 +310,13 @@ impl TroubleshootState {
     }
 
     fn start_with_command(&mut self, command: Command, diagnostics: Option<PathBuf>) -> bool {
-        if self.job.is_some() {
+        if self.job.is_some() || self.upload_job.is_some() {
             return false;
         }
         self.completed = None;
+        self.upload_state = UploadUiState::Hidden;
+        self.receipt_id = None;
+        self.report_revision = self.report_revision.wrapping_add(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
@@ -258,11 +354,13 @@ impl TroubleshootState {
     }
 
     pub(super) fn poll(&mut self) -> bool {
+        let mut changed = self.poll_upload();
+
         let Some(job) = self.job.as_mut() else {
-            return false;
+            return changed;
         };
         if !job.is_finished() {
-            return false;
+            return changed;
         }
         job.join();
         let cancelled = job.cancel.load(Ordering::Acquire);
@@ -274,6 +372,53 @@ impl TroubleshootState {
         self.job = None;
         self.completed =
             completed.or_else(|| (!cancelled).then(|| failed_run(CHILD_FAILURE_DETAIL)));
+        if self.completed.is_some() {
+            self.upload_state = UploadUiState::Idle;
+            self.receipt_id = None;
+        }
+        self.report_revision = self.report_revision.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+        changed = true;
+        changed
+    }
+
+    fn poll_upload(&mut self) -> bool {
+        let Some(job) = self.upload_job.as_mut() else {
+            return false;
+        };
+        if !job.is_finished() {
+            return false;
+        }
+        let report_revision = job.report_revision;
+        job.join();
+        let cancelled = job.cancel.load(Ordering::Acquire);
+        let result = if cancelled {
+            None
+        } else {
+            job.receiver.try_recv().ok()
+        };
+        self.upload_job = None;
+        if cancelled {
+            if report_revision == self.report_revision && self.completed.is_some() {
+                self.upload_state = UploadUiState::Idle;
+                self.receipt_id = None;
+            }
+            self.generation = self.generation.wrapping_add(1);
+            return true;
+        }
+        if report_revision != self.report_revision {
+            self.generation = self.generation.wrapping_add(1);
+            return true;
+        }
+        self.upload_state = match result {
+            Some(Ok(report_id)) => {
+                self.receipt_id = Some(report_id);
+                UploadUiState::Sent
+            }
+            Some(Err(upload::UploadError::SignedOut)) => UploadUiState::SignInRequired,
+            Some(Err(_)) => UploadUiState::Retry,
+            None => UploadUiState::Retry,
+        };
         self.generation = self.generation.wrapping_add(1);
         true
     }
@@ -282,11 +427,24 @@ impl TroubleshootState {
         if let Some(job) = self.job.as_mut() {
             job.cancel();
         }
+        let mut changed = false;
+        if let Some(job) = self.upload_job.as_mut() {
+            job.cancel();
+            self.upload_state = UploadUiState::Cancelling;
+            self.receipt_id = None;
+            changed = true;
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     pub(super) fn clear(&mut self) {
         self.cancel();
         self.completed = None;
+        self.upload_state = UploadUiState::Hidden;
+        self.receipt_id = None;
+        self.report_revision = self.report_revision.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -302,17 +460,116 @@ impl TroubleshootState {
         self.completed.as_ref().map(CompletedRun::summary)
     }
 
+    pub(super) fn headline(&self) -> &'static str {
+        if self.job.is_some() {
+            "Checking Orange and your connection…"
+        } else if self.completed.is_some() {
+            "Here’s what we found:"
+        } else {
+            "Having trouble sharing or watching? Let’s check."
+        }
+    }
+
+    pub(super) fn friendly_checks(&self) -> Vec<FriendlyCheck> {
+        self.checks()
+            .iter()
+            .map(|check| {
+                let (state_text, action_text) = match check.status {
+                    CheckStatus::Pass => ("Looks good", ""),
+                    CheckStatus::Fail => ("Needs attention", fail_action(check.id)),
+                    CheckStatus::Inconclusive => ("Could not check", inconclusive_action(check.id)),
+                };
+                FriendlyCheck {
+                    label: check.label,
+                    status: check.status,
+                    state_text,
+                    action_text,
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn upload_state(&self) -> UploadUiState {
+        if self.completed.is_none() {
+            UploadUiState::Hidden
+        } else {
+            self.upload_state.clone()
+        }
+    }
+
+    pub(super) fn is_uploading(&self) -> bool {
+        self.upload_job.is_some()
+    }
+
+    pub(super) fn send_report(
+        &mut self,
+        server: &str,
+        token: Option<&str>,
+        diagnostics: Option<PathBuf>,
+        version: &str,
+        build: &str,
+    ) -> bool {
+        if self.upload_job.is_some()
+            || self.completed.is_none()
+            || self.upload_state == UploadUiState::Sent
+        {
+            return false;
+        }
+        let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
+            self.upload_state = UploadUiState::SignInRequired;
+            self.generation = self.generation.wrapping_add(1);
+            return false;
+        };
+        let Some(report) = self.report_text(version, build) else {
+            return false;
+        };
+
+        let report_revision = self.report_revision;
+        let server = server.to_string();
+        let token = token.to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let mut report = report;
+            let logs = diagnostics
+                .as_deref()
+                .map(|directory| logs::collect(directory, &worker_cancel))
+                .unwrap_or_else(|| Ok(Vec::new()));
+            let logs = match logs {
+                Ok(logs) => logs,
+                Err(error) => {
+                    report.push_str("\n\nLog collection note: ");
+                    report.push_str(&error);
+                    Vec::new()
+                }
+            };
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let _ = sender.send(upload::send(&server, &token, &report, logs));
+        });
+
+        self.upload_job = Some(UploadJob {
+            cancel,
+            cancelled_at: None,
+            receiver,
+            worker: Some(worker),
+            report_revision,
+        });
+        self.upload_state = UploadUiState::Sending;
+        self.receipt_id = None;
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+
     pub(super) fn checks(&self) -> &[CheckResult] {
         self.completed
             .as_ref()
             .map(|run| run.checks.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub(super) fn history(&self) -> &[String] {
-        self.completed
-            .as_ref()
-            .map(|run| run.history.as_slice())
             .unwrap_or(&[])
     }
 
@@ -327,11 +584,14 @@ impl TroubleshootState {
             format!("Generated: {}", run.generated_at_unix_ms),
             format!("Version: {version}"),
             format!("Build: {build}"),
-            String::new(),
-            format!("Summary: {}", run.summary()),
-            String::new(),
-            "Current checks".to_string(),
         ];
+        if let Some(receipt_id) = &self.receipt_id {
+            lines.push(format!("Support reference: {receipt_id}"));
+        }
+        lines.push(String::new());
+        lines.push(format!("Summary: {}", run.summary()));
+        lines.push(String::new());
+        lines.push("Current checks".to_string());
         for check in &run.checks {
             lines.push(format!(
                 "- {} ({}) [{}] {}",
@@ -357,6 +617,23 @@ impl TroubleshootState {
                 .to_string(),
         );
         Some(lines.join("\n"))
+    }
+}
+
+fn fail_action(check_id: &str) -> &'static str {
+    match check_id {
+        "runtime" | "capture" | "audio" => "Restart or reinstall Orange, then try again.",
+        "encoder" | "decoder" => "Try reinstalling Orange or updating your graphics driver.",
+        "signalling" => "Check your internet connection, then try again.",
+        "stun" => "Try again, or try another network.",
+        _ => "Try again.",
+    }
+}
+
+fn inconclusive_action(check_id: &str) -> &'static str {
+    match check_id {
+        "stun" => "Try again, or try another network.",
+        _ => "Try this check again in a moment.",
     }
 }
 
@@ -635,5 +912,335 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!state.has_result());
+    }
+
+    #[test]
+    fn friendly_projection_keeps_the_seven_labels_and_hides_technical_details() {
+        let checks = parse_checks(
+            br#"{"schema":1,"checks":[{"id":"runtime","status":"pass","detail":"plugin build 123"},{"id":"capture","status":"fail","detail":"codec failed"},{"id":"encoder","status":"inconclusive","detail":"stun ice turn"},{"id":"decoder","status":"pass","detail":"history"},{"id":"audio","status":"fail","detail":"time"},{"id":"signalling","status":"inconclusive","detail":"build"},{"id":"stun","status":"pass","detail":"plugin"}]}"#,
+        )
+        .unwrap();
+        let state = TroubleshootState {
+            completed: Some(CompletedRun {
+                checks,
+                history: Vec::new(),
+                generated_at_unix_ms: 1,
+            }),
+            ..Default::default()
+        };
+        let projected = state.friendly_checks();
+        assert_eq!(
+            projected
+                .iter()
+                .map(|check| check.label)
+                .collect::<Vec<_>>(),
+            vec![
+                "Orange setup",
+                "Screen sharing",
+                "Sending video",
+                "Playing video",
+                "Sound",
+                "Orange connection",
+                "Network check",
+            ]
+        );
+        assert_eq!(projected[0].state_text, "Looks good");
+        assert_eq!(projected[1].state_text, "Needs attention");
+        assert_eq!(projected[2].state_text, "Could not check");
+        assert_eq!(
+            projected[1].action_text,
+            "Restart or reinstall Orange, then try again."
+        );
+        assert_eq!(
+            projected[4].action_text,
+            "Restart or reinstall Orange, then try again."
+        );
+        assert_eq!(
+            projected[2].action_text,
+            "Try this check again in a moment."
+        );
+        assert_eq!(
+            projected[5].action_text,
+            "Try this check again in a moment."
+        );
+        let ui_text = projected
+            .iter()
+            .flat_map(|check| [check.label, check.state_text, check.action_text])
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        for secret in [
+            "plugin", "codec", "stun", "ice", "turn", "build", "time", "history",
+        ] {
+            assert!(!ui_text.contains(secret), "leaked {secret}: {ui_text}");
+        }
+    }
+
+    #[test]
+    fn failed_items_show_per_check_actions_without_fake_transport_claims() {
+        let state = TroubleshootState {
+            completed: Some(CompletedRun {
+                checks: vec![
+                    CheckResult {
+                        label: "Orange setup",
+                        id: "runtime",
+                        status: CheckStatus::Fail,
+                        detail: "x".into(),
+                    },
+                    CheckResult {
+                        label: "Screen sharing",
+                        id: "capture",
+                        status: CheckStatus::Fail,
+                        detail: "x".into(),
+                    },
+                    CheckResult {
+                        label: "Sending video",
+                        id: "encoder",
+                        status: CheckStatus::Fail,
+                        detail: "x".into(),
+                    },
+                    CheckResult {
+                        label: "Playing video",
+                        id: "decoder",
+                        status: CheckStatus::Fail,
+                        detail: "x".into(),
+                    },
+                    CheckResult {
+                        label: "Sound",
+                        id: "audio",
+                        status: CheckStatus::Fail,
+                        detail: "x".into(),
+                    },
+                    CheckResult {
+                        label: "Orange connection",
+                        id: "signalling",
+                        status: CheckStatus::Fail,
+                        detail: "x".into(),
+                    },
+                    CheckResult {
+                        label: "Network check",
+                        id: "stun",
+                        status: CheckStatus::Fail,
+                        detail: "x".into(),
+                    },
+                ],
+                history: Vec::new(),
+                generated_at_unix_ms: 1,
+            }),
+            ..Default::default()
+        };
+        let checks = state.friendly_checks();
+        assert_eq!(
+            checks[0].action_text,
+            "Restart or reinstall Orange, then try again."
+        );
+        assert_eq!(
+            checks[1].action_text,
+            "Restart or reinstall Orange, then try again."
+        );
+        assert_eq!(
+            checks[2].action_text,
+            "Try reinstalling Orange or updating your graphics driver."
+        );
+        assert_eq!(
+            checks[3].action_text,
+            "Try reinstalling Orange or updating your graphics driver."
+        );
+        assert_eq!(
+            checks[4].action_text,
+            "Restart or reinstall Orange, then try again."
+        );
+        assert_eq!(
+            checks[5].action_text,
+            "Check your internet connection, then try again."
+        );
+        assert_eq!(checks[6].action_text, "Try again, or try another network.");
+        let ui_text = checks
+            .iter()
+            .flat_map(|check| [check.label, check.state_text, check.action_text])
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        for claim in ["firewall", "drivercause", "measured"] {
+            assert!(
+                !ui_text.contains(claim),
+                "unexpected claim {claim}: {ui_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_report_requires_sign_in_prevents_double_send_and_clear_suppresses_stale_results() {
+        let ws = "ws://127.0.0.1:9/ws";
+        let mut state = TroubleshootState::default();
+        assert!(state.start_with_command(fixture_command("ok"), None));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.has_result() {
+            state.poll();
+            assert!(Instant::now() < deadline, "checks did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(!state.send_report(ws, None, None, "1.0.0", "build"));
+        assert_eq!(state.upload_state(), UploadUiState::SignInRequired);
+        assert!(!state.send_report(ws, Some("   "), None, "1.0.0", "build"));
+        assert_eq!(state.upload_state(), UploadUiState::SignInRequired);
+
+        assert!(state.send_report(ws, Some("token"), None, "1.0.0", "build"));
+        assert!(state.is_uploading());
+        assert!(!state.send_report(ws, Some("token"), None, "1.0.0", "build"));
+
+        state.clear();
+        assert_eq!(state.upload_state(), UploadUiState::Hidden);
+        assert!(!state.has_result());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.is_uploading() {
+            state.poll();
+            assert!(Instant::now() < deadline, "upload worker was not reaped");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(state.upload_state(), UploadUiState::Hidden);
+        assert!(!state.has_result());
+    }
+
+    #[test]
+    fn a_sent_report_cannot_be_sent_again_until_a_new_run_and_receipt_enters_copied_report() {
+        let server = crate::background::tests::HttpServer::new(vec![
+            (
+                201,
+                br#"{"report_id":"0123456789abcdef0123456789abcdef"}"#.to_vec(),
+            ),
+            (
+                201,
+                br#"{"report_id":"fedcba9876543210fedcba9876543210"}"#.to_vec(),
+            ),
+        ]);
+        let ws = server.url("/ws").replacen("http://", "ws://", 1);
+        let mut state = TroubleshootState::default();
+        assert!(state.start_with_command(fixture_command("ok"), None));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.has_result() {
+            state.poll();
+            assert!(Instant::now() < deadline, "checks did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(state.send_report(ws.as_str(), Some("token"), None, "1.0.0", "build"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.is_uploading() {
+            state.poll();
+            assert!(Instant::now() < deadline, "upload did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(state.upload_state(), UploadUiState::Sent);
+        assert!(!state.send_report(ws.as_str(), Some("token"), None, "1.0.0", "build"));
+
+        let report = state.report_text("1.0.0", "build").unwrap();
+        assert!(report.contains("Support reference: 0123456789abcdef0123456789abcdef"));
+
+        assert!(state.start_with_command(fixture_command("ok"), None));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.has_result() {
+            state.poll();
+            assert!(Instant::now() < deadline, "second checks did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let report = state.report_text("1.0.0", "build").unwrap();
+        assert!(!report.contains("Support reference:"));
+
+        assert!(state.send_report(ws.as_str(), Some("token"), None, "1.0.0", "build"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.is_uploading() {
+            state.poll();
+            assert!(Instant::now() < deadline, "second upload did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(state.upload_state(), UploadUiState::Sent);
+
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn cancelling_a_blocked_local_upload_returns_immediately_and_reaps_without_sent_state() {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let content_length = request
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if content_length > 0 {
+                let mut body = vec![0; content_length];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+            }
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            let stream = reader.get_mut();
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Length: 48\r\nConnection: close\r\n\r\n{{\"report_id\":\"0123456789abcdef0123456789abcdef\"}}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let ws = format!("ws://{address}/ws");
+        let mut state = TroubleshootState::default();
+        assert!(state.start_with_command(fixture_command("ok"), None));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.has_result() {
+            state.poll();
+            assert!(Instant::now() < deadline, "checks did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(state.send_report(&ws, Some("token"), None, "1.0.0", "build"));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let cancel_started = Instant::now();
+        state.cancel();
+        assert!(cancel_started.elapsed() < Duration::from_millis(100));
+        assert_eq!(state.upload_state(), UploadUiState::Cancelling);
+        assert!(state.is_uploading());
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.is_uploading() {
+            state.poll();
+            assert!(Instant::now() < deadline, "cancelled upload was not reaped");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(state.upload_state(), UploadUiState::Idle);
+        assert!(state
+            .report_text("1.0.0", "build")
+            .is_some_and(|report| !report.contains("Support reference:")));
+        worker.join().unwrap();
     }
 }

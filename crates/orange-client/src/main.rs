@@ -1167,6 +1167,18 @@ impl Orange {
         }
     }
 
+    fn send_troubleshoot_report(&mut self) {
+        if self.troubleshoot.send_report(
+            &self.server,
+            self.session.as_ref().map(|session| session.token.as_str()),
+            supervisor::diagnostics_directory(),
+            update::current_version(),
+            update::build_label(),
+        ) {
+            self.clear_error();
+        }
+    }
+
     fn cancel_troubleshoot(&mut self) {
         self.troubleshoot.cancel();
     }
