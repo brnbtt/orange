@@ -7,6 +7,7 @@ use std::time::Instant;
 
 impl Orange {
     pub(super) fn render_streaming(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let copy = self.copy();
         let code = self.code();
         let viewers = self.viewers();
         let quality = self.quality();
@@ -20,7 +21,7 @@ impl Orange {
                     target.title.clone()
                 }
             })
-            .unwrap_or_else(|| "Selected source".into());
+            .unwrap_or_else(|| self.copy().stream.selected_source.into());
         let stream_details = format!("{} · {} fps", quality.label, self.fps);
         let preview = self.active_preview.clone();
         let just_copied = self
@@ -55,9 +56,9 @@ impl Orange {
                             .child(
                                 label(
                                     if code.is_some() {
-                                        "Streaming"
+                                        self.copy().stream.streaming
                                     } else {
-                                        "Starting stream…"
+                                        self.copy().stream.starting
                                     },
                                     TEXT,
                                 )
@@ -94,7 +95,7 @@ impl Orange {
                                 Some(image) => gpui::img(image)
                                     .h(px(STREAM_PREVIEW_HEIGHT))
                                     .into_any_element(),
-                                None => label("Source preview unavailable", FAINT)
+                                None => label(copy.stream.source_preview_unavailable, FAINT)
                                     .text_xs()
                                     .into_any_element(),
                             }),
@@ -119,7 +120,7 @@ impl Orange {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .child(micro("SOURCE PREVIEW", ORANGE)),
+                                    .child(micro(copy.stream.source_preview, ORANGE)),
                             ),
                     ),
             )
@@ -138,13 +139,13 @@ impl Orange {
                             .flex()
                             .flex_col()
                             .gap_0p5()
-                            .child(label("Share code", TEXT).text_xs())
+                            .child(label(copy.stream.share_code, TEXT).text_xs())
                             .child(
                                 label(
                                     if just_copied {
-                                        "Copied to clipboard"
+                                        copy.stream.copied
                                     } else {
-                                        "Click to copy again"
+                                        copy.stream.click_to_copy
                                     },
                                     if just_copied { SUCCESS } else { FAINT },
                                 )
@@ -167,7 +168,7 @@ impl Orange {
                 None => card()
                     .items_center()
                     .py_3()
-                    .child(label("Connecting…", MUTED).text_xs())
+                    .child(label(copy.stream.connecting, MUTED).text_xs())
                     .into_any_element(),
             })
             .child(
@@ -181,9 +182,9 @@ impl Orange {
                     .child(
                         label(
                             if viewers.is_empty() {
-                                "Nobody watching yet".to_string()
+                                copy.stream.nobody_watching.to_string()
                             } else {
-                                format!("{} watching", viewers.len())
+                                crate::i18n::fill(copy.stream.n_watching, viewers.len())
                             },
                             MUTED,
                         )
@@ -214,7 +215,7 @@ impl Orange {
             .min_h(px(0.0))
             .child(content)
             .child(
-                secondary("back-streaming", "Back")
+                secondary("back-streaming", copy.stream.back)
                     .flex_shrink_0()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.screen = Screen::Home;
@@ -222,7 +223,7 @@ impl Orange {
                     })),
             )
             .child(
-                secondary("stop", "Stop streaming")
+                secondary("stop", copy.stream.stop_streaming)
                     .flex_shrink_0()
                     .text_color(rgb(DANGER))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -237,6 +238,7 @@ impl Orange {
     }
 
     pub(super) fn render_watching(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let copy = self.copy();
         let count = self.watches.len();
         let sessions = self
             .watches
@@ -254,7 +256,7 @@ impl Orange {
                             .flex_col()
                             .gap_0p5()
                             .child(label(code, TEXT).font_weight(FontWeight::SEMIBOLD))
-                            .child(label("Open in its own viewer window", FAINT).text_xs()),
+                            .child(label(copy.stream.open_own_viewer, FAINT).text_xs()),
                     )
                     .child(
                         div()
@@ -263,7 +265,7 @@ impl Orange {
                             .text_color(rgb(FAINT))
                             .cursor_pointer()
                             .hover(|style| style.text_color(rgb(DANGER)))
-                            .child("Close")
+                            .child(copy.stream.close)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.stop_watch(index);
                                 cx.notify();
@@ -292,7 +294,9 @@ impl Orange {
                     .items_center()
                     .gap_1p5()
                     .child(live_dot(self.animate))
-                    .child(label("Watching friends", TEXT).font_weight(FontWeight::SEMIBOLD)),
+                    .child(
+                        label(copy.stream.watching_friends, TEXT).font_weight(FontWeight::SEMIBOLD),
+                    ),
             )
             .child(
                 div()
@@ -306,7 +310,7 @@ impl Orange {
                     .children(sessions),
             )
             .child(
-                secondary("join-another", "Watch another stream").on_click(cx.listener(
+                secondary("join-another", copy.stream.watch_another).on_click(cx.listener(
                     |this, _, _, cx| {
                         let code = cx
                             .read_from_clipboard()
@@ -318,13 +322,15 @@ impl Orange {
                 )),
             )
             .child(
-                secondary("back-watching", "Back").on_click(cx.listener(|this, _, _, cx| {
-                    this.screen = Screen::Home;
-                    cx.notify();
-                })),
+                secondary("back-watching", copy.stream.back).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.screen = Screen::Home;
+                        cx.notify();
+                    },
+                )),
             )
             .child(
-                secondary("leave-all", "Close all viewer windows")
+                secondary("leave-all", copy.stream.close_all)
                     .text_color(rgb(DANGER))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.stop_all_watches();

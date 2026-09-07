@@ -89,26 +89,27 @@ impl Orange {
         if !self.updates.status().is_visible() {
             return None;
         }
-        let action = self.updates.status().action_label();
+        let copy = self.copy();
+        let action = self.updates.status().action_label(copy);
         let (heading, detail, action) = match self.updates.status() {
             update::UpdateStatus::Available(info) => (
-                format!("UPDATE {} AVAILABLE", info.version),
+                crate::i18n::fill(copy.update.available_heading, &info.version),
                 if info.notes.is_empty() {
-                    "A new beta build is ready.".to_string()
+                    copy.update.beta_ready.to_string()
                 } else {
                     info.notes.clone()
                 },
                 action,
             ),
             update::UpdateStatus::Downloading(info) => (
-                format!("DOWNLOADING {}", info.version),
-                "Orange will restart when the verified installer is ready.".to_string(),
+                crate::i18n::fill(copy.update.downloading_heading, &info.version),
+                copy.update.will_restart.to_string(),
                 None,
             ),
             update::UpdateStatus::Failed { message, .. } => (
-                "UPDATE PAUSED".to_string(),
-                message.clone(),
-                self.updates.status().action_label(),
+                copy.update.paused_heading.to_string(),
+                copy.update_failure(message),
+                self.updates.status().action_label(copy),
             ),
             _ => return None,
         };

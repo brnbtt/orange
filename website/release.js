@@ -17,17 +17,29 @@
         release.installer_url !== `${base}orange-setup-${release.version}.exe`) {
       throw new Error('Invalid release');
     }
+    const copy = window.orangeCopy || {};
+    const i18n = window.orangeI18n;
+    const fill = i18n?.fill || ((template, value) => String(template).replace('{}', value));
     for (const link of links) {
       link.href = release.installer_url;
-      link.textContent = 'Download for Windows';
+      link.textContent = copy.download?.button || 'Download for Windows';
     }
-    status.textContent = `Version ${release.version} · Windows 10 / 11 · 64-bit`;
+    status.textContent = fill(
+      copy.download?.versionLine || 'Version {} · Windows 10 / 11 · 64-bit',
+      release.version,
+    );
     if (typeof release.notes === 'string') {
       document.getElementById('release-notes').textContent = release.notes;
     }
   } catch {
     // The repository is private. Deploy bakes a public, immutable installer
     // into the HTML so a failed check still leaves a usable download.
-    status.textContent = `Update check unavailable. Download ${fallbackVersion || 'the saved release'} above, or reload to check again.`;
+    const copy = window.orangeCopy || {};
+    const i18n = window.orangeI18n;
+    const fill = i18n?.fill || ((template, value) => String(template).replace('{}', value));
+    status.textContent = fill(
+      copy.download?.updateUnavailable || 'Update check unavailable. Download {} above, or reload to check again.',
+      fallbackVersion || 'the saved release',
+    );
   }
 })();

@@ -11,10 +11,14 @@ impl Orange {
     fn request_row(&self, contact: &Contact, incoming: bool, cx: &mut Context<Self>) -> gpui::Div {
         let id = contact.profile.id.clone();
         let revision = contact.revision.clone();
+        let copy = self.copy();
         let actions: Vec<_> = if incoming {
-            vec![(Action::Accept, "Accept"), (Action::Decline, "Decline")]
+            vec![
+                (Action::Accept, copy.requests.accept),
+                (Action::Decline, copy.requests.decline),
+            ]
         } else {
-            vec![(Action::Cancel, "Cancel")]
+            vec![(Action::Cancel, copy.requests.cancel)]
         };
         let busy = self.friend_sync.busy();
         card()
@@ -35,9 +39,9 @@ impl Orange {
                             .child(
                                 label(
                                     if incoming {
-                                        "Wants to be friends"
+                                        copy.requests.wants_friends
                                     } else {
-                                        "Request pending"
+                                        copy.requests.request_pending
                                     },
                                     MUTED,
                                 )
@@ -69,6 +73,7 @@ impl Orange {
     }
 
     pub(super) fn render_requests(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let copy = self.copy();
         let snapshot = &self.friend_sync.snapshot;
         div()
             .id("request-list")
@@ -78,9 +83,9 @@ impl Orange {
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
-            .child(micro("INCOMING", ORANGE))
+            .child(micro(copy.requests.incoming, ORANGE))
             .when(snapshot.incoming.is_empty(), |element| {
-                element.child(label("No incoming requests", MUTED).text_xs())
+                element.child(label(copy.requests.no_incoming, MUTED).text_xs())
             })
             .children(
                 snapshot
@@ -88,9 +93,9 @@ impl Orange {
                     .iter()
                     .map(|contact| self.request_row(contact, true, cx)),
             )
-            .child(micro("SENT", MUTED))
+            .child(micro(copy.requests.sent, MUTED))
             .when(snapshot.outgoing.is_empty(), |element| {
-                element.child(label("No pending requests sent", MUTED).text_xs())
+                element.child(label(copy.requests.no_pending_sent, MUTED).text_xs())
             })
             .children(
                 snapshot

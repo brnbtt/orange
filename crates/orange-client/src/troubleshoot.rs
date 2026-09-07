@@ -1,5 +1,6 @@
 //! Running bounded `orange troubleshoot` checks and formatting a safe report.
 
+use crate::i18n::Catalog;
 use crate::{background, supervisor};
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -170,6 +171,10 @@ struct CompletedRun {
 
 impl CompletedRun {
     fn summary(&self) -> &'static str {
+        self.summary_for(crate::i18n::Locale::En.catalog())
+    }
+
+    fn summary_for(&self, copy: &Catalog) -> &'static str {
         if self
             .checks
             .iter()
@@ -180,22 +185,22 @@ impl CompletedRun {
                 .as_ref()
                 .is_some_and(|latest| latest.outcome == history::RecentConnectionOutcome::Failed)
         {
-            return "Basic checks passed. Your last connection needs attention.";
+            return copy.troubleshoot.summary_attention;
         }
         if self
             .checks
             .iter()
             .all(|check| check.status == CheckStatus::Pass)
         {
-            "Everything checked looks good."
+            copy.troubleshoot.summary_ok
         } else if self
             .checks
             .iter()
             .any(|check| check.status == CheckStatus::Fail)
         {
-            "Some checks need attention."
+            copy.troubleshoot.summary_needs
         } else {
-            "Some checks could not be completed."
+            copy.troubleshoot.summary_incomplete
         }
     }
 }
@@ -314,14 +319,14 @@ pub(super) enum UploadUiState {
 }
 
 impl UploadUiState {
-    pub(super) fn message(&self) -> Option<&'static str> {
+    pub(super) fn message_for(&self, copy: &Catalog) -> Option<&'static str> {
         match self {
             Self::Hidden | Self::Idle => None,
-            Self::Sending => Some("Sending…"),
-            Self::Cancelling => Some("Stopping…"),
-            Self::Sent => Some("Report sent. Thank you!"),
-            Self::Retry => Some("Could not send the report. Please try again."),
-            Self::SignInRequired => Some("Sign in to send a report."),
+            Self::Sending => Some(copy.troubleshoot.upload_sending),
+            Self::Cancelling => Some(copy.troubleshoot.upload_stopping),
+            Self::Sent => Some(copy.troubleshoot.upload_sent),
+            Self::Retry => Some(copy.troubleshoot.upload_retry),
+            Self::SignInRequired => Some(copy.troubleshoot.upload_sign_in),
         }
     }
 }
@@ -722,43 +727,64 @@ impl TroubleshootState {
         self.completed.is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn summary(&self) -> Option<&'static str> {
         self.completed.as_ref().map(CompletedRun::summary)
     }
 
+    pub(super) fn summary_for(&self, copy: &Catalog) -> Option<&'static str> {
+        self.completed.as_ref().map(|run| run.summary_for(copy))
+    }
+
+    #[cfg(test)]
     pub(super) fn headline(&self) -> &'static str {
+        self.headline_for(crate::i18n::Locale::En.catalog())
+    }
+
+    pub(super) fn headline_for(&self, copy: &Catalog) -> &'static str {
         if self.is_cancelling() {
-            "Stopping…"
+            copy.troubleshoot.headline_stopping
         } else if self
             .job
             .as_ref()
             .is_some_and(|job| job.kind == JobKind::Repair)
         {
-            "Fixing Windows connection settings…"
+            copy.troubleshoot.headline_repair
         } else if self.job.is_some() {
-            "Checking Orange and your connection…"
+            copy.troubleshoot.headline_running
         } else if self.completed.is_some() {
-            "Here’s what we found:"
+            copy.troubleshoot.headline_found
         } else {
-            "Having trouble sharing or watching? Let’s check."
+            copy.troubleshoot.headline_idle
         }
     }
 
+    #[cfg(test)]
     pub(super) fn friendly_checks(&self) -> Vec<FriendlyCheck> {
+        self.friendly_checks_for(crate::i18n::Locale::En.catalog())
+    }
+
+    pub(super) fn friendly_checks_for(&self, copy: &Catalog) -> Vec<FriendlyCheck> {
         self.checks()
             .iter()
             .map(|check| {
                 let (state_text, action_text) = match check.status {
-                    CheckStatus::Pass => ("Looks good", ""),
+                    CheckStatus::Pass => (copy.troubleshoot.looks_good, ""),
                     CheckStatus::Fail if check.id == "firewall" && check.repairable => (
-                        "Needs attention",
-                        "Select Fix connection to check and update Windows settings.",
+                        copy.troubleshoot.needs_attention,
+                        copy.troubleshoot.firewall_fail_action,
                     ),
-                    CheckStatus::Fail => ("Needs attention", fail_action(check.id)),
-                    CheckStatus::Inconclusive => ("Could not check", inconclusive_action(check.id)),
+                    CheckStatus::Fail => (
+                        copy.troubleshoot.needs_attention,
+                        copy.fail_action(check.id),
+                    ),
+                    CheckStatus::Inconclusive => (
+                        copy.troubleshoot.could_not_check,
+                        copy.inconclusive_action(check.id),
+                    ),
                 };
                 FriendlyCheck {
-                    label: check.label,
+                    label: copy.check_label(check.id),
                     status: check.status,
                     state_text,
                     action_text,
@@ -937,27 +963,6 @@ impl TroubleshootState {
                 .to_string(),
         );
         Some(lines.join("\n"))
-    }
-}
-
-fn fail_action(check_id: &str) -> &'static str {
-    match check_id {
-        "runtime" | "capture" | "audio" => "Restart or reinstall Orange, then try again.",
-        "encoder" | "decoder" => "Try reinstalling Orange or updating your graphics driver.",
-        "signalling" => "Check your internet connection, then try again.",
-        "stun" => "Try again, or try another network.",
-        "ice" => "Try again, or try another network.",
-        "firewall" => "Your Windows settings need attention. Send a report for help.",
-        _ => "Try again.",
-    }
-}
-
-fn inconclusive_action(check_id: &str) -> &'static str {
-    match check_id {
-        "stun" => "Try again, or try another network.",
-        "ice" => "Try again, or try another network.",
-        "firewall" => "Windows settings could not be verified. Send a report for help.",
-        _ => "Try this check again in a moment.",
     }
 }
 

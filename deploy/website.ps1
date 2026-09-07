@@ -34,6 +34,7 @@ function Invoke-WebsiteAzure([string[]]$Arguments) {
 # surface explicit, and validate every source before making any Azure changes.
 $uploads = @(
     @{ Source = 'website/styles.css'; Name = 'styles.css'; Type = 'text/css; charset=utf-8' }
+    @{ Source = 'website/i18n.js'; Name = 'i18n.js'; Type = 'application/javascript; charset=utf-8' }
     @{ Source = 'website/release.js'; Name = 'release.js'; Type = 'application/javascript; charset=utf-8' }
     @{ Source = 'website/fonts/orbitron-latin-700.woff2'; Name = 'fonts/orbitron-latin-700.woff2'; Type = 'font/woff2' }
     @{ Source = 'website/fonts/ibm-plex-mono-latin-400.woff2'; Name = 'fonts/ibm-plex-mono-latin-400.woff2'; Type = 'font/woff2' }

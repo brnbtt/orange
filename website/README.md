@@ -4,6 +4,9 @@ Live: **https://orangealpha0d8d5893e69a3.z15.web.core.windows.net/**
 
 Plain HTML, CSS, and a small download script. No build step or production
 dependencies. The desktop scanline mark in `assets/logo.png` is reused as-is.
+English is in the HTML so the page works without JavaScript. `i18n.js` applies
+Brazilian Portuguese when the browser language is `pt*` or when EN/PT is
+chosen; that choice is stored in `localStorage`.
 
 ## Identity and app captures
 
@@ -45,15 +48,15 @@ From the repository root, with Azure CLI authenticated to the subscription:
 
 ```powershell
 .\deploy\test-website-script.ps1
-node --test website/release.test.mjs
+node --test website/release.test.mjs website/i18n.test.mjs
 .\deploy\website.ps1
 ```
 
-The script checks all fifteen source assets, fetches and validates the public
+The script checks all sixteen source assets, fetches and validates the public
 release manifest, and stages an index with that installer as its fallback. It
 then enables static hosting, discovers the
 web endpoint, and adds a Blob-service GET/HEAD CORS rule for that origin if one
-does not already allow reads. Existing CORS rules are preserved. Only fifteen
+does not already allow reads. Existing CORS rules are preserved. Only sixteen
 explicit public files are uploaded, with correct MIME types and `no-cache`
 revalidation; the index is uploaded last. Re-running deploy updates these files.
 The script does not deploy the relay or publish an app release.
@@ -93,7 +96,7 @@ Stage the public assets locally, then use any static server. For example:
 ```powershell
 $preview = Join-Path $env:LOCALAPPDATA 'Temp\opencode\orange-site-preview'
 New-Item -ItemType Directory -Force $preview | Out-Null
-Copy-Item website\index.html, website\404.html, website\styles.css, website\release.js, assets\logo.png $preview
+Copy-Item website\index.html, website\404.html, website\styles.css, website\i18n.js, website\release.js, assets\logo.png $preview
 New-Item -ItemType Directory -Force "$preview\fonts", "$preview\screenshots" | Out-Null
 Copy-Item website\fonts\*.woff2, website\fonts\*-OFL.txt "$preview\fonts"
 Copy-Item website\screenshots\*.png "$preview\screenshots"

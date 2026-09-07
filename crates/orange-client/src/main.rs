@@ -12,6 +12,7 @@ mod background;
 mod capture;
 mod client;
 mod friends;
+mod i18n;
 mod presence;
 mod session;
 mod sound;
@@ -66,9 +67,6 @@ struct WatchSession {
 }
 
 const WATCH_RETRY_BUDGET: u8 = 1;
-const WATCH_RETRY_NOTICE: &str = "Trying another connection…";
-const WATCH_RETRY_FAILED: &str =
-    "Could not connect. Open Settings > Troubleshooting to check your connection.";
 
 struct Notice {
     text: String,
@@ -108,7 +106,10 @@ fn poll_login(
     Some(match load() {
         Ok(Some(session)) => Ok(session),
         Ok(None) => Err(reason),
-        Err(error) => Err(format!("Could not read session: {error}")),
+        Err(error) => Err(i18n::fill(
+            i18n::Locale::detect().catalog().notice.load_session,
+            error,
+        )),
     })
 }
 
@@ -269,6 +270,7 @@ struct Orange {
     animate: bool,
     updates: update::UpdateController,
     troubleshoot: troubleshoot::TroubleshootState,
+    locale: i18n::Locale,
 }
 
 /// The parts of the app the view can actually see.
@@ -325,9 +327,14 @@ struct Digest {
     friend_menu: Option<String>,
     troubleshoot_running: bool,
     troubleshoot_generation: u64,
+    locale: i18n::Locale,
 }
 
 impl Orange {
+    fn copy(&self) -> &'static i18n::Catalog {
+        self.locale.catalog()
+    }
+
     fn load_friend_account(&mut self, id: &str) {
         self.close_friend_menu();
         let account = self.friend_accounts.entry(id.to_string()).or_default();
@@ -349,17 +356,18 @@ impl Orange {
     }
 
     fn change_friend(&mut self, action: friends::Action, id: &str, revision: Option<String>) {
+        let copy = self.copy();
         let Some(session) = &self.session else {
-            self.show_error("Sign in with Discord to manage friends.");
+            self.show_error(copy.notice.sign_in_manage_friends);
             return;
         };
         if session.id == id {
-            self.show_error("That is your own account.");
+            self.show_error(copy.notice.own_account);
             return;
         }
         if action == friends::Action::Request {
             if self.is_friend(id) {
-                self.show_notice(NoticeKind::Ordinary, "You are already friends.");
+                self.show_notice(NoticeKind::Ordinary, copy.notice.already_friends);
                 return;
             }
             if self
@@ -371,10 +379,7 @@ impl Orange {
             {
                 self.requests_open = true;
                 self.screen = Screen::Home;
-                self.show_notice(
-                    NoticeKind::Ordinary,
-                    "They already sent you a request. Accept it in Requests.",
-                );
+                self.show_notice(NoticeKind::Ordinary, copy.notice.they_sent_request);
                 return;
             }
             if self
@@ -386,10 +391,7 @@ impl Orange {
             {
                 self.requests_open = true;
                 self.screen = Screen::Home;
-                self.show_notice(
-                    NoticeKind::Ordinary,
-                    "Your friend request is already pending.",
-                );
+                self.show_notice(NoticeKind::Ordinary, copy.notice.request_pending);
                 return;
             }
         }
@@ -401,9 +403,9 @@ impl Orange {
             self.show_notice(
                 NoticeKind::Ordinary,
                 if self.friend_sync.busy() {
-                    "A friend change is being saved. Please wait."
+                    copy.notice.change_saving
                 } else {
-                    "Wait for friends to sync, then try again."
+                    copy.notice.wait_sync
                 },
             );
         }
@@ -588,24 +590,18 @@ impl Orange {
                         .iter()
                         .any(|contact| !before.contains(&contact.profile.id))
                 {
-                    self.show_notice(
-                        NoticeKind::Ordinary,
-                        "New friend request. Open Requests on Home to respond.",
-                    );
+                    self.show_notice(NoticeKind::Ordinary, self.copy().notice.new_request);
                 }
             }
             Some(friends::Event::Changed(change)) => {
                 self.dismiss_friend_offer(&change.target_id);
+                let copy = self.copy();
                 let message = match change.action {
-                    friends::Action::Request => {
-                        "Friend request sent. They can accept it in Requests."
-                    }
-                    friends::Action::Accept => {
-                        "Friend request accepted. You are now on each other's friend lists."
-                    }
-                    friends::Action::Decline => "Friend request declined.",
-                    friends::Action::Cancel => "Friend request cancelled.",
-                    friends::Action::Remove => "Friend removed from both friend lists.",
+                    friends::Action::Request => copy.notice.request_sent,
+                    friends::Action::Accept => copy.notice.request_accepted,
+                    friends::Action::Decline => copy.notice.request_declined,
+                    friends::Action::Cancel => copy.notice.request_cancelled,
+                    friends::Action::Remove => copy.notice.friend_removed,
                 };
                 self.show_notice(NoticeKind::Ordinary, message);
                 self.save_preferences();
@@ -618,7 +614,7 @@ impl Orange {
                     self.reject_session();
                 } else if mutation {
                     if let Some(error) = &self.friend_sync.error {
-                        self.show_error(format!("Friend change failed: {error}"));
+                        self.show_error(i18n::fill(self.copy().notice.friend_change_failed, error));
                     }
                 }
             }
@@ -646,7 +642,7 @@ impl Orange {
             picker_loading: self.picker_loading(),
             has_preview: self.active_preview.is_some(),
             recently_copied: self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FOR),
-            update_status: self.updates.settings_detail(),
+            update_status: self.updates.settings_detail(self.copy()),
             presence: self
                 .friends
                 .iter()
@@ -664,6 +660,7 @@ impl Orange {
             friend_menu: self.friend_menu_target().map(|friend| friend.id.clone()),
             troubleshoot_running: self.troubleshoot.is_running(),
             troubleshoot_generation: self.troubleshoot.generation(),
+            locale: self.locale,
         }
     }
 
@@ -872,12 +869,16 @@ impl Orange {
             Ok(preferences) => (preferences, None),
             Err(error) => (session::Preferences::default(), Some(error)),
         };
+        let locale = preferences.locale.unwrap_or_else(i18n::Locale::detect);
+        let copy = locale.catalog();
         let startup_error = match (session_error, preference_error) {
-            (Some(session_error), Some(preference_error)) => Some(format!(
-                "Could not load session: {session_error}; could not load preferences: {preference_error}"
+            (Some(session_error), Some(preference_error)) => Some(i18n::fill2(
+                copy.notice.load_both,
+                session_error,
+                preference_error,
             )),
-            (Some(error), None) => Some(format!("Could not load session: {error}")),
-            (None, Some(error)) => Some(format!("Could not load preferences: {error}")),
+            (Some(error), None) => Some(i18n::fill(copy.notice.load_session, error)),
+            (None, Some(error)) => Some(i18n::fill(copy.notice.load_preferences, error)),
             (None, None) => None,
         };
         let mut avatar_job = AvatarJobs::default();
@@ -952,6 +953,7 @@ impl Orange {
             animate: false,
             updates,
             troubleshoot: troubleshoot::TroubleshootState::default(),
+            locale,
         }
     }
 
@@ -1129,11 +1131,14 @@ impl Orange {
     /// attach the contents to bug reports; nothing is uploaded automatically.
     fn open_diagnostics(&mut self) {
         let Some(directory) = supervisor::diagnostics_directory() else {
-            self.show_error("Could not locate the diagnostics folder.");
+            self.show_error(self.copy().notice.diagnostics_missing);
             return;
         };
         if let Err(error) = supervisor::open_directory(&directory) {
-            self.show_error(format!("Could not open diagnostics: {error}"));
+            self.show_error(i18n::fill(
+                self.copy().notice.diagnostics_open_failed,
+                error,
+            ));
         }
     }
 
@@ -1172,7 +1177,7 @@ impl Orange {
             return;
         };
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(report));
-        self.show_notice(NoticeKind::Ordinary, "Troubleshooting report copied.");
+        self.show_notice(NoticeKind::Ordinary, self.copy().notice.report_copied);
     }
 
     /// Offers belong to the UI, not to a playback process that may already
@@ -1214,18 +1219,17 @@ impl Orange {
     }
 
     fn offer_friend_code(&mut self, code: &str) {
+        let copy = self.copy();
         let Some(session) = self.session.as_ref() else {
-            self.show_error("Sign in with Discord to add friends.");
+            self.show_error(copy.notice.sign_in_add_friends);
             return;
         };
         match session::Friend::from_code(code) {
-            Ok(friend) if friend.id == session.id => {
-                self.show_error("That is your own friend code.")
-            }
+            Ok(friend) if friend.id == session.id => self.show_error(copy.notice.own_friend_code),
             Ok(friend) if self.is_friend(&friend.id) => {
                 self.show_notice(
                     NoticeKind::Ordinary,
-                    format!("{} is already a friend.", friend.name),
+                    i18n::fill(copy.notice.already_a_friend, &friend.name),
                 );
             }
             Ok(friend)
@@ -1238,10 +1242,7 @@ impl Orange {
                     .any(|contact| contact.profile.id == friend.id) =>
             {
                 self.requests_open = true;
-                self.show_notice(
-                    NoticeKind::Ordinary,
-                    "There is already a pending request. Open it here to respond or cancel.",
-                );
+                self.show_notice(NoticeKind::Ordinary, copy.notice.pending_request);
             }
             Ok(friend) => {
                 self.requests_open = false;
@@ -1250,7 +1251,7 @@ impl Orange {
                 self.friend_offers.truncate(100);
                 self.clear_error();
             }
-            Err(error) => self.show_error(format!("Could not add friend: {error}")),
+            Err(error) => self.show_error(i18n::fill(copy.notice.add_friend_failed, error)),
         }
     }
 
@@ -1304,9 +1305,10 @@ impl Orange {
             friends: self.legacy_friends.clone(),
             friend_accounts: self.friend_accounts.clone(),
             friends_panel_collapsed: self.friends_panel_collapsed,
+            locale: Some(self.locale),
         };
         if let Err(error) = session::save_preferences(&preferences) {
-            self.show_error(format!("Could not save preferences: {error}"));
+            self.show_error(i18n::fill(self.copy().notice.save_preferences, error));
             return false;
         }
         true
@@ -1314,7 +1316,7 @@ impl Orange {
 
     fn sign_out(&mut self, destination: Option<Screen>) {
         if let Err(error) = session::clear() {
-            self.show_error(format!("Could not sign out: {error}"));
+            self.show_error(i18n::fill(self.copy().notice.sign_out_failed, error));
             return;
         }
         // Children authenticate once at startup. Keeping them across signout
@@ -1348,10 +1350,7 @@ impl Orange {
     fn reject_session(&mut self) {
         self.sign_out(Some(Screen::SignedOut));
         if self.session.is_none() {
-            self.show_notice(
-                NoticeKind::Ordinary,
-                "Your session expired. Sign in with Discord to reconnect.",
-            );
+            self.show_notice(NoticeKind::Ordinary, self.copy().notice.session_expired);
         }
     }
 
@@ -1415,7 +1414,7 @@ impl Orange {
     fn start_stream(&mut self, target: WindowTarget) {
         self.thumbnail_job.cancel();
         if !supervisor::gstreamer_available() {
-            self.show_error(supervisor::MEDIA_RUNTIME_MISSING.to_string());
+            self.show_error(self.copy().notice.media_runtime_missing);
             return;
         }
         let preview = self.thumbnails.get(&target.hwnd).cloned();
@@ -1476,11 +1475,11 @@ impl Orange {
                         watch.retry_budget -= 1;
                         watch.retried_after_initial_ice_failure = true;
                         watch.supervisor = supervisor;
-                        self.show_notice(NoticeKind::Ordinary, WATCH_RETRY_NOTICE);
+                        self.show_notice(NoticeKind::Ordinary, self.copy().notice.watch_retry);
                         survivors.push(watch);
                     }
                     Err(_) => {
-                        watch_error = Some(WATCH_RETRY_FAILED.to_string());
+                        watch_error = Some(self.copy().notice.watch_retry_failed.to_string());
                     }
                 }
                 continue;
@@ -1494,7 +1493,7 @@ impl Orange {
                 let error = if watch.retried_after_initial_ice_failure
                     && Self::initial_ice_failure_retry_eligible(&status)
                 {
-                    WATCH_RETRY_FAILED.to_string()
+                    self.copy().notice.watch_retry_failed.to_string()
                 } else {
                     status
                         .error
@@ -1514,7 +1513,7 @@ impl Orange {
             self.show_error(error);
         } else if watch_ended {
             sound::play(sound::Cue::Ended);
-            self.show_notice(NoticeKind::Ordinary, "Stream ended");
+            self.show_notice(NoticeKind::Ordinary, self.copy().notice.stream_ended);
         }
         if self.screen == Screen::Watching && self.watches.is_empty() {
             self.screen = Screen::Home;
@@ -1524,19 +1523,19 @@ impl Orange {
     fn join(&mut self, code: String) {
         let code = code.trim().to_ascii_uppercase();
         if code.is_empty() {
-            self.show_error("No code on the clipboard");
+            self.show_error(self.copy().notice.no_clipboard_code);
             return;
         }
         if self.watches.iter().any(|watch| watch.code == code) {
-            self.show_error(format!("Already watching {code}"));
+            self.show_error(i18n::fill(self.copy().notice.already_watching, &code));
             return;
         }
         if self.own_codes.contains(&code) {
-            self.show_error("That's your own active or previous stream code.");
+            self.show_error(self.copy().notice.own_stream_code);
             return;
         }
         if !supervisor::gstreamer_available() {
-            self.show_error(supervisor::MEDIA_RUNTIME_MISSING.to_string());
+            self.show_error(self.copy().notice.media_runtime_missing);
             return;
         }
         let cascade = self.watches.len();
@@ -1873,6 +1872,7 @@ mod tests {
             animate: false,
             updates: update::UpdateController::new(),
             troubleshoot: troubleshoot::TroubleshootState::default(),
+            locale: i18n::Locale::En,
         }
     }
 
@@ -2033,14 +2033,15 @@ mod tests {
         let mut saw_retry_notice = false;
         poll_watches_until(&mut app, &mut spawn, |app| {
             saw_retry_notice |= app.notice.as_ref().is_some_and(|notice| {
-                notice.text == WATCH_RETRY_NOTICE && notice.kind == NoticeKind::Ordinary
+                notice.text == i18n::Locale::En.catalog().notice.watch_retry
+                    && notice.kind == NoticeKind::Ordinary
             });
             app.watches.is_empty()
         });
 
         assert_eq!(
             app.notice.as_ref().map(|notice| notice.text.as_str()),
-            Some(WATCH_RETRY_FAILED)
+            Some(i18n::Locale::En.catalog().notice.watch_retry_failed)
         );
         assert!(saw_retry_notice, "first failure did not show retry notice");
         assert!(matches!(
@@ -2069,7 +2070,7 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
         assert_ne!(
             app.notice.as_ref().map(|notice| notice.text.as_str()),
-            Some(WATCH_RETRY_FAILED)
+            Some(i18n::Locale::En.catalog().notice.watch_retry_failed)
         );
     }
 
@@ -2089,7 +2090,7 @@ mod tests {
         assert!(app.notice.is_some());
         assert_ne!(
             app.notice.as_ref().map(|notice| notice.text.as_str()),
-            Some(WATCH_RETRY_FAILED)
+            Some(i18n::Locale::En.catalog().notice.watch_retry_failed)
         );
     }
 
@@ -2106,7 +2107,7 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
         assert_eq!(
             app.notice.as_ref().map(|notice| notice.text.as_str()),
-            Some("Stream ended")
+            Some(i18n::Locale::En.catalog().notice.stream_ended)
         );
     }
 

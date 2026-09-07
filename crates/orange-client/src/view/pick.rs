@@ -11,6 +11,7 @@ use gpui::{div, prelude::*, px, rgb, Context, SharedString};
 
 impl Orange {
     pub(super) fn render_pick(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let copy = self.copy();
         let selected = self.quality;
         // Distinguishes "still capturing" from "this window refuses to draw",
         // which previously both showed as "no preview" and made every card
@@ -52,24 +53,21 @@ impl Orange {
                             .gap_0p5()
                             .child(micro(
                                 if loading {
-                                    "FINDING SOURCES".to_string()
+                                    copy.pick.finding_sources.to_string()
                                 } else {
-                                    format!("{} SOURCES AVAILABLE", count)
+                                    crate::i18n::fill(copy.pick.sources_available, count)
                                 },
                                 ORANGE,
                             ))
-                            .child(heading("Choose what to share", 14.0))
-                            .child(
-                                label("Click a preview to start streaming immediately.", FAINT)
-                                    .text_xs(),
-                            ),
+                            .child(heading(copy.pick.choose_what, 14.0))
+                            .child(label(copy.pick.click_preview, FAINT).text_xs()),
                     )
-                    .child(
-                        ghost("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| {
+                    .child(ghost("refresh", copy.pick.refresh).on_click(cx.listener(
+                        |this, _, _, cx| {
                             this.refresh_windows();
                             cx.notify();
-                        })),
-                    ),
+                        },
+                    ))),
             )
             .children(
                 displays
@@ -104,9 +102,9 @@ impl Orange {
                                     card().w_full().items_center().child(
                                         label(
                                             if loading {
-                                                "Finding windows…"
+                                                copy.pick.finding_windows
                                             } else {
-                                                "No windows found"
+                                                copy.pick.no_windows
                                             },
                                             MUTED,
                                         )
@@ -163,12 +161,12 @@ impl Orange {
                     // left the titlebar as the only way out of this screen. The
                     // same sentence is the detail on Settings -> Resolution,
                     // where somebody actually choosing a quality will read it.
-                    .child(
-                        ghost("back", "← Back").on_click(cx.listener(|this, _, _, cx| {
+                    .child(ghost("back", copy.pick.back).on_click(cx.listener(
+                        |this, _, _, cx| {
                             this.leave_picker(Screen::Home);
                             cx.notify();
-                        })),
-                    ),
+                        },
+                    ))),
             )
     }
 
@@ -186,13 +184,11 @@ impl Orange {
     ) -> impl IntoElement {
         let thumb = self.thumbnails.get(&target.hwnd).cloned();
         let group = SharedString::from("display-row");
+        let copy = self.copy();
         let meta = if target.width > 0 && target.height > 0 {
-            format!(
-                "{}\u{d7}{} \u{b7} includes all system audio",
-                target.width, target.height
-            )
+            crate::i18n::fill2(copy.pick.includes_system_audio, target.width, target.height)
         } else {
-            "Full display \u{b7} includes all system audio".to_string()
+            copy.pick.full_display_audio.to_string()
         };
 
         div()
@@ -227,7 +223,7 @@ impl Orange {
                             .h(px(SCREEN_THUMB_HEIGHT))
                             .into_any_element(),
                         (None, true) => micro("\u{2026}", FAINT).into_any_element(),
-                        (None, false) => micro("NO PREVIEW", FAINT).into_any_element(),
+                        (None, false) => micro(copy.pick.no_preview, FAINT).into_any_element(),
                     }),
             )
             .child(
@@ -334,8 +330,10 @@ impl Orange {
                             gpui::img(image).h(px(PICKER_PREVIEW_HEIGHT)),
                         )
                         .into_any_element(),
-                        (None, true) => label("capturing…", FAINT).text_xs().into_any_element(),
-                        (None, false) => label("preview unavailable · click to share", FAINT)
+                        (None, true) => label(self.copy().pick.capturing, FAINT)
+                            .text_xs()
+                            .into_any_element(),
+                        (None, false) => label(self.copy().pick.preview_unavailable, FAINT)
                             .text_xs()
                             .into_any_element(),
                     })

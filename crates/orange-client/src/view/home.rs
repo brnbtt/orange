@@ -13,6 +13,7 @@ use gpui::{
 
 impl Orange {
     pub(super) fn render_signed_out(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let copy = self.copy();
         let animate = self.animate;
         div()
             .flex()
@@ -41,17 +42,14 @@ impl Orange {
                     .flex_col()
                     .gap_1p5()
                     .items_center()
-                    .child(heading("Share games directly with friends", 20.0))
+                    .child(heading(copy.home.share_heading, 20.0))
                     .child(
                         div()
                             .max_w(px(260.0))
                             .text_center()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(
-                                "High bitrate, low overhead, straight to your friends. \
-                                 Sign in so people know whose stream they are opening.",
-                            ),
+                            .child(copy.home.share_blurb),
                     ),
             )
             .child(
@@ -59,9 +57,9 @@ impl Orange {
                     primary(
                         "signin",
                         if self.logging_in.is_some() {
-                            "Waiting for Discord…"
+                            copy.home.waiting_discord
                         } else {
-                            "Sign in with Discord"
+                            copy.home.sign_in_discord
                         },
                         false,
                     )
@@ -73,14 +71,14 @@ impl Orange {
                 ),
             )
             .children(
-                self.logging_in.is_some().then(|| {
-                    label("Finish in your browser, then come back here.", FAINT).text_xs()
-                }),
+                self.logging_in
+                    .is_some()
+                    .then(|| label(copy.home.finish_in_browser, FAINT).text_xs()),
             )
             // Identity is optional in the protocol - it only attaches a name.
             // Blocking streaming behind it would be a self-imposed limit.
             .child(
-                quiet("skip", "Continue without signing in").on_click(cx.listener(
+                quiet("skip", copy.home.continue_without).on_click(cx.listener(
                     |this, _, _, cx| {
                         this.logging_in = None;
                         this.screen = Screen::Home;
@@ -98,11 +96,12 @@ impl Orange {
         let friend = &self.friends[index];
         let state = self.presence.get(&friend.id).cloned();
         let polled = self.presence_error.is_none() && !self.presence.is_empty();
+        let copy = self.copy();
         let (status, status_color) = match (&state, polled) {
-            (Some(Presence::Live { .. }), _) => ("Streaming now", SUCCESS),
-            (Some(Presence::Full), _) => ("Stream is full", MUTED),
-            (Some(Presence::Offline), _) | (None, true) => ("Not streaming", MUTED),
-            (None, false) => ("Checking\u{2026}", FAINT),
+            (Some(Presence::Live { .. }), _) => (copy.home.streaming_now, SUCCESS),
+            (Some(Presence::Full), _) => (copy.home.stream_full, MUTED),
+            (Some(Presence::Offline), _) | (None, true) => (copy.home.not_streaming, MUTED),
+            (None, false) => (copy.home.checking, FAINT),
         };
         let joinable = match &state {
             Some(Presence::Live { code }) => Some(code.clone()),
@@ -183,7 +182,10 @@ impl Orange {
                                     })
                                     .child(label(status, status_color).text_xs()),
                             )
-                            .children(alerts_muted.then(|| label("Alerts muted", MUTED).text_xs())),
+                            .children(
+                                alerts_muted
+                                    .then(|| label(copy.home.alerts_muted, MUTED).text_xs()),
+                            ),
                     ),
             )
             .child(
@@ -193,7 +195,9 @@ impl Orange {
                     .gap_2()
                     .flex_shrink_0()
                     .child(match (joinable, already_watching) {
-                        (Some(_), true) => label("Watching", FAINT).text_xs().into_any_element(),
+                        (Some(_), true) => label(copy.home.watching, FAINT)
+                            .text_xs()
+                            .into_any_element(),
                         (Some(code), false) => div()
                             .id(SharedString::from(format!("join-friend-{}", friend_id)))
                             .tab_index(0)
@@ -207,7 +211,7 @@ impl Orange {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(ORANGE_HOT)))
                             .focus(|style| style.bg(rgb(ORANGE_HOT)))
-                            .child("Join")
+                            .child(copy.home.join)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.join(code.clone());
                                 cx.notify();
@@ -264,10 +268,11 @@ impl Orange {
         let target = self.friend_menu_target()?;
         let friend_name = menu.friend_name.clone();
         let alerts_muted = self.friend_stream_alerts_muted(&target.id);
+        let copy = self.copy();
         let mute_label = if alerts_muted {
-            "Unmute stream alerts"
+            copy.home.unmute_alerts
         } else {
-            "Mute stream alerts"
+            copy.home.mute_alerts
         };
         let mute = div()
             .id("friend-menu-mute")
@@ -307,7 +312,7 @@ impl Orange {
             .cursor_pointer()
             .hover(|style| style.bg(rgb(DANGER_WASH)))
             .focus(|style| style.bg(rgb(DANGER_WASH)))
-            .child("Remove friend")
+            .child(copy.home.remove_friend)
             .on_click(cx.listener(|this, _, window, cx| {
                 if let Some(focus) = this.remove_friend_from_menu() {
                     focus.focus(window);
@@ -395,7 +400,13 @@ impl Orange {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_ellipsis(),
                                 )
-                                .child(label(format!("Discord ID: {id}"), MUTED).text_xs()),
+                                .child(
+                                    label(
+                                        crate::i18n::fill(self.copy().home.discord_id, &id),
+                                        MUTED,
+                                    )
+                                    .text_xs(),
+                                ),
                         ),
                 )
                 .child(
@@ -419,9 +430,9 @@ impl Orange {
                                 .hover(|style| style.bg(rgb(ORANGE_HOT)))
                                 .focus(|style| style.bg(rgb(ORANGE_HOT)))
                                 .child(if self.friend_sync.busy() {
-                                    "Saving…"
+                                    self.copy().home.saving
                                 } else {
-                                    "Send request"
+                                    self.copy().home.send_request
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     // Act on the person rendered, not whoever
@@ -439,7 +450,7 @@ impl Orange {
                                 .cursor_pointer()
                                 .hover(|style| style.text_color(rgb(TEXT)))
                                 .focus(|style| style.text_color(rgb(TEXT)).bg(rgb(SURFACE_HOVER)))
-                                .child("Dismiss")
+                                .child(self.copy().home.dismiss)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.dismiss_friend_offer(&id);
                                     cx.notify();
@@ -450,6 +461,7 @@ impl Orange {
     }
 
     pub(super) fn render_home(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let copy = self.copy();
         let hosting = self.host.is_some();
         let watching = !self.watches.is_empty();
         let defaults = format!(
@@ -500,14 +512,34 @@ impl Orange {
                         this.toggle_friends_panel_collapsed();
                         cx.notify();
                     }))
-                    .child(micro("FRIENDS", MUTED))
+                    .child(micro(copy.home.friends_heading, MUTED))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(label(if self.friends_panel_collapsed { "Show" } else { "Hide" }, MUTED).text_xs())
-                            .child(label(if self.friends_panel_collapsed { "▾" } else { "▴" }, MUTED).text_sm()),
+                            .child(
+                                label(
+                                    if self.friends_panel_collapsed {
+                                        copy.home.show
+                                    } else {
+                                        copy.home.hide
+                                    },
+                                    MUTED,
+                                )
+                                .text_xs(),
+                            )
+                            .child(
+                                label(
+                                    if self.friends_panel_collapsed {
+                                        "▾"
+                                    } else {
+                                        "▴"
+                                    },
+                                    MUTED,
+                                )
+                                .text_sm(),
+                            ),
                     ),
             )
             .children((!self.friends_panel_collapsed).then(|| {
@@ -516,7 +548,7 @@ impl Orange {
                     .items_center()
                     .gap_2()
                     .child(
-                        ghost("paste-friend", "Add friend")
+                        ghost("paste-friend", copy.home.add_friend)
                             .tab_index(0)
                             .focus(|style| style.border_color(rgb(ORANGE)))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -529,7 +561,7 @@ impl Orange {
                             })),
                     )
                     .child(
-                        quiet("copy-friend", "Copy my code")
+                        quiet("copy-friend", copy.home.copy_my_code)
                             .flex()
                             .items_center()
                             .justify_center()
@@ -540,28 +572,28 @@ impl Orange {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 match this.session.as_ref().map(|session| session.friend_code()) {
                                     Some(Ok(code)) => {
-                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            code,
+                                        ));
                                         this.show_notice(
                                             crate::NoticeKind::Ordinary,
-                                            "Friend code copied. Send it to your friend so they can add you.",
+                                            this.copy().home.friend_code_copied,
                                         );
                                     }
-                                    Some(Err(error)) => {
-                                        this.show_error(format!("Could not copy friend code: {error}"))
-                                    }
-                                    None => this.show_error("Sign in with Discord to share your friend code."),
+                                    Some(Err(error)) => this.show_error(crate::i18n::fill(
+                                        this.copy().notice.copy_code_failed,
+                                        error,
+                                    )),
+                                    None => this.show_error(this.copy().notice.sign_in_share_code),
                                 }
                                 cx.notify();
                             })),
                     )
             }))
-            .children((!self.friends_panel_collapsed).then(|| {
-                label(
-                    "Copy their friend code, then choose Add friend.",
-                    MUTED,
-                )
-                .text_xs()
-            }));
+            .children(
+                (!self.friends_panel_collapsed)
+                    .then(|| label(copy.home.copy_their_code, MUTED).text_xs()),
+            );
 
         div()
             .flex()
@@ -576,7 +608,7 @@ impl Orange {
                     .gap_2()
                     .flex_shrink_0()
                     .child(dot(ORANGE))
-                    .child(micro("READY TO STREAM", ORANGE))
+                    .child(micro(copy.home.ready_to_stream, ORANGE))
                     .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
                     .child(micro(defaults, MUTED)),
             )
@@ -584,9 +616,9 @@ impl Orange {
                 friend_tools
             } else {
                 setting_row(
-                    "Add friends without streaming",
-                    "Sign in with Discord to exchange personal friend codes.",
-                    ghost("friends-signin", "Sign in")
+                    copy.home.add_friends_without,
+                    copy.home.sign_in_to_exchange,
+                    ghost("friends-signin", copy.home.sign_in)
                         .tab_index(0)
                         .focus(|style| style.border_color(rgb(ORANGE)))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -664,7 +696,7 @@ impl Orange {
                             .child(
                                 tab(
                                     "friends-tab",
-                                    "Friends",
+                                    copy.home.tab_friends,
                                     friends,
                                     !self.requests_open,
                                     false,
@@ -680,7 +712,7 @@ impl Orange {
                             .child(
                                 tab(
                                     "requests-tab",
-                                    "Requests",
+                                    copy.home.tab_requests,
                                     incoming,
                                     self.requests_open,
                                     incoming > 0,
@@ -698,9 +730,9 @@ impl Orange {
                     .child(
                         label(
                             if self.friend_sync.busy() {
-                                "Saving…"
+                                copy.home.saving
                             } else if !self.friend_sync.synced {
-                                "Syncing…"
+                                copy.home.syncing
                             } else {
                                 ""
                             },
@@ -722,7 +754,7 @@ impl Orange {
                                 label(
                                     match error {
                                         PresenceError::SignedOut => {
-                                            "Sign in again to sync friends.".into()
+                                            copy.home.sign_in_again_sync.into()
                                         }
                                         PresenceError::Unreachable(detail) => detail,
                                     },
@@ -732,7 +764,7 @@ impl Orange {
                             ),
                     )
                     .child(
-                        quiet("retry-friends", "Retry")
+                        quiet("retry-friends", copy.home.retry)
                             .tab_index(0)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if matches!(this.friend_sync.error, Some(PresenceError::SignedOut))
@@ -787,7 +819,7 @@ impl Orange {
                             .items_center()
                             .gap_1p5()
                             .child(people_mark(14.0, MUTED))
-                            .child(micro("NO FRIENDS YET", MUTED)),
+                            .child(micro(copy.home.no_friends_yet, MUTED)),
                     )
                     .child(
                         div()
@@ -797,17 +829,14 @@ impl Orange {
                             .items_center()
                             .max_w(px(300.0))
                             .child(
-                                label("Add friends above, even when nobody is streaming.", MUTED)
+                                label(copy.home.add_friends_above, MUTED)
                                     .text_xs()
                                     .text_center(),
                             )
                             .child(
-                                label(
-                                    "Already have a stream code? Use Join with a code below.",
-                                    FAINT,
-                                )
-                                .text_xs()
-                                .text_center(),
+                                label(copy.home.already_have_code, FAINT)
+                                    .text_xs()
+                                    .text_center(),
                             ),
                     )
                     .into_any_element()
@@ -825,7 +854,11 @@ impl Orange {
                             .gap_2()
                             .flex_shrink_0()
                             .child(micro(
-                                format!("{live} OF {} STREAMING", self.friends.len()),
+                                crate::i18n::fill2(
+                                    copy.home.of_streaming,
+                                    live,
+                                    self.friends.len(),
+                                ),
                                 if live > 0 { SUCCESS } else { MUTED },
                             ))
                             .child(div().flex_1().h(px(1.0)).bg(rgb(BORDER)))
@@ -834,7 +867,10 @@ impl Orange {
                                     .id("open-watching")
                                     .cursor_pointer()
                                     .child(micro(
-                                        format!("{} OPEN \u{2192}", self.watches.len()),
+                                        crate::i18n::fill(
+                                            copy.home.open_watchers,
+                                            self.watches.len(),
+                                        ),
                                         SUCCESS,
                                     ))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -864,28 +900,22 @@ impl Orange {
                                         .gap_0p5()
                                         .min_w(px(0.0))
                                         .child(
-                                            label("Signed out", TEXT)
+                                            label(copy.home.signed_out, TEXT)
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_xs(),
                                         )
-                                        .child(
-                                            label(
-                                                "The relay restarted. Sign in to see friends.",
-                                                FAINT,
-                                            )
-                                            .text_xs(),
-                                        ),
+                                        .child(label(copy.home.relay_restarted, FAINT).text_xs()),
                                 )
-                                .child(ghost("presence-signin", "Sign in").on_click(cx.listener(
-                                    |this, _, _, cx| {
+                                .child(ghost("presence-signin", copy.home.sign_in).on_click(
+                                    cx.listener(|this, _, _, cx| {
                                         this.start_login();
                                         cx.notify();
-                                    },
-                                ))),
+                                    }),
+                                )),
                             PresenceError::Unreachable(detail) => card()
                                 .py_2()
                                 .flex_shrink_0()
-                                .child(label("Could not reach the relay", DANGER).text_xs())
+                                .child(label(copy.home.could_not_reach_relay, DANGER).text_xs())
                                 .child(label(detail, FAINT).text_xs()),
                         }
                     }))
@@ -918,9 +948,9 @@ impl Orange {
                                 .gap_2()
                                 .child(share_icon(INK))
                                 .child(if hosting {
-                                    "View active stream"
+                                    copy.home.view_active_stream
                                 } else {
-                                    "Start streaming"
+                                    copy.home.start_streaming
                                 }),
                             false,
                         )
@@ -950,7 +980,7 @@ impl Orange {
                                 .items_center()
                                 .gap_2()
                                 .child(join_icon(TEXT))
-                                .child("Join with a code"),
+                                .child(copy.home.join_with_code),
                         )
                         .h(px(40.0))
                         .px_3()
@@ -981,13 +1011,13 @@ impl Orange {
                     .pt_3()
                     .border_t_1()
                     .border_color(rgb(BORDER))
-                    .child(identity(avatar_image, user_name, "SIGNED IN AS"))
-                    .child(
-                        ghost("signout", "Sign out").on_click(cx.listener(|this, _, _, cx| {
+                    .child(identity(avatar_image, user_name, copy.home.signed_in_as))
+                    .child(ghost("signout", copy.home.sign_out).on_click(cx.listener(
+                        |this, _, _, cx| {
                             this.sign_out(Some(Screen::SignedOut));
                             cx.notify();
-                        })),
-                    ),
+                        },
+                    ))),
             )
     }
 }

@@ -7,11 +7,12 @@
   <title>Page not found — Orange</title>
   <link rel="icon" href="/logo.png" type="image/png">
   <link rel="stylesheet" href="/styles.css">
+  <script src="/i18n.js" defer></script>
 </head>
 <body>
   <div class="page-shell">
-    <header class="site-header"><a class="brand" href="/"><img src="/logo.png" alt="" width="32" height="32">ORANGE</a></header>
-    <main class="workflow"><p class="eyebrow">404 / Page not found</p><h1>This page doesn't exist.</h1><p>Return to the website for app information and the latest Windows download.</p><div class="hero-actions"><a class="button" href="/">Back to Orange</a></div></main>
+    <header class="site-header"><a class="brand" href="/" data-i18n-aria="nav.home"><img src="/logo.png" alt="" width="32" height="32">ORANGE</a></header>
+    <main class="workflow"><p class="eyebrow" data-i18n="notFound.eyebrow">404 / Page not found</p><h1 data-i18n="notFound.heading">This page doesn't exist.</h1><p data-i18n="notFound.body">Return to the website for app information and the latest Windows download.</p><div class="hero-actions"><a class="button" href="/" data-i18n="notFound.back">Back to Orange</a></div></main>
   </div>
 </body>
 </html>

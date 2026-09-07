@@ -18,6 +18,16 @@ async function render(fetch) {
   const source = await readFile(new URL('./release.js', import.meta.url), 'utf8');
   await runInNewContext(source, {
     fetch, AbortSignal,
+    window: {
+      orangeCopy: {
+        download: {
+          button: 'Download for Windows',
+          versionLine: 'Version {} · Windows 10 / 11 · 64-bit',
+          updateUnavailable: 'Update check unavailable. Download {} above, or reload to check again.',
+        },
+      },
+      orangeI18n: { fill: (template, value) => String(template).replace('{}', value) },
+    },
     document: {
       querySelectorAll: () => links,
       getElementById: (id) => id === 'release-status' ? status : notes,

@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::i18n::{self, Catalog};
+
 const BETA_MANIFEST_URL: &str =
     "https://orangealpha0d8d5893e69a3.blob.core.windows.net/releases/orange-beta.json";
 const BETA_ASSET_HOST: &str = "orangealpha0d8d5893e69a3.blob.core.windows.net";
@@ -60,10 +62,10 @@ impl UpdateStatus {
         )
     }
 
-    pub(crate) fn action_label(&self) -> Option<&'static str> {
+    pub(crate) fn action_label(&self, copy: &Catalog) -> Option<&'static str> {
         match self {
-            Self::Available(_) => Some("Update now"),
-            Self::Failed { .. } => Some("Check again"),
+            Self::Available(_) => Some(copy.update.update_now),
+            Self::Failed { .. } => Some(copy.update.check_again),
             Self::Disabled | Self::Checking | Self::Current | Self::Downloading(_) => None,
         }
     }
@@ -98,14 +100,8 @@ fn check_startable(status: &UpdateStatus) -> bool {
 ///
 /// Pure so the wording is testable without waiting on a clock. Returns `None`
 /// before the first check completes.
-fn checked_ago(elapsed: Option<Duration>) -> Option<String> {
-    let seconds = elapsed?.as_secs();
-    let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
-    Some(match seconds {
-        0..=59 => "just now".to_string(),
-        60..=3599 => plural(seconds / 60, "minute"),
-        _ => plural(seconds / 3600, "hour"),
-    })
+fn checked_ago(copy: &Catalog, elapsed: Option<Duration>) -> Option<String> {
+    Some(copy.checked_ago(elapsed?))
 }
 
 pub(crate) struct UpdateController {
@@ -200,10 +196,11 @@ impl UpdateController {
                 self.status = UpdateStatus::Current;
             }
             Some(Ok(UpdateEvent::Checked(Err(_)))) | Some(Err(())) => {
+                let copy = i18n::Locale::En.catalog();
                 let message = if matches!(self.status, UpdateStatus::Downloading(_)) {
-                    "Update download failed"
+                    copy.update.download_failed
                 } else {
-                    "Could not check for updates"
+                    copy.update.could_not_check
                 };
                 self.status = UpdateStatus::Failed {
                     message: message.into(),
@@ -213,7 +210,7 @@ impl UpdateController {
                 Ok(installer) => return Some((info, installer)),
                 Err(_) => {
                     self.status = UpdateStatus::Failed {
-                        message: "Update download failed".into(),
+                        message: i18n::Locale::En.catalog().update.download_failed.into(),
                     };
                 }
             },
@@ -224,7 +221,7 @@ impl UpdateController {
 
     pub(crate) fn updater_launch_failed(&mut self) {
         self.status = UpdateStatus::Failed {
-            message: "Could not start the updater".into(),
+            message: i18n::Locale::En.catalog().update.could_not_start.into(),
         };
     }
 
@@ -266,11 +263,11 @@ impl UpdateController {
     /// Mirrors the banner: an available update offers to install it, anything
     /// else offers a check. Both routes call the same status machine, so the
     /// two controls are views of one state rather than two states to reconcile.
-    pub(crate) fn settings_action(&self) -> Option<&'static str> {
+    pub(crate) fn settings_action(&self, copy: &Catalog) -> Option<&'static str> {
         if matches!(self.status, UpdateStatus::Available(_)) {
-            Some("Update now")
+            Some(copy.update.update_now)
         } else if self.can_check_now() {
-            Some("Check now")
+            Some(copy.update.check_now)
         } else {
             None
         }
@@ -291,17 +288,19 @@ impl UpdateController {
     /// trailing dot is visual lint. "installed builds only" is gone too - that
     /// was our mental model leaking, and a friend handed a build has no idea
     /// which kind they have.
-    pub(crate) fn settings_detail(&self) -> String {
+    pub(crate) fn settings_detail(&self, copy: &Catalog) -> String {
         match &self.status {
-            UpdateStatus::Disabled => "Automatic updates are off in this build".into(),
-            UpdateStatus::Checking => "Checking for updates".into(),
-            UpdateStatus::Downloading(info) => format!("Downloading {}", info.version),
-            UpdateStatus::Available(info) => format!("{} is available", info.version),
-            UpdateStatus::Failed { message } => message.clone(),
-            UpdateStatus::Current => match checked_ago(self.last_checked.map(|at| at.elapsed())) {
-                Some(ago) => format!("Up to date \u{b7} last checked {ago}"),
-                None => "Up to date".into(),
-            },
+            UpdateStatus::Disabled => copy.update.auto_off.into(),
+            UpdateStatus::Checking => copy.update.checking.into(),
+            UpdateStatus::Downloading(info) => i18n::fill(copy.update.downloading, &info.version),
+            UpdateStatus::Available(info) => i18n::fill(copy.update.is_available, &info.version),
+            UpdateStatus::Failed { message } => copy.update_failure(message),
+            UpdateStatus::Current => {
+                match checked_ago(copy, self.last_checked.map(|at| at.elapsed())) {
+                    Some(ago) => i18n::fill(copy.update.up_to_date_ago, ago),
+                    None => copy.update.up_to_date.into(),
+                }
+            }
         }
     }
 

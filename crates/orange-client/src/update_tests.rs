@@ -5,6 +5,10 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+fn en() -> &'static crate::i18n::Catalog {
+    crate::i18n::Locale::En.catalog()
+}
+
 struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
 
 impl ReleaseOnDrop {
@@ -369,7 +373,7 @@ fn manual_check_is_the_periodic_check_without_the_deadline() {
 
 #[test]
 fn checked_ago_phrases_each_magnitude_and_singularises() {
-    assert_eq!(checked_ago(None), None);
+    assert_eq!(checked_ago(en(), None), None);
     for (seconds, expected) in [
         (0u64, "just now"),
         (59, "just now"),
@@ -382,7 +386,7 @@ fn checked_ago_phrases_each_magnitude_and_singularises() {
         (7200, "2 hours ago"),
     ] {
         assert_eq!(
-            checked_ago(Some(Duration::from_secs(seconds))).as_deref(),
+            checked_ago(en(), Some(Duration::from_secs(seconds))).as_deref(),
             Some(expected),
             "{seconds}s"
         );
@@ -405,7 +409,7 @@ fn settings_detail_describes_every_status() {
         ),
     ];
     for (status, expected) in cases {
-        let detail = controller(status, None).settings_detail();
+        let detail = controller(status, None).settings_detail(en());
         assert!(detail.contains(expected), "{detail:?} lacks {expected:?}");
         assert!(!detail.is_empty());
         // These are captions, not sentences. A trailing period at 12px in a
@@ -421,11 +425,11 @@ fn settings_detail_describes_every_status() {
 fn settings_detail_reports_when_the_last_check_happened() {
     let mut controller = controller(UpdateStatus::Current, None);
     // Before any check completes there is nothing truthful to report.
-    assert_eq!(controller.settings_detail(), "Up to date");
+    assert_eq!(controller.settings_detail(en()), "Up to date");
 
     controller.last_checked = Instant::now().checked_sub(Duration::from_secs(120));
     assert_eq!(
-        controller.settings_detail(),
+        controller.settings_detail(en()),
         "Up to date \u{b7} last checked 2 minutes ago"
     );
 }
@@ -447,7 +451,7 @@ fn settings_action_offers_install_for_available_and_nothing_while_busy() {
     // `can_check_now`, which is false here because tests are not built with
     // ORANGE_UPDATE_CHANNEL set.
     assert_eq!(
-        controller(UpdateStatus::Available(update_info()), None).settings_action(),
+        controller(UpdateStatus::Available(update_info()), None).settings_action(en()),
         Some("Update now")
     );
     for status in [
@@ -461,7 +465,7 @@ fn settings_action_offers_install_for_available_and_nothing_while_busy() {
     ] {
         let controller = controller(status.clone(), None);
         assert_eq!(
-            controller.settings_action(),
+            controller.settings_action(en()),
             None,
             "unexpected action for {status:?}"
         );
@@ -476,7 +480,7 @@ fn settings_action_is_inert_when_it_offers_nothing() {
         UpdateStatus::Disabled,
     ] {
         let mut controller = controller(status.clone(), None);
-        assert!(controller.settings_action().is_none());
+        assert!(controller.settings_action(en()).is_none());
         controller.activate_settings_action();
         assert_eq!(
             std::mem::discriminant(controller.status()),
@@ -702,15 +706,15 @@ fn banner_state_exposes_one_clear_action() {
         notes: "Faster joining".into(),
     };
     assert_eq!(
-        UpdateStatus::Available(info.clone()).action_label(),
+        UpdateStatus::Available(info.clone()).action_label(en()),
         Some("Update now")
     );
-    assert_eq!(UpdateStatus::Downloading(info).action_label(), None);
+    assert_eq!(UpdateStatus::Downloading(info).action_label(en()), None);
     assert_eq!(
         UpdateStatus::Failed {
             message: "offline".into(),
         }
-        .action_label(),
+        .action_label(en()),
         Some("Check again")
     );
     assert!(!UpdateStatus::Current.is_visible());

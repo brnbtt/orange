@@ -108,6 +108,8 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/troubleshoot/history.rs` | Bounded recent JSONL tails, per-connection historical outcomes and sanitized build/timestamp evidence |
 | `crates/orange-client/src/troubleshoot/logs.rs` | Explicit-upload log attachments: bounded tails, preserved session correlation, allowlisted metadata and payloads |
 | `crates/orange-client/src/troubleshoot/upload.rs` | Authenticated support report POST, transport/body/receipt bounds and fixed error classification |
+| `crates/orange-client/src/i18n.rs` | UI language: `Locale`, a compile-checked catalog, English and Brazilian Portuguese copy. Views look up strings here rather than embedding them |
+| `crates/orange-client/src/i18n/en.rs`, `i18n/pt_br.rs` | The two catalogs. Adding a field to `Catalog` is a compile error until both files fill it |
 | `crates/orange-client/src/session.rs` | Reads CLI session JSON including the relay token; atomically reads/writes client preferences and the friend roster |
 | `crates/orange-client/src/client.rs` | Native notification icon, message-only HWND/thread, events, bounded cleanup, fail-fast ownership policy |
 | `crates/orange-client/src/update.rs` | Beta checks, fixed-host/manifest validation, SHA-256 download verification, jobs, updater handoff |
@@ -522,7 +524,7 @@ not a source-level result.
 
 ## Deployment Model And Boundaries
 
-- The public landing page is plain HTML/CSS/JavaScript in the existing release storage account's `$web` container. `deploy/website.ps1` uploads fifteen allowlisted assets, including self-hosted identity fonts and native gaming/friend-flow captures with demo data, and adds an origin-scoped Blob CORS rule. The browser resolves the latest download from the live beta manifest. Each site deploy also snapshots that manifest's public Azure installer into the HTML for failed checks or disabled JavaScript; GitHub releases are private. Normal browser downloads follow app releases automatically; redeploying refreshes the fallback snapshot. Hosting has no fixed compute charge, with storage, operations and bandwidth metered.
+- The public landing page is plain HTML/CSS/JavaScript in the existing release storage account's `$web` container. `deploy/website.ps1` uploads sixteen allowlisted assets, including self-hosted identity fonts and native gaming/friend-flow captures with demo data, and adds an origin-scoped Blob CORS rule. The browser resolves the latest download from the live beta manifest. Each site deploy also snapshots that manifest's public Azure installer into the HTML for failed checks or disabled JavaScript; GitHub releases are private. Normal browser downloads follow app releases automatically; redeploying refreshes the fallback snapshot. Hosting has no fixed compute charge, with storage, operations and bandwidth metered.
 - Azure is deliberately pinned to one always-on replica in `deploy/azure.ps1`.
 - Sessions are durable in Azure Table Storage, so a deploy no longer signs users out. Memory is a read-through cache in front of it; the store is consulted only on a miss. Login and durable restoration share the same 4,096-entry eviction policy; replacing a cached token neither evicts another entry nor renews its original expiration.
 - Rooms and pending OAuth attempts are still in memory. A revision switch, deploy, or restart interrupts every active room. There is no horizontal-scaling claim: rooms are per-process, so two replicas behind one ingress could put host and viewer on different instances.

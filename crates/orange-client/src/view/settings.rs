@@ -1,6 +1,7 @@
 //! The settings screen: its collapsible sections and the cards inside them.
 
 use crate::{
+    i18n,
     supervisor::{FRAME_RATES, QUALITIES},
     troubleshoot::{CheckStatus, LastConnectionStatus, UploadUiState},
     ui::*,
@@ -19,6 +20,7 @@ impl Orange {
         let signed_in = self.session.as_ref().map(|s| s.name.clone());
         // The person is the content and the provider is the qualifier; the other
         // way round read like a list of connected services when there is one.
+        let copy = self.copy();
         let identity = match &signed_in {
             Some(name) => div()
                 .flex()
@@ -41,8 +43,8 @@ impl Orange {
                 .flex_col()
                 .gap_0p5()
                 .min_w(px(0.0))
-                .child(label("Not signed in", TEXT))
-                .child(label("Sign in with Discord to share", MUTED).text_xs())
+                .child(label(copy.settings.not_signed_in, TEXT))
+                .child(label(copy.settings.sign_in_to_share, MUTED).text_xs())
                 .into_any_element(),
         };
 
@@ -54,13 +56,13 @@ impl Orange {
             .gap_3()
             .child(identity)
             .child(match signed_in {
-                Some(_) => ghost("so", "Sign out")
+                Some(_) => ghost("so", copy.settings.sign_out)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sign_out(None);
                         cx.notify();
                     }))
                     .into_any_element(),
-                None => ghost("si", "Sign in")
+                None => ghost("si", copy.settings.sign_in)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.screen = Screen::SignedOut;
                         cx.notify();
@@ -92,13 +94,13 @@ impl Orange {
             .collect();
 
         setting_choice(
-            "Resolution",
+            self.copy().settings.resolution,
             Some(SharedString::from(format!(
                 "{} \u{d7} {}",
                 chosen.max_width, chosen.max_height
             ))),
             pills,
-            chosen.detail,
+            self.copy().quality_detail(selected),
         )
         .into_any_element()
     }
@@ -123,23 +125,57 @@ impl Orange {
             })
             .collect();
 
-        let detail = FRAME_RATES
+        let detail_index = FRAME_RATES
             .iter()
-            .find(|rate| rate.fps == selected)
-            .unwrap_or(&FRAME_RATES[0])
-            .detail;
+            .position(|rate| rate.fps == selected)
+            .unwrap_or(0);
 
         // No readout: a readout shows what an abstract label resolves to, and
         // "60" is not abstract.
-        setting_choice("Frame rate", None, pills, detail).into_any_element()
+        setting_choice(
+            self.copy().settings.frame_rate,
+            None,
+            pills,
+            self.copy().fps_detail(detail_index),
+        )
+        .into_any_element()
+    }
+
+    fn settings_language_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let copy = self.copy();
+        let selected = self.locale;
+        let pills = i18n::Locale::ALL
+            .iter()
+            .map(|&locale| {
+                option_pill(
+                    SharedString::from(format!("settings-lang-{}", locale.as_str())),
+                    locale.label(),
+                    locale == selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.locale = locale;
+                    this.save_preferences();
+                    cx.notify();
+                }))
+                .into_any_element()
+            })
+            .collect();
+        setting_choice(
+            copy.settings.language,
+            None,
+            pills,
+            copy.settings.language_detail,
+        )
+        .into_any_element()
     }
 
     fn settings_updates_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The action is always rendered so the row does not reflow while a
         // check runs; dimmed and inert when nothing applies. The label follows
         // the state: an available update installs, anything else checks.
-        let action = self.updates.settings_action();
-        let button = quiet("check-updates", action.unwrap_or("Check now"));
+        let copy = self.copy();
+        let action = self.updates.settings_action(copy);
+        let button = quiet("check-updates", action.unwrap_or(copy.update.check_now));
         let action = if action.is_some() {
             button
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -157,14 +193,19 @@ impl Orange {
                 .cursor_default()
                 .into_any_element()
         };
-        setting_row("Updates", self.updates.settings_detail(), action).into_any_element()
+        setting_row(
+            copy.settings.updates,
+            self.updates.settings_detail(copy),
+            action,
+        )
+        .into_any_element()
     }
 
     fn settings_diagnostics_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         setting_row(
-            "Diagnostics",
-            "Logs from your recent sessions",
-            quiet("open-diagnostics", "Open folder")
+            self.copy().settings.diagnostics,
+            self.copy().settings.logs_recent,
+            quiet("open-diagnostics", self.copy().settings.open_folder)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.open_diagnostics();
                     cx.notify();
@@ -175,6 +216,7 @@ impl Orange {
     }
 
     fn settings_troubleshoot_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let copy = self.copy();
         let running = self.troubleshoot.is_running();
         let repair_running = self.troubleshoot.is_repair_running();
         let has_result = self.troubleshoot.has_result();
@@ -183,13 +225,13 @@ impl Orange {
         let cancelling = self.troubleshoot.is_cancelling();
         let sent = upload_state == UploadUiState::Sent;
         let action_label = if cancelling {
-            "Stopping…"
+            copy.settings.stopping
         } else if running || sending {
-            "Cancel"
+            copy.settings.cancel
         } else if has_result {
-            "Run again"
+            copy.settings.run_again
         } else {
-            "Troubleshoot"
+            copy.settings.troubleshoot
         };
 
         let action = quiet("run-troubleshoot", action_label)
@@ -222,18 +264,22 @@ impl Orange {
             .flex_shrink_0()
             .gap_2()
             .child(
-                setting_row("Troubleshooting", self.troubleshoot.headline(), action)
-                    .p_0()
-                    .border_0()
-                    .bg(rgb(SURFACE)),
+                setting_row(
+                    copy.settings.troubleshooting,
+                    self.troubleshoot.headline_for(copy),
+                    action,
+                )
+                .p_0()
+                .border_0()
+                .bg(rgb(SURFACE)),
             );
 
-        if let Some(summary) = self.troubleshoot.summary() {
-            content = content.child(micro("LAST RUN", MUTED));
+        if let Some(summary) = self.troubleshoot.summary_for(copy) {
+            content = content.child(micro(copy.settings.last_run, MUTED));
             content = content.child(
                 label(
                     summary,
-                    if summary == "Everything checked looks good." {
+                    if summary == copy.troubleshoot.summary_ok {
                         SUCCESS
                     } else {
                         DANGER
@@ -242,36 +288,34 @@ impl Orange {
                 .text_xs(),
             );
 
-            content = content.child(micro("LAST CONNECTION", MUTED));
-            let (last_connection, last_connection_detail, color) = match self
-                .troubleshoot
-                .latest_connection()
-            {
-                Some((LastConnectionStatus::Failed, age)) => (
-                    "The last stream had a problem",
-                    format!("{age}. This was the last recorded attempt. Try your stream again."),
-                    DANGER,
-                ),
-                Some((LastConnectionStatus::Connected, age)) => {
-                    ("Connection established", format!("{age}."), SUCCESS)
-                }
-                Some((LastConnectionStatus::Unknown, age)) => (
-                    "No completed connection check yet",
-                    format!("{age}."),
-                    MUTED,
-                ),
-                None => (
-                    "No completed connection check yet",
-                    "Try a stream, then run Troubleshoot again.".to_string(),
-                    MUTED,
-                ),
-            };
+            content = content.child(micro(copy.settings.last_connection, MUTED));
+            let (last_connection, last_connection_detail, color) =
+                match self.troubleshoot.latest_connection() {
+                    Some((LastConnectionStatus::Failed, age)) => (
+                        copy.settings.last_stream_problem,
+                        i18n::fill(copy.settings.last_stream_problem_detail, age),
+                        DANGER,
+                    ),
+                    Some((LastConnectionStatus::Connected, age)) => (
+                        copy.settings.connection_established,
+                        format!("{age}."),
+                        SUCCESS,
+                    ),
+                    Some((LastConnectionStatus::Unknown, age)) => {
+                        (copy.settings.no_completed_check, format!("{age}."), MUTED)
+                    }
+                    None => (
+                        copy.settings.no_completed_check,
+                        copy.settings.try_stream_then.to_string(),
+                        MUTED,
+                    ),
+                };
             content = content
                 .child(label(last_connection, color).text_xs())
                 .child(label(last_connection_detail, MUTED).text_xs());
 
-            content = content.child(micro("CURRENT CHECKS", MUTED));
-            for check in self.troubleshoot.friendly_checks() {
+            content = content.child(micro(copy.settings.current_checks, MUTED));
+            for check in self.troubleshoot.friendly_checks_for(copy) {
                 let color = match check.status {
                     CheckStatus::Pass => SUCCESS,
                     CheckStatus::Fail => DANGER,
@@ -298,17 +342,17 @@ impl Orange {
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(label("Windows may ask for permission.", MUTED).text_xs())
+                                .child(label(copy.settings.windows_may_ask, MUTED).text_xs())
                                 .child(
                                     {
                                         let button = quiet(
                                             "repair-network",
                                             if cancelling {
-                                                "Stopping…"
+                                                copy.settings.stopping
                                             } else if repair_running {
-                                                "Fixing…"
+                                                copy.settings.fixing
                                             } else {
-                                                "Fix connection"
+                                                copy.settings.fix_connection
                                             },
                                         )
                                         .tab_index(0)
@@ -361,24 +405,18 @@ impl Orange {
                     content.child(label(message, if success { SUCCESS } else { DANGER }).text_xs());
             }
 
-            content = content.child(
-                label(
-                    "Sends these results and recent Orange logs to our team.",
-                    MUTED,
-                )
-                .text_xs(),
-            );
+            content = content.child(label(copy.settings.send_results, MUTED).text_xs());
 
             let send_button = quiet(
                 "send-troubleshoot-report",
                 if cancelling {
-                    "Stopping…"
+                    copy.settings.stopping
                 } else if sending {
-                    "Sending…"
+                    copy.settings.sending
                 } else if sent {
-                    "Sent"
+                    copy.settings.sent
                 } else {
-                    "Send report"
+                    copy.settings.send_report
                 },
             )
             .tab_index(0)
@@ -406,7 +444,7 @@ impl Orange {
                     .into_any_element()
             });
 
-            if let Some(message) = upload_state.message() {
+            if let Some(message) = upload_state.message_for(copy) {
                 let color = match upload_state {
                     UploadUiState::Sent => SUCCESS,
                     UploadUiState::Retry | UploadUiState::SignInRequired => DANGER,
@@ -417,7 +455,7 @@ impl Orange {
 
             // Keep copy as an offline fallback, after the send path.
             content = content.child(
-                quiet("copy-troubleshoot", "Copy report")
+                quiet("copy-troubleshoot", copy.settings.copy_report)
                     .tab_index(0)
                     .focus(|style| style.border_color(rgb(ORANGE_DIM)).text_color(rgb(TEXT)))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -435,13 +473,7 @@ impl Orange {
         }
 
         content
-            .child(
-                label(
-                    "Try a stream with a friend to check picture and sound.",
-                    MUTED,
-                )
-                .text_xs(),
-            )
+            .child(label(copy.settings.try_stream_friend, MUTED).text_xs())
             .into_any_element()
     }
 
@@ -477,9 +509,11 @@ impl Orange {
 
     pub(super) fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let fade = scroll_fade(&self.settings_scroll);
+        let copy = self.copy();
         let account = self.settings_account_card(cx);
         let resolution = self.settings_resolution_card(cx);
         let frame_rate = self.settings_frame_rate_card(cx);
+        let language = self.settings_language_card(cx);
         let updates = self.settings_updates_card(cx);
         let diagnostics = self.settings_diagnostics_card(cx);
         let troubleshoot = self.settings_troubleshoot_card(cx);
@@ -487,7 +521,7 @@ impl Orange {
         let account = self.settings_section(
             SECTION_ACCOUNT,
             "section-account",
-            "ACCOUNT",
+            copy.settings.account,
             None,
             vec![account],
             cx,
@@ -500,17 +534,17 @@ impl Orange {
         let video = self.settings_section(
             SECTION_STREAMING,
             "section-video",
-            "VIDEO",
-            Some("DEFAULTS"),
+            copy.settings.video,
+            Some(copy.settings.defaults),
             vec![resolution, frame_rate],
             cx,
         );
         let system = self.settings_section(
             SECTION_APPLICATION,
             "section-system",
-            "SYSTEM",
+            copy.settings.system,
             None,
-            vec![updates, diagnostics, troubleshoot],
+            vec![language, updates, diagnostics, troubleshoot],
             cx,
         );
 
@@ -550,15 +584,15 @@ impl Orange {
                     .children(fade),
             )
             .child(micro(
-                format!(
-                    "VERSION {}  ·  {}",
+                crate::i18n::fill2(
+                    copy.settings.version,
                     update::current_version(),
-                    update::build_label()
+                    update::build_label(),
                 ),
                 FAINT,
             ))
             .child(
-                ghost("back-settings", "Done")
+                ghost("back-settings", copy.settings.done)
                     .w_full()
                     .h(px(44.0))
                     .text_size(px(13.0))

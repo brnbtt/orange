@@ -13,7 +13,7 @@ impl Orange {
     /// draggable regions have to be declared. The buttons are deliberately
     /// left out of those regions, or the hit test would swallow their clicks.
     pub(super) fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let breadcrumb = self.screen.breadcrumb();
+        let breadcrumb = self.screen.breadcrumb(self.copy());
 
         div()
             .flex()

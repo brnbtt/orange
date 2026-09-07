@@ -81,7 +81,7 @@ try {
     Copy-Item -LiteralPath $scriptPath -Destination "$fixture\deploy\website.ps1"
     $deploy = "$fixture\deploy\website.ps1"
     $assets = @(
-        'website/index.html', 'website/styles.css', 'website/release.js', 'website/404.html', 'assets/logo.png',
+        'website/index.html', 'website/styles.css', 'website/i18n.js', 'website/release.js', 'website/404.html', 'assets/logo.png',
         'website/fonts/orbitron-latin-700.woff2', 'website/fonts/ibm-plex-mono-latin-400.woff2',
         'website/fonts/orbitron-OFL.txt', 'website/fonts/ibm-plex-mono-OFL.txt',
         'website/screenshots/home.png', 'website/screenshots/pick.png', 'website/screenshots/streaming.png',
@@ -190,6 +190,7 @@ try {
     $expected = @{
         'index.html' = @('website/index.html', 'text/html; charset=utf-8')
         'styles.css' = @('website/styles.css', 'text/css; charset=utf-8')
+        'i18n.js' = @('website/i18n.js', 'application/javascript; charset=utf-8')
         'release.js' = @('website/release.js', 'application/javascript; charset=utf-8')
         '404.html' = @('website/404.html', 'text/html; charset=utf-8')
         'logo.png' = @('assets/logo.png', 'image/png')
@@ -205,7 +206,7 @@ try {
         'screenshots/requests-incoming.png' = @('website/screenshots/requests-incoming.png', 'image/png')
     }
     $uploads = @($firstCalls | Where-Object { ($_ | Select-Object -First 3) -join ' ' -eq 'storage blob upload' })
-    Assert ($uploads.Count -eq 15) 'Only the fifteen public assets may be uploaded'
+    Assert ($uploads.Count -eq 16) 'Only the sixteen public assets may be uploaded'
     $names = @()
     foreach ($upload in $uploads) {
         $name = Option $upload '--name'
@@ -222,7 +223,7 @@ try {
         Assert ((Option $upload '--overwrite') -eq 'true') "Repeat deployment must overwrite $name"
         Assert ((Option $upload '--auth-mode') -eq 'key') 'Uploads must use key authentication'
     }
-    Assert (@($names | Select-Object -Unique).Count -eq 15) 'Each public asset must be uploaded once'
+    Assert (@($names | Select-Object -Unique).Count -eq 16) 'Each public asset must be uploaded once'
     Assert ($names[-1] -eq 'index.html') 'Index must be uploaded after its dependencies'
     foreach ($call in $firstCalls) {
         if ($call[1] -eq 'account') {

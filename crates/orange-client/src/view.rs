@@ -43,12 +43,12 @@ impl Screen {
         }
     }
 
-    fn breadcrumb(self) -> Option<&'static str> {
+    fn breadcrumb(self, copy: &crate::i18n::Catalog) -> Option<&'static str> {
         match self {
-            Screen::PickWindow => Some("/ SHARE"),
-            Screen::Streaming => Some("/ STREAMING"),
-            Screen::Watching => Some("/ WATCHING"),
-            Screen::Settings => Some("/ SETTINGS"),
+            Screen::PickWindow => Some(copy.chrome.share),
+            Screen::Streaming => Some(copy.chrome.streaming),
+            Screen::Watching => Some(copy.chrome.watching),
+            Screen::Settings => Some(copy.chrome.settings),
             Screen::SignedOut | Screen::Home => None,
         }
     }

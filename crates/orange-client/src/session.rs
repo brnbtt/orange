@@ -99,6 +99,10 @@ pub struct Preferences {
     pub friends: Vec<Friend>,
     pub friend_accounts: std::collections::HashMap<String, AccountFriends>,
     pub friends_panel_collapsed: bool,
+    /// Explicit UI language. Absent on older files; the client then follows
+    /// the Windows display language and writes the choice on the next save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<crate::i18n::Locale>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,6 +134,7 @@ impl Default for Preferences {
             friends: Vec::new(),
             friend_accounts: Default::default(),
             friends_panel_collapsed: false,
+            locale: None,
         }
     }
 }
@@ -220,6 +225,15 @@ fn save_preferences_to(path: &Path, preferences: &Preferences) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_preferences_without_locale_still_load() {
+        // Installed clients wrote this file before UI language existed. Missing
+        // must mean "follow Windows", not a parse error that wipes the roster.
+        let preferences: Preferences = serde_json::from_str(r#"{"quality":1}"#).unwrap();
+        assert_eq!(preferences.locale, None);
+        assert_eq!(preferences.quality, 1);
+    }
 
     #[test]
     fn legacy_friends_become_suggestions_for_one_account_without_granting_friendship() {

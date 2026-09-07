@@ -36,6 +36,10 @@ strong { font-weight: 400; color: var(--text); }
 .brand img { flex-shrink: 0; }
 nav { display: flex; align-items: center; gap: 32px; font-size: 12px; }
 nav a, .site-footer a { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; text-decoration: none; }
+.lang-switch { display: inline-flex; gap: 4px; }
+.lang-switch button { min-height: 44px; padding: 0 10px; border: 0; background: transparent; color: var(--muted); font: inherit; letter-spacing: .12em; cursor: pointer; }
+.lang-switch button[aria-pressed="true"] { color: var(--text); }
+.lang-switch button:hover { color: var(--orange-hot); }
 .nav-download { padding: 8px 18px; border: 1px solid #594133; border-radius: 6px; }
 .nav-download:hover { border-color: var(--orange); }
 .hero { position: relative; isolation: isolate; display: grid; grid-template-columns: 1.2fr 1fr; align-items: center; gap: 64px; padding: 64px 0 56px; }
