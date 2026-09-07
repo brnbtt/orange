@@ -41,3 +41,14 @@ or show raw diagnostic details in the user-facing results.
 - Cloud deployment and live Azure uploads were not performed. `deploy/azure.ps1`
   provisions the private container and enables the endpoint when this change is
   deployed; the desktop changes need a new client release.
+
+## Deployment verification (subsequent release request)
+
+Server commit `a93c96f` deployed successfully through ACR run `cqg` to ready
+revision `orange-relay--0000020`, with one minimum/maximum replica and the
+private `diagnostics` container enabled. A live unauthenticated POST returned
+401. An authenticated synthetic report returned 201; the exact report and log
+were downloaded from Blob storage and compared with the submitted payload.
+Anonymous access to that object was denied, and the synthetic object was
+deleted after verification. No real session log contents were uploaded by
+this deployment check.
