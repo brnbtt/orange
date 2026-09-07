@@ -289,10 +289,10 @@ d3d11screencapturesrc
 ```
 
 - The shared tee is after the parser: capture and hardware encode happen once.
-- With no viewers, the shared graph waits in `READY`: capture, encoding, and
-  audio stop after the final viewer branch has been removed. A barrier on the
-  serial teardown worker finishes that transition before the host handles the
-  next join, whose branch is attached before capture restarts.
+- With no viewers, capture and encoding keep running. The tee allows unlinked
+  pads, so idle hosting drops encoded buffers instead of restarting WGC, the
+  encoder, and WASAPI. A barrier on the serial teardown worker finishes the
+  last branch removal before the host handles the next join.
 - Every viewer receives its own payloader, RTP stream, WebRTC peer, offer, ICE, startup keyframe worker, diagnostics handle, and requested pads.
 - NACK, periodic keyframes, and redraw requests support recovery and late joins, including windows that are not repainting.
 - `--codec auto` tries `mfh265enc`, `nvd3d11h265enc`, `mfh264enc`, then `nvd3d11h264enc`; explicit CLI codec choices retain their fixed factories without fallback.

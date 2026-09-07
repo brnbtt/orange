@@ -549,12 +549,13 @@ async fn wait_for_media(counters: &[Arc<AtomicUsize>], previous: &[usize]) {
 }
 
 #[tokio::test]
-async fn last_viewer_suspension_stops_video_and_audio_until_a_new_branch_is_ready() {
-    // An empty viewer map used to leave both shared sources PLAYING forever.
-    // Real tee links exercise removal and restart without GPU or audio devices.
+async fn last_viewer_teardown_leaves_shared_sources_running_for_rejoin() {
+    // PLAYING -> READY -> PLAYING broke WGC/encoder restart, so a rejoining
+    // viewer got one frame or none. Keep sources running after the last branch
+    // detaches; a new branch must see media without restarting capture.
     if run_in_bounded_subprocess(
         "ORANGE_TEST_HOST_IDLE_MEDIA_CHILD",
-        "peer::host_branch::tests::last_viewer_suspension_stops_video_and_audio_until_a_new_branch_is_ready",
+        "peer::host_branch::tests::last_viewer_teardown_leaves_shared_sources_running_for_rejoin",
     ) {
         return;
     }
@@ -584,18 +585,18 @@ async fn last_viewer_suspension_stops_video_and_audio_until_a_new_branch_is_read
     wait_for_media(&viewer_counters, &[0, 0]).await;
 
     teardown.enqueue(branch).await.unwrap();
-    teardown.suspend().await.unwrap();
+    teardown.drain().await.unwrap();
     teardown.finish().await.unwrap();
     let state = pipeline.current_state();
-    let stopped: Vec<_> = counters
+    let after_last: Vec<_> = counters
         .iter()
         .map(|counter| counter.load(Ordering::SeqCst))
         .collect();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let remained_stopped = counters
+    let kept_producing = counters
         .iter()
-        .zip(&stopped)
-        .all(|(counter, count)| counter.load(Ordering::SeqCst) == *count);
+        .zip(&after_last)
+        .all(|(counter, count)| counter.load(Ordering::SeqCst) > *count);
     let pads_released =
         tees.iter().all(|tee| tee.src_pads().is_empty()) && bin.sink_pads().is_empty();
     let detached = bin.parent().is_none();
@@ -604,18 +605,17 @@ async fn last_viewer_suspension_stops_video_and_audio_until_a_new_branch_is_read
 
     let (branch, sink) = synthetic_viewer(&pipeline, &tees);
     let resumed_viewer_counters = count_viewer_buffers(&branch);
-    pipeline.set_state(gst::State::Playing).unwrap();
-    wait_for_media(&counters, &stopped).await;
+    wait_for_media(&counters, &after_last).await;
     wait_for_media(&resumed_viewer_counters, &[0, 0]).await;
     remove_viewer(&pipeline, branch);
     sink.set_state(gst::State::Null).unwrap();
     pipeline.remove(&sink).unwrap();
     pipeline.set_state(gst::State::Null).unwrap();
 
-    assert_eq!(state, gst::State::Ready);
+    assert_eq!(state, gst::State::Playing);
     assert!(
-        remained_stopped,
-        "video and audio must stay idle without viewers"
+        kept_producing,
+        "video and audio must keep running without viewers"
     );
     assert!(pads_released);
     assert!(detached);
@@ -624,7 +624,7 @@ async fn last_viewer_suspension_stops_video_and_audio_until_a_new_branch_is_read
 #[tokio::test(flavor = "current_thread")]
 async fn suspension_waits_for_all_removals_without_blocking_the_executor() {
     // The last removal may still be queued behind a startup worker join.
-    // READY must follow both removals, not just removal from the host's map.
+    // Drain must follow both removals, not just removal from the host's map.
     if run_in_bounded_subprocess(
         "ORANGE_TEST_HOST_IDLE_ORDER_CHILD",
         "peer::host_branch::tests::suspension_waits_for_all_removals_without_blocking_the_executor",
@@ -661,35 +661,32 @@ async fn suspension_waits_for_all_removals_without_blocking_the_executor() {
             .unwrap();
     }
     {
-        let suspension = teardown.suspend();
-        tokio::pin!(suspension);
-        let pending = tokio::time::timeout(Duration::from_millis(30), &mut suspension)
+        let drain = teardown.drain();
+        tokio::pin!(drain);
+        let pending = tokio::time::timeout(Duration::from_millis(30), &mut drain)
             .await
             .is_err();
         let still_playing = pipeline.current_state() == gst::State::Playing;
         let both_attached = first.parent().is_some() && last.parent().is_some();
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), suspension)
+        tokio::time::timeout(Duration::from_secs(1), drain)
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            pending,
-            "suspension must wait for the startup worker to join"
-        );
+        assert!(pending, "drain must wait for the startup worker to join");
         assert!(still_playing);
         assert!(both_attached);
     }
-    let suspended = pipeline.current_state();
+    let drained = pipeline.current_state();
     let both_detached = first.parent().is_none() && last.parent().is_none();
     teardown.finish().await.unwrap();
     pipeline.set_state(gst::State::Null).unwrap();
-    assert_eq!(suspended, gst::State::Ready);
+    assert_eq!(drained, gst::State::Playing);
     assert!(both_detached);
 }
 
 #[tokio::test]
-async fn suspension_fallback_stops_media_when_the_worker_channel_is_closed() {
+async fn drain_fallback_completes_when_the_worker_channel_is_closed() {
     // A failed send must keep the same off-executor fallback as branch removal.
     gst::init().unwrap();
     let pipeline = gst::Pipeline::new();
@@ -701,53 +698,17 @@ async fn suspension_fallback_stops_media_when_the_worker_channel_is_closed() {
         pipeline: pipeline.clone(),
         worker: None,
     };
-    let result = teardown.suspend().await;
+    let result = teardown.drain().await;
     let state = pipeline.current_state();
     teardown.finish().await.unwrap();
     pipeline.set_state(gst::State::Null).unwrap();
     result.unwrap();
-    assert_eq!(state, gst::State::Ready);
+    assert_eq!(state, gst::State::Playing);
 }
 
 #[tokio::test]
-async fn suspension_propagates_state_change_failure_from_worker_and_fallback() {
-    // An acknowledgment must carry READY failure, not silently allow a rejoin
-    // against a pipeline whose shared sources never actually stopped.
-    gst::init().unwrap();
-    for fallback in [false, true] {
-        let pipeline = gst::Pipeline::new();
-        let sink = gst::ElementFactory::make("fakesink")
-            .property("async", false)
-            .build()
-            .unwrap();
-        pipeline.add(&sink).unwrap();
-        pipeline.set_state(gst::State::Playing).unwrap();
-        sink.set_property_from_str("state-error", "paused-to-ready");
-        let teardown = if fallback {
-            let (sender, receiver) = mpsc::channel(1);
-            drop(receiver);
-            ViewerTeardown {
-                sender: Some(sender),
-                pipeline: pipeline.clone(),
-                worker: None,
-            }
-        } else {
-            ViewerTeardown::new(&pipeline).unwrap()
-        };
-        let result = teardown.suspend().await;
-        teardown.finish().await.unwrap();
-        sink.set_property_from_str("state-error", "none");
-        pipeline.set_state(gst::State::Null).unwrap();
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("failed to suspend shared host media"));
-    }
-}
-
-#[tokio::test]
-async fn suspension_reports_a_lost_acknowledgment() {
-    // A lost command must not leave the host waiting indefinitely for READY.
+async fn drain_reports_a_lost_acknowledgment() {
+    // A lost command must not leave the host waiting indefinitely for removal.
     gst::init().unwrap();
     let pipeline = gst::Pipeline::new();
     let (sender, mut receiver) = mpsc::channel(1);
@@ -759,7 +720,7 @@ async fn suspension_reports_a_lost_acknowledgment() {
     let receiver = tokio::spawn(async move {
         drop(receiver.recv().await);
     });
-    let result = tokio::time::timeout(Duration::from_secs(1), teardown.suspend())
+    let result = tokio::time::timeout(Duration::from_secs(1), teardown.drain())
         .await
         .unwrap();
     receiver.await.unwrap();
@@ -767,5 +728,5 @@ async fn suspension_reports_a_lost_acknowledgment() {
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("stopped before suspending"));
+        .contains("stopped before draining"));
 }

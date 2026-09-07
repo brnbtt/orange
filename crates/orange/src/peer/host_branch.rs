@@ -170,19 +170,15 @@ pub(super) struct ViewerBranch {
 
 enum ViewerTeardownCommand {
     Remove(ViewerBranch),
-    Suspend(oneshot::Sender<Result<()>>),
+    Drain(oneshot::Sender<Result<()>>),
 }
 
 impl ViewerTeardownCommand {
     fn run(self, pipeline: &gst::Pipeline) {
         match self {
             Self::Remove(branch) => remove_viewer(pipeline, branch),
-            Self::Suspend(completed) => {
-                let result = pipeline
-                    .set_state(gst::State::Ready)
-                    .map(|_| ())
-                    .context("failed to suspend shared host media");
-                let _ = completed.send(result);
+            Self::Drain(completed) => {
+                let _ = completed.send(Ok(()));
             }
         }
     }
@@ -233,15 +229,14 @@ impl ViewerTeardown {
     }
 
     // The single-owner host awaits this barrier before accepting another join.
-    // FIFO removal finishes first, so READY cannot race a new viewer branch or
-    // leave WASAPI running after the final video branch has disappeared.
-    pub(super) async fn suspend(&self) -> Result<()> {
+    // FIFO removal finishes first, so a new branch cannot race the last unlink.
+    pub(super) async fn drain(&self) -> Result<()> {
         let (completed, completion) = oneshot::channel();
-        self.enqueue_command(ViewerTeardownCommand::Suspend(completed))
+        self.enqueue_command(ViewerTeardownCommand::Drain(completed))
             .await?;
         completion
             .await
-            .context("viewer teardown stopped before suspending shared host media")?
+            .context("viewer teardown stopped before draining queued removals")?
     }
 
     async fn enqueue_command(&self, command: ViewerTeardownCommand) -> Result<()> {
