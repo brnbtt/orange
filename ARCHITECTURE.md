@@ -339,6 +339,9 @@ webrtcbin OPUS pad
 - Overlay composition cache hits hash borrowed metadata and displayed numeric
   buckets without formatting labels. One connection-stage snapshot supplies
   the key and any labels drawn on a miss; collapsed status skips unused text.
+- Overlay rectangles, hit testing and window aspect use D3D11's pixel-aspect-
+  corrected display dimensions. Encoded dimensions are kept separately for the
+  quality label; GPU-scaled streams can have non-square pixels.
 
 ## Ownership And Teardown
 
@@ -496,6 +499,10 @@ cargo build --locked --release --workspace --all-features
 # D3D presentation, 60/120 fps, and two WebRTC peers including high-bitrate H.265.
 cargo test --locked -p orange delayed_audio_is_audible -- --ignored --nocapture --test-threads=1
 cargo test --locked -p orange webrtc_audio_is_audible -- --ignored --nocapture --test-threads=1
+
+# Overlay acceptance: screen-captured D3D11 hover pixels and native hit testing
+# with non-square source pixels, letterboxing and 100-200% overlay scaling.
+cargo test --locked -p orange displayed_close_button -- --ignored --nocapture --test-threads=1
 
 # Builds and validates the per-user installer; requires Inno Setup 6.
 .\package.ps1

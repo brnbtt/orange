@@ -322,7 +322,7 @@ fn expand(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, exiting: bool, color: Col
 
 // --- layout -----------------------------------------------------------------
 
-/// A rasterised cluster and where it belongs, in video coordinates.
+/// A rasterised cluster and where it belongs, in sink display coordinates.
 struct Panel {
     pixmap: Pixmap,
     x: f32,
@@ -361,7 +361,7 @@ fn cluster(
 /// Hidden controls become one transparent pixel. The element's `draw` signal
 /// requires a composition object even when there is nothing visible.
 pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlayComposition> {
-    let (vw, vh) = state.video;
+    let (vw, vh) = state.display_size();
     if vw == 0 || vh == 0 {
         state.hits.clear();
         return transparent_composition();
@@ -389,7 +389,7 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
 
     let alpha = state.opacity();
     let status_alpha = if persistent_live { 1.0 } else { alpha };
-    // Placement is in video coordinates; painting is at the output's physical
+    // Placement is in sink display coordinates; painting is at the output's physical
     // DPI. If both use video scale, tiny-skia's antialiasing is filtered again
     // when the sink fits the stream to the window, which softens every icon.
     let render_scale = state.scale();

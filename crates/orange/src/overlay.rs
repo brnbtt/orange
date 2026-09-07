@@ -12,10 +12,10 @@
 //! these things - status top-left, close top-right, audio bottom-left, view
 //! controls bottom-right.
 //!
-//! Everything is authored in screen pixels and scaled to video pixels at the
-//! last moment. The overlay is composited into the frame, which the sink then
-//! scales to the window, so authoring in video pixels would make the controls
-//! shrink on a 4K stream and swell on a 720p one.
+//! Everything is authored in screen pixels and scaled to the sink's display
+//! space at the last moment. D3D11 uses PAR-corrected dimensions for overlay
+//! rectangles, then scales them to the window. Authoring in video pixels would
+//! make the controls shrink on a 4K stream and swell on a 720p one.
 //!
 //! Each cluster is composited as its own rectangle. Nothing rasterises a
 //! full-frame pixmap, so the cost does not grow with the stream resolution.
@@ -71,9 +71,12 @@ impl Hit {
 }
 
 pub struct OverlayState {
-    /// Video frame size. The overlay is composited into this space.
+    /// Encoded video frame size, retained for the receive-quality label.
     pub video: (u32, u32),
-    /// Window client size, fed from the message loop. Together with `video`
+    /// D3D11's square-pixel display space. Non-square source pixels make this
+    /// differ from `video`; both rectangles and pointer coordinates use it.
+    display: Option<(u32, u32)>,
+    /// Window client size, fed from the message loop. Together with `display`
     /// this gives the scale the sink will apply, which is what keeps the
     /// controls a constant size on screen.
     pub client: (u32, u32),
@@ -122,6 +125,7 @@ impl OverlayState {
     ) -> Self {
         Self {
             video: (0, 0),
+            display: None,
             client: (0, 0),
             dpi: 1.0,
             volume: profile.initial_volume(),
@@ -183,7 +187,12 @@ impl OverlayState {
         0.45 + 0.55 * wave
     }
 
-    /// Video pixels per unit of design.
+    /// The shared coordinate space for the sink's rectangles and native input.
+    pub fn display_size(&self) -> (u32, u32) {
+        self.display.unwrap_or(self.video)
+    }
+
+    /// Display-space pixels per unit of design.
     ///
     /// Two conversions. The sink letterboxes to preserve aspect, so the
     /// picture is scaled by `min(cw/vw, ch/vh)` on its way to the window;
@@ -191,7 +200,7 @@ impl OverlayState {
     /// so display scaling has to be applied on top or the controls come out
     /// smaller the more zoomed-in the desktop is.
     fn scale(&self) -> f32 {
-        let (vw, vh) = self.video;
+        let (vw, vh) = self.display_size();
         let (cw, ch) = self.client;
         let dpi = if self.dpi > 0.0 { self.dpi } else { 1.0 };
         if vw == 0 || vh == 0 {
@@ -225,7 +234,7 @@ impl OverlayState {
         !matches!(self.hot, None | Some(Control::Stats))
     }
 
-    /// Feed a mouse position in video coordinates. Returns true if a redraw is
+    /// Feed a mouse position in display coordinates. Returns true if a redraw is
     /// warranted.
     pub fn on_mouse_move(&mut self, x: f32, y: f32) -> bool {
         self.wake();
@@ -250,7 +259,7 @@ impl OverlayState {
         previous != self.hot
     }
 
-    /// Handle a click in video coordinates.
+    /// Handle a click in display coordinates.
     pub fn on_click(&mut self, x: f32, y: f32) {
         self.wake();
         let Some(hit) = self.hits.iter().find(|h| h.contains(x, y)).copied() else {
@@ -372,6 +381,7 @@ impl OverlayState {
     fn signature(&self, connection: Option<ConnectionStage>) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.video.hash(&mut hasher);
+        self.display_size().hash(&mut hasher);
         self.client.hash(&mut hasher);
         self.dpi.to_bits().hash(&mut hasher);
         self.visible().hash(&mut hasher);
@@ -476,6 +486,7 @@ mod tests {
         // picture, its physical-DPI raster or its interactive hit geometry.
         let changes: &[fn(&mut OverlayState)] = &[
             |s| s.video = (2560, 1440),
+            |s| s.display = Some((2560, 1080)),
             |s| s.client = (1920, 1080),
             |s| s.dpi = 1.5,
             |s| s.volume = 0.8,

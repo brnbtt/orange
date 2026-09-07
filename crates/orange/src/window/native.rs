@@ -385,7 +385,7 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
     }
 }
 
-/// Map a point in client coordinates to the video's coordinate space.
+/// Map a client point to the sink's PAR-corrected display coordinate space.
 ///
 /// The sink letterboxes to preserve aspect ratio, so the video does not fill
 /// the client area and a naive mapping would put the controls in the wrong
@@ -1078,7 +1078,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let over_control = with_context(hwnd, |ctx| ctx.overlay.clone())
                     .and_then(|overlay| {
                         let mut overlay = overlay.lock().ok()?;
-                        let video = overlay.video;
+                        let video = overlay.display_size();
                         let (vx, vy) =
                             client_to_video(hwnd, point.x as f32, point.y as f32, video)?;
                         with_context(hwnd, |_| ())?;
@@ -1109,7 +1109,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let mut volume_dragging = false;
                 if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
                     if let Ok(mut overlay) = overlay.lock() {
-                        let video = overlay.video;
+                        let video = overlay.display_size();
                         if let Some((vx, vy)) = client_to_video(hwnd, x, y, video) {
                             if with_context(hwnd, |_| ()).is_some() {
                                 overlay.on_click(vx, vy);
@@ -1136,7 +1136,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
                     if let Ok(mut overlay) = overlay.lock() {
                         if overlay.volume_dragging() {
-                            let video = overlay.video;
+                            let video = overlay.display_size();
                             if let Some((vx, _)) = client_to_video(hwnd, x, y, video) {
                                 if with_context(hwnd, |_| ()).is_some() {
                                     overlay.drag_volume(vx);
