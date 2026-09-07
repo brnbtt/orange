@@ -101,7 +101,9 @@ impl Render for Orange {
                     && !modifiers.alt
                     && !modifiers.platform
                 {
-                    this.close_friend_menu_and_restore_focus(window);
+                    if this.friend_menu.is_some() && !this.friend_menu_has_focus(window, cx) {
+                        this.close_friend_menu_and_restore_focus(window);
+                    }
                     if modifiers.shift {
                         window.focus_prev();
                     } else {

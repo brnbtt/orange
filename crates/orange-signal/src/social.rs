@@ -148,6 +148,7 @@ pub(crate) struct Social {
     store: Option<TableStore>,
     memory: Arc<Mutex<Memory>>,
     requests: Arc<tokio::sync::Semaphore>,
+    presence_waiters: Arc<tokio::sync::Semaphore>,
     mutations: Arc<Mutex<()>>,
 }
 
@@ -157,6 +158,7 @@ impl Social {
             store,
             memory: Default::default(),
             requests: Arc::new(tokio::sync::Semaphore::new(32)),
+            presence_waiters: Arc::new(tokio::sync::Semaphore::new(512)),
             mutations: Default::default(),
         }
     }
@@ -198,6 +200,22 @@ impl Social {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Capacity)
+    }
+
+    pub(crate) fn admit_presence_waiter(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.presence_waiters.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) async fn admit_presence_refresh(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.requests.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::Capacity)?
+        .map_err(|_| Error::Capacity)
     }
 
     pub(crate) async fn admit_read(&self, id: &str) -> Result<(), Error> {
@@ -405,6 +423,8 @@ impl Social {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     fn identity(id: &str) -> Identity {
         Identity {
             id: id.into(),
@@ -577,5 +597,53 @@ mod tests {
         }
         assert!(matches!(social.admit_read("1").await, Err(Error::Capacity)));
         assert!(social.admit_read("2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admitted_presence_refresh_waits_for_capacity_instead_of_failing_fast() {
+        let social = Social::new(None);
+        let mut permits: Vec<_> = (0..32).map(|_| social.admit().unwrap()).collect();
+        let waiter = tokio::spawn({
+            let social = social.clone();
+            async move { social.admit_presence_refresh().await.map(drop) }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "refresh admission completed without waiting for capacity"
+        );
+
+        drop(permits.pop());
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("refresh admission did not resume after capacity was released")
+            .expect("refresh admission task panicked");
+        assert!(
+            result.is_ok(),
+            "refresh admission returned an error: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_waiter_admission_is_capped_and_releases_slots() {
+        let social = Social::new(None);
+        let mut waiters = Vec::new();
+        for _ in 0..512 {
+            waiters.push(
+                social
+                    .admit_presence_waiter()
+                    .expect("presence waiter slot should be available"),
+            );
+        }
+        assert!(
+            social.admit_presence_waiter().is_none(),
+            "presence waiter admission exceeded the documented 512 cap"
+        );
+        drop(waiters.pop());
+        assert!(
+            social.admit_presence_waiter().is_some(),
+            "presence waiter slot was not released after dropping a permit"
+        );
     }
 }

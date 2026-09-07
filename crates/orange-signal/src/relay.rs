@@ -194,7 +194,10 @@ async fn find_presence(
     let rooms = rooms.lock().await;
     let mut best: HashMap<&str, Found> = HashMap::new();
 
-    for (code, room) in rooms.iter() {
+    let mut ordered: Vec<_> = rooms.iter().collect();
+    ordered.sort_by_key(|(code, _)| *code);
+
+    for (code, room) in ordered {
         if room.host.is_none() {
             continue;
         }
@@ -215,9 +218,9 @@ async fn find_presence(
             name: room.host_name.clone(),
             avatar_url: room.host_avatar.clone(),
         };
-        // One host can hold two rooms open. Iteration order over a HashMap is
-        // not stable, so without preferring the joinable one the answer for
-        // that host would flap between polls.
+        // One host can hold two rooms open. Preserve deterministic ordering by
+        // scanning room codes in lexical order, then prefer joinable over full
+        // so a listed friend keeps the room that can still accept viewers.
         if !matches!(
             best.get(host_id),
             Some(Found {
@@ -409,6 +412,24 @@ mod presence_tests {
                 )]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn presence_chooses_the_lexically_first_code_when_two_rooms_are_joinable() {
+        let rooms = rooms(vec![
+            ("ZZZ-999", room("host", &["friend"], 0)),
+            ("AAA-111", room("host", &["friend"], 0)),
+        ]);
+
+        assert_eq!(
+            states(&rooms, "friend", &["host"]).await,
+            vec![(
+                "host".to_string(),
+                Presence::Live {
+                    code: "AAA-111".into()
+                }
+            )]
+        );
     }
 
     /// The client renders one row per friend and pairs the answers up by

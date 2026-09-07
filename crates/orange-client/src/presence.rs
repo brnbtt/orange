@@ -1,13 +1,8 @@
 //! Asking the relay which friends are streaming right now.
 //!
-//! This is a poll rather than a pushed subscription. A pushed one would need a
-//! held WebSocket per signed-in user, and the relay only has 512 connections in
-//! total, shared with every host and viewer; presence would then cost more
-//! capacity than streaming does. Polling costs nothing from that budget because
-//! the semaphore only guards `/ws`.
-//!
-//! Latency is the price: a friend who goes live is invisible for up to
-//! `INTERVAL`. That is a deliberate trade, not an oversight.
+//! A bounded HTTP long-poll returns when the visible snapshot changes without
+//! consuming one of the relay's streaming WebSocket permits. Older relays omit
+//! the revision and keep the original timed polling behavior.
 
 use crate::{background::join_background_worker, session::Friend};
 use serde::Deserialize;
@@ -16,8 +11,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How often the client asks. Chosen as the largest delay that still feels like
-/// "my friend just went live" rather than "I refreshed and noticed".
+/// Retry and legacy fallback delay. Revision-bearing replies renew immediately.
 pub(crate) const INTERVAL: Duration = Duration::from_secs(15);
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
@@ -48,12 +42,14 @@ pub(crate) struct Entry {
     pub(crate) presence: Presence,
 }
 
-#[derive(Debug, Deserialize)]
-struct Body {
-    friends: Vec<Entry>,
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct Snapshot {
+    pub(crate) friends: Vec<Entry>,
+    #[serde(default)]
+    pub(crate) revision: Option<String>,
 }
 
-pub(crate) struct PresenceJob<T = Vec<Entry>> {
+pub(crate) struct PresenceJob<T = Snapshot> {
     cancel: Arc<AtomicBool>,
     cancelled_at: Option<Instant>,
     receiver: mpsc::Receiver<Result<T, PresenceError>>,
@@ -146,14 +142,16 @@ pub(crate) fn start(
     url: String,
     token: String,
     friends: &[Friend],
+    since: Option<&str>,
 ) {
     // A cancelled request still owns its worker until polling reaps it.
     if job.is_some() || friends.is_empty() {
         return;
     }
     let ids: Vec<String> = friends.iter().map(|friend| friend.id.clone()).collect();
+    let since = since.map(str::to_owned);
     *job = Some(start_job(client, move |client| {
-        fetch(&client, &url, &token, &ids)
+        fetch(&client, &url, &token, &ids, since.as_deref())
     }));
 }
 
@@ -212,13 +210,17 @@ fn fetch(
     url: &str,
     token: &str,
     ids: &[String],
-) -> Result<Vec<Entry>, PresenceError> {
+    since: Option<&str>,
+) -> Result<Snapshot, PresenceError> {
     let send = || -> anyhow::Result<reqwest::blocking::Response> {
-        Ok(client
+        let mut request = client
             .get(url)
             .query(&[("ids", ids.join(","))])
-            .bearer_auth(token)
-            .send()?)
+            .query(&[("wait", "20")]);
+        if let Some(since) = since.filter(|revision| !revision.is_empty()) {
+            request = request.query(&[("since", since)]);
+        }
+        Ok(request.bearer_auth(token).send()?)
     };
     let response = send().map_err(|error| PresenceError::Unreachable(error.to_string()))?;
 
@@ -231,9 +233,8 @@ fn fetch(
         .error_for_status()
         .map_err(|error| PresenceError::Unreachable(error.to_string()))?;
 
-    let body: Body = serde_json::from_reader(std::io::Read::take(response, RESPONSE_MAX_BYTES))
-        .map_err(|error| PresenceError::Unreachable(error.to_string()))?;
-    Ok(body.friends)
+    serde_json::from_reader(std::io::Read::take(response, RESPONSE_MAX_BYTES))
+        .map_err(|error| PresenceError::Unreachable(error.to_string()))
 }
 
 #[cfg(test)]
@@ -262,6 +263,7 @@ mod tests {
                 server.url("/presence"),
                 token.into(),
                 &friends,
+                None,
             );
             job.as_ref()
                 .unwrap()
@@ -276,7 +278,7 @@ mod tests {
             requests[0].0, requests[1].0,
             "each poll created a fresh connection"
         );
-        assert!(requests[0].1.starts_with("GET /presence?ids=42 "));
+        assert!(requests[0].1.starts_with("GET /presence?ids=42&wait=20 "));
         assert!(requests[0]
             .1
             .to_ascii_lowercase()
@@ -307,6 +309,7 @@ mod tests {
             server.url("/presence"),
             "secret".into(),
             &friends,
+            None,
         );
         let job = job.as_mut().unwrap();
         job.join();
@@ -322,7 +325,10 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let _ = release_rx.recv_timeout(Duration::from_secs(3));
-            let _ = sender.send(Ok(Vec::new()));
+            let _ = sender.send(Ok(Snapshot {
+                friends: Vec::new(),
+                revision: None,
+            }));
         });
         let mut job = Some(PresenceJob {
             cancel: Arc::clone(&cancel),
@@ -341,6 +347,7 @@ mod tests {
                 name: "Friend".into(),
                 avatar_url: None,
             }],
+            None,
         );
         assert!(Arc::ptr_eq(&job.as_ref().unwrap().cancel, &cancel));
         assert!(!job.as_ref().unwrap().is_finished());
@@ -361,18 +368,56 @@ mod tests {
         let client = PresenceClient::default();
         let http = client.client().unwrap();
         assert_eq!(
-            fetch(&http, &server.url("/presence"), "secret", &[]),
+            fetch(&http, &server.url("/presence"), "secret", &[], None),
             Err(PresenceError::SignedOut)
         );
         assert!(matches!(
-            fetch(&http, &server.url("/presence"), "secret", &[]),
+            fetch(&http, &server.url("/presence"), "secret", &[], None),
             Err(PresenceError::Unreachable(_))
         ));
         assert!(matches!(
-            fetch(&http, &server.url("/presence"), "secret", &[]),
+            fetch(&http, &server.url("/presence"), "secret", &[], None),
             Err(PresenceError::Unreachable(_))
         ));
         assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn revision_aware_polls_send_since_but_legacy_omits_it() {
+        let server = crate::background::tests::HttpServer::new(vec![
+            (200, br#"{"friends":[],"revision":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#.to_vec()),
+            (200, br#"{"friends":[]}"#.to_vec()),
+        ]);
+        let friends = vec![Friend {
+            id: "42".into(),
+            name: "Friend".into(),
+            avatar_url: None,
+        }];
+        let mut job = None;
+        start(
+            &mut job,
+            PresenceClient::default(),
+            server.url("/presence"),
+            "secret".into(),
+            &friends,
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        );
+        job.take().unwrap().join();
+        start(
+            &mut job,
+            PresenceClient::default(),
+            server.url("/presence"),
+            "secret".into(),
+            &friends,
+            None,
+        );
+        job.take().unwrap().join();
+
+        let requests = server.finish();
+        assert!(requests[0]
+            .1
+            .starts_with("GET /presence?ids=42&wait=20&since=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef "));
+        assert!(requests[1].1.starts_with("GET /presence?ids=42&wait=20 "));
     }
 
     /// `ORANGE_SERVER` and the shipped default are both WebSocket URLs ending
@@ -399,7 +444,7 @@ mod tests {
     /// tolerate a profile being absent for an offline friend.
     #[test]
     fn presence_body_decodes_every_state_and_an_optional_profile() {
-        let body: Body = serde_json::from_str(
+        let body: Snapshot = serde_json::from_str(
             r#"{"friends":[
                 {"id":"a","state":"offline"},
                 {"id":"b","name":"Bee","avatar_url":"https://cdn/b.png","state":"live","code":"ABC-234"},
@@ -433,6 +478,12 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(body.revision, None);
+        let revision = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let with_revision: Snapshot =
+            serde_json::from_str(&format!("{{\"friends\":[],\"revision\":\"{revision}\"}}"))
+                .unwrap();
+        assert_eq!(with_revision.revision.as_deref(), Some(revision));
     }
 
     /// A relay that has forgotten this session answers 401, and the fix is a

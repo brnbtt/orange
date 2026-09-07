@@ -98,6 +98,7 @@ pub struct Preferences {
     pub own_codes: Vec<String>,
     pub friends: Vec<Friend>,
     pub friend_accounts: std::collections::HashMap<String, AccountFriends>,
+    pub friends_panel_collapsed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -105,6 +106,7 @@ pub struct Preferences {
 pub struct AccountFriends {
     pub friends: Vec<Friend>,
     pub suggestions: Vec<Friend>,
+    pub muted_stream_alert_friend_ids: Vec<String>,
 }
 
 impl Preferences {
@@ -127,6 +129,7 @@ impl Default for Preferences {
             own_codes: Vec::new(),
             friends: Vec::new(),
             friend_accounts: Default::default(),
+            friends_panel_collapsed: false,
         }
     }
 }
@@ -358,6 +361,42 @@ mod tests {
         assert_eq!(preferences.quality, 1);
         assert_eq!(preferences.fps, None);
         assert!(preferences.own_codes.is_empty());
+        assert!(!preferences.friends_panel_collapsed);
+    }
+
+    #[test]
+    fn friend_mutes_and_panel_state_persist_per_account() {
+        let mut preferences = Preferences {
+            friends_panel_collapsed: true,
+            ..Preferences::default()
+        };
+        preferences.friend_accounts.insert(
+            "1".into(),
+            AccountFriends {
+                muted_stream_alert_friend_ids: vec!["42".into()],
+                ..AccountFriends::default()
+            },
+        );
+        preferences.friend_accounts.insert(
+            "2".into(),
+            AccountFriends {
+                muted_stream_alert_friend_ids: vec!["99".into()],
+                ..AccountFriends::default()
+            },
+        );
+
+        let json = serde_json::to_string(&preferences).unwrap();
+        let mut loaded: Preferences = serde_json::from_str(&json).unwrap();
+
+        assert!(loaded.friends_panel_collapsed);
+        assert_eq!(
+            loaded.friend_account("1").muted_stream_alert_friend_ids,
+            vec!["42".to_string()]
+        );
+        assert_eq!(
+            loaded.friend_account("2").muted_stream_alert_friend_ids,
+            vec!["99".to_string()]
+        );
     }
 
     #[test]

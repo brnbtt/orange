@@ -4,6 +4,7 @@
 use super::*;
 use crate::client::DropSignal;
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use std::time::Duration;
 
 #[test]
@@ -189,6 +190,102 @@ async fn receive_signal(
             return serde_json::from_str(&text).expect("relay sent malformed signal");
         }
     }
+}
+
+async fn accepted_friendship_server() -> (
+    tokio::task::JoinHandle<()>,
+    reqwest::Client,
+    String,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let auth = auth::Auth::new(None);
+    for id in ["1", "2", "3"] {
+        auth.insert_session_for_test(
+            id,
+            Identity {
+                id: id.into(),
+                name: format!("User {id}"),
+                avatar_url: None,
+            },
+        )
+        .await;
+    }
+    let app = server::router(server::AppState {
+        rooms: Rooms::default(),
+        auth,
+        social: crate::social::Social::new(None),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{address}");
+    let http = reqwest::Client::new();
+
+    for id in ["1", "2"] {
+        assert!(http
+            .get(format!("{base}/friends"))
+            .bearer_auth(id)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+    let request = http
+        .post(format!("{base}/friends"))
+        .bearer_auth("2")
+        .json(&serde_json::json!({"action":"request","target_id":"1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(request.status(), reqwest::StatusCode::NO_CONTENT);
+    let inbox: Value = http
+        .get(format!("{base}/friends"))
+        .bearer_auth("1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let revision = inbox["incoming"][0]["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = http
+        .post(format!("{base}/friends"))
+        .bearer_auth("1")
+        .json(&serde_json::json!({"action":"accept","target_id":"2","revision":revision}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let (mut host, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+        .await
+        .unwrap();
+    host.send(tokio_tungstenite::tungstenite::Message::Text(
+        Signal::Authenticate {
+            session: "1".into(),
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+    receive_signal(&mut host).await;
+
+    (relay, http, base, host)
+}
+
+async fn presence_json(http: &reqwest::Client, url: String, bearer: &str) -> Value {
+    http.get(url)
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -834,6 +931,150 @@ async fn abrupt_host_disconnect_notifies_existing_viewers() {
     };
     assert_eq!(message, "The stream ended");
     assert!(rooms.lock().await.is_empty());
+
+    relay.abort();
+}
+
+#[tokio::test]
+async fn waited_presence_returns_quickly_when_a_friend_goes_live_then_offline() {
+    let (relay, http, base, mut host) = accepted_friendship_server().await;
+
+    let first = presence_json(&http, format!("{base}/presence?ids=1&wait=1"), "2").await;
+    assert_eq!(first["friends"][0]["state"], "offline");
+    let first_revision = first["revision"].as_str().unwrap().to_string();
+
+    let http_live = http.clone();
+    let live_url = format!("{base}/presence?ids=1&wait=20&since={first_revision}");
+    let live_wait = tokio::spawn(async move { presence_json(&http_live, live_url, "2").await });
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    host.send(tokio_tungstenite::tungstenite::Message::Text(
+        Signal::Host { visible_to: vec![] }.to_json(),
+    ))
+    .await
+    .unwrap();
+    let Signal::Hosting { code, .. } = receive_signal(&mut host).await else {
+        panic!("host did not receive a room code");
+    };
+
+    let live = tokio::time::timeout(Duration::from_secs(1), live_wait)
+        .await
+        .expect("waited presence did not wake when friend went live")
+        .unwrap();
+    assert_eq!(live["friends"][0]["state"], "live");
+    assert_eq!(live["friends"][0]["code"], code);
+    let live_revision = live["revision"].as_str().unwrap().to_string();
+    assert_ne!(live_revision, first_revision);
+
+    let http_offline = http.clone();
+    let offline_url = format!("{base}/presence?ids=1&wait=20&since={live_revision}");
+    let offline_wait =
+        tokio::spawn(async move { presence_json(&http_offline, offline_url, "2").await });
+
+    drop(host);
+    let offline = tokio::time::timeout(Duration::from_secs(1), offline_wait)
+        .await
+        .expect("waited presence did not wake when friend went offline")
+        .unwrap();
+    assert_eq!(offline["friends"][0]["state"], "offline");
+    assert!(offline["friends"][0].get("code").is_none());
+    assert_ne!(offline["revision"].as_str().unwrap(), live_revision);
+
+    relay.abort();
+}
+
+#[tokio::test]
+async fn waited_presence_releases_social_permits_and_times_out_without_changes() {
+    let (relay, http, base, _host) = accepted_friendship_server().await;
+    let first = presence_json(&http, format!("{base}/presence?ids=1&wait=1"), "2").await;
+    let revision = first["revision"].as_str().unwrap().to_string();
+
+    let mut waiters = Vec::new();
+    for _ in 0..32 {
+        let http_wait = http.clone();
+        let url = format!("{base}/presence?ids=1&wait=20&since={revision}");
+        waiters.push(tokio::spawn(async move {
+            http_wait.get(url).bearer_auth("2").send().await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let friends_status = tokio::time::timeout(
+        Duration::from_secs(1),
+        http.get(format!("{base}/friends")).bearer_auth("2").send(),
+    )
+    .await
+    .expect("/friends blocked while waited /presence requests were idle")
+    .unwrap()
+    .status();
+    assert_eq!(friends_status, reqwest::StatusCode::OK);
+
+    for waiter in &waiters {
+        waiter.abort();
+    }
+
+    let started = tokio::time::Instant::now();
+    let timed_out = presence_json(
+        &http,
+        format!("{base}/presence?ids=1&wait=1&since={revision}"),
+        "2",
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(900));
+    assert!(elapsed < Duration::from_secs(3));
+    assert_eq!(timed_out["revision"].as_str().unwrap(), revision);
+    assert_eq!(timed_out["friends"][0]["state"], "offline");
+
+    relay.abort();
+}
+
+#[tokio::test]
+async fn waited_presence_rechecks_relationships_before_returning_after_candidate_change() {
+    let (relay, http, base, mut host) = accepted_friendship_server().await;
+    host.send(tokio_tungstenite::tungstenite::Message::Text(
+        Signal::Host { visible_to: vec![] }.to_json(),
+    ))
+    .await
+    .unwrap();
+    let Signal::Hosting { .. } = receive_signal(&mut host).await else {
+        panic!("host did not receive a room code");
+    };
+
+    let live = presence_json(&http, format!("{base}/presence?ids=1&wait=1"), "2").await;
+    assert_eq!(live["friends"][0]["state"], "live");
+    let live_revision = live["revision"].as_str().unwrap().to_string();
+
+    let waiting_http = http.clone();
+    let waiting_url = format!("{base}/presence?ids=1&wait=20&since={live_revision}");
+    let waiting = tokio::spawn(async move { presence_json(&waiting_http, waiting_url, "2").await });
+
+    let inbox: Value = http
+        .get(format!("{base}/friends"))
+        .bearer_auth("2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let remove_revision = inbox["friends"][0]["revision"].as_str().unwrap();
+    let removed = http
+        .post(format!("{base}/friends"))
+        .bearer_auth("2")
+        .json(&serde_json::json!({"action":"remove","target_id":"1","revision":remove_revision}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::NO_CONTENT);
+
+    drop(host);
+    let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("waited presence did not wake when room changed")
+        .unwrap();
+    assert_eq!(result["friends"][0]["state"], "offline");
+    assert!(result["friends"][0].get("code").is_none());
 
     relay.abort();
 }

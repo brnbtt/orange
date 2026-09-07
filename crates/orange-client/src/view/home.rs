@@ -108,6 +108,7 @@ impl Orange {
             Some(Presence::Live { code }) => Some(code.clone()),
             _ => None,
         };
+        let alerts_muted = self.friend_stream_alerts_muted(&friend.id);
         let already_watching = joinable
             .as_ref()
             .is_some_and(|code| self.watches.iter().any(|watch| &watch.code == code));
@@ -181,7 +182,8 @@ impl Orange {
                                         dot(status_color).into_any_element()
                                     })
                                     .child(label(status, status_color).text_xs()),
-                            ),
+                            )
+                            .children(alerts_muted.then(|| label("Alerts muted", MUTED).text_xs())),
                     ),
             )
             .child(
@@ -259,10 +261,42 @@ impl Orange {
 
     fn render_friend_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Deferred> {
         let menu = self.friend_menu.as_ref()?;
-        self.friend_menu_target()?;
+        let target = self.friend_menu_target()?;
         let friend_name = menu.friend_name.clone();
+        let alerts_muted = self.friend_stream_alerts_muted(&target.id);
+        let mute_label = if alerts_muted {
+            "Unmute stream alerts"
+        } else {
+            "Mute stream alerts"
+        };
+        let mute = div()
+            .id("friend-menu-mute")
+            .tab_index(0)
+            .flex()
+            .items_center()
+            .px_2()
+            .h(px(30.0))
+            .rounded_md()
+            .text_color(rgb(TEXT))
+            .text_xs()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(SURFACE_HOVER)))
+            .focus(|style| style.bg(rgb(SURFACE_HOVER)))
+            .child(mute_label)
+            .on_click(cx.listener(|this, _, window, cx| {
+                if let Some(focus) = this.toggle_friend_stream_alerts_from_menu() {
+                    focus.focus(window);
+                }
+                cx.notify();
+            }));
+        let mute = if let Some(mute_focus) = menu.mute_focus.clone() {
+            mute.track_focus(&mute_focus)
+        } else {
+            mute
+        };
         let remove = div()
             .id("friend-menu-remove")
+            .tab_index(0)
             .flex()
             .items_center()
             .px_2()
@@ -280,8 +314,8 @@ impl Orange {
                 }
                 cx.notify();
             }));
-        let remove = if let Some(menu_focus) = menu.menu_focus.clone() {
-            remove.track_focus(&menu_focus)
+        let remove = if let Some(remove_focus) = menu.remove_focus.clone() {
+            remove.track_focus(&remove_focus)
         } else {
             remove
         };
@@ -310,7 +344,13 @@ impl Orange {
                     .py_1()
                     .text_ellipsis(),
             )
+            .child(mute)
             .child(remove);
+        let menu_card = if let Some(menu_focus) = menu.menu_focus.clone() {
+            menu_card.track_focus(&menu_focus)
+        } else {
+            menu_card
+        };
         Some(
             deferred(
                 anchored()
@@ -444,64 +484,84 @@ impl Orange {
             .gap_1p5()
             .child(
                 div()
+                    .id("friends-tools-toggle")
+                    .tab_index(0)
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
+                    .rounded_md()
+                    .px_1()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(SURFACE_HOVER)))
+                    .focus(|style| style.bg(rgb(SURFACE_HOVER)).border_color(rgb(ORANGE_DIM)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_friends_panel_collapsed();
+                        cx.notify();
+                    }))
                     .child(micro("FRIENDS", MUTED))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                ghost("paste-friend", "Add friend")
-                                    .tab_index(0)
-                                    .focus(|style| style.border_color(rgb(ORANGE)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let code = cx
-                                            .read_from_clipboard()
-                                            .and_then(|item| item.text())
-                                            .unwrap_or_default();
-                                        this.offer_friend_code(&code);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                quiet("copy-friend", "Copy my code")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .h(px(30.0))
-                                    .px_3()
-                                    .tab_index(0)
-                                    .focus(|style| style.border_color(rgb(ORANGE)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        match this.session.as_ref().map(|session| session.friend_code()) {
-                                            Some(Ok(code)) => {
-                                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
-                                                this.show_notice(
-                                                    crate::NoticeKind::Ordinary,
-                                                    "Friend code copied. Send it to your friend so they can add you.",
-                                                );
-                                            }
-                                            Some(Err(error)) => {
-                                                this.show_error(format!("Could not copy friend code: {error}"))
-                                            }
-                                            None => this.show_error("Sign in with Discord to share your friend code."),
-                                        }
-                                        cx.notify();
-                                    })),
-                            ),
+                            .child(label(if self.friends_panel_collapsed { "Show" } else { "Hide" }, MUTED).text_xs())
+                            .child(label(if self.friends_panel_collapsed { "▾" } else { "▴" }, MUTED).text_sm()),
                     ),
             )
-            .child(
+            .children((!self.friends_panel_collapsed).then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        ghost("paste-friend", "Add friend")
+                            .tab_index(0)
+                            .focus(|style| style.border_color(rgb(ORANGE)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let code = cx
+                                    .read_from_clipboard()
+                                    .and_then(|item| item.text())
+                                    .unwrap_or_default();
+                                this.offer_friend_code(&code);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        quiet("copy-friend", "Copy my code")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(30.0))
+                            .px_3()
+                            .tab_index(0)
+                            .focus(|style| style.border_color(rgb(ORANGE)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                match this.session.as_ref().map(|session| session.friend_code()) {
+                                    Some(Ok(code)) => {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
+                                        this.show_notice(
+                                            crate::NoticeKind::Ordinary,
+                                            "Friend code copied. Send it to your friend so they can add you.",
+                                        );
+                                    }
+                                    Some(Err(error)) => {
+                                        this.show_error(format!("Could not copy friend code: {error}"))
+                                    }
+                                    None => this.show_error("Sign in with Discord to share your friend code."),
+                                }
+                                cx.notify();
+                            })),
+                    )
+            }))
+            .children((!self.friends_panel_collapsed).then(|| {
                 label(
                     "Copy their friend code, then choose Add friend.",
                     MUTED,
                 )
-                .text_xs(),
-            );
+                .text_xs()
+            }));
 
         div()
             .flex()

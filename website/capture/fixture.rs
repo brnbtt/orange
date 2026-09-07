@@ -129,6 +129,8 @@ fn state() -> Orange {
         friend_sync,
         requests_open: capture_screen == "requests",
         friend_menu: None,
+        muted_stream_alert_friend_ids: Default::default(),
+        friends_panel_collapsed: false,
         presence: [
             (
                 "demo-fragbyte".into(),
@@ -141,6 +143,8 @@ fn state() -> Orange {
         .into_iter()
         .collect(),
         presence_job: None,
+        retiring_presence_job: None,
+        presence_revision: None,
         presence_client: presence::PresenceClient::default(),
         presence_due: Instant::now() + Duration::from_secs(86400),
         presence_error: None,

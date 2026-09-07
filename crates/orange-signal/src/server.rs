@@ -17,6 +17,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 #[cfg(test)]
@@ -175,12 +176,18 @@ async fn auth_poll(
 /// stops one request from pinning the room lock while it walks an attacker's
 /// arbitrarily long id list.
 const PRESENCE_QUERY_CAPACITY: usize = 256;
+const PRESENCE_MAX_WAIT_SECS: u64 = 20;
+const PRESENCE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Deserialize)]
 struct PresenceParams {
     /// Comma-separated Discord ids.
     #[serde(default)]
     ids: String,
+    #[serde(default)]
+    wait: Option<u64>,
+    #[serde(default)]
+    since: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -201,6 +208,24 @@ struct PresenceBody {
     friends: Vec<PresenceEntry>,
 }
 
+#[derive(Serialize)]
+struct PresenceWaitBody {
+    friends: Vec<PresenceEntry>,
+    revision: String,
+}
+
+#[derive(Clone)]
+struct PresenceAuthz {
+    accepted: Vec<String>,
+    legacy: Vec<String>,
+}
+
+struct PresenceSnapshot {
+    friends: Vec<PresenceEntry>,
+    revision: String,
+    authz: PresenceAuthz,
+}
+
 /// Who among the caller's friends is streaming right now.
 ///
 /// Unlike `/ws`, this refuses an unauthenticated caller. Presence is answered
@@ -212,7 +237,7 @@ async fn presence(
     Query(params): Query<PresenceParams>,
     headers: HeaderMap,
 ) -> Response {
-    let _permit = match app.social.admit() {
+    let permit = match app.social.admit() {
         Ok(permit) => permit,
         Err(error) => return social_error(error),
     };
@@ -220,6 +245,7 @@ async fn presence(
         Ok(identity) => identity,
         Err(response) => return *response,
     };
+    let mut viewer_id = identity.id.clone();
 
     let ids: Vec<String> = params
         .ids
@@ -232,13 +258,123 @@ async fn presence(
         return (StatusCode::BAD_REQUEST, "too many ids").into_response();
     }
 
+    let wait_secs = params.wait.unwrap_or(0).min(PRESENCE_MAX_WAIT_SECS);
+    let since = if wait_secs > 0 {
+        match parse_since(params.since.as_deref()) {
+            Ok(since) => since,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        }
+    } else {
+        None
+    };
+
     if let Err(error) = app.social.admit_read(&identity.id).await {
         return social_error(error);
     }
-    let relationships = match app.social.relationships(&identity.id).await {
-        Ok(relationships) => relationships,
+    let mut snapshot = match snapshot_for_presence(&app, &identity, &ids).await {
+        Ok(snapshot) => snapshot,
         Err(error) => return social_error(error),
     };
+
+    if wait_secs == 0 {
+        return Json(PresenceBody {
+            friends: snapshot.friends,
+        })
+        .into_response();
+    }
+
+    let Some(since) = since else {
+        return Json(PresenceWaitBody {
+            friends: snapshot.friends,
+            revision: snapshot.revision,
+        })
+        .into_response();
+    };
+    if snapshot.revision != since {
+        return Json(PresenceWaitBody {
+            friends: snapshot.friends,
+            revision: snapshot.revision,
+        })
+        .into_response();
+    }
+
+    let Some(_waiter) = app.social.admit_presence_waiter() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    drop(permit);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    while tokio::time::Instant::now() < deadline {
+        let now = tokio::time::Instant::now();
+        let sleep_for = std::cmp::min(
+            PRESENCE_POLL_INTERVAL,
+            deadline.saturating_duration_since(now),
+        );
+        if sleep_for.is_zero() {
+            break;
+        }
+        tokio::time::sleep(sleep_for).await;
+
+        let candidate = candidate_revision(&app, &viewer_id, &ids, &snapshot.authz).await;
+        if candidate != since {
+            let _permit = match app.social.admit_presence_refresh().await {
+                Ok(permit) => permit,
+                Err(error) => return social_error(error),
+            };
+            let refreshed_identity = match authenticated_identity(&app, &headers).await {
+                Ok(identity) => identity,
+                Err(response) => return *response,
+            };
+            viewer_id = refreshed_identity.id.clone();
+            snapshot = match snapshot_for_presence(&app, &refreshed_identity, &ids).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => return social_error(error),
+            };
+            if snapshot.revision != since {
+                return Json(PresenceWaitBody {
+                    friends: snapshot.friends,
+                    revision: snapshot.revision,
+                })
+                .into_response();
+            }
+        }
+    }
+
+    let _permit = match app.social.admit_presence_refresh().await {
+        Ok(permit) => permit,
+        Err(error) => return social_error(error),
+    };
+    let refreshed_identity = match authenticated_identity(&app, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+    snapshot = match snapshot_for_presence(&app, &refreshed_identity, &ids).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return social_error(error),
+    };
+    Json(PresenceWaitBody {
+        friends: snapshot.friends,
+        revision: snapshot.revision,
+    })
+    .into_response()
+}
+
+fn parse_since(raw: Option<&str>) -> std::result::Result<Option<String>, &'static str> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("invalid since revision");
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
+async fn snapshot_for_presence(
+    app: &AppState,
+    identity: &crate::auth::Identity,
+    ids: &[String],
+) -> std::result::Result<PresenceSnapshot, crate::social::Error> {
+    let relationships = app.social.relationships(&identity.id).await?;
     let states: HashMap<_, _> = relationships
         .iter()
         .map(|r| {
@@ -255,27 +391,53 @@ async fn presence(
         .filter(|id| states.get(id.as_str()) == Some(&crate::social::RelationshipState::Accepted))
         .cloned()
         .collect();
-    // A canonical row overrides the legacy room snapshot, including removal.
-    // Otherwise an old visible_to flag would keep sharing presence forever.
     let legacy: Vec<_> = ids
         .iter()
         .filter(|id| !states.contains_key(id.as_str()))
         .cloned()
         .collect();
+
     let mut found: HashMap<_, _> = presence_for(&app.rooms, &identity.id, &legacy)
         .await
         .into_iter()
         .collect();
     found.extend(crate::relay::presence_for_friends(&app.rooms, &accepted).await);
-    let friends = ids
+    let friends = materialize_presence_entries(ids, &mut found);
+    let revision = revision_for_presence(&friends);
+    Ok(PresenceSnapshot {
+        friends,
+        revision,
+        authz: PresenceAuthz { accepted, legacy },
+    })
+}
+
+async fn candidate_revision(
+    app: &AppState,
+    viewer_id: &str,
+    ids: &[String],
+    authz: &PresenceAuthz,
+) -> String {
+    let mut found: HashMap<_, _> = presence_for(&app.rooms, viewer_id, &authz.legacy)
+        .await
         .into_iter()
+        .collect();
+    found.extend(crate::relay::presence_for_friends(&app.rooms, &authz.accepted).await);
+    let friends = materialize_presence_entries(ids, &mut found);
+    revision_for_presence(&friends)
+}
+
+fn materialize_presence_entries(
+    ids: &[String],
+    found: &mut HashMap<String, Found>,
+) -> Vec<PresenceEntry> {
+    ids.iter()
         .map(|id| {
-            let value = found.remove(&id).unwrap_or(Found {
+            let value = found.remove(id).unwrap_or(Found {
                 presence: crate::relay::Presence::Offline,
                 name: None,
                 avatar_url: None,
             });
-            (id, value)
+            (id.clone(), value)
         })
         .map(|(id, found)| {
             let Found {
@@ -290,8 +452,18 @@ async fn presence(
                 presence,
             }
         })
-        .collect();
-    Json(PresenceBody { friends }).into_response()
+        .collect()
+}
+
+fn revision_for_presence(entries: &[PresenceEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        let encoded = serde_json::to_vec(entry)
+            .expect("presence entries are always serializable for revision hashing");
+        hasher.update((encoded.len() as u64).to_le_bytes());
+        hasher.update(&encoded);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 async fn friends(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -464,6 +636,7 @@ mod tests {
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
     };
+    use serde_json::Value;
     use tower::ServiceExt;
 
     async fn limited_ws_upgrade(
@@ -591,6 +764,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waited_presence_rejects_non_sha256_since_revisions() {
+        let state = AppState {
+            rooms: Default::default(),
+            auth: Auth::new(None),
+            social: crate::social::Social::new(None),
+        };
+        state
+            .auth
+            .insert_session_for_test(
+                "good-token",
+                crate::auth::Identity {
+                    id: "me".into(),
+                    name: "Me".into(),
+                    avatar_url: None,
+                },
+            )
+            .await;
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/presence?ids=1&wait=1&since=xyz")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn wait_zero_keeps_the_legacy_presence_json_shape() {
+        let state = AppState {
+            rooms: Default::default(),
+            auth: Auth::new(None),
+            social: crate::social::Social::new(None),
+        };
+        state
+            .auth
+            .insert_session_for_test(
+                "good-token",
+                crate::auth::Identity {
+                    id: "me".into(),
+                    name: "Me".into(),
+                    avatar_url: None,
+                },
+            )
+            .await;
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/presence?ids=friend&wait=0&since=not-checked")
+                    .header(header::AUTHORIZATION, "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            r#"{"friends":[{"id":"friend","state":"offline"}]}"#
+        );
+    }
+
+    #[tokio::test]
     async fn websocket_permit_is_held_until_the_connection_closes() {
         assert_eq!(CONNECTION_CAPACITY, 512);
         let connections = Arc::new(tokio::sync::Semaphore::new(1));
@@ -627,6 +867,95 @@ mod tests {
         .await
         .expect("connection permit was not released");
         assert_eq!(connections.available_permits(), 1);
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn waited_presence_refresh_uses_queued_admission_after_wait() {
+        let state = AppState {
+            rooms: Default::default(),
+            auth: Auth::new(None),
+            social: crate::social::Social::new(None),
+        };
+        state
+            .auth
+            .insert_session_for_test(
+                "good-token",
+                crate::auth::Identity {
+                    id: "me".into(),
+                    name: "Me".into(),
+                    avatar_url: None,
+                },
+            )
+            .await;
+
+        let app = router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let baseline = client
+            .get(format!("http://{address}/presence?ids=friend&wait=1"))
+            .bearer_auth("good-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(baseline.status(), StatusCode::OK);
+        let baseline: Value = baseline.json().await.unwrap();
+        let since = baseline
+            .get("revision")
+            .and_then(Value::as_str)
+            .expect("waited presence response should carry a revision")
+            .to_owned();
+
+        let mut permits: Vec<_> = (0..31).map(|_| state.social.admit().unwrap()).collect();
+        let waited = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .get(format!(
+                        "http://{address}/presence?ids=friend&wait=1&since={since}"
+                    ))
+                    .bearer_auth("good-token")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waited.is_finished(),
+            "presence wait finished before entering long-poll"
+        );
+
+        let extra_permit = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(permit) = state.social.admit() {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waited presence did not release its initial request permit in time");
+        permits.push(extra_permit);
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !waited.is_finished(),
+            "waited presence returned immediately when post-wait refresh capacity was full"
+        );
+
+        drop(permits.pop());
+        let response = tokio::time::timeout(Duration::from_secs(2), waited)
+            .await
+            .expect("waited presence did not resume after request capacity was released")
+            .expect("waited presence task panicked");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        drop(permits);
         relay.abort();
     }
 }

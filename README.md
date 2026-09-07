@@ -106,6 +106,13 @@ that are already running. Removing a friend updates both lists and revokes
 automatic discovery. Existing local-only friends become suggestions to send
 requests. Local caches are separated by Discord account.
 
+Friend stream status updates through a waiting presence request as soon as the
+relay detects a change. A short sound plays when a friend starts streaming;
+open that friend's **…** menu and choose **Mute stream alerts** to silence it.
+Mutes are remembered for your account on this device. Use the Home friends
+panel's disclosure control to fold away the add-friend tools; the friend list
+and **Requests** remain accessible, and Orange remembers your choice.
+
 Existing valid Discord logins continue working after this update. Expired or
 rejected sessions automatically return to sign-in; network and Azure storage
 failures show a retryable error instead. Signing out closes that account's

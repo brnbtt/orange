@@ -37,6 +37,11 @@ $git = Get-ChildItem "$env:LOCALAPPDATA\Temp\opencode" -Filter git.exe -Recurse 
 `. .\dev.ps1` is required before any `cargo` or `gst-inspect-1.0` invocation. It
 is idempotent and cheap; just run it.
 
+For the native UI capture scripts, bare `python` currently resolves to the
+Microsoft Store alias. The interpreter at
+`%LOCALAPPDATA%\Temp\opencode\vtracer-env\Scripts\python.exe` has Pillow and
+runs `website/capture/prepare.py`; the nearby `cd-venv` interpreter lacks Pillow.
+
 Do not run `git add -A` in the root checkout. `.agents/` and `skills-lock.json`
 are untracked and **not** ignored, so a blanket add sweeps the whole local skill
 library into a commit. Stage paths explicitly there, or work in a worktree,

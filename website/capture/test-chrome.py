@@ -36,8 +36,10 @@ u.EnumWindows.argtypes = [callback_type, W.LPARAM]
 
 class MouseInput(C.Structure):
     _fields_ = [("dx", W.LONG), ("dy", W.LONG), ("data", W.DWORD), ("flags", W.DWORD), ("time", W.DWORD), ("extra", W.WPARAM)]
+class KeyboardInput(C.Structure):
+    _fields_ = [("vk", W.WORD), ("scan", W.WORD), ("flags", W.DWORD), ("time", W.DWORD), ("extra", W.WPARAM)]
 class InputData(C.Union):
-    _fields_ = [("mouse", MouseInput)]
+    _fields_ = [("mouse", MouseInput), ("keyboard", KeyboardInput)]
 class Input(C.Structure):
     _anonymous_ = ("data",)
     _fields_ = [("type", W.DWORD), ("data", InputData)]
@@ -70,7 +72,13 @@ try:
         u.EnumWindows(find, 0)
         time.sleep(.1)
     assert found, "No fixture window"
-    hwnd = found[0]; u.SetForegroundWindow(hwnd)
+    hwnd = found[0]
+    # Windows can reject activation from a background test runner until Alt
+    # releases its foreground lock, even though the fixture painted normally.
+    for flags in [0, 2]:
+        event = Input(type=1, keyboard=KeyboardInput(vk=0x12, flags=flags))
+        assert u.SendInput(1, C.byref(event), C.sizeof(Input)) == 1
+    assert u.SetForegroundWindow(hwnd), "Windows refused fixture activation"
     time.sleep(1)
     client = W.RECT(); u.GetClientRect(hwnd, C.byref(client))
     failures = []

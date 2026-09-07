@@ -24,7 +24,7 @@ ownership, media defaults, compatibility contracts, and validation paths.
      |  | starts successor   |           | sessions in Table    |
      |  +--------------------+           +----------+-----------+
      |                                              |
-     +---- GET /presence?ids= (bearer, polled) -----+
+      +---- GET /presence?ids= (bearer, long-poll) --+
 
  host orange.exe  ===== WebRTC media, peer to peer =====> watch orange.exe
                   (relay forwards SDP/ICE, never media)
@@ -98,7 +98,7 @@ reopen the older one, which would find the same update waiting and loop.
 | `crates/orange-client/src/sound.rs` | Synthesised cues for things that happen while the user is looking elsewhere |
 | `crates/orange-client/src/background.rs` | Owned discovery, thumbnail and avatar jobs; nonblocking cancellation, coalesced replacement, joined cleanup, bounded avatar download/decode and failed-avatar retry backoff |
 | `crates/orange-client/src/background_tests.rs` | Background-job ownership, cancellation, retry and HTTP reuse regression tests |
-| `crates/orange-client/src/presence.rs` | Throttled `/presence` polling off the UI thread with a reusable HTTP client, signed-out versus unreachable, decoding friend state and profile |
+| `crates/orange-client/src/presence.rs` | Bounded `/presence` long-polling off the UI thread with a reusable HTTP client, legacy polling fallback, signed-out versus unreachable, decoding friend state and profile |
 | `crates/orange-client/src/friends.rs` | Serialized friend snapshot/mutation polling, cancellable account resets, request revision tracking |
 | `crates/orange-client/src/view/requests.rs` | Home request inbox, incoming Accept/Decline and outgoing Pending/Cancel |
 | `crates/orange-client/src/capture.rs` | `PrintWindow` window stills, primary-screen stills, BGRA buffers, GPUI image conversion |
@@ -188,7 +188,7 @@ host client            relay                       viewer client
     |                    |                              |
     |-- Host{visible_to} ->  Room{host_id, host_avatar,  |
     |   (legacy fallback) |       visible_to, code}      |
-    |                     |<-- GET /presence?ids= -------|  every 15 s, bearer
+    |                     |<-- GET /presence?ids= -------|  bounded wait, bearer
     |                     |                              |
     |                     |--- per id, authorized by     |
     |                         the mutual friendship:     |
@@ -211,6 +211,22 @@ host client            relay                       viewer client
   resets discard cancelled results. `preferences.json` caches roster and
   suggestions by Discord account; legacy device-wide friends migrate once as
   suggestions, never as accepted cloud friendships.
+- Stream presence uses a separate bounded HTTP long-poll: `wait=20` opts into
+  a `revision` in the response, and `since=<revision>` waits for the caller's
+  visible snapshot to change. The relay checks in-memory room state every
+  250 ms during the wait, releases the social I/O permit while idle, and
+  rechecks authentication and relationships before returning. Idle waits do
+  not issue Azure Table queries. Legacy requests retain their original JSON;
+  clients talking to an older relay retain 15-second polling. Faster discovery
+  requires both the updated relay and updated desktop client.
+  Already-admitted waits queue up to five seconds for a social I/O permit on
+  refresh, so a burst of simultaneous wakeups does not immediately reject
+  everyone beyond the 32 active readers.
+- A short cue marks an observed offline-to-streaming transition, including a
+  stream already full when observed. Initial snapshots and room-capacity
+  changes are silent. Per-friend stream-alert mutes are stored by signed-in
+  account on this device. Home's friend-management panel can be collapsed;
+  its saved state leaves friend rows and request navigation available.
 - `visible_to` is not an access boundary on the room. Anyone holding the code
   can still join. It decides only who is *handed* the code without being told
   it, so the security model is unchanged and the discovery model is new.
@@ -363,7 +379,7 @@ are named in the test that owns them.
 | Signal JSON tags, fields, defaults, and peer stamping | `crates/orange-signal/src/protocol.rs` |
 | Client window discovery JSON from `orange list --json` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
 | Client child commands/flags: `list --json`; `login --server`; `host --hwnd --server --codec --scale --fps --visible-to`; `watch --code --server --cascade --profile` | producer: `crates/orange-client/src/supervisor.rs`; consumer: `crates/orange/src/main.rs` |
-| `GET /presence?ids=` request, bearer auth, and `{friends:[{id,name,avatar_url,state,code}]}` reply | producer: `crates/orange-signal/src/server.rs`; consumer: `crates/orange-client/src/presence.rs` |
+| `GET /presence?ids=` request, bearer auth, and `{friends:[{id,name,avatar_url,state,code}]}` reply; optional `wait`/`since` opt into bounded waiting and a response `revision` | producer: `crates/orange-signal/src/server.rs`; consumer: `crates/orange-client/src/presence.rs` |
 | Host stdout markers `Share this code:` and `[host-status] <json>`, whose `joined` event carries `id` and `avatar_url` | producer: `crates/orange/src/peer/host.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
 | Automatic bitrate cap marker `[quality-status] <json>` | producer: `crates/orange/src/main.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
 | Watch stdout markers `[watch-status] ended` and `[watch-host] <json>` | producer: `crates/orange/src/peer/watch.rs`; consumer: `crates/orange-client/src/supervisor.rs` |
@@ -426,6 +442,9 @@ For client chrome changes, also run `website/capture/test-chrome.py` against a
 prepared disposable capture fixture (see `website/capture/README.md`). This
 Windows desktop check uses real mouse input and measures window movement:
 `HTCAPTION` alone still passed when the 1.0.1 focus handler blocked dragging.
+`website/capture/test-friend-controls.py` uses native mouse/keyboard input and
+checks saved preferences for disclosure and per-friend mute changes. It caught
+the double toggle caused by adding key handlers alongside GPUI's keyboard clicks.
 
 Run from a PowerShell prompt at the repository root:
 
@@ -481,6 +500,6 @@ not a source-level result.
 - The process accepts at most 512 concurrent WebSocket connections and each room accepts at most 16 viewers.
 - Each peer has a 64-message outbound queue. Inbound signalling permits 256 text messages per 10-second fixed window; WebSocket messages cap at 64 KiB.
 - Auth memory is bounded to 1,024 pending attempts and 4,096 cached sessions, with 10-minute pending and 30-day session lifetimes. The session bound is a cache limit, not a user limit: eviction drops the memory copy and the row survives.
-- Presence is polled over HTTP rather than pushed over the WebSocket, so it costs nothing against the 512-connection cap. The price is up to `presence::INTERVAL` of latency on a friend going live.
+- Presence uses bounded HTTP long-polls independently of the 512 streaming WebSocket permits. Up to 512 presence waits may be idle; the 32 social I/O permits still bound authentication and relationship reads. Updated clients renew a completed wait immediately, with 15-second retry/legacy fallback. Discovery latency includes the 250 ms room check, HTTP/storage latency and the client's 500 ms UI tick.
 - Direct ICE and public Google STUN are configured; no TURN configuration exists, so TURN-required networks are unsupported.
 - HTTPS host restrictions constrain download origin and the manifest SHA-256 detects corruption, but neither authenticates the publisher if the origin or manifest is compromised. Production promotion remains blocked on a trusted Authenticode certificate.

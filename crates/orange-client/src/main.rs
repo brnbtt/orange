@@ -73,6 +73,8 @@ struct FriendMenu {
     anchor: Point<Pixels>,
     return_focus: Option<FocusHandle>,
     menu_focus: Option<FocusHandle>,
+    mute_focus: Option<FocusHandle>,
+    remove_focus: Option<FocusHandle>,
 }
 
 /// Whether a notice is reporting a failure or just saying what happened.
@@ -142,6 +144,34 @@ fn next_friend_offer<'a>(
         .find(|offer| offer.id != own_id && !friends.iter().any(|friend| friend.id == offer.id))
 }
 
+fn friend_started_streaming(
+    previous: Option<&presence::Presence>,
+    current: &presence::Presence,
+) -> bool {
+    matches!(
+        (previous, current),
+        (
+            Some(presence::Presence::Offline),
+            presence::Presence::Live { .. } | presence::Presence::Full
+        )
+    )
+}
+
+fn friend_presence_alert_cue(
+    previous: &std::collections::HashMap<String, presence::Presence>,
+    entries: &[presence::Entry],
+    accepted_friend_ids: &std::collections::HashSet<String>,
+    muted_friend_ids: &std::collections::HashSet<String>,
+) -> Option<sound::Cue> {
+    entries.iter().find_map(|entry| {
+        if !accepted_friend_ids.contains(&entry.id) || muted_friend_ids.contains(&entry.id) {
+            return None;
+        }
+        friend_started_streaming(previous.get(&entry.id), &entry.presence)
+            .then_some(sound::Cue::FriendLive)
+    })
+}
+
 struct Orange {
     client_available: bool,
     /// Receives keyboard navigation before a control has been focused.
@@ -197,11 +227,15 @@ struct Orange {
     friend_sync: friends::Sync,
     requests_open: bool,
     friend_menu: Option<FriendMenu>,
+    muted_stream_alert_friend_ids: std::collections::HashSet<String>,
+    friends_panel_collapsed: bool,
     /// Last answer from the relay, keyed by Discord id. Absent means "not
     /// asked yet or the poll failed", which the view renders differently from
     /// a friend who is genuinely offline.
     presence: std::collections::HashMap<String, presence::Presence>,
     presence_job: Option<presence::PresenceJob>,
+    retiring_presence_job: Option<presence::PresenceJob>,
+    presence_revision: Option<String>,
     presence_client: presence::PresenceClient,
     presence_due: Instant,
     /// Why the last poll failed, if it did. Surfaced rather than swallowed:
@@ -293,9 +327,15 @@ impl Orange {
         }
         self.friends = account.friends.clone();
         self.friend_offers = account.suggestions.clone();
+        self.muted_stream_alert_friend_ids = account
+            .muted_stream_alert_friend_ids
+            .iter()
+            .cloned()
+            .collect();
         self.friend_avatars.clear();
         self.presence.clear();
         self.presence_error = None;
+        self.presence_revision = None;
         self.requests_open = false;
     }
 
@@ -369,13 +409,17 @@ impl Orange {
     ) {
         let return_focus = window.focused(cx);
         let menu_focus = cx.focus_handle().tab_stop(true);
-        menu_focus.focus(window);
+        let mute_focus = cx.focus_handle().tab_stop(true);
+        let remove_focus = cx.focus_handle().tab_stop(true);
+        mute_focus.focus(window);
         self.friend_menu = Some(FriendMenu {
             friend_id: friend.id.clone(),
             friend_name: friend.name.clone(),
             anchor,
             return_focus,
             menu_focus: Some(menu_focus),
+            mute_focus: Some(mute_focus),
+            remove_focus: Some(remove_focus),
         });
     }
 
@@ -428,10 +472,14 @@ impl Orange {
             return;
         };
         let keep_open = window.is_window_active()
-            && menu
-                .menu_focus
-                .as_ref()
-                .is_some_and(|handle| handle.contains_focused(window, cx));
+            && [
+                menu.menu_focus.as_ref(),
+                menu.mute_focus.as_ref(),
+                menu.remove_focus.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|handle| handle.contains_focused(window, cx));
         if !keep_open {
             if window.is_window_active() {
                 // Another control already owns focus; keep the user's place.
@@ -440,6 +488,52 @@ impl Orange {
                 self.close_friend_menu_and_restore_focus(window);
             }
         }
+    }
+
+    fn friend_menu_has_focus(&self, window: &mut Window, cx: &App) -> bool {
+        self.friend_menu
+            .as_ref()
+            .map(|menu| {
+                [
+                    menu.menu_focus.as_ref(),
+                    menu.mute_focus.as_ref(),
+                    menu.remove_focus.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|handle| handle.contains_focused(window, cx))
+            })
+            .unwrap_or(false)
+    }
+
+    fn friend_stream_alerts_muted(&self, id: &str) -> bool {
+        self.muted_stream_alert_friend_ids.contains(id)
+    }
+
+    fn set_friend_stream_alerts_muted(&mut self, id: &str, muted: bool) {
+        if muted {
+            self.muted_stream_alert_friend_ids.insert(id.to_string());
+        } else {
+            self.muted_stream_alert_friend_ids.remove(id);
+        }
+        self.save_preferences();
+    }
+
+    fn toggle_friend_stream_alerts_from_menu(&mut self) -> Option<FocusHandle> {
+        let friend_id = self.friend_menu_target().map(|friend| friend.id.clone())?;
+        let return_focus = self
+            .friend_menu
+            .as_ref()
+            .and_then(|menu| menu.return_focus.clone());
+        let muted = !self.friend_stream_alerts_muted(&friend_id);
+        self.close_friend_menu();
+        self.set_friend_stream_alerts_muted(&friend_id, muted);
+        return_focus
+    }
+
+    fn toggle_friends_panel_collapsed(&mut self) {
+        self.friends_panel_collapsed = !self.friends_panel_collapsed;
+        self.save_preferences();
     }
 
     fn poll_friends(&mut self) {
@@ -475,10 +569,7 @@ impl Orange {
                     .retain(|offer| !self.friends.iter().any(|friend| friend.id == offer.id));
                 if changed || !was_synced {
                     self.save_preferences();
-                    if let Some(job) = &mut self.presence_job {
-                        job.cancel();
-                    }
-                    self.presence_due = Instant::now();
+                    self.refresh_presence_now();
                 }
                 if was_synced
                     && self
@@ -576,48 +667,103 @@ impl Orange {
             .collect()
     }
 
-    /// Start a poll when one is due, and collect the answer from the last one.
-    ///
-    /// Runs inside the 500 ms tick but only reaches the network every
-    /// `presence::INTERVAL`, the same shape as the update controller's
-    /// six-hourly check.
+    /// A roster change needs a fresh snapshot rather than waiting on the old
+    /// subscription. Retain one cancelled worker while its replacement starts.
+    fn refresh_presence_now(&mut self) {
+        self.presence_revision = None;
+        if let Some(job) = self.presence_job.as_mut() {
+            job.cancel();
+        }
+        if self.retiring_presence_job.is_none() {
+            self.retiring_presence_job = self.presence_job.take();
+        }
+        self.presence_due = Instant::now();
+    }
+
+    fn poll_retiring_presence_job(&mut self) {
+        if self
+            .retiring_presence_job
+            .as_ref()
+            .is_some_and(presence::PresenceJob::is_finished)
+        {
+            if let Some(mut job) = self.retiring_presence_job.take() {
+                job.join();
+            }
+        }
+    }
+
+    /// Collect and renew long-polls on the 500 ms UI tick. Failures and legacy
+    /// replies use the slower interval instead of spinning immediate requests.
     fn poll_presence(&mut self) {
+        self.poll_retiring_presence_job();
         if self.logging_in.is_some() {
             return;
         }
-        if let Some(job) = self.presence_job.as_ref() {
-            if job.is_finished() {
-                let result = job.take_result();
-                if let Some(mut job) = self.presence_job.take() {
-                    job.join();
-                }
-                match result {
-                    Some(Ok(entries)) => {
-                        self.presence_error = None;
-                        self.absorb_profiles(&entries);
-                        self.presence = entries
-                            .into_iter()
-                            .map(|entry| (entry.id, entry.presence))
-                            .collect();
-                    }
-                    Some(Err(presence::PresenceError::SignedOut)) => self.reject_session(),
-                    Some(Err(error)) => self.presence_error = Some(error),
-                    // The worker was cancelled before it sent anything. Leave
-                    // the previous answer standing rather than blanking the
-                    // list on a race.
-                    None => {}
-                }
-            }
+        if self
+            .presence_job
+            .as_ref()
+            .is_some_and(|job| !job.is_finished())
+        {
             return;
+        }
+        if let Some(job) = self.presence_job.as_ref() {
+            let completed_at = Instant::now();
+            let result = job.take_result();
+            if let Some(mut job) = self.presence_job.take() {
+                job.join();
+            }
+            match result {
+                Some(Ok(snapshot)) => {
+                    let accepted_friend_ids: std::collections::HashSet<_> = self
+                        .friends
+                        .iter()
+                        .map(|friend| friend.id.clone())
+                        .collect();
+                    let cue = friend_presence_alert_cue(
+                        &self.presence,
+                        &snapshot.friends,
+                        &accepted_friend_ids,
+                        &self.muted_stream_alert_friend_ids,
+                    );
+                    self.presence_error = None;
+                    self.absorb_profiles(&snapshot.friends);
+                    self.presence = snapshot
+                        .friends
+                        .into_iter()
+                        .map(|entry| (entry.id, entry.presence))
+                        .collect();
+                    self.presence_revision = snapshot.revision.clone();
+                    self.presence_due = if snapshot.revision.is_some() {
+                        completed_at
+                    } else {
+                        completed_at + presence::INTERVAL
+                    };
+                    if let Some(cue) = cue {
+                        sound::play(cue);
+                    }
+                }
+                Some(Err(presence::PresenceError::SignedOut)) => {
+                    self.reject_session();
+                    return;
+                }
+                Some(Err(error)) => {
+                    self.presence_error = Some(error);
+                    self.presence_due = completed_at + presence::INTERVAL;
+                }
+                // The worker was cancelled before it sent anything. Leave
+                // the previous answer standing rather than blanking the
+                // list on a race.
+                None => {}
+            }
         }
 
         if Instant::now() < self.presence_due {
             return;
         }
-        self.presence_due = Instant::now() + presence::INTERVAL;
 
         let Some(session) = self.session.as_ref() else {
             self.presence.clear();
+            self.presence_revision = None;
             return;
         };
         let Some(url) = presence::presence_url(&self.server) else {
@@ -625,14 +771,22 @@ impl Orange {
                 "cannot derive a presence URL from {}",
                 self.server
             )));
+            self.presence_due = Instant::now() + presence::INTERVAL;
             return;
         };
+        if self.friends.is_empty() {
+            self.presence.clear();
+            self.presence_revision = None;
+            self.presence_due = Instant::now() + presence::INTERVAL;
+            return;
+        }
         presence::start(
             &mut self.presence_job,
             self.presence_client.clone(),
             url,
             session.token.clone(),
             &self.friends,
+            self.presence_revision.as_deref(),
         );
     }
 
@@ -768,8 +922,15 @@ impl Orange {
             friend_sync: friends::Sync::default(),
             requests_open: false,
             friend_menu: None,
+            muted_stream_alert_friend_ids: account
+                .muted_stream_alert_friend_ids
+                .into_iter()
+                .collect(),
+            friends_panel_collapsed: preferences.friends_panel_collapsed,
             presence: std::collections::HashMap::new(),
             presence_job: None,
+            retiring_presence_job: None,
+            presence_revision: None,
             presence_client: presence::PresenceClient::default(),
             // Ask immediately on startup rather than after one interval, so a
             // friend who is already live is on screen when the window opens.
@@ -822,10 +983,7 @@ impl Orange {
                     self.avatar = None;
                     self.avatar_job.request(session.avatar_url.clone());
                     self.session = Some(session);
-                    if let Some(job) = self.presence_job.as_mut() {
-                        job.cancel();
-                    }
-                    self.presence_due = Instant::now();
+                    self.refresh_presence_now();
                     self.logging_in = None;
                     self.screen = Screen::Home;
                 }
@@ -1136,11 +1294,15 @@ impl Orange {
 
     fn save_preferences(&mut self) -> bool {
         if let Some(session) = &self.session {
+            let mut muted_stream_alert_friend_ids: Vec<String> =
+                self.muted_stream_alert_friend_ids.iter().cloned().collect();
+            muted_stream_alert_friend_ids.sort();
             self.friend_accounts.insert(
                 session.id.clone(),
                 session::AccountFriends {
                     friends: self.friends.clone(),
                     suggestions: self.friend_offers.clone(),
+                    muted_stream_alert_friend_ids,
                 },
             );
         }
@@ -1150,6 +1312,7 @@ impl Orange {
             own_codes: self.own_codes.clone(),
             friends: self.legacy_friends.clone(),
             friend_accounts: self.friend_accounts.clone(),
+            friends_panel_collapsed: self.friends_panel_collapsed,
         };
         if let Err(error) = session::save_preferences(&preferences) {
             self.show_error(format!("Could not save preferences: {error}"));
@@ -1177,12 +1340,14 @@ impl Orange {
         self.avatar = None;
         self.avatar_job.request(None);
         self.thumbnail_job.cancel();
-        if let Some(job) = self.presence_job.as_mut() {
+        self.refresh_presence_now();
+        if let Some(job) = self.retiring_presence_job.as_mut() {
             job.cancel();
         }
         self.presence.clear();
         self.presence_error = None;
-        self.presence_due = Instant::now();
+        self.presence_revision = None;
+        self.muted_stream_alert_friend_ids.clear();
         if let Some(destination) = destination {
             self.screen = destination;
         }
@@ -1248,9 +1413,7 @@ impl Orange {
             return;
         }
         self.friend_sync.reset();
-        if let Some(job) = &mut self.presence_job {
-            job.cancel();
-        }
+        self.refresh_presence_now();
         self.clear_error();
         match supervisor::start_login(&self.server) {
             Ok(attempt) => self.logging_in = Some(attempt),
@@ -1397,6 +1560,9 @@ impl Drop for Orange {
         self.avatar_job.request(None);
         self.friend_avatar_job.cancel();
         if let Some(job) = self.presence_job.as_mut() {
+            job.cancel();
+        }
+        if let Some(job) = self.retiring_presence_job.as_mut() {
             job.cancel();
         }
         self.troubleshoot.cancel();
@@ -1614,8 +1780,12 @@ mod tests {
             friend_sync: friends::Sync::default(),
             requests_open: false,
             friend_menu: None,
+            muted_stream_alert_friend_ids: Default::default(),
+            friends_panel_collapsed: false,
             presence: Default::default(),
             presence_job: None,
+            retiring_presence_job: None,
+            presence_revision: None,
             presence_client: Default::default(),
             presence_due: Instant::now(),
             presence_error: None,
@@ -1718,6 +1888,15 @@ mod tests {
         }
     }
 
+    fn presence_entry(id: &str, presence: presence::Presence) -> presence::Entry {
+        presence::Entry {
+            id: id.into(),
+            name: None,
+            avatar_url: None,
+            presence,
+        }
+    }
+
     #[test]
     fn stopping_children_keeps_their_last_friend_offer_available() {
         // Exercise real stdout readers and each explicit teardown path. A
@@ -1789,6 +1968,8 @@ mod tests {
             anchor: gpui::point(px(40.0), px(40.0)),
             return_focus: None,
             menu_focus: None,
+            mute_focus: None,
+            remove_focus: None,
         });
 
         app.friends.swap(0, 1);
@@ -1810,6 +1991,8 @@ mod tests {
             anchor: gpui::point(px(40.0), px(40.0)),
             return_focus: None,
             menu_focus: None,
+            mute_focus: None,
+            remove_focus: None,
         });
 
         app.friends.clear();
@@ -1836,6 +2019,8 @@ mod tests {
             anchor: gpui::point(px(40.0), px(40.0)),
             return_focus: None,
             menu_focus: None,
+            mute_focus: None,
+            remove_focus: None,
         });
 
         app.friends.swap(0, 1);
@@ -1843,6 +2028,215 @@ mod tests {
 
         assert!(app.friend_menu.is_none());
         assert!(app.friend_sync.busy());
+    }
+
+    #[test]
+    fn muting_from_friend_menu_uses_selected_id_after_reorder() {
+        let mut app = friend_test_app();
+        app.friends = vec![friend("a"), friend("b")];
+        app.friend_menu = Some(FriendMenu {
+            friend_id: "a".into(),
+            friend_name: "Friend a".into(),
+            anchor: gpui::point(px(40.0), px(40.0)),
+            return_focus: None,
+            menu_focus: None,
+            mute_focus: None,
+            remove_focus: None,
+        });
+
+        app.friends.swap(0, 1);
+        let _ = app.toggle_friend_stream_alerts_from_menu();
+
+        assert!(app.friend_menu.is_none());
+        assert!(app.friend_stream_alerts_muted("a"));
+        assert!(!app.friend_stream_alerts_muted("b"));
+    }
+
+    #[test]
+    fn friend_live_alert_only_fires_on_offline_to_live_or_full_transitions() {
+        let previous =
+            std::collections::HashMap::from([("42".to_string(), presence::Presence::Offline)]);
+        let accepted = std::collections::HashSet::from(["42".to_string()]);
+        let muted = std::collections::HashSet::new();
+
+        assert_eq!(
+            friend_presence_alert_cue(
+                &previous,
+                &[presence_entry(
+                    "42",
+                    presence::Presence::Live {
+                        code: "ABC-234".into(),
+                    }
+                )],
+                &accepted,
+                &muted,
+            ),
+            Some(sound::Cue::FriendLive)
+        );
+        assert_eq!(
+            friend_presence_alert_cue(
+                &previous,
+                &[presence_entry("42", presence::Presence::Full)],
+                &accepted,
+                &muted,
+            ),
+            Some(sound::Cue::FriendLive)
+        );
+        assert_eq!(
+            friend_presence_alert_cue(
+                &std::collections::HashMap::new(),
+                &[presence_entry("42", presence::Presence::Full)],
+                &accepted,
+                &muted,
+            ),
+            None
+        );
+        assert_eq!(
+            friend_presence_alert_cue(
+                &std::collections::HashMap::from([(
+                    "42".to_string(),
+                    presence::Presence::Live {
+                        code: "ABC-234".into(),
+                    }
+                )]),
+                &[presence_entry("42", presence::Presence::Full)],
+                &accepted,
+                &muted,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn friend_live_alert_ignores_muted_and_unknown_friends() {
+        let previous =
+            std::collections::HashMap::from([("42".to_string(), presence::Presence::Offline)]);
+        assert_eq!(
+            friend_presence_alert_cue(
+                &previous,
+                &[presence_entry(
+                    "42",
+                    presence::Presence::Live {
+                        code: "ABC-234".into(),
+                    }
+                )],
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+            ),
+            None
+        );
+        assert_eq!(
+            friend_presence_alert_cue(
+                &previous,
+                &[presence_entry(
+                    "42",
+                    presence::Presence::Live {
+                        code: "ABC-234".into(),
+                    }
+                )],
+                &std::collections::HashSet::from(["42".to_string()]),
+                &std::collections::HashSet::from(["42".to_string()]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn revision_presence_completion_can_start_next_poll_without_waiting_for_tick_interval() {
+        let server = background::tests::HttpServer::new(vec![
+            (
+                200,
+                br#"{"friends":[{"id":"42","state":"offline"}],"revision":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#.to_vec(),
+            ),
+            (
+                200,
+                br#"{"friends":[{"id":"42","state":"offline"}],"revision":"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"}"#.to_vec(),
+            ),
+        ]);
+        let mut app = friend_test_app();
+        app.server = server.url("/ws").replacen("http://", "ws://", 1);
+        app.friends = vec![friend("42")];
+        app.presence_due = Instant::now();
+
+        app.poll_presence();
+        app.presence_job.as_mut().unwrap().join();
+        app.poll_presence();
+
+        assert!(
+            app.presence_job.is_some(),
+            "next long poll did not start immediately"
+        );
+        let _ = server.finish();
+    }
+
+    #[test]
+    fn legacy_presence_reply_uses_interval_backoff_instead_of_immediate_renewal() {
+        let server = background::tests::HttpServer::new(vec![(
+            200,
+            br#"{"friends":[{"id":"42","state":"offline"}]}"#.to_vec(),
+        )]);
+        let mut app = friend_test_app();
+        app.server = server.url("/ws").replacen("http://", "ws://", 1);
+        app.friends = vec![friend("42")];
+        app.presence_due = Instant::now();
+
+        app.poll_presence();
+        app.presence_job.as_mut().unwrap().join();
+        app.poll_presence();
+
+        assert!(app.presence_job.is_none());
+        assert!(app.presence_revision.is_none());
+        assert!(app.presence_due > Instant::now());
+        let _ = server.finish();
+    }
+
+    #[test]
+    fn refreshing_presence_can_replace_one_waiting_worker_without_growth() {
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (first_release_tx, first_release_rx) = std::sync::mpsc::channel();
+        let mut app = friend_test_app();
+        app.presence_job = Some(presence::start_job(Default::default(), move |_| {
+            let _ = first_entered_tx.send(());
+            let _ = first_release_rx.recv_timeout(Duration::from_secs(3));
+            Ok(presence::Snapshot {
+                friends: Vec::new(),
+                revision: None,
+            })
+        }));
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+
+        app.refresh_presence_now();
+        assert!(app.presence_job.is_none());
+        assert!(app.retiring_presence_job.is_some());
+
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let (second_release_tx, second_release_rx) = std::sync::mpsc::channel();
+        app.presence_job = Some(presence::start_job(Default::default(), move |_| {
+            let _ = second_entered_tx.send(());
+            let _ = second_release_rx.recv_timeout(Duration::from_secs(3));
+            Ok(presence::Snapshot {
+                friends: Vec::new(),
+                revision: None,
+            })
+        }));
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+
+        app.refresh_presence_now();
+        assert!(app.presence_job.is_some());
+        assert!(app.retiring_presence_job.is_some());
+
+        let _ = first_release_tx.send(());
+        let _ = second_release_tx.send(());
+        if let Some(mut job) = app.presence_job.take() {
+            job.join();
+        }
+        if let Some(mut job) = app.retiring_presence_job.take() {
+            job.join();
+        }
     }
 
     #[test]

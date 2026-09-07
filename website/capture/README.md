@@ -1,17 +1,17 @@
-# Reproduce the native 1.0.1 interface captures
+# Capture the native interface
 
 Local capture tooling, **not website content to deploy**. It patches only a
 separate disposable linked worktree; the website checkout's production crates
 and all renderer files remain untouched.
 
 Requirements: Windows desktop session, Orange's Rust/GStreamer development
-environment, Python 3 with Pillow, and the source from tag `v1.0.1`.
-This includes the compact home layout,
-contextual friend actions, icon-labelled buttons and soft ambient lighting.
-The original captures preceded the version bump and use the same renderer.
+environment, Python 3 with Pillow, and the current source. The fixture tracks
+the current client state fields and uses the production renderers unchanged.
+To reproduce the historical 1.0.1 captures, use both the scripts and source
+from tag `v1.0.1`.
 
 1. Fetch `origin/main` and create a separate worktree following `AGENTS.md`.
-    Pin the disposable worktree to `v1.0.1` for this interface.
+    Use the same revision as these capture scripts.
 2. In that clean worktree, run `. .\dev.ps1` followed by
    `cargo test --locked -p orange-client`.
 3. From this capture-tool directory, run:
@@ -86,3 +86,12 @@ the fixture afterward. It verifies that dragging the brand and empty titlebar
 actually moves the HWND, while settings and body drags do not. In 1.0.1 both
 titlebar regions still returned `HTCAPTION`, but GPUI's root focus handler
 prevented the native mouse-down default; hit-test assertions alone missed it.
+
+## Friend controls regression
+
+Against a current prepared fixture, run `test-friend-controls.py` with the same
+worktree and optional `--binary` arguments. It checks mouse/Space/Enter collapse
+and persisted per-account mute changes. GPUI already emits keyboard clicks;
+adding explicit Enter/Space handlers made the disclosure toggle twice.
+Run native input checks separately from the workspace tests, which also open
+Windows and can take focus.

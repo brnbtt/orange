@@ -4,8 +4,8 @@
 //! looking at the game, not at this window. A viewer arriving, or the stream
 //! you are watching ending, is invisible unless the client is in front of you.
 //!
-//! The tones are generated rather than shipped as files. Five WAVs would be
-//! five assets to source, licence, embed and keep in step; this file has none
+//! The tones are generated rather than shipped as files. WAV files would be
+//! assets to source, licence, embed and keep in step; this file has none
 //! of that, and it lets the cues share a vocabulary the way `ui::motion` does
 //! for animation. Everything is built from three shapes:
 //!
@@ -13,9 +13,8 @@
 //!   a falling fifth  something ended
 //!   a single note    somebody else arrived or left
 //!
-//! There is no mute switch, so restraint is the whole design. The cues are
-//! short, and never fire for something the user just clicked and is already
-//! watching happen.
+//! Friend-start alerts can be muted per friend. All cues are short, and never
+//! fire for something the user just clicked and is already watching happen.
 //!
 //! Two earlier attempts are worth recording, because both failed for reasons
 //! that are measurable rather than matters of taste.
@@ -186,6 +185,8 @@ pub enum Cue {
     Joined,
     /// Somebody stopped watching you.
     Left,
+    /// A friend started streaming.
+    FriendLive,
     /// Something failed.
     Alert,
 }
@@ -220,6 +221,7 @@ const ENDED: &[Note] = &[
 /// of it - it should sound like a different kind of event entirely.
 const JOINED: &[Note] = &[note(C6, 70, PEER_GAIN), note(D6, 150, PEER_GAIN)];
 const LEFT: &[Note] = &[note(D6, 70, PEER_GAIN), note(C6, 150, PEER_GAIN)];
+const FRIEND_LIVE: &[Note] = &[note(D5, 70, PEER_GAIN), note(A5, 120, PEER_GAIN)];
 
 /// Both pitches at once rather than one after the other. Sounded together a
 /// minor ninth beats; played in sequence it is just a wide leap, and the
@@ -236,6 +238,7 @@ impl Cue {
             Cue::Ended => ENDED,
             Cue::Joined => JOINED,
             Cue::Left => LEFT,
+            Cue::FriendLive => FRIEND_LIVE,
             Cue::Alert => ALERT,
         }
     }
@@ -246,13 +249,14 @@ impl Cue {
     /// goes, so the bytes have to outlive the call. A static is the only way to
     /// promise that without tracking when the sound stopped.
     fn wave(self) -> &'static [u8] {
-        static WAVES: OnceLock<[Vec<u8>; 5]> = OnceLock::new();
+        static WAVES: OnceLock<[Vec<u8>; 6]> = OnceLock::new();
         let waves = WAVES.get_or_init(|| {
             [
                 render(Cue::Live.notes(), &VOICE),
                 render(Cue::Ended.notes(), &VOICE),
                 render(Cue::Joined.notes(), &VOICE),
                 render(Cue::Left.notes(), &VOICE),
+                render(Cue::FriendLive.notes(), &VOICE),
                 render(Cue::Alert.notes(), &VOICE),
             ]
         });
@@ -261,7 +265,8 @@ impl Cue {
             Cue::Ended => &waves[1],
             Cue::Joined => &waves[2],
             Cue::Left => &waves[3],
-            Cue::Alert => &waves[4],
+            Cue::FriendLive => &waves[4],
+            Cue::Alert => &waves[5],
         }
     }
 }
@@ -492,7 +497,14 @@ fn wav(samples: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const CUES: [Cue; 5] = [Cue::Live, Cue::Ended, Cue::Joined, Cue::Left, Cue::Alert];
+    const CUES: [Cue; 6] = [
+        Cue::Live,
+        Cue::Ended,
+        Cue::Joined,
+        Cue::Left,
+        Cue::FriendLive,
+        Cue::Alert,
+    ];
 
     fn samples(cue: Cue) -> Vec<i16> {
         cue.wave()[44..]
@@ -522,7 +534,7 @@ mod tests {
     #[test]
     fn no_cue_outstays_the_moment_it_marks() {
         // A cue is punctuation, and past some length it starts reading as a
-        // jingle - there is no way to turn these off. The bound was 240 ms on
+        // jingle. The bound was 240 ms on
         // the reasoning that shorter is politer, until a listening test found
         // the cues easy to miss entirely, which beats the reasoning. Half a
         // second of notes is the point where a cue stops being an aside.
@@ -601,7 +613,7 @@ mod tests {
     fn a_stranger_arriving_never_drowns_out_your_own_session() {
         // Peer cues fire while the user is mid-game and are ambient; session
         // cues answer a question they actually asked.
-        for cue in [Cue::Joined, Cue::Left] {
+        for cue in [Cue::Joined, Cue::Left, Cue::FriendLive] {
             for note in cue.notes() {
                 assert!(note.gain < SESSION_GAIN, "{cue:?}");
             }
@@ -629,7 +641,13 @@ mod tests {
                 "expected a minor ninth, got {interval:.1} semitones"
             );
         }
-        for cue in [Cue::Live, Cue::Ended, Cue::Joined, Cue::Left] {
+        for cue in [
+            Cue::Live,
+            Cue::Ended,
+            Cue::Joined,
+            Cue::Left,
+            Cue::FriendLive,
+        ] {
             for note in cue.notes().iter().filter(|note| note.with > 0.0) {
                 let interval = semitones(note) % 12.0;
                 let consonant = interval < 0.1 || (interval - 7.0).abs() < 0.1;
@@ -647,7 +665,11 @@ mod tests {
         // peer cue ever grew to match, the two would be told apart only by
         // their pitches, which is exactly what does not carry at a distance.
         let session = Cue::Live.notes().len().min(Cue::Ended.notes().len());
-        let peer = Cue::Joined.notes().len().max(Cue::Left.notes().len());
+        let peer = Cue::Joined
+            .notes()
+            .len()
+            .max(Cue::Left.notes().len())
+            .max(Cue::FriendLive.notes().len());
         assert!(session > peer, "{session} against {peer}");
 
         // And the two peer cues are a step apart rather than a leap, so they
@@ -657,6 +679,12 @@ mod tests {
             let step = 12.0 * (notes[1].hz / notes[0].hz).log2();
             assert!(step.abs() < 3.0, "{cue:?} moves {step:.1} semitones");
         }
+        let friend_step =
+            12.0 * (Cue::FriendLive.notes()[1].hz / Cue::FriendLive.notes()[0].hz).log2();
+        assert!(
+            (friend_step - 7.0).abs() < 0.1,
+            "FriendLive moves {friend_step:.1} semitones"
+        );
     }
 
     #[test]
@@ -674,6 +702,16 @@ mod tests {
             );
             assert!(rising[0] < rising[rising.len() - 1], "{up:?} has to rise");
         }
+    }
+
+    #[test]
+    fn friend_live_cue_is_a_short_rising_fifth() {
+        let notes = Cue::FriendLive.notes();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].ms, 70);
+        assert_eq!(notes[1].ms, 120);
+        assert!((notes[0].hz - D5).abs() < 0.01);
+        assert!((notes[1].hz - A5).abs() < 0.01);
     }
 
     #[test]
@@ -701,7 +739,7 @@ mod tests {
         // literal. This existed alongside a table of alternatives while the
         // voice was being chosen; the alternatives are gone, but writing the
         // shipping set out is still the only way to hear a change to it without
-        // launching the app and provoking five different events.
+        // launching the app and provoking each event.
         let directory = std::env::temp_dir().join("orange-cues");
         std::fs::create_dir_all(&directory).unwrap();
         for cue in CUES {
