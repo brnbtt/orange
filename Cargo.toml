@@ -6,7 +6,7 @@ resolver = "2"
 members = ["crates/orange-signal", "crates/orange-relay", "crates/orange", "crates/orange-client", "crates/orange-updater"]
 
 [workspace.package]
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 rust-version = "1.98"
 license = "MIT"
