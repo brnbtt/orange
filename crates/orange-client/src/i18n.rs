@@ -361,6 +361,7 @@ pub struct Notice {
     pub media_runtime_missing: &'static str,
     pub stream_ended: &'static str,
     pub no_clipboard_code: &'static str,
+    pub invalid_room_code: &'static str,
     pub already_watching: &'static str,
     pub own_stream_code: &'static str,
     pub watch_retry: &'static str,

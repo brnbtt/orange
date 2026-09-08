@@ -68,6 +68,19 @@ struct WatchSession {
 
 const WATCH_RETRY_BUDGET: u8 = 1;
 
+/// Keep the local shape check aligned with the relay's generated room codes.
+const ROOM_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+fn is_valid_room_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 7
+        && bytes[3] == b'-'
+        && bytes[..3]
+            .iter()
+            .chain(bytes[4..].iter())
+            .all(|byte| ROOM_CODE_ALPHABET.contains(byte))
+}
+
 struct Notice {
     text: String,
     kind: NoticeKind,
@@ -1526,6 +1539,10 @@ impl Orange {
             self.show_error(self.copy().notice.no_clipboard_code);
             return;
         }
+        if !is_valid_room_code(&code) {
+            self.show_error(self.copy().notice.invalid_room_code);
+            return;
+        }
         if self.watches.iter().any(|watch| watch.code == code) {
             self.show_error(i18n::fill(self.copy().notice.already_watching, &code));
             return;
@@ -1874,6 +1891,30 @@ mod tests {
             troubleshoot: troubleshoot::TroubleshootState::default(),
             locale: i18n::Locale::En,
         }
+    }
+
+    #[test]
+    fn room_code_validation_accepts_generated_codes_and_rejects_clipboard_text() {
+        // Clipboard contents are arbitrary; malformed text must not start a
+        // watch child just to learn that the relay cannot find it.
+        assert!(is_valid_room_code("ABC-234"));
+        assert!(is_valid_room_code("XYZ-789"));
+        assert!(!is_valid_room_code("ABC123"));
+        assert!(!is_valid_room_code("ABC-123"));
+        assert!(!is_valid_room_code("ABC-23!"));
+    }
+
+    #[test]
+    fn malformed_join_code_is_rejected_before_starting_a_watch() {
+        let mut app = friend_test_app();
+
+        app.join("not-a-room-code".into());
+
+        assert!(app.watches.is_empty());
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some(i18n::Locale::En.catalog().notice.invalid_room_code)
+        );
     }
 
     #[test]

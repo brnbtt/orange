@@ -252,6 +252,7 @@ pub const CATALOG: Catalog = Catalog {
         media_runtime_missing: "O runtime de mídia que vem com o orange está ausente. Reinstalar o orange o restaura.",
         stream_ended: "Transmissão encerrada",
         no_clipboard_code: "Nenhum código na área de transferência",
+        invalid_room_code: "Código de transmissão inválido. Use um código como ABC-234.",
         already_watching: "Já está assistindo {}",
         own_stream_code: "Esse é o código da sua própria transmissão, atual ou anterior.",
         watch_retry: "Tentando outra conexão…",

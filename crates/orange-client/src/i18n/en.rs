@@ -252,6 +252,7 @@ pub const CATALOG: Catalog = Catalog {
         media_runtime_missing: crate::supervisor::MEDIA_RUNTIME_MISSING,
         stream_ended: "Stream ended",
         no_clipboard_code: "No code on the clipboard",
+        invalid_room_code: "Invalid stream code. Use a code like ABC-234.",
         already_watching: "Already watching {}",
         own_stream_code: "That's your own active or previous stream code.",
         watch_retry: "Trying another connection…",
