@@ -7,6 +7,8 @@ const SESSION_TTL_MS = 30 * DAY_MS;
 const REPORT_LIMIT = 2000;
 const WEBHOOK_TIMEOUT_MS = 15_000;
 const MAX_TABLE_PAGES = 128;
+const AZURE_COMMAND = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : 'az';
+const AZURE_PREFIX = process.platform === 'win32' ? ['/d', '/s', '/c', 'az.cmd'] : [];
 
 export const DEFAULT_CONFIG = Object.freeze({
   account: 'orangealpha0d8d5893e69a3',
@@ -136,9 +138,12 @@ export function validateWebhookUrl(value) {
 
 function runAzJson(args) {
   const result = spawnSync(
-    'az',
-    [...args, '--only-show-errors', '--output', 'json'],
-    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
+    AZURE_COMMAND,
+    [...AZURE_PREFIX, ...args, '--only-show-errors', '--output', 'json'],
+    {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    },
   );
   if (result.error) throw new Error(`Azure CLI is unavailable: ${result.error.message}`);
   if (result.status !== 0) {
