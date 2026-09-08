@@ -1,0 +1,50 @@
+name: daily Orange usage report
+
+on:
+  schedule:
+    # 12:00 UTC is 09:00 in Brazil during the usual UTC-3 offset.
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Collect and print the report without posting to Discord'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: daily-orange-usage-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AZURE_CORE_OUTPUT: none
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # OIDC avoids storing an Azure client secret in GitHub. The service
+      # principal needs only Reader, Monitoring Reader, and Storage Table Data Reader;
+      # the exact one-time setup is documented beside the script.
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Collect and send daily report
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: node automation/daily-usage-report.mjs

@@ -391,6 +391,12 @@ az login
 The script uses `az containerapp up --source .`; local Docker availability is
 not evidence for or against the source or deployment design.
 
+The optional daily usage report setup is documented in
+[docs/operations/daily-usage-report.md](docs/operations/daily-usage-report.md).
+It reports authenticated-account and Azure storage activity, while identifying
+the anonymous download and stream-usage measurements the current deployment
+does not collect.
+
 ## Gotchas
 
 - Backslashes are escapes in GStreamer parse strings. File sinks are created
