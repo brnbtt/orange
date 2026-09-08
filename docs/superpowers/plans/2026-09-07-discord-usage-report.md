@@ -4,7 +4,7 @@
 
 **Goal:** Send one truthful daily Orange usage summary to a Discord webhook using the existing Azure Table and Blob telemetry.
 
-**Architecture:** A dependency-free Node script runs in GitHub Actions once per day. It authenticates to Azure through GitHub OIDC, counts persisted profile/session rows, reads Azure Storage `GetBlob` transaction and egress metrics, fetches the public release manifest, and posts a bounded text report to Discord. The webhook remains a GitHub secret and is never written to source, logs, or the report.
+**Architecture:** A dependency-free Node script runs in GitHub Actions once per day. It authenticates to Azure through GitHub OIDC, counts persisted profile/session rows, reads Azure Storage `GetBlob` transaction metrics, fetches the public release manifest, and posts a compact colored embed card to Discord. The webhook remains a GitHub secret and is never written to source, logs, or the report.
 
 **Tech Stack:** Node.js 24, Azure CLI, Azure Monitor Storage metrics, Azure Table Storage query, GitHub Actions, Discord webhook JSON API.
 
@@ -16,9 +16,9 @@
 - Use `azure/login@v3` with GitHub OIDC; do not create a long-lived Azure credential in the repository.
 - Report distinct persisted profile rows as registered accounts and session rows as durable sessions.
 - Report session rows created in the preceding 24 hours as login activity, not as unique new people.
-- Report successful Blob `GetBlob` requests and egress as storage activity, never as unique downloaders.
+- Report successful Blob `GetBlob` requests as storage activity, never as unique downloaders.
 - Say explicitly that Azure’s public static Blob endpoint cannot identify unique people downloading an installer.
-- Keep the report under Discord’s 2,000-character content limit and fail without leaking secrets.
+- Omit unavailable or low-value fields from the card and fail without leaking secrets.
 
 ---
 
@@ -31,8 +31,7 @@
 **Interfaces:**
 - `normalizeRows(payload)` returns the entity array from Azure CLI table output.
 - `sumMetric(payload)` returns the sum of Azure Monitor time-series `total` values.
-- `formatBytes(bytes)` returns a compact human-readable byte count.
-- `buildReport(data)` returns the bounded Discord message body.
+- `buildCard(data)` returns the colored Discord webhook embed payload.
 - `validateWebhookUrl(value)` accepts only Discord webhook hosts and returns a `URL`.
 
 - [ ] **Step 1: Write failing formatter tests**
@@ -41,8 +40,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildReport,
-  formatBytes,
+  buildCard,
   normalizeRows,
   sumMetric,
   validateWebhookUrl,
@@ -58,21 +56,16 @@ test('sums Azure Monitor totals without treating missing data as an error', () =
   assert.equal(sumMetric({ timeseries: [] }), 0);
 });
 
-test('formats bytes and keeps the report honest about unique downloaders', () => {
-  assert.equal(formatBytes(1536), '1.5 KiB');
-  const report = buildReport({
+test('builds a compact card and omits unavailable metrics', () => {
+  const card = buildCard({
     asOf: new Date('2026-09-07T12:00:00Z'),
-    registeredAccounts: 12,
-    durableSessions: 4,
-    loginSessions: 3,
+    validSessionAccounts: 12,
     loginAccounts: 2,
     blobGets: 17,
-    blobEgress: 2048,
     release: { version: '1.0.9' },
   });
-  assert.match(report, /Registered Discord accounts: 12/);
-  assert.match(report, /Unique downloaders: unavailable/);
-  assert.ok(report.length <= 2000);
+  assert.equal(card.embeds[0].color, 0xff5a1f);
+  assert.doesNotMatch(JSON.stringify(card), /unavailable|egress/i);
 });
 
 test('rejects non-Discord webhook URLs', () => {
@@ -107,12 +100,12 @@ Expected: PASS.
 **Interfaces:**
 - `queryTableRows({ account, table, filter, runAz })` paginates `az storage entity query` results.
 - `collectUsage({ now, runAz, fetchImpl, config })` returns counts and optional release/metric values without exposing entity identities.
-- `postWebhook(url, content, fetchImpl)` sends `{ username: "Orange usage", content }` and accepts Discord’s 204 response.
+- `postWebhook(url, payload, fetchImpl)` sends the embed payload and accepts Discord’s 204 response.
 - `main()` reads `DISCORD_WEBHOOK_URL`, Azure defaults, and `DRY_RUN`/`--dry-run`.
 
 - [ ] **Step 1: Add failing tests for pagination, session windows, metric filters, and webhook payloads**
 
-Use injected `runAz` and `fetchImpl` fakes. Assert that profile and session filters are `PartitionKey eq 'profile'` and `PartitionKey eq 'session'`, that `ApiName eq 'GetBlob' and ResponseType eq 'Success'` is used for both metrics, that two table pages are combined, and that the webhook request contains no Azure rows or credentials.
+Use injected `runAz` and `fetchImpl` fakes. Assert that profile and session filters are `PartitionKey eq 'profile'` and `PartitionKey eq 'session'`, that `ApiName eq 'GetBlob' and ResponseType eq 'Success'` is used for the transaction metric, that two table pages are combined, and that the webhook request contains no Azure rows or credentials.
 
 - [ ] **Step 2: Run the focused test and verify the new cases fail**
 
@@ -122,7 +115,7 @@ Expected: the new collection and delivery tests fail before their implementation
 
 - [ ] **Step 3: Implement the Azure collector**
 
-Run Azure CLI through `spawnSync` with `--only-show-errors --output json`. Query only the required fields, keep account IDs in memory for distinct-counting, and never print rows. Count active durable sessions using the existing 30-day TTL and count the prior-24-hour session rows and distinct IDs. Sum `Transactions` and `Egress` time series with the `GetBlob`/successful-response filter; render unavailable metrics instead of inventing zero when Azure rejects a metric query.
+Run Azure CLI through `spawnSync` with `--only-show-errors --output json`. Query only the required fields, keep account IDs in memory for distinct-counting, and never print rows. Count active durable sessions using the existing 30-day TTL and count the prior-24-hour session rows and distinct IDs. Sum `Transactions` time series with the `GetBlob`/successful-response filter; omit the download field when Azure rejects the optional metric query.
 
 - [ ] **Step 4: Implement the webhook sender and CLI entry point**
 
@@ -165,7 +158,7 @@ Use `actions/checkout@v4`, `actions/setup-node@v4` with Node 24, `azure/login@v3
 
 - [ ] **Step 4: Document Azure role setup, GitHub secrets, schedule, and metric limits**
 
-Document OIDC federated-credential setup, the three least-privilege Azure read roles, `gh secret set` commands using placeholders only, manual dry-run invocation, the default Brazil-friendly UTC time, and the fact that Blob GETs/egress are activity estimates rather than unique people or installer-only downloads.
+Document OIDC federated-credential setup, the three least-privilege Azure read roles, `gh secret set` commands using placeholders only, manual dry-run invocation, the default Brazil-friendly UTC time, and the fact that Blob GETs are activity estimates rather than unique people or installer-only downloads.
 
 - [ ] **Step 5: Run all automation tests**
 

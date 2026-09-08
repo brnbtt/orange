@@ -2,7 +2,8 @@
 
 The repository contains a scheduled GitHub Actions workflow at
 `.github/workflows/daily-usage-report.yml`. It runs at 12:00 UTC (normally
-09:00 in Brazil) and sends one text message to the configured Discord webhook.
+09:00 in Brazil) and sends a compact orange embed card to the configured
+Discord webhook.
 The workflow can also be started manually with `dry_run=true`; that collects
 and prints the message without sending it.
 
@@ -18,12 +19,10 @@ stores:
 - **Registered Discord profiles**: distinct rows in the `profile` partition of
   the durable `sessions` table. This is the set of accounts that have reached a
   profile-backed Orange feature, not anonymous installations.
-- **Durable sessions**: session rows whose `CreatedAt` is still within the
-  relay's existing 30-day session lifetime.
 - **Login activity**: session rows and distinct account IDs created during the
   preceding 24 hours. This is login activity, not a claim that each row is a
   new person.
-- **Successful Blob GETs and Blob egress**: Azure Monitor Storage metrics for
+- **Successful Blob GETs**: Azure Monitor Storage transaction metrics for
   successful `GetBlob` operations during the preceding 24 hours. They include
   the public website, manifest, installer, and other public blobs in the
   account.
@@ -37,7 +36,7 @@ website asset GETs. Add a first-party, privacy-reviewed download counter if
 exact unique installer downloads are required.
 
 Anonymous launches and stream minutes are not collected by the current Orange
-relay, so the report calls them out rather than inferring usage from storage or
+relay, so the card omits them rather than inferring usage from storage or
 authentication traffic.
 
 ## One-time Azure setup
@@ -113,5 +112,5 @@ gh run watch --repo brnbtt/orange
 The workflow's Azure CLI commands set `AZURE_CORE_OUTPUT=none`; only the
 specific JSON responses consumed by the Node script are captured, and table
 rows are never printed. A normal run fails rather than sending a misleading
-report if the table query or Azure login fails. Optional Storage metric failures
-are called out as `unavailable` in the Discord message.
+report if the table query or Azure login fails. Optional metrics that are
+unavailable are omitted from the card.
