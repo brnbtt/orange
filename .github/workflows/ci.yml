@@ -29,8 +29,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: download manifest behavior
-        run: node --test website/release.test.mjs
+      - name: website and usage automation behavior
+        run: node --test website/release.test.mjs website/i18n.test.mjs automation/daily-usage-report.test.mjs
 
   gate:
     runs-on: ubuntu-latest
