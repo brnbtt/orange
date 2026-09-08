@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 10
     env:
       AZURE_CORE_OUTPUT: none
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       DRY_RUN: ${{ inputs.dry_run || 'false' }}
     steps:
       - uses: actions/checkout@v4
