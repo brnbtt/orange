@@ -4,9 +4,9 @@ import { resolve } from 'node:path';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SESSION_TTL_MS = 30 * DAY_MS;
-const REPORT_LIMIT = 2000;
 const WEBHOOK_TIMEOUT_MS = 15_000;
 const MAX_TABLE_PAGES = 128;
+const EMBED_COLOR = 0xff5a1f;
 const AZURE_COMMAND = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : 'az';
 const AZURE_PREFIX = process.platform === 'win32' ? ['/d', '/s', '/c', 'az.cmd'] : [];
 
@@ -52,70 +52,49 @@ export function sumMetric(payload) {
   return total;
 }
 
-export function formatBytes(bytes) {
-  if (!Number.isFinite(bytes)) return 'unavailable';
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-  let value = bytes;
-  let unit = units[0];
-  for (let index = 0; value >= 1024 && index < units.length; index += 1) {
-    value /= 1024;
-    unit = units[index];
-  }
-  const rounded = value >= 100 ? value.toFixed(0) : value.toFixed(1);
-  return `${rounded.replace(/\.0$/, '')} ${unit}`;
-}
-
 function displayNumber(value) {
   return Number.isFinite(value) ? Math.round(value).toLocaleString('en-US') : 'unavailable';
 }
 
-function displayValue(value) {
-  return value === null || value === undefined ? 'unavailable' : displayNumber(value);
-}
-
-function displayRelease(release) {
-  return release?.version || 'unavailable';
-}
-
-/**
- * Keep this report deliberately plain text: it renders consistently in Discord
- * and leaves enough room for a useful warning when an optional Azure metric is
- * unavailable.
- */
-export function buildReport(data) {
+export function buildCard(data) {
   const asOf = data.asOf instanceof Date ? data.asOf : new Date(data.asOf);
-  const periodStart = new Date(asOf.getTime() - DAY_MS);
-  const lines = [
-    `🟠 Orange daily usage — ${asOf.toISOString().slice(0, 10)}`,
-    `Period: ${periodStart.toISOString()} → ${asOf.toISOString()}`,
-    '',
-    '**Users**',
-    `• Accounts with a valid session (30d): ${displayValue(data.validSessionAccounts ?? data.registeredAccounts)}`,
-    `• Registered Discord profiles: ${displayValue(data.registeredProfiles ?? data.registeredAccounts)}`,
-    `• Durable sessions: ${displayValue(data.durableSessions)}`,
-    `• Accounts with a login in the last 24h: ${displayValue(data.loginAccounts)}`,
-    `• Login sessions in the last 24h: ${displayValue(data.loginSessions)}`,
-    '',
-    '**Download activity**',
-    `• Successful Blob GETs: ${displayValue(data.blobGets)}`,
-    `• Blob egress: ${formatBytes(data.blobEgress)}`,
-    '• Unique downloaders: unavailable (public Azure Blob downloads expose no person/device identity)',
-    '',
-    '• Anonymous launches and stream minutes: not collected',
-    `• Current beta release: ${displayRelease(data.release)}`,
-    '• Source: Azure Table Storage, Azure Monitor, and the public beta manifest',
-  ];
-  if (data.warnings?.length) {
-    lines.push('', '**Notes**', ...data.warnings.map((warning) => `• ${warning}`));
+  const fields = [];
+  const userLines = [];
+  if (Number.isFinite(data.validSessionAccounts)) {
+    userLines.push(`**${displayNumber(data.validSessionAccounts)}** valid accounts (30d)`);
   }
-  let report = '';
-  for (const line of lines) {
-    const candidate = report ? `${report}\n${line}` : line;
-    if (candidate.length > REPORT_LIMIT) break;
-    report = candidate;
+  if (Number.isFinite(data.loginAccounts)) {
+    userLines.push(`**${displayNumber(data.loginAccounts)}** accounts logged in (24h)`);
   }
-  return report;
+  if (userLines.length) {
+    fields.push({ name: '👤 Users', value: userLines.join('\n'), inline: true });
+  }
+  if (Number.isFinite(data.blobGets)) {
+    fields.push({
+      name: '⬇️ Download activity',
+      value: `**${displayNumber(data.blobGets)}** successful public Blob GETs\nUnique people are not identifiable`,
+      inline: true,
+    });
+  }
+  if (data.release?.version) {
+    fields.push({ name: '🚀 Release', value: `**v${data.release.version}**`, inline: true });
+  }
+  return {
+    username: 'Orange usage',
+    allowed_mentions: { parse: [] },
+    embeds: [{
+      title: 'Orange daily usage',
+      description: `Last 24 hours • <t:${Math.floor(asOf.getTime() / 1000)}:D>`,
+      color: EMBED_COLOR,
+      fields,
+      timestamp: asOf.toISOString(),
+      footer: {
+        text: Number.isFinite(data.blobGets)
+          ? 'Blob GETs include website assets; they are not unique downloads.'
+          : 'Orange usage telemetry',
+      },
+    }],
+  };
 }
 
 export function validateWebhookUrl(value) {
@@ -232,11 +211,10 @@ function storageResourceId(config) {
     `/providers/Microsoft.Storage/storageAccounts/${config.account}`;
 }
 
-async function optionalMetric({ resourceId, metric, start, end, runAz, warnings }) {
+async function optionalMetric({ resourceId, metric, start, end, runAz }) {
   try {
     return sumMetric(runAz(metricArgs(resourceId, metric, start, end)));
   } catch {
-    warnings.push(`${metric} storage metric unavailable`);
     return null;
   }
 }
@@ -291,14 +269,15 @@ export async function collectUsage({
     const date = createdAt(row);
     return date && date >= activeCutoff && date <= asOf;
   });
-  const warnings = [];
   const resourceId = storageResourceId(config);
-  const [blobGets, blobEgress] = await Promise.all([
-    optionalMetric({ resourceId, metric: 'Transactions', start: periodStart, end: asOf, runAz, warnings }),
-    optionalMetric({ resourceId, metric: 'Egress', start: periodStart, end: asOf, runAz, warnings }),
-  ]);
+  const blobGets = await optionalMetric({
+    resourceId,
+    metric: 'Transactions',
+    start: periodStart,
+    end: asOf,
+    runAz,
+  });
   const release = await releaseVersion(config.manifestUrl, fetchImpl);
-  if (!release) warnings.push('public beta manifest unavailable');
   return {
     asOf,
     validSessionAccounts: distinctIds(activeSessions).size,
@@ -307,21 +286,21 @@ export async function collectUsage({
     loginSessions: recentSessions.length,
     loginAccounts: distinctIds(recentSessions).size,
     blobGets,
-    blobEgress,
     release,
-    warnings,
   };
 }
 
-export async function postWebhook(value, content, fetchImpl = fetch) {
+export async function postWebhook(value, payload, fetchImpl = fetch) {
   const url = validateWebhookUrl(value);
-  if (typeof content !== 'string' || content.length > REPORT_LIMIT) {
-    throw new Error('Discord webhook content exceeds the 2,000-character limit');
+  if (!payload || !Array.isArray(payload.embeds) || payload.embeds.length === 0) {
+    throw new Error('Discord webhook payload must contain an embed');
   }
+  const body = JSON.stringify(payload);
+  if (body.length > 6000) throw new Error('Discord webhook embed is too large');
   const response = await fetchImpl(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'Orange usage', content }),
+    body,
     signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`Discord webhook failed with HTTP ${response.status}`);
@@ -342,12 +321,12 @@ export async function main() {
   const dryRun = process.argv.includes('--dry-run') || process.env.DRY_RUN === 'true';
   const webhook = process.env.DISCORD_WEBHOOK_URL;
   if (!dryRun && !webhook) throw new Error('DISCORD_WEBHOOK_URL is required');
-  const report = buildReport(await collectUsage({ config: configFromEnvironment() }));
+  const card = buildCard(await collectUsage({ config: configFromEnvironment() }));
   if (dryRun) {
-    console.log(report);
+    console.log(JSON.stringify(card, null, 2));
     return;
   }
-  await postWebhook(webhook, report);
+  await postWebhook(webhook, card);
   console.log('Daily Orange usage report sent to Discord');
 }
 

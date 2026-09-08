@@ -4,9 +4,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  buildReport,
+  buildCard,
   collectUsage,
-  formatBytes,
   normalizeRows,
   postWebhook,
   sumMetric,
@@ -30,24 +29,34 @@ test('sums Azure Monitor totals without treating missing data as an error', () =
   assert.equal(sumMetric(null), 0);
 });
 
-test('formats bytes and keeps the report honest about unique downloaders', () => {
-  assert.equal(formatBytes(1536), '1.5 KiB');
-  const report = buildReport({
+test('builds a compact orange Discord card from available data', () => {
+  const card = buildCard({
     asOf: new Date('2026-09-07T12:00:00Z'),
     validSessionAccounts: 12,
-    registeredProfiles: 10,
-    durableSessions: 4,
-    loginSessions: 3,
     loginAccounts: 2,
     blobGets: 17,
-    blobEgress: 2048,
     release: { version: '1.0.9' },
   });
-  assert.match(report, /Accounts with a valid session \(30d\): 12/);
-  assert.match(report, /Registered Discord profiles: 10/);
-  assert.match(report, /Unique downloaders: unavailable/);
-  assert.match(report, /Current beta release: 1\.0\.9/);
-  assert.ok(report.length <= 2000);
+  assert.equal(card.embeds[0].color, 0xff5a1f);
+  assert.deepEqual(card.embeds[0].fields.map(({ name }) => name), [
+    '👤 Users',
+    '⬇️ Download activity',
+    '🚀 Release',
+  ]);
+  assert.match(card.embeds[0].fields[0].value, /12.*valid accounts/);
+  assert.match(card.embeds[0].fields[2].value, /v1\.0\.9/);
+});
+
+test('omits unavailable metrics instead of rendering unavailable card fields', () => {
+  const card = buildCard({
+    asOf: new Date('2026-09-07T12:00:00Z'),
+    validSessionAccounts: 2,
+    loginAccounts: 1,
+    blobGets: null,
+    release: null,
+  });
+  assert.deepEqual(card.embeds[0].fields.map(({ name }) => name), ['👤 Users']);
+  assert.doesNotMatch(JSON.stringify(card), /unavailable|egress/i);
 });
 
 test('rejects non-Discord webhook URLs', () => {
@@ -83,9 +92,6 @@ test('collects paginated account/session rows and filtered storage metrics', asy
     if (args[0] === 'monitor' && args[args.indexOf('--metrics') + 1] === 'Transactions') {
       return [{ timeseries: [{ data: [{ total: 7 }] }] }];
     }
-    if (args[0] === 'monitor' && args[args.indexOf('--metrics') + 1] === 'Egress') {
-      return [{ timeseries: [{ data: [{ total: 1024 }] }] }];
-    }
     throw new Error(`unexpected az call: ${args.join(' ')}`);
   };
   const fetchImpl = async () => ({
@@ -112,7 +118,6 @@ test('collects paginated account/session rows and filtered storage metrics', asy
   assert.equal(data.loginSessions, 2);
   assert.equal(data.loginAccounts, 1);
   assert.equal(data.blobGets, 7);
-  assert.equal(data.blobEgress, 1024);
   const sessionFilter = azCalls.find(
     (args) => args.includes("PartitionKey eq 'session'") && args.includes('--marker'),
   );
@@ -120,27 +125,26 @@ test('collects paginated account/session rows and filtered storage metrics', asy
   const metricFilters = azCalls
     .filter((args) => args[0] === 'monitor')
     .map((args) => args[args.indexOf('--filter') + 1]);
-  assert.deepEqual(metricFilters, [
-    "ApiName eq 'GetBlob' and ResponseType eq 'Success'",
-    "ApiName eq 'GetBlob' and ResponseType eq 'Success'",
-  ]);
+  assert.deepEqual(metricFilters, ["ApiName eq 'GetBlob' and ResponseType eq 'Success'"]);
 });
 
-test('posts only the bounded report body to a Discord webhook', async () => {
+test('posts only the Discord card payload to a webhook', async () => {
   let request;
+  const payload = buildCard({
+    asOf: new Date('2026-09-07T12:00:00Z'),
+    validSessionAccounts: 2,
+    loginAccounts: 1,
+  });
   await postWebhook(
     'https://discord.com/api/webhooks/123/token',
-    'Orange report',
+    payload,
     async (url, options) => {
       request = { url, options };
       return { ok: true, status: 204 };
     },
   );
   assert.equal(request.url.hostname, 'discord.com');
-  assert.deepEqual(JSON.parse(request.options.body), {
-    username: 'Orange usage',
-    content: 'Orange report',
-  });
+  assert.deepEqual(JSON.parse(request.options.body), payload);
 });
 
 test('workflow schedules the report without embedding credentials', () => {
