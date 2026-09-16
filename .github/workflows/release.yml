@@ -1,0 +1,288 @@
+# Automated beta release. A tag carries the version and the user-facing notes;
+# CI builds the installer, links it in a GitHub prerelease, and — when the
+# Azure secret is present — publishes the installer and the update manifest to
+# the beta channel that installed clients poll.
+#
+# This is the publish half of ship.ps1, triggered by tag. The bump itself stays
+# local (edit Cargo.toml, commit, push main), so CI never writes to main and
+# the workspace version remains the single source of truth. Release from a dev
+# machine with:
+#
+#   git tag -a v1.0.10 -m "One line users see in the update banner"
+#   git push origin v1.0.10
+#
+# Tag rules, enforced below and mirroring publish-beta.ps1:
+# - vMAJOR.MINOR.PATCH, equal to [workspace.package] version in Cargo.toml.
+# - The annotated message is the release notes: non-empty, at most 500 UTF-8
+#   bytes, no control characters. Keep it to one line; that is all the beta
+#   manifest allows.
+# - Tags and installers are immutable. Re-running this workflow for the same
+#   tag reuses the existing assets after verifying they match this commit; a
+#   bad release is fixed by a newer tag, never by moving one.
+#
+# Without the AZURE_STORAGE_KEY secret the Azure leg is skipped and the run
+# still produces the installer and the GitHub prerelease. With the secret it
+# additionally uploads the installer (once, never overwritten) and the update
+# manifest (overwritten, like publish-beta.ps1). Like local publishes, releases
+# stay prereleases with --latest=false; marking a Latest is an owner decision.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # gstreamer-rs 0.25 targets the GStreamer 1.26 series; pin the latest
+      # 1.26 bug-fix release so CI tracks what developers install locally.
+      GSTREAMER_VERSION: 1.26.11
+      GSTREAMER_ROOT: C:\gstreamer\1.0\msvc_x86_64
+      # Authority for these names is publish-beta.ps1 ($BetaStorageAccount,
+      # $BetaContainer); keep them in step with it.
+      BETA_STORAGE_ACCOUNT: orangealpha0d8d5893e69a3
+      BETA_CONTAINER: releases
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag message carries the release notes, so the tag object has
+          # to be present, not just the tagged commit.
+          fetch-depth: 0
+
+      # rust-toolchain.toml pins the version and the components, so there is
+      # nothing to state twice here.
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install GStreamer runtime and development files
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = $env:GSTREAMER_VERSION
+          $root = $env:GSTREAMER_ROOT
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc"
+          $files = @(
+            "gstreamer-1.0-msvc-x86_64-$ver.msi",
+            "gstreamer-1.0-devel-msvc-x86_64-$ver.msi"
+          )
+          foreach ($file in $files) {
+            $url = "$base/$file"
+            $out = Join-Path $env:RUNNER_TEMP $file
+            Write-Host "Downloading $url"
+            Invoke-WebRequest -Uri $url -OutFile $out
+            Write-Host "Installing $file to $root"
+            # Since 1.26 the WiX v5 installers take a full-path INSTALLDIR.
+            $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i `"$out`" INSTALLDIR=`"$root`" /quiet /norestart"
+            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              throw "msiexec failed for $file with exit $($proc.ExitCode)"
+            }
+          }
+          $dll = Join-Path $root "bin\gstreamer-1.0-0.dll"
+          if (-not (Test-Path -LiteralPath $dll)) {
+            throw "GStreamer install did not produce $dll"
+          }
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PKG_CONFIG_PATH=$root\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install pkg-config
+        run: choco install pkgconfiglite -y --no-progress
+
+      # package.ps1 looks in ProgramFiles(x86) as well as per-user locations,
+      # which is where the Chocolatey package lands.
+      - name: Install Inno Setup 6
+        run: choco install innosetup -y --no-progress
+
+      # The tag is the version claim; Cargo.toml is the version truth. They
+      # must agree, otherwise the installer filename, the manifest and the tag
+      # would name three different releases.
+      - name: Assert tag matches workspace version
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -cnotmatch '^v([0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw "Tag $tag is not vMAJOR.MINOR.PATCH"
+          }
+          $version = $Matches[1]
+          $found = Select-String -LiteralPath Cargo.toml -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"$' |
+            Select-Object -First 1
+          if ($null -eq $found -or $found.Matches[0].Groups[1].Value -cne $version) {
+            throw "Tag $tag does not match the workspace version in Cargo.toml"
+          }
+          $tagCommit = (& git rev-list -n 1 $tag).Trim()
+          if ($tagCommit -cne $env:GITHUB_SHA) {
+            throw "Tag $tag resolves to $tagCommit, not the built commit $env:GITHUB_SHA"
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The annotated tag message is what users read in the update banner, so
+      # it follows the same rules publish-beta.ps1 enforces on -Notes.
+      - name: Read release notes from tag message
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          $notes = (& git tag -l --format='%(contents:strip)' $tag | Out-String).Trim()
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            throw "Tag $tag has no message. Re-tag as annotated: git tag -a $tag -m `"Notes users see`""
+          }
+          if ([Text.Encoding]::UTF8.GetByteCount($notes) -gt 500) {
+            throw "Release notes exceed the 500 byte client limit"
+          }
+          if (@($notes.ToCharArray() | Where-Object { [char]::IsControl($_) }).Count -ne 0) {
+            throw "Release notes must not contain control characters: keep them to one line"
+          }
+          [IO.File]::WriteAllText("notes.txt", $notes, (New-Object Text.UTF8Encoding($false)))
+
+      # Same contract tests publish-beta.ps1 runs before building. Each in its
+      # own step so the exit code unambiguously belongs to one script.
+      - name: installer contract
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\windows\test-installer.ps1
+
+      - name: beta publish contract
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\windows\test-beta-publish.ps1
+
+      # Runs the full workspace test suite first, like ship.ps1 does locally.
+      # Never pipe this: under ErrorActionPreference=Stop, cargo's ordinary
+      # stderr progress would become a terminating error mid-build.
+      - name: Build installer
+        run: .\package.ps1 -BuildId $env:GITHUB_SHA
+
+      # Mirrors New-BetaManifest and Test-BetaManifest in publish-beta.ps1 so
+      # the manifest CI writes is one local publishing could also have written.
+      - name: Build and validate beta manifest
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:VERSION
+          $installer = "dist\orange-setup-$version.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Installer was not created"
+          }
+          if ((Get-Item -LiteralPath $installer).Length -gt 250MB) {
+            throw "Installer exceeds the 250 MiB client limit"
+          }
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToUpperInvariant()
+          $manifest = [pscustomobject][ordered]@{
+            schema = 1
+            channel = "beta"
+            version = $version
+            build = $env:GITHUB_SHA
+            installer_url = "https://$env:BETA_STORAGE_ACCOUNT.blob.core.windows.net/$env:BETA_CONTAINER/orange-setup-$version.exe"
+            sha256 = $hash
+            notes = [IO.File]::ReadAllText("notes.txt")
+          }
+          [IO.File]::WriteAllText(
+            "dist\orange-beta.json",
+            ($manifest | ConvertTo-Json -Depth 4),
+            (New-Object Text.UTF8Encoding($false)))
+          "SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Installer: $installer"
+          Write-Host "SHA-256: $hash"
+
+      # Mirrors Ensure-GitHubRelease: create once, then only reuse assets that
+      # match this build byte for byte. A re-run never replaces anything.
+      - name: GitHub prerelease
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          $version = $env:VERSION
+          & gh release view $tag --json assets 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            & gh release create $tag --target $env:GITHUB_SHA `
+              --title "Orange $version" --notes-file notes.txt `
+              --prerelease --latest=false
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+          $assets = (& gh release view $tag --json assets | Out-String | ConvertFrom-Json).assets
+          foreach ($file in @("dist\orange-setup-$version.exe", "dist\orange-beta.json")) {
+            $name = Split-Path -Leaf $file
+            $remote = @($assets | Where-Object { $_.name -ceq $name })
+            if ($remote.Count -eq 0) {
+              & gh release upload $tag $file
+              if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for $name" }
+            } elseif ($remote.Count -ne 1 -or [int64]$remote[0].size -ne (Get-Item -LiteralPath $file).Length) {
+              throw "Existing GitHub asset $name does not match this build"
+            }
+            $check = Join-Path $env:RUNNER_TEMP ("orange-release-check-" + [guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $check | Out-Null
+            try {
+              & gh release download $tag --pattern $name --dir $check
+              if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $name" }
+              $local = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+              $fetched = (Get-FileHash -LiteralPath (Join-Path $check $name) -Algorithm SHA256).Hash
+              if ($fetched -cne $local) { throw "GitHub asset $name failed remote SHA-256 verification" }
+            } finally {
+              Remove-Item -LiteralPath $check -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      # The Azure leg of publish-beta.ps1. Skipped without the secret: az
+      # --auth-mode key reads AZURE_STORAGE_KEY from the environment.
+      - name: Publish to Azure beta channel
+        if: ${{ secrets.AZURE_STORAGE_KEY != '' }}
+        env:
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:VERSION
+          $installer = "dist\orange-setup-$version.exe"
+          $installerName = "orange-setup-$version.exe"
+          $manifestPath = "dist\orange-beta.json"
+          & az storage blob show --account-name $env:BETA_STORAGE_ACCOUNT `
+            --container-name $env:BETA_CONTAINER --name $installerName `
+            --auth-mode key --output json --only-show-errors 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            & az storage blob upload --account-name $env:BETA_STORAGE_ACCOUNT `
+              --container-name $env:BETA_CONTAINER --file $installer --name $installerName `
+              --auth-mode key --overwrite false `
+              --metadata "sha256=$env:SHA256" "build=$env:GITHUB_SHA" --only-show-errors
+            if ($LASTEXITCODE -ne 0) { throw "Azure installer upload failed" }
+          } else {
+            throw "Installer $installerName already exists in Azure: versions are immutable, cut a newer tag"
+          }
+          $check = Join-Path $env:RUNNER_TEMP ("orange-azure-check-" + [guid]::NewGuid().ToString("N") + ".exe")
+          try {
+            & az storage blob download --account-name $env:BETA_STORAGE_ACCOUNT `
+              --container-name $env:BETA_CONTAINER --name $installerName `
+              --file $check --auth-mode key --overwrite true --only-show-errors
+            if ($LASTEXITCODE -ne 0) { throw "Azure installer download failed" }
+            if ((Get-FileHash -LiteralPath $check -Algorithm SHA256).Hash -cne $env:SHA256) {
+              throw "Azure installer failed remote SHA-256 verification"
+            }
+          } finally {
+            Remove-Item -LiteralPath $check -Force -ErrorAction SilentlyContinue
+          }
+          & az storage blob upload --account-name $env:BETA_STORAGE_ACCOUNT `
+            --container-name $env:BETA_CONTAINER --file $manifestPath --name "orange-beta.json" `
+            --auth-mode key --overwrite true --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw "Azure manifest upload failed" }
+          $live = Invoke-WebRequest -UseBasicParsing `
+            "https://$env:BETA_STORAGE_ACCOUNT.blob.core.windows.net/$env:BETA_CONTAINER/orange-beta.json" |
+            Select-Object -ExpandProperty Content | ConvertFrom-Json
+          if ($live.version -cne $version) {
+            throw "Live manifest still reports $($live.version)"
+          }
+          Write-Host "Beta channel now serves $version ($env:GITHUB_SHA)"
+
+      - name: Summary
+        if: always()
+        run: |
+          Write-Host "Version: $env:VERSION"
+          Write-Host "Build: $env:GITHUB_SHA"
+          Write-Host "Release: https://github.com/brnbtt/orange/releases/tag/$env:GITHUB_REF_NAME"
