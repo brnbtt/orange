@@ -51,6 +51,9 @@ jobs:
       # $BetaContainer); keep them in step with it.
       BETA_STORAGE_ACCOUNT: orangealpha0d8d5893e69a3
       BETA_CONTAINER: releases
+      # Empty when the repo has no such secret. Read through env because the
+      # secrets context is not allowed in step if: conditions.
+      AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -235,9 +238,7 @@ jobs:
       # The Azure leg of publish-beta.ps1. Skipped without the secret: az
       # --auth-mode key reads AZURE_STORAGE_KEY from the environment.
       - name: Publish to Azure beta channel
-        if: ${{ secrets.AZURE_STORAGE_KEY != '' }}
-        env:
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+        if: env.AZURE_STORAGE_KEY != ''
         run: |
           $ErrorActionPreference = "Stop"
           $version = $env:VERSION
