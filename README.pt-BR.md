@@ -17,7 +17,10 @@
   🇺🇸 <a href="README.md"><strong>Read in English</strong></a>
 </p>
 
-![Orange transmitindo um jogo para dois viewers](website/screenshots/streaming.png)
+<p align="center">
+  <img src="docs/screenshots/home.png" width="400" alt="Tela inicial do Orange, pronto para transmitir">
+  <img src="docs/screenshots/pick.png" width="400" alt="Seletor de fonte do Orange com previews privados borrados">
+</p>
 
 O Orange transmite a janela do jogo (imagem **e** som do jogo) direto do PC
 de quem transmite para cada viewer. Sem re-encode no servidor, sem conta

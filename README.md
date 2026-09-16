@@ -17,7 +17,10 @@
   🇧🇷 <a href="README.pt-BR.md"><strong>Leia em português</strong></a>
 </p>
 
-![Orange streaming a game to two viewers](website/screenshots/streaming.png)
+<p align="center">
+  <img src="docs/screenshots/home.png" width="400" alt="Orange home, ready to stream">
+  <img src="docs/screenshots/pick.png" width="400" alt="Orange source picker with blurred private previews">
+</p>
 
 Orange streams a game window (picture **and** game sound) directly from the
 host PC to each viewer. No server re-encode, no account needed to join:
