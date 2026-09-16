@@ -17,3 +17,6 @@
 
 # These are published website assets, not local diagnostic captures.
 !/website/screenshots/*.png
+
+# Real app screenshots used by the README, not local diagnostic captures.
+!/docs/screenshots/*.png
