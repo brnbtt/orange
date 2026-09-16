@@ -1,12 +1,13 @@
-# The Linux-safe part of the gate in ARCHITECTURE.md, so it holds on every push
+# The automated part of the gate in ARCHITECTURE.md, so it holds on every push
 # without each clone having to run `git config core.hooksPath packaging/hooks`.
 #
-# `orange` and `orange-client` are deliberately absent: they need GStreamer,
-# D3D11 and Win32, so they cannot build here at all. `orange-updater` is absent
-# for the same reason. They stay covered by the full local suite that ship.ps1
-# runs before it commits anything. What is left still covers the relay, which
-# is the one component where a bug breaks every user at once and which deploys
-# on its own path.
+# The `gate` job runs the Linux-safe subset on Ubuntu: `orange` and
+# `orange-client` need GStreamer, D3D11 and Win32, so they cannot build there
+# at all, and `orange-updater` calls Win32 directly. That subset still covers
+# the relay, which is the one component where a bug breaks every user at once
+# and which deploys on its own path. The `windows` job installs GStreamer and
+# builds the Windows crates Ubuntu cannot. Tests that need a GPU or a display
+# stay on the full local suite that ship.ps1 runs before it commits anything.
 
 name: ci
 
@@ -62,3 +63,77 @@ jobs:
 
       - name: tests
         run: cargo test --locked -p orange-signal -p orange-relay
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # gstreamer-rs 0.25 targets the GStreamer 1.26 series; pin the latest
+      # 1.26 bug-fix release so CI tracks what developers install locally.
+      GSTREAMER_VERSION: 1.26.11
+      GSTREAMER_ROOT: C:\gstreamer\1.0\msvc_x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version and the components, so there is
+      # nothing to state twice here.
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install GStreamer runtime and development files
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = $env:GSTREAMER_VERSION
+          $root = $env:GSTREAMER_ROOT
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc"
+          $files = @(
+            "gstreamer-1.0-msvc-x86_64-$ver.msi",
+            "gstreamer-1.0-devel-msvc-x86_64-$ver.msi"
+          )
+          foreach ($file in $files) {
+            $url = "$base/$file"
+            $out = Join-Path $env:RUNNER_TEMP $file
+            Write-Host "Downloading $url"
+            Invoke-WebRequest -Uri $url -OutFile $out
+            Write-Host "Installing $file to $root"
+            # Since 1.26 the WiX v5 installers take a full-path INSTALLDIR.
+            $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i `"$out`" INSTALLDIR=`"$root`" /quiet /norestart"
+            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              throw "msiexec failed for $file with exit $($proc.ExitCode)"
+            }
+          }
+          $dll = Join-Path $root "bin\gstreamer-1.0-0.dll"
+          if (-not (Test-Path -LiteralPath $dll)) {
+            throw "GStreamer install did not produce $dll"
+          }
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PKG_CONFIG_PATH=$root\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install pkg-config
+        run: choco install pkgconfiglite -y --no-progress
+
+      # Clippy covers the crates the Ubuntu job cannot compile. The relay and
+      # signal crates stay on the Ubuntu job: they deploy to Linux.
+      - name: clippy (Windows crates)
+        run: cargo clippy --locked -p orange -p orange-client -p orange-updater --all-targets -- -D warnings
+
+      # A full-workspace build proves the relay also compiles for Windows,
+      # even though it deploys to Linux.
+      - name: build
+        run: cargo build --locked --workspace
+
+      # The updater is Windows-only and dependency-free, so its tests run here
+      # rather than on Ubuntu. Media and UI tests need a GPU or a display and
+      # stay on the local suite that ship.ps1 runs.
+      - name: updater tests
+        run: cargo test --locked -p orange-updater
