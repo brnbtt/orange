@@ -40,6 +40,7 @@ const ICON_SPEAKER_LOW: &str = "M155.51,24.81a8,8,0,0,0-8.42.88L77.25,80H32A16,1
 const ICON_SPEAKER_HIGH: &str = "M155.51,24.81a8,8,0,0,0-8.42.88L77.25,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V32A8,8,0,0,0,155.51,24.81ZM32,96H72v64H32ZM144,207.64,88,164.09V91.91l56-43.55Zm54-106.08a40,40,0,0,1,0,52.88,8,8,0,0,1-12-10.58,24,24,0,0,0,0-31.72,8,8,0,0,1,12-10.58ZM248,128a79.9,79.9,0,0,1-20.37,53.34,8,8,0,0,1-11.92-10.67,64,64,0,0,0,0-85.33,8,8,0,1,1,11.92-10.67A79.83,79.83,0,0,1,248,128Z";
 const ICON_SPEAKER_SLASH: &str = "M53.92,34.62A8,8,0,1,0,42.08,45.38L73.55,80H32A16,16,0,0,0,16,96v64a16,16,0,0,0,16,16H77.25l69.84,54.31A8,8,0,0,0,160,224V175.09l42.08,46.29a8,8,0,1,0,11.84-10.76ZM32,96H72v64H32ZM144,207.64,88,164.09V95.89l56,61.6Zm42-63.77a24,24,0,0,0,0-31.72,8,8,0,1,1,12-10.57,40,40,0,0,1,0,52.88,8,8,0,0,1-12-10.59Zm-80.16-76a8,8,0,0,1,1.4-11.23l39.85-31A8,8,0,0,1,160,32v74.83a8,8,0,0,1-16,0V48.36l-26.94,21A8,8,0,0,1,105.84,67.91ZM248,128a79.9,79.9,0,0,1-20.37,53.34,8,8,0,0,1-11.92-10.67,64,64,0,0,0,0-85.33,8,8,0,1,1,11.92-10.67A79.83,79.83,0,0,1,248,128Z";
 const ICON_X: &str = "M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z";
+const ICON_PIN: &str = "M216,104a8,8,0,0,1-8,8H176v32a8,8,0,0,1-8,8H136v72a8,8,0,0,1-16,0V152H88a8,8,0,0,1-8-8V112H48a8,8,0,0,1,0-16H80V48H64a8,8,0,0,1,0-16H192a8,8,0,0,1,0,16H176V96h32A8,8,0,0,1,216,104ZM96,136h64V48H96Z";
 const ICON_ARROWS_OUT: &str = "M216,48V96a8,8,0,0,1-16,0V67.31l-42.34,42.35a8,8,0,0,1-11.32-11.32L188.69,56H160a8,8,0,0,1,0-16h48A8,8,0,0,1,216,48ZM98.34,146.34,56,188.69V160a8,8,0,0,0-16,0v48a8,8,0,0,0,8,8H96a8,8,0,0,0,0-16H67.31l42.35-42.34a8,8,0,0,0-11.32-11.32ZM208,152a8,8,0,0,0-8,8v28.69l-42.34-42.35a8,8,0,0,0-11.32,11.32L188.69,200H160a8,8,0,0,0,0,16h48a8,8,0,0,0,8-8V160A8,8,0,0,0,208,152ZM67.31,56H96a8,8,0,0,0,0-16H48a8,8,0,0,0-8,8V96a8,8,0,0,0,16,0V67.31l42.34,42.35a8,8,0,0,0,11.32-11.32Z";
 const ICON_ARROWS_IN: &str = "M144,104V64a8,8,0,0,1,16,0V84.69l42.34-42.35a8,8,0,0,1,11.32,11.32L171.31,96H192a8,8,0,0,1,0,16H152A8,8,0,0,1,144,104Zm-40,40H64a8,8,0,0,0,0,16H84.69L42.34,202.34a8,8,0,0,0,11.32,11.32L96,171.31V192a8,8,0,0,0,16,0V152A8,8,0,0,0,104,144Zm67.31,16H192a8,8,0,0,0,0-16H152a8,8,0,0,0-8,8v40a8,8,0,0,0,16,0V171.31l42.34,42.35a8,8,0,0,0,11.32-11.32ZM104,56a8,8,0,0,0-8,8V84.69L53.66,42.34A8,8,0,0,0,42.34,53.66L84.69,96H64a8,8,0,0,0,0,16h40a8,8,0,0,0,8-8V64A8,8,0,0,0,104,56Z";
 
@@ -153,6 +154,7 @@ enum Icon {
     SpeakerHigh,
     SpeakerSlash,
     Close,
+    Pin,
     ArrowsOut,
     ArrowsIn,
 }
@@ -165,6 +167,7 @@ impl Icon {
             Self::SpeakerHigh => ICON_SPEAKER_HIGH,
             Self::SpeakerSlash => ICON_SPEAKER_SLASH,
             Self::Close => ICON_X,
+            Self::Pin => ICON_PIN,
             Self::ArrowsOut => ICON_ARROWS_OUT,
             Self::ArrowsIn => ICON_ARROWS_IN,
         }
@@ -318,6 +321,10 @@ fn expand(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, exiting: bool, color: Col
         },
         color,
     );
+}
+
+fn pin(pixmap: &mut Pixmap, x: f32, y: f32, s: f32, color: Color) {
+    draw_svg_icon(pixmap, x, y, s, Icon::Pin, color);
 }
 
 // --- layout -----------------------------------------------------------------
@@ -731,10 +738,63 @@ pub(super) fn render(state: &mut OverlayState) -> Option<gst_video::VideoOverlay
     }
 
     // --- view, bottom-right -------------------------------------------------
-    // Fullscreen, where every video player puts it.
-    let audio_displaces_fullscreen =
-        state.audio_open() && logical_width < MARGIN * 2.0 + BUTTON * 2.0 + 12.0 + PAD + TRACK;
-    if alpha > 0.0 && !audio_displaces_fullscreen {
+    // Pin sits beside fullscreen so the two window-level controls stay grouped.
+    let audio_displaces_view_controls =
+        state.audio_open() && logical_width < MARGIN * 2.0 + BUTTON * 3.0 + 20.0 + PAD + TRACK;
+    if alpha > 0.0 && !audio_displaces_view_controls {
+        let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
+        let x = fw - (MARGIN + BUTTON * 2.0 + 8.0) * render_scale;
+        let y = fh - (MARGIN + BUTTON) * render_scale;
+        let active = state.always_on_top;
+        let hovered = state.hot == Some(Control::Pin);
+        if let Some(p) = cluster(
+            x,
+            y,
+            w,
+            h,
+            BUTTON * raster_scale,
+            BUTTON * raster_scale,
+            |pixmap| {
+                let w = BUTTON * raster_scale;
+                let icon = ICON * raster_scale;
+                let radius = CONTROL_RADIUS * raster_scale;
+                panel(pixmap, 0.0, 0.0, w, w, radius, alpha);
+                if active || hovered {
+                    fill_round(
+                        pixmap,
+                        0.0,
+                        0.0,
+                        w,
+                        w,
+                        radius,
+                        rgba(if active { ORANGE } else { CREAM }, 0.16 * alpha),
+                    );
+                }
+                pin(
+                    pixmap,
+                    (w - icon) / 2.0,
+                    (w - icon) / 2.0,
+                    icon,
+                    rgba(
+                        if active { ORANGE } else { CREAM },
+                        hot_alpha(Control::Pin, 0.85) * alpha,
+                    ),
+                );
+            },
+        ) {
+            panels.push(p);
+            hits.push(Hit {
+                control: Control::Pin,
+                x,
+                y,
+                w,
+                h,
+            });
+        }
+    }
+
+    // Fullscreen remains the right-most control, where video players put it.
+    if alpha > 0.0 && !audio_displaces_view_controls {
         let (w, h) = (BUTTON * render_scale, BUTTON * render_scale);
         let x = fw - (MARGIN + BUTTON) * render_scale;
         let y = fh - (MARGIN + BUTTON) * render_scale;
@@ -1214,6 +1274,7 @@ mod tests {
         render(&mut state).unwrap();
         assert!(state.hits.iter().any(|hit| hit.control == Control::Close));
         assert!(state.hits.iter().any(|hit| hit.control == Control::Mute));
+        assert!(state.hits.iter().any(|hit| hit.control == Control::Pin));
         assert!(state
             .hits
             .iter()
@@ -1225,6 +1286,7 @@ mod tests {
 
         assert!(state.hits.iter().any(|hit| hit.control == Control::Close));
         assert!(state.hits.iter().any(|hit| hit.control == Control::Mute));
+        assert!(state.hits.iter().any(|hit| hit.control == Control::Pin));
         assert!(state
             .hits
             .iter()
@@ -1245,6 +1307,7 @@ mod tests {
             Icon::SpeakerHigh,
             Icon::SpeakerSlash,
             Icon::Close,
+            Icon::Pin,
             Icon::ArrowsOut,
             Icon::ArrowsIn,
         ] {

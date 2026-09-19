@@ -50,6 +50,7 @@ pub enum Control {
     Mute,
     AudioGap,
     VolumeTrack,
+    Pin,
     Fullscreen,
     Close,
     Stats,
@@ -88,6 +89,7 @@ pub struct OverlayState {
     pub muted: bool,
     volume_dragging: bool,
     pub fullscreen: bool,
+    pub always_on_top: bool,
     pub viewers: Option<usize>,
     pub host: Option<String>,
     pub fps: Option<f64>,
@@ -104,6 +106,7 @@ pub struct OverlayState {
     cache: Option<(u64, gst_video::VideoOverlayComposition)>,
     pub close_requested: bool,
     pub fullscreen_requested: bool,
+    pub pin_requested: Option<bool>,
     /// Hold the controls open instead of hiding them. Only the design harness
     /// sets this; chasing a fading overlay with the mouse makes layout work
     /// impossible.
@@ -132,6 +135,7 @@ impl OverlayState {
             muted: profile.starts_muted(),
             volume_dragging: false,
             fullscreen: false,
+            always_on_top: profile.always_on_top(),
             viewers: None,
             host: None,
             fps: None,
@@ -147,6 +151,7 @@ impl OverlayState {
             cache: None,
             close_requested: false,
             fullscreen_requested: false,
+            pin_requested: None,
             pinned: false,
         }
     }
@@ -268,6 +273,7 @@ impl OverlayState {
         match hit.control {
             Control::Mute => self.muted = !self.muted,
             Control::Close => self.close_requested = true,
+            Control::Pin => self.pin_requested = Some(!self.always_on_top),
             Control::Fullscreen => self.fullscreen_requested = true,
             Control::Stats | Control::AudioGap => {}
             Control::VolumeTrack => {
@@ -390,6 +396,7 @@ impl OverlayState {
         self.muted.hash(&mut hasher);
         self.volume_dragging.hash(&mut hasher);
         self.fullscreen.hash(&mut hasher);
+        self.always_on_top.hash(&mut hasher);
         self.profile.hash(&mut hasher);
         self.hot.map(|c| c as u8).hash(&mut hasher);
         // Cache hits run on every video frame, including hidden controls.
@@ -434,6 +441,28 @@ mod tests {
         state.video = (1920, 1080);
         state.client = (1280, 720);
         state
+    }
+
+    #[test]
+    fn pin_control_requests_the_opposite_window_level() {
+        // Viewers need to opt into staying above a fullscreen application and
+        // be able to return the player to ordinary window ordering.
+        let mut state = state();
+        state.hits.push(Hit {
+            control: Control::Pin,
+            x: 10.0,
+            y: 20.0,
+            w: 40.0,
+            h: 40.0,
+        });
+
+        state.on_click(30.0, 40.0);
+        assert_eq!(state.pin_requested, Some(true));
+
+        state.always_on_top = true;
+        state.pin_requested = None;
+        state.on_click(30.0, 40.0);
+        assert_eq!(state.pin_requested, Some(false));
     }
 
     #[test]
@@ -493,6 +522,7 @@ mod tests {
             |s| s.muted = true,
             |s| s.volume_dragging = true,
             |s| s.fullscreen = true,
+            |s| s.always_on_top = true,
             |s| s.hot = Some(Control::Stats),
             |s| s.host = Some("A friend".into()),
             |s| s.viewers = Some(2),

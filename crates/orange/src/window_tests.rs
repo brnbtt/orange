@@ -15,7 +15,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, IsWindowVisible, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_CLOSE, WM_LBUTTONDOWN,
+    GetClientRect, GetWindowLongPtrW, IsWindowVisible, SendMessageTimeoutW, GWL_EXSTYLE,
+    SMTO_ABORTIFHUNG, WM_CLOSE, WM_LBUTTONDOWN, WS_EX_TOPMOST,
 };
 
 fn hidden_window(title: &str) -> PlaybackWindow {
@@ -62,6 +63,38 @@ fn shutdown_hidden(mut owner: PlaybackWindow) {
 fn taskbar_identity_matches_client_process() {
     assert_eq!(APP_USER_MODEL_ID, "brnbtt.orange");
     set_taskbar_identity().expect("taskbar identity should be accepted by Windows");
+}
+
+#[test]
+fn pin_message_moves_the_player_in_and_out_of_the_topmost_band() {
+    // The pin must change native z-order, not merely change the overlay icon.
+    let owner = hidden_window("orange pin window level test");
+    let handle = owner.handle();
+    let hwnd = HWND(handle.hwnd().expect("window did not publish its HWND") as *mut _);
+    handle.reveal();
+    assert!(wait_until_visible(hwnd.0 as isize));
+    let is_topmost =
+        || unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 };
+    assert!(!is_topmost());
+
+    for enabled in [true, false] {
+        let delivered = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                super::PIN_MESSAGE,
+                WPARAM(enabled as usize),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                1_000,
+                None,
+            )
+            .0 != 0
+        };
+        assert!(delivered);
+        assert_eq!(is_topmost(), enabled);
+    }
+
+    shutdown_hidden(owner);
 }
 
 #[test]

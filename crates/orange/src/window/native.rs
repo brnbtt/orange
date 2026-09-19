@@ -1,7 +1,7 @@
 use super::{
     connection_surface, fail_fast_native_cleanup, finish_window_startup, CleanupFailure,
     CleanupResult, NativeWindowState, PlaybackProfile, ShutdownEvent, WorkerFinish, ASPECT_MESSAGE,
-    CONNECTION_MESSAGE, REVEAL_MESSAGE,
+    CONNECTION_MESSAGE, PIN_MESSAGE, REVEAL_MESSAGE,
 };
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -313,6 +313,33 @@ unsafe fn set_corner_style(hwnd: HWND, fullscreen: bool) {
         &pref as *const _ as *const _,
         std::mem::size_of_val(&pref) as u32,
     );
+}
+
+unsafe fn set_always_on_top(hwnd: HWND, enabled: bool) -> bool {
+    SetWindowPos(
+        hwnd,
+        Some(if enabled {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        }),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    )
+    .is_ok()
+}
+
+unsafe fn apply_always_on_top(hwnd: HWND, enabled: bool) {
+    if set_always_on_top(hwnd, enabled) {
+        if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
+            if let Ok(mut overlay) = overlay.lock() {
+                overlay.always_on_top = enabled;
+            }
+        }
+    }
 }
 
 /// Fill the monitor the window is currently on, or go back to where it was.
@@ -978,6 +1005,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 }
                 LRESULT(0)
             }
+            PIN_MESSAGE => {
+                apply_always_on_top(hwnd, wparam.0 != 0);
+                LRESULT(0)
+            }
             WM_PAINT => {
                 let stage = with_context(hwnd, |ctx| ctx.connection.snapshot())
                     .flatten()
@@ -1106,6 +1137,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 }
                 let mut close = false;
                 let mut fullscreen = false;
+                let mut pin = None;
                 let mut volume_dragging = false;
                 if let Some(overlay) = with_context(hwnd, |ctx| ctx.overlay.clone()) {
                     if let Ok(mut overlay) = overlay.lock() {
@@ -1115,14 +1147,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                                 overlay.on_click(vx, vy);
                                 close = overlay.close_requested;
                                 fullscreen = std::mem::take(&mut overlay.fullscreen_requested);
+                                pin = overlay.pin_requested.take();
                                 volume_dragging = overlay.volume_dragging();
                             }
                         }
                     }
                 }
-                // Outside the lock: toggling fullscreen takes it again.
+                // Outside the lock: changing native window state takes it again.
                 if close {
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                } else if let Some(enabled) = pin {
+                    apply_always_on_top(hwnd, enabled);
                 } else if fullscreen {
                     toggle_fullscreen(hwnd);
                 } else if volume_dragging {

@@ -104,6 +104,7 @@ pub fn target_refresh_rate(hwnd: isize) -> Option<u32> {
 const REVEAL_MESSAGE: u32 = WM_APP + 1;
 const ASPECT_MESSAGE: u32 = WM_APP + 2;
 const CONNECTION_MESSAGE: u32 = WM_APP + 3;
+const PIN_MESSAGE: u32 = WM_APP + 4;
 const WORKER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,7 +133,7 @@ impl PlaybackProfile {
         matches!(self, Self::LiveMonitor)
     }
 
-    fn always_on_top(self) -> bool {
+    pub(crate) fn always_on_top(self) -> bool {
         matches!(self, Self::LiveMonitor)
     }
 
