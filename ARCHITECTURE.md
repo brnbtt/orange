@@ -139,7 +139,7 @@ animation gate as the grid and logo aura.
 | `crates/orange/src/peer/watch.rs` | Viewer join, offer/answer handling, dynamic receive pads, playback ownership, receive teardown |
 | `crates/orange/src/webrtc.rs` | WebRTC facade, loopback graph, payloaders, output ownership split, accepted-pad dispatch |
 | `crates/orange/src/webrtc/receive.rs` | Transactional dynamic video/audio receive branches, decoder/sink construction, rollback |
-| `crates/orange/src/webrtc/playout.rs` | Shared live playout correction, segment-to-running-time deadlines, audio resynchronization and expired-timeline failure |
+| `crates/orange/src/webrtc/playout.rs` | Shared live playout correction, segment-to-running-time deadlines, audio resynchronization and expired-timeline fallback to unsynchronized output |
 | `crates/orange/src/webrtc/receive_playout_tests.rs`, `crates/orange/src/webrtc/playout_webrtc_tests.rs` | Hardware marker tests comparing D3D presentation with actual process-loopback audio output, through direct RTP and two WebRTC peers |
 | `crates/orange/src/webrtc/workers.rs` | First audio/video pad claims, audio-control and bitrate workers, cancellation, probe removal, joining |
 | `crates/orange/src/webrtc/transport.rs` | RTP payload/caps constants and live jitterbuffer policy |
@@ -154,6 +154,7 @@ animation gate as the grid and logo aura.
 | `crates/orange/src/media_diagnostics/writer_tests.rs` | The `writer.rs` test module, in a sibling file because it outgrew the module |
 | `crates/orange/src/media_diagnostics/operation.rs` | Started/finished timing records around media graph operations |
 | `crates/orange/src/media_diagnostics/progress.rs` | RTP/depay/parsed/decoded pad counters, keyframes, queue overruns |
+| `crates/orange/src/media_diagnostics/decode_timeline.rs` | Reports a decoder whose output PTS stalls or falls behind its input, rate-limited |
 | `crates/orange/src/media_diagnostics/webrtc_monitor.rs` | Periodic sanitized WebRTC statistics and UI/media progress worker |
 | `crates/orange/src/auth.rs` | Desktop OAuth polling and atomic `%APPDATA%\orange\session.json` ownership |
 | `crates/orange/src/targets.rs` | Capturable-window enumeration/filtering, HWND-to-PID lookup, late-join redraw request |
@@ -329,7 +330,9 @@ webrtcbin OPUS pad
   same positive `ts-offset` correction and the next real audio buffer receives
   `RESYNC`. The correction leaves 60 ms of scheduling headroom and is capped at
   one second. Isolated expired buffers are discarded; one second of continuously
-  expired input reports a playback error instead of staying silently connected.
+  expired input gives up synchronizing that one output — `sync` is cleared so it
+  plays unsynchronized rather than being discarded as late — instead of failing
+  the whole session, because a late audio branch used to tear down healthy video.
   The video reservoir is before decode, bounded to 1.5 seconds / 16 MB of
   compressed access units, rather than retaining decoded GPU surfaces.
 - `media-progress.av_offset_ms` subtracts the last sink-input PTS values. It

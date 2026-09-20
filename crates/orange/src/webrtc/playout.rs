@@ -17,7 +17,6 @@ struct State {
     offset: i64,
     resync_audio: bool,
     expired_since: [Option<gst::ClockTime>; 2],
-    reported_failure: bool,
 }
 
 #[derive(Default)]
@@ -105,20 +104,37 @@ impl LivePlayout {
                     }
                     Err(()) => {
                         // Discard isolated obsolete startup/burst buffers. A
-                        // continuously invalid timeline must report a failure,
-                        // rather than leave a connected but silent viewer.
+                        // continuously invalid timeline used to post a fatal
+                        // error here, which tore the whole viewer down: three
+                        // watchers lost a stream whose video had dropped no
+                        // packets at all, because only the audio branch was
+                        // late. Give up on scheduling this one output instead,
+                        // so the viewer keeps both its picture and its sound.
                         let since = *state.expired_since[usize::from(audio)].get_or_insert(now);
-                        let report = now.saturating_sub(since) >= gst::ClockTime::SECOND
-                            && !state.reported_failure;
-                        state.reported_failure |= report;
-                        drop(state);
-                        if report {
-                            sink.post_error_message(
-                                gst::error_msg!(gst::StreamError::Failed,
-                                ["received media remains outside the live playback timing budget"]),
-                            );
+                        if now.saturating_sub(since) < gst::ClockTime::SECOND {
+                            return gst::PadProbeReturn::Drop;
                         }
-                        return gst::PadProbeReturn::Drop;
+                        drop(state);
+                        // AudioBaseSink only aligns samples to their timestamps
+                        // while sync is on; clearing it appends them at the
+                        // ringbuffer write pointer instead, so a frozen PTS
+                        // still plays rather than being discarded as late.
+                        sink.set_sync(false);
+                        crate::media_diagnostics::emit_diagnostic(
+                            "playout-unsynchronized",
+                            &role,
+                            serde_json::json!({
+                                "audio": audio,
+                                "observed_running_ms": now.mseconds(),
+                                "buffer_running_ms": running.mseconds(),
+                                "sink_latency_ms": sink.latency().mseconds(),
+                                "expired_for_ms": now.saturating_sub(since).mseconds(),
+                            }),
+                        );
+                        // Remove still passes this buffer downstream; the
+                        // output is unsynchronized now, so there is nothing
+                        // left for the probe to correct.
+                        return gst::PadProbeReturn::Remove;
                     }
                     Ok(None) => {}
                 }
@@ -305,37 +321,49 @@ mod tests {
     }
 
     #[test]
-    fn permanently_expired_media_reports_an_error_instead_of_remaining_silent() {
-        // A cap that only clamps the offset recreates the old all-audio-dropped
-        // fault. Isolated stale buffers may be discarded; a sustained fault ends.
+    fn permanently_expired_media_keeps_playing_unsynchronized_instead_of_ending_the_stream() {
+        // Posting a fatal error here tore down the entire viewer. Three
+        // watchers lost a stream whose video had lost no packets, because only
+        // the late audio branch had left the budget. Isolated stale buffers may
+        // still be discarded; a sustained fault gives up the clock, not the
+        // stream.
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let timing = LivePlayout::new(&pipeline);
-        let (source, sink, _) = input(&pipeline);
+        let (source, sink, played) = input(&pipeline);
+        sink.set_property("sync", true);
         timing.attach(&sink, true, "test").unwrap();
         pipeline.set_state(gst::State::Playing).unwrap();
         let now = pipeline.clock().unwrap().time();
         sink.set_base_time(now - gst::ClockTime::from_seconds(2));
         // appsrc asks for more data after pushing its queue downstream, even
         // when our sink probe drops that buffer.
-        let (sent, received) = std::sync::mpsc::sync_channel(2);
+        let (sent, needs_data) = std::sync::mpsc::sync_channel(2);
         source.connect("need-data", false, move |_| {
             let _ = sent.try_send(());
             None
         });
         push(&source, gst::ClockTime::ZERO, gst::ClockTime::ZERO);
         while timing.0.lock().unwrap().expired_since[1].is_none() {
-            received
+            needs_data
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap();
         }
         sink.set_base_time(now - gst::ClockTime::from_seconds(4));
         push(&source, ms(10), gst::ClockTime::ZERO);
+        let rendered = played.recv_timeout(std::time::Duration::from_secs(1));
         let error = pipeline
             .bus()
             .unwrap()
             .timed_pop_filtered(gst::ClockTime::SECOND, &[gst::MessageType::Error]);
+        let synchronized = sink.property::<bool>("sync");
         pipeline.set_state(gst::State::Null).unwrap();
-        assert!(error.is_some(), "expired audio stayed silently connected");
+
+        rendered.expect("expired audio stayed silently dropped");
+        assert!(
+            error.is_none(),
+            "a late audio branch ended the whole stream"
+        );
+        assert!(!synchronized, "late media would still be discarded as late");
     }
 }

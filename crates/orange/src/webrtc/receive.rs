@@ -481,6 +481,19 @@ pub(crate) fn build_audio_branch(
     playout.attach(&sink.element, true, diagnostic_role)?;
 
     if let Some(progress) = progress {
+        let decoder_input = dec
+            .element
+            .static_pad("sink")
+            .context("audio decoder has no sink pad")?;
+        let decoder_output = dec
+            .element
+            .static_pad("src")
+            .context("audio decoder has no src pad")?;
+        crate::media_diagnostics::track_decode_timeline(
+            &decoder_input,
+            &decoder_output,
+            diagnostic_role,
+        );
         track_pad(
             &depay
                 .element
@@ -489,13 +502,7 @@ pub(crate) fn build_audio_branch(
             MediaStage::AudioDepay,
             progress.clone(),
         );
-        track_pad(
-            &dec.element
-                .static_pad("src")
-                .context("audio decoder has no src pad")?,
-            MediaStage::AudioDecoded,
-            progress.clone(),
-        );
+        track_pad(&decoder_output, MediaStage::AudioDecoded, progress.clone());
         track_pad(
             &sink
                 .element
