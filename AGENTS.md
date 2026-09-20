@@ -54,6 +54,12 @@ Worktrees live in `%LOCALAPPDATA%\Temp\opencode\<name>`, not in `.worktrees/`.
 A fresh worktree builds dependencies into its own `target/`; the A/V fix's
 first workspace test run spent about 90 seconds compiling before tests began.
 
+After a worktree's changes have landed or been merged, remove that worktree's
+`target/` directory before retiring it. These Orange worktrees keep separate
+Rust debug and incremental caches, and leaving them behind can consume many
+gigabytes. Do not remove `target/` while the worktree is still being tested or
+used by another session; leave the current checkout's build directory alone.
+
 **Always branch from `origin/main` after fetching**, never from whatever the
 current checkout happens to be at:
 
