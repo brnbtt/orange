@@ -439,6 +439,7 @@ are named in the test that owns them.
 | Installer contents/prerequisites | `package.ps1`, `packaging/windows/orange.iss` |
 | Which GStreamer elements ship in the installer | `packaging/windows/stage-gstreamer.ps1` |
 | Release procedure (bump, test, commit, push, publish) | `ship.ps1` |
+| Automated beta release from a version tag | `.github/workflows/release.yml` |
 | Pre-push gate | `packaging/hooks/pre-push.ps1` |
 | Continuous integration | `.github/workflows/ci.yml` |
 | Application icon or logo | `assets/` |

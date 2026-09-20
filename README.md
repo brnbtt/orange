@@ -284,6 +284,25 @@ and converges on the same commit:
 .\publish-beta.ps1 -Publish -Notes "<same notes>"
 ```
 
+### Automated release
+
+Pushing a version tag runs the same publish in CI (`.github/workflows/release.yml`):
+it checks the tag against `Cargo.toml`, runs the contract tests and the full
+suite, builds the installer, links it in a prerelease, and — when the repo has
+the `AZURE_STORAGE_KEY` secret — uploads the installer and the update manifest
+to the beta channel. Without the secret the run still produces the installer
+and the GitHub release.
+
+```powershell
+# Cargo.toml already bumped, committed and pushed on main, then:
+git tag -a v1.0.10 -m "One line users see in the update banner."
+git push origin v1.0.10
+```
+
+The tag message is the release notes: at most 500 bytes, no line breaks. Tags
+and installers are immutable — a bad release is fixed by a newer tag, never by
+moving one. Releases stay prereleases; marking a `Latest` is an owner decision.
+
 Build an installer locally without publishing anything:
 
 ```powershell
