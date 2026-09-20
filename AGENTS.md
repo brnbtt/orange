@@ -194,15 +194,29 @@ rather than reasoning from the source alone.
 - **Parallelize independent operations in a single turn.** Call multiple independent reads, globs, or searches concurrently rather than issuing them sequentially.
 - **Use parallel subagents for multi-area research.** When investigating multiple independent components, spawn background subagents (`agent: "explore"` or `"general"` with `background: true`) to execute in parallel child sessions.
 - Reserve `shell` strictly for native builds, cargo, and git commands.
+- **Do not pipe `cargo` through `2>&1 |`.** PowerShell turns cargo's ordinary
+  `Compiling ...` stderr progress into `NativeCommandError` records and the
+  command reports exit code 1 even when the run succeeded — a full
+  `cargo test --workspace` that printed `test result: ok` still came back as
+  failure. Redirect to a file and read it instead:
+  `cargo test ... > "$env:TEMP\out.txt" 2>&1; $LASTEXITCODE` then
+  `Select-String`/`Get-Content -Tail`. This is the same defect called out for
+  `ship.ps1` and `deploy/azure.ps1`, but it bites any cargo invocation.
 
 ## Flaky Under Load
 
-`peer_worker_review_*` in `crates/orange` spawn child processes and kill them
-on a deadline (`crates/orange/src/test_support.rs`). Run immediately after a
-release build or another full suite they can miss that deadline and fail, which
-looks alarming when the change under test was in another crate entirely. Re-run
-the named tests on an idle machine before believing it. Two failed this way
-during a change that touched only `orange-signal` and `orange-client`.
+`peer::host_branch::tests` in `crates/orange` spawn child processes and kill
+them on a deadline (`crates/orange/src/test_support.rs`). Run immediately after
+a release build or another full suite they can miss that deadline and fail,
+which looks alarming when the change under test was in another crate entirely.
+Re-run the named tests on an idle machine before believing it. Two failed this
+way during a change that touched only `orange-signal` and `orange-client`, and
+a clean-baseline run on `origin/main` failed four —
+`last_viewer_teardown_leaves_shared_sources_running_for_rejoin`,
+`suspension_waits_for_all_removals_without_blocking_the_executor` and two
+`peer_worker_review_*` — then passed all 18 when re-run idle with
+`cargo test -p orange --bin orange peer::host_branch::tests`. It is not only
+the `peer_worker_review_*` names.
 
 ## Bulk Renames
 
