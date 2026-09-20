@@ -514,9 +514,10 @@ cargo test --locked -p orange displayed_close_button -- --ignored --nocapture --
 The fast subset of the source gates runs automatically on `git push` once
 `git config core.hooksPath packaging/hooks` is set. See
 `packaging/hooks/pre-push.ps1` for what it covers and what it deliberately
-leaves to the full matrix above. `.github/workflows/ci.yml` runs the same
-subset on GitHub so the gate holds whether or not that hook is installed; it
-cannot cover `orange` or `orange-client`, which need GStreamer and Win32.
+leaves to the full matrix above. `.github/workflows/ci.yml` runs that subset
+on Ubuntu, plus a Windows job that installs GStreamer and builds the crates
+Ubuntu cannot compile (`orange`, `orange-client`, `orange-updater`); media and
+UI tests that need a GPU or a display stay local under `ship.ps1`.
 
 Direct PowerShell contract tests do not publish or deploy:
 
